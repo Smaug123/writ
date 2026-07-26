@@ -14,13 +14,15 @@
 //! `read_plan_body_bytes` helper. The two novelties of the implement
 //! workflow are:
 //!
-//! 1. The decision-note gate. Per slice E of
+//! 1. The workflow gate. Per slice E of
 //!    `docs/plans/2026-05-14-bailiff-split.md`: "the *is the plan
 //!    accepted?* gate lives in bailiff's read-side: refuse to compose
-//!    unless bailiff's own decision note says accepted." Bailiff
-//!    surfaces three pre-RPC error variants — `PlanSubmissionMissing`,
-//!    `PlanNotDecided`, `PlanRejected` — so an operator can tell which
-//!    precondition tripped.
+//!    unless bailiff's own decision note says accepted." Since slice 1
+//!    (`docs/plans/2026-07-26-bailiff-workflow-as-data.md`) that gate
+//!    is one call to [`crate::bailiff_plan_state::allows`] rather than
+//!    a hand-rolled chain, and it additionally requires a review — the
+//!    single `IllegalTransition` variant names the observed state, so
+//!    an operator still sees exactly which precondition tripped.
 //! 2. The composed prompt uses `PLAN_PROMPT_SEPARATOR`
 //!    (`# Approved plan`), not the reviewer's `# Proposed plan`. The
 //!    implementer is acting on an accepted artefact and the prompt
@@ -37,7 +39,10 @@
 //! Reviewer feedback stays *out* of the composed prompt: per
 //! `docs/plans/2026-05-11-agent-plans.md` §"Implementer prompt
 //! construction" reviewer feedback drives the *decision*, not the
-//! execution. The review note is therefore not consulted here.
+//! execution. The review note is therefore not read for prompt
+//! composition — though since slice 1 the workflow does require one
+//! to exist, because `implement` runs only from `accepted` and a
+//! verdict is only reachable through `review`.
 //!
 //! # Error handling
 //!
@@ -52,17 +57,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
-use crate::bailiff_decision::Decision;
 use crate::bailiff_plan_note::{PlanId, PlanNote};
 use crate::bailiff_plan_read::{
-    ReadDecisionError, ReadImplementError, ReadPlanBodyError, ReadPlanError, read_decision_note,
-    read_implement_note, read_plan_body_bytes, read_plan_note,
+    ReadPlanBodyError, ReadPlanError, SummarizePlanError, read_plan_body_bytes, read_plan_note,
+    summarize_plan,
 };
+use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
 use crate::bailiff_plan_write::{WriteImplementNoteError, write_implement_note};
-use crate::bailiff_repo_guard::BailiffRepoGuard;
+use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
@@ -77,12 +81,13 @@ use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClie
 /// [`submit_implement`] and never appears on the input struct.
 #[derive(Debug)]
 pub struct SubmitImplementInputs {
-    /// Plan to implement. Both the submission note and an *accepted*
-    /// decision note must already exist under
-    /// [`crate::bailiff_plan_note::plan_notes_ref`]`(plan_id)` or
-    /// [`submit_implement`] surfaces [`SubmitImplementError::PlanSubmissionMissing`]
-    /// / [`SubmitImplementError::PlanNotDecided`] /
-    /// [`SubmitImplementError::PlanRejected`] respectively.
+    /// Plan to implement. It must be in
+    /// [`crate::bailiff_plan_state::PlanState::Reviewed`] — submission,
+    /// an *accepted* decision, and a review note all attached under
+    /// [`crate::bailiff_plan_note::plan_notes_ref`]`(plan_id)` — or
+    /// [`submit_implement`] surfaces
+    /// [`SubmitImplementError::IllegalTransition`] naming the state it
+    /// actually found.
     pub plan_id: PlanId,
     /// The operator's original feature prompt — the request that
     /// triggered the plan. The composed prompt is `feature_prompt` +
@@ -166,19 +171,13 @@ pub struct SubmitImplementOutcome {
 
 /// Drive the full plan-implement workflow against a live writ broker.
 ///
-/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so the
-/// single-writer invariant on bailiff's bare repo can be enforced for
-/// the whole workflow: [`submit_implement`] acquires the lock via
-/// [`BailiffRepoGuard`] before reading the decision and duplicate
-/// gates and releases it only on return. Holding the guard across the
-/// gate-then-write sequence is what makes the duplicate gate
-/// load-bearing for in-process callers — without it two concurrent
-/// `submit_implement` calls could both pass `read_implement_note` and
-/// then both open `WorkspaceWrite` sessions whose side effects no
-/// later `write_implement_note` rejection can undo.
+/// `bailiff_repo` is an `Arc<NotesRepo>`; the workflow takes
+/// this plan's lock via [`PlanGuard`] before its first read and holds
+/// it until return, so the gate and the eventual note write cannot be
+/// interleaved by another workflow — in this process or another.
 pub async fn submit_implement(
     client: &WritClient,
-    bailiff_repo: Arc<AsyncMutex<NotesRepo>>,
+    bailiff_repo: Arc<NotesRepo>,
     writ_repo_path: &Path,
     allowed_signers: AllowedSigners,
     inputs: SubmitImplementInputs,
@@ -187,7 +186,10 @@ pub async fn submit_implement(
     // gates, opens, run, write, close — so concurrent submit_*/bailiff
     // workflows serialise instead of racing the gate-then-write
     // sequence. Released on function return.
-    let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+    let plan_id = inputs.plan_id;
+    let mut bailiff = PlanGuard::acquire(bailiff_repo, plan_id)
+        .await
+        .map_err(SubmitImplementError::PlanLock)?;
 
     // Pre-RPC: read the submission note, read the decision note (and
     // gate on it being an `accepted` verdict), gate on the absence of
@@ -201,37 +203,33 @@ pub async fn submit_implement(
     let read_outcome = bailiff
         .run_blocking(
             move |repo| -> Result<(PlanNote, String), SubmitImplementError> {
-                let plan_note = match read_plan_note(repo, plan_id)
+                // One gate, one definition. This replaces a 25-line
+                // hand-rolled sequence (submission? decision? is it
+                // Accepted? no implement note yet?) that was one of
+                // four disagreeing encodings of the workflow's
+                // transition relation — see
+                // `docs/plans/2026-07-26-bailiff-workflow-as-data.md`.
+                // The old duplicate-implement check is subsumed:
+                // `Implement` is illegal from `Implemented`.
+                //
+                // The workflow-held guard is what makes the gate
+                // load-bearing rather than advisory: a second caller
+                // blocks on `acquire` until the first either writes
+                // the implement note (so this read observes it) or
+                // fails and releases. Without it, both callers could
+                // pass here and both open `WorkspaceWrite` sessions
+                // whose side effects no later note-write rejection can
+                // undo.
+                let state = summarize_plan(repo, plan_id)
+                    .map_err(SubmitImplementError::ReadPlanState)?
+                    .state();
+                allows(state, PlanStage::Implement).map_err(|source| {
+                    SubmitImplementError::IllegalTransition { plan_id, source }
+                })?;
+
+                let plan_note = read_plan_note(repo, plan_id)
                     .map_err(SubmitImplementError::ReadPlanNote)?
-                {
-                    Some(note) => note,
-                    None => return Err(SubmitImplementError::PlanSubmissionMissing { plan_id }),
-                };
-                let decision = match read_decision_note(repo, plan_id)
-                    .map_err(SubmitImplementError::ReadDecisionNote)?
-                {
-                    Some(note) => note,
-                    None => return Err(SubmitImplementError::PlanNotDecided { plan_id }),
-                };
-                if decision.outcome != Decision::Accepted {
-                    return Err(SubmitImplementError::PlanRejected { plan_id });
-                }
-                // Duplicate gate: if an implement note already exists,
-                // refuse before opening a session. The implementer
-                // holds `WorkspaceWrite`, so a re-run can push a
-                // second set of changes even though
-                // `write_implement_note` would reject the bailiff-side
-                // write. The workflow-held guard makes the gate
-                // atomic against concurrent in-process callers: the
-                // second caller blocks on `acquire` until the first
-                // either writes the implement note (so this read
-                // returns `Some`) or fails and releases.
-                if read_implement_note(repo, plan_id)
-                    .map_err(SubmitImplementError::ReadImplementNote)?
-                    .is_some()
-                {
-                    return Err(SubmitImplementError::AlreadyImplemented { plan_id });
-                }
+                    .expect("gate passed, so a submission note exists");
                 let body = read_plan_body_bytes(
                     repo,
                     &writ_repo_path_owned,
@@ -362,6 +360,11 @@ fn compose_implementer_prompt_bytes(
 /// the time any post-RPC variant returns.
 #[derive(Debug, Error)]
 pub enum SubmitImplementError {
+    /// This plan's lock could not be taken — another bailiff process
+    /// is working on it, or the lockfile is unusable. Pre-RPC: no
+    /// session was opened and no note was read.
+    #[error("locking plan: {0}")]
+    PlanLock(#[source] PlanGuardError),
     /// The `spawn_blocking` task that owns the pre-RPC read chain
     /// panicked or was cancelled. Surfaces separately from
     /// `ReadPlanNote` / `ReadDecisionNote` / `ReadPlanEnvelope`
@@ -370,49 +373,34 @@ pub enum SubmitImplementError {
     /// opened.
     #[error("plan-body read task failed: {0}")]
     ReadTaskFailed(#[source] JoinError),
-    /// [`read_plan_note`] returned an error. Distinct from
-    /// [`Self::PlanSubmissionMissing`] (which is the `Ok(None)`
-    /// case) so the operator can tell "bailiff's repo is broken"
-    /// from "this plan has no submission yet." Pre-RPC.
+    /// [`read_plan_note`] returned an error. The gate has already
+    /// passed by the time this read runs, so this is "bailiff's repo
+    /// broke between two reads", not "the plan is in the wrong
+    /// state" — that is [`Self::IllegalTransition`]. Pre-RPC.
     #[error("reading the plan submission note failed: {0}")]
     ReadPlanNote(#[source] ReadPlanError),
-    /// Bailiff was asked to implement a plan with no submission note
-    /// recorded. The plan id may be wrong, or the operator may
-    /// have asked for an implementation before `bailiff plan submit`
-    /// ran. Pre-RPC.
-    #[error("no plan submission note recorded for plan {plan_id}")]
-    PlanSubmissionMissing { plan_id: PlanId },
-    /// [`read_decision_note`] returned an error. Distinct from
-    /// [`Self::PlanNotDecided`] (which is the `Ok(None)` case) so the
-    /// operator can tell "bailiff's repo is broken" from "this plan
-    /// has no decision yet." Pre-RPC.
-    #[error("reading the plan decision note failed: {0}")]
-    ReadDecisionNote(#[source] ReadDecisionError),
-    /// Bailiff was asked to implement a plan whose decision note has
-    /// not been recorded yet. The operator's recourse is to run
-    /// `bailiff plan decide accept|reject` first; this variant fires
-    /// before any session is opened. Pre-RPC.
-    #[error("no decision recorded for plan {plan_id}; run `bailiff plan decide` first")]
-    PlanNotDecided { plan_id: PlanId },
-    /// Bailiff was asked to implement a plan whose decision note
-    /// records `rejected`. The implementer gate is "decision says
-    /// accepted"; a rejected plan is dead and bailiff refuses to
-    /// compose an implementer prompt against it. Pre-RPC.
-    #[error("plan {plan_id} was rejected; refusing to compose an implementer prompt")]
-    PlanRejected { plan_id: PlanId },
-    /// [`read_implement_note`] returned an error. Distinct from
-    /// [`Self::AlreadyImplemented`] (which is the `Ok(Some(_))` case)
-    /// so the operator can tell "bailiff's repo is broken" from "this
-    /// plan has already been implemented." Pre-RPC.
-    #[error("reading the plan implement note failed: {0}")]
-    ReadImplementNote(#[source] ReadImplementError),
-    /// Bailiff was asked to implement a plan that already has an
-    /// implement note recorded. The implementer holds
-    /// `WorkspaceWrite`, so a duplicate run could push a second set
-    /// of changes; the gate fires before any session is opened.
+    /// Reading the four notes to determine the plan's state failed.
+    /// Distinct from [`Self::IllegalTransition`] (the state was read
+    /// fine and forbids the stage) so the operator can tell
+    /// "bailiff's repo is broken" from "this plan is not ready".
     /// Pre-RPC.
-    #[error("plan {plan_id} has already been implemented; refusing to re-run the implementer")]
-    AlreadyImplemented { plan_id: PlanId },
+    #[error("reading the plan's state failed: {0}")]
+    ReadPlanState(#[source] SummarizePlanError),
+    /// The plan is not in a state from which `implement` may run.
+    ///
+    /// Replaces the five separate variants this gate used to raise
+    /// (`PlanSubmissionMissing`, `PlanNotDecided`, `PlanRejected`,
+    /// `AlreadyImplemented`, and their read-error siblings): the
+    /// wrapped [`IllegalTransition`] names the observed state, the
+    /// blocked stage, and the operator's next command, all derived
+    /// from the one transition relation rather than hand-written per
+    /// failure mode. Pre-RPC: no session was opened.
+    #[error("plan {plan_id}: {source}")]
+    IllegalTransition {
+        plan_id: PlanId,
+        #[source]
+        source: IllegalTransition,
+    },
     /// The fetch / verify / decode chain that extracts the plan
     /// body from the planner envelope failed. The wrapped
     /// [`ReadPlanBodyError`] names the specific step. Pre-RPC.
@@ -605,6 +593,9 @@ mod end_to_end_tests {
     use super::*;
     use crate::bailiff_decision::{Decider, Decision};
     use crate::bailiff_plan_note::{DecisionNote, ImplementNote, plan_notes_ref};
+    use crate::bailiff_plan_note::{ReviewNote, plan_review_seed_blob_bytes};
+    use crate::bailiff_plan_read::read_plan_note;
+    use crate::bailiff_plan_state::PlanState;
     use crate::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
     use crate::bailiff_plan_write::write_decision_note;
     use writ::audit::AuditLog;
@@ -723,7 +714,7 @@ mod end_to_end_tests {
     /// recorded in bailiff's repo. Returns the plan id so the caller
     /// can plant a decision and drive `submit_implement`.
     async fn record_submission(
-        bailiff: &Arc<AsyncMutex<NotesRepo>>,
+        bailiff: &Arc<NotesRepo>,
         client: &WritClient,
         writ_repo_path: &Path,
         allowed: &AllowedSigners,
@@ -757,11 +748,7 @@ mod end_to_end_tests {
     /// Plant a decision note on `plan_id` with the supplied outcome,
     /// using `write_decision_note` so the on-disk shape matches what
     /// the production `bailiff plan decide` verb produces.
-    async fn record_decision(
-        bailiff: &Arc<AsyncMutex<NotesRepo>>,
-        plan_id: PlanId,
-        outcome: Decision,
-    ) {
+    async fn record_decision(bailiff: &Arc<NotesRepo>, plan_id: PlanId, outcome: Decision) {
         let bailiff = Arc::clone(bailiff);
         let note = DecisionNote {
             plan_id,
@@ -770,9 +757,44 @@ mod end_to_end_tests {
             decided_at: UnixMillis::from_millis(1_700_000_000_000),
         };
         tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff.blocking_lock();
             write_decision_note(&bailiff, &note)
                 .expect("write_decision_note must succeed for the fixture");
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Plant a review note on `plan_id` so the plan reaches
+    /// `PlanState::Reviewed`, the only state `implement` is legal
+    /// from.
+    ///
+    /// Written directly rather than through `submit_review` because
+    /// the implement gate reads note *presence*, never the review
+    /// note's envelope — running a second real agent to produce a
+    /// verifiable one would slow every implement test for no extra
+    /// coverage. The signed metadata and signature are copied off the
+    /// plan note so the planted note is still structurally
+    /// well-formed.
+    async fn record_review(bailiff: &Arc<NotesRepo>, plan_id: PlanId) {
+        let bailiff = Arc::clone(bailiff);
+        tokio::task::spawn_blocking(move || {
+            let plan_note = read_plan_note(&bailiff, plan_id)
+                .expect("reading the plan note must succeed for the fixture")
+                .expect("record_review requires a submission note");
+            let note = ReviewNote {
+                plan_id,
+                purpose: "plan-review".into(),
+                writ_output_oid: plan_note.writ_output_oid.clone(),
+                signed_metadata: plan_note.signed_metadata.clone(),
+                signature: plan_note.signature.clone(),
+            };
+            bailiff
+                .write_note(
+                    &plan_notes_ref(plan_id),
+                    &plan_review_seed_blob_bytes(plan_id),
+                    &note.canonical_bytes(),
+                )
+                .expect("write_note must succeed for the review fixture");
         })
         .await
         .unwrap();
@@ -810,7 +832,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -822,6 +844,9 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nReplace bar with baz.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        // `implement` is legal only from `accepted`, which under the
+        // shipped order means both a review and a verdict.
+        record_review(&bailiff, plan_id).await;
         record_decision(&bailiff, plan_id, Decision::Accepted).await;
 
         let outcome = tokio::time::timeout(
@@ -850,7 +875,7 @@ mod end_to_end_tests {
         let plan_ref = plan_notes_ref(plan_id);
         let oid = outcome.implement_note_oid.clone();
         let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
+            let bailiff = &*bailiff_for_read;
             bailiff.read_note(&plan_ref, &oid)
         })
         .await
@@ -881,10 +906,10 @@ mod end_to_end_tests {
     }
 
     /// Pre-RPC: `submit_implement` against a plan id that has no
-    /// submission note returns `PlanSubmissionMissing` *without
+    /// submission note returns `IllegalTransition` *without
     /// opening a session*. The variant alone witnesses that
     /// `open_session` was never reached — `submit_implement` returns
-    /// `PlanSubmissionMissing` strictly before the
+    /// `IllegalTransition` strictly before the
     /// `client.open_session` call.
     #[tokio::test]
     async fn submit_implement_returns_plan_submission_missing_without_opening_session() {
@@ -893,7 +918,7 @@ mod end_to_end_tests {
         let (_state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = tmp.path().join("writ-bare");
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -911,13 +936,21 @@ mod end_to_end_tests {
         )
         .await
         .expect("submit_implement must return within 15s")
-        .expect_err("missing submission must surface as PlanSubmissionMissing");
+        .expect_err("missing submission must surface as IllegalTransition");
 
         match err {
-            SubmitImplementError::PlanSubmissionMissing { plan_id: found } => {
+            SubmitImplementError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
                 assert_eq!(found, plan_id);
+                // Strictly more informative than the old
+                // `PlanSubmissionMissing`: the error now names the
+                // state observed, not just the note that was missing.
+                assert_eq!(source.state, PlanState::Absent);
+                assert_eq!(source.stage, PlanStage::Implement);
             }
-            other => panic!("expected PlanSubmissionMissing, got: {other:?}"),
+            other => panic!("expected IllegalTransition, got: {other:?}"),
         }
 
         broker_task.abort();
@@ -925,7 +958,7 @@ mod end_to_end_tests {
     }
 
     /// Pre-RPC: a plan with a submission note but *no decision note*
-    /// surfaces `PlanNotDecided` without opening a session. Verifies
+    /// surfaces `IllegalTransition` without opening a session. Verifies
     /// that the decision gate fires distinctly from the submission
     /// gate so an operator can tell which precondition tripped.
     #[tokio::test]
@@ -935,7 +968,7 @@ mod end_to_end_tests {
         let (_state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = tmp.path().join("writ-bare");
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -957,13 +990,18 @@ mod end_to_end_tests {
         )
         .await
         .expect("submit_implement must return within 15s")
-        .expect_err("undecided plan must surface as PlanNotDecided");
+        .expect_err("undecided plan must surface as IllegalTransition");
 
         match err {
-            SubmitImplementError::PlanNotDecided { plan_id: found } => {
+            SubmitImplementError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
                 assert_eq!(found, plan_id);
+                assert_eq!(source.state, PlanState::Submitted);
+                assert_eq!(source.stage, PlanStage::Implement);
             }
-            other => panic!("expected PlanNotDecided, got: {other:?}"),
+            other => panic!("expected IllegalTransition, got: {other:?}"),
         }
 
         broker_task.abort();
@@ -971,7 +1009,7 @@ mod end_to_end_tests {
     }
 
     /// Pre-RPC: a plan with a *rejected* decision note surfaces
-    /// `PlanRejected` without opening a session. Verifies the gate's
+    /// `IllegalTransition` without opening a session. Verifies the gate's
     /// negative-acceptance branch fires distinctly from the
     /// no-decision branch.
     #[tokio::test]
@@ -981,7 +1019,7 @@ mod end_to_end_tests {
         let (_state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = tmp.path().join("writ-bare");
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -989,6 +1027,8 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nDo a thing.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        // A verdict presupposes a review under the shipped order.
+        record_review(&bailiff, plan_id).await;
         record_decision(&bailiff, plan_id, Decision::Rejected).await;
 
         let err = tokio::time::timeout(
@@ -1003,13 +1043,18 @@ mod end_to_end_tests {
         )
         .await
         .expect("submit_implement must return within 15s")
-        .expect_err("rejected plan must surface as PlanRejected");
+        .expect_err("rejected plan must surface as IllegalTransition");
 
         match err {
-            SubmitImplementError::PlanRejected { plan_id: found } => {
+            SubmitImplementError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
                 assert_eq!(found, plan_id);
+                assert_eq!(source.state, PlanState::Rejected);
+                assert_eq!(source.stage, PlanStage::Implement);
             }
-            other => panic!("expected PlanRejected, got: {other:?}"),
+            other => panic!("expected IllegalTransition, got: {other:?}"),
         }
 
         broker_task.abort();
@@ -1017,9 +1062,87 @@ mod end_to_end_tests {
     }
 
     /// Pre-RPC: a plan that has already been implemented surfaces
-    /// `AlreadyImplemented` on a repeat call, without opening a new
+    /// `IllegalTransition` on a repeat call, without opening a new
     /// session or running the implementer agent a second time. Guards
     /// the codex-flagged footgun: the implementer holds
+    /// Behaviour delta (slice 1): implementing a reviewed plan that
+    /// has **no verdict yet** is refused, pre-RPC.
+    ///
+    /// The pre-slice gate never read the review note at all, so it
+    /// could not distinguish these states; and because the operator's
+    /// verdict is the last gate before a `WorkspaceWrite`-capable
+    /// agent run, "reviewed but nobody has decided" must not reach
+    /// it.
+    ///
+    /// Unlike its siblings this test needs no VM: the gate fires
+    /// before any RPC, so it does not depend on the workspace
+    /// plumbing that has the round-trip tests ignored.
+    #[tokio::test]
+    async fn submit_implement_refuses_an_undecided_plan_before_any_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
+
+        let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let bailiff = Arc::new(bailiff_repo);
+        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let client = WritClient::new(&socket_path);
+
+        let plan_body = "# Plan\n\nDo a thing.\n";
+        let plan_id =
+            record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        record_review(&bailiff, plan_id).await;
+        // Deliberately no `record_decision`.
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_implement(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed,
+                implement_inputs(plan_id),
+            ),
+        )
+        .await
+        .expect("submit_implement must return within 15s")
+        .expect_err("an undecided plan must not be implementable");
+
+        match &err {
+            SubmitImplementError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
+                assert_eq!(*found, plan_id);
+                assert_eq!(source.state, PlanState::Reviewed);
+                assert_eq!(source.stage, PlanStage::Implement);
+                assert!(
+                    source
+                        .to_string()
+                        .contains("run `bailiff plan decide` first"),
+                    "{source}",
+                );
+            }
+            other => panic!("expected IllegalTransition, got: {other:?}"),
+        }
+
+        // No implement note was written, so the plan stays
+        // implementable once it has actually been reviewed.
+        let bailiff_for_read = Arc::clone(&bailiff);
+        let implement_note = tokio::task::spawn_blocking(move || {
+            let repo = &*bailiff_for_read;
+            crate::bailiff_plan_read::read_implement_note(repo, plan_id)
+        })
+        .await
+        .unwrap()
+        .expect("reading the implement note must succeed");
+        assert!(implement_note.is_none());
+
+        broker_task.abort();
+        let _ = broker_task.await;
+    }
+
     /// `WorkspaceWrite`, so an accidental double-click on
     /// `bailiff plan implement` must not let it push twice. The
     /// bailiff-side implement note's OID is unchanged across the
@@ -1034,7 +1157,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -1042,6 +1165,9 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nDo a thing.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        // `implement` is legal only from `accepted`, which under the
+        // shipped order means both a review and a verdict.
+        record_review(&bailiff, plan_id).await;
         record_decision(&bailiff, plan_id, Decision::Accepted).await;
 
         // First call must succeed and stamp an implement note.
@@ -1073,13 +1199,20 @@ mod end_to_end_tests {
         )
         .await
         .expect("duplicate submit_implement must return within 15s")
-        .expect_err("duplicate implement must surface as AlreadyImplemented");
+        .expect_err("duplicate implement must surface as IllegalTransition");
 
         match err {
-            SubmitImplementError::AlreadyImplemented { plan_id: found } => {
+            // The duplicate-implement gate is no longer a bespoke
+            // check: `Implement` is simply illegal from `Implemented`.
+            SubmitImplementError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
                 assert_eq!(found, plan_id);
+                assert_eq!(source.state, PlanState::Implemented);
+                assert_eq!(source.stage, PlanStage::Implement);
             }
-            other => panic!("expected AlreadyImplemented, got: {other:?}"),
+            other => panic!("expected IllegalTransition, got: {other:?}"),
         }
 
         // Witness 1: the first session is still closed and untouched.
@@ -1106,7 +1239,7 @@ mod end_to_end_tests {
         let plan_ref = plan_notes_ref(plan_id);
         let oid = first.implement_note_oid.clone();
         let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
+            let bailiff = &*bailiff_for_read;
             bailiff.read_note(&plan_ref, &oid)
         })
         .await
@@ -1121,14 +1254,14 @@ mod end_to_end_tests {
 
     /// Concurrent `submit_implement` against the same plan: exactly
     /// one call must succeed and every other must surface
-    /// `AlreadyImplemented` — the *pre-RPC* duplicate-gate variant,
+    /// `IllegalTransition` — the *pre-RPC* duplicate-gate variant,
     /// never the post-RPC
     /// [`WriteImplementNoteError::ImplementAlreadyRecorded`] that
     /// `write_implement_note` would surface if two callers both
     /// reached the write step.
     ///
     /// Witnesses the in-process atomicity invariant
-    /// [`BailiffRepoGuard`] is the primitive of: the
+    /// [`PlanGuard`] is the primitive of: the
     /// `read_implement_note` gate and the `write_implement_note` call
     /// happen under one held lock, so a second caller blocks on
     /// `acquire` until the first has either landed the implement note
@@ -1146,7 +1279,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -1154,6 +1287,9 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nDo a thing.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        // `implement` is legal only from `accepted`, which under the
+        // shipped order means both a review and a verdict.
+        record_review(&bailiff, plan_id).await;
         record_decision(&bailiff, plan_id, Decision::Accepted).await;
 
         // Three concurrent calls is enough to exercise the
@@ -1199,20 +1335,25 @@ mod end_to_end_tests {
         );
         for err in &failures {
             match err {
-                SubmitImplementError::AlreadyImplemented { plan_id: found } => {
+                SubmitImplementError::IllegalTransition {
+                    plan_id: found,
+                    source,
+                } => {
                     assert_eq!(*found, plan_id);
+                    assert_eq!(source.state, PlanState::Implemented);
+                    assert_eq!(source.stage, PlanStage::Implement);
                 }
                 SubmitImplementError::WriteImplementNote { .. } => panic!(
                     "duplicate must trip the pre-RPC gate, not the write-side idempotency \
                      check; got: {err:?}",
                 ),
-                other => panic!("expected AlreadyImplemented, got: {other:?}"),
+                other => panic!("expected IllegalTransition, got: {other:?}"),
             }
         }
 
         // All three sessions writ recorded must be closed — both the
         // succeeding caller and the two callers that surfaced
-        // `AlreadyImplemented` before opening any session leave a
+        // `IllegalTransition` before opening any session leave a
         // tidy audit trail. The losers never opened sessions, so
         // only the winner's session id should appear in the log.
         let winner_session = successes[0].implementer_session_id;

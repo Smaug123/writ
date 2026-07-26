@@ -36,15 +36,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::{PlanId, PlanNote};
 use crate::bailiff_plan_read::{
-    ReadPlanBodyError, ReadPlanError, read_plan_body_bytes, read_plan_note,
+    ReadPlanBodyError, ReadPlanError, SummarizePlanError, read_plan_body_bytes, read_plan_note,
+    summarize_plan,
 };
+use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
 use crate::bailiff_plan_write::{WriteReviewNoteError, write_review_note};
-use crate::bailiff_repo_guard::BailiffRepoGuard;
+use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
@@ -61,7 +62,7 @@ use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClie
 pub struct SubmitReviewInputs {
     /// Plan to review. The submission note must already exist under
     /// [`crate::bailiff_plan_note::plan_notes_ref`]`(plan_id)` or
-    /// [`submit_review`] surfaces [`SubmitReviewError::PlanSubmissionMissing`].
+    /// [`submit_review`] surfaces [`SubmitReviewError::IllegalTransition`].
     pub plan_id: PlanId,
     /// Reviewer instructions the operator authored. The composed
     /// prompt is `reviewer_instructions` + separator + plan body;
@@ -129,16 +130,13 @@ pub struct SubmitReviewOutcome {
 
 /// Drive the full plan-review workflow against a live writ broker.
 ///
-/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so the
-/// single-writer invariant on bailiff's bare repo can be enforced for
-/// the whole workflow: [`submit_review`] acquires the lock via
-/// [`BailiffRepoGuard`] before reading the submission note and
-/// releases it only on return, so a concurrent bailiff workflow
-/// cannot interleave between the pre-RPC read gate and the eventual
-/// review-note write.
+/// `bailiff_repo` is an `Arc<NotesRepo>`; the workflow takes
+/// this plan's lock via [`PlanGuard`] before its first read and holds
+/// it until return, so the gate and the eventual note write cannot be
+/// interleaved by another workflow — in this process or another.
 pub async fn submit_review(
     client: &WritClient,
-    bailiff_repo: Arc<AsyncMutex<NotesRepo>>,
+    bailiff_repo: Arc<NotesRepo>,
     writ_repo_path: &Path,
     allowed_signers: AllowedSigners,
     inputs: SubmitReviewInputs,
@@ -147,24 +145,35 @@ pub async fn submit_review(
     // read, opens, run, write, close — so concurrent submit_*/bailiff
     // workflows serialise instead of racing the gate-then-write
     // sequence. Released on function return.
-    let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+    let plan_id = inputs.plan_id;
+    let mut bailiff = PlanGuard::acquire(bailiff_repo, plan_id)
+        .await
+        .map_err(SubmitReviewError::PlanLock)?;
 
     // Pre-RPC: read the submission note, fetch+verify+decode the
     // planner envelope, extract the plan body. Done before opening
     // a session so a missing or unverifiable submission never burns
     // a writ audit row.
-    let plan_id = inputs.plan_id;
     let writ_repo_path_owned = writ_repo_path.to_path_buf();
     let writ_output_ref_for_read = inputs.writ_output_ref.clone();
     let allowed_for_read = allowed_signers.clone();
     let read_outcome = bailiff
         .run_blocking(
             move |repo| -> Result<(PlanNote, String), SubmitReviewError> {
-                let plan_note =
-                    match read_plan_note(repo, plan_id).map_err(SubmitReviewError::ReadPlanNote)? {
-                        Some(note) => note,
-                        None => return Err(SubmitReviewError::PlanSubmissionMissing { plan_id }),
-                    };
+                // Before slice 1 this workflow gated on the
+                // submission note by hand; it now asks the shared
+                // relation. `Review` is legal from `Submitted` only —
+                // reviewer feedback is an input to the verdict, so a
+                // plan that already has one is past this stage.
+                let state = summarize_plan(repo, plan_id)
+                    .map_err(SubmitReviewError::ReadPlanState)?
+                    .state();
+                allows(state, PlanStage::Review)
+                    .map_err(|source| SubmitReviewError::IllegalTransition { plan_id, source })?;
+
+                let plan_note = read_plan_note(repo, plan_id)
+                    .map_err(SubmitReviewError::ReadPlanNote)?
+                    .expect("gate passed, so a submission note exists");
                 let body = read_plan_body_bytes(
                     repo,
                     &writ_repo_path_owned,
@@ -307,6 +316,11 @@ fn compose_reviewer_prompt_bytes(
 /// the close itself failed — the session may still be open.
 #[derive(Debug, Error)]
 pub enum SubmitReviewError {
+    /// This plan's lock could not be taken — another bailiff process
+    /// is working on it, or the lockfile is unusable. Pre-RPC: no
+    /// session was opened and no note was read.
+    #[error("locking plan: {0}")]
+    PlanLock(#[source] PlanGuardError),
     /// The `spawn_blocking` task that owns the pre-RPC read chain
     /// panicked or was cancelled. Surfaces separately from
     /// `ReadPlanNote` / `ReadPlanEnvelope` because the cause is a
@@ -314,18 +328,31 @@ pub enum SubmitReviewError {
     /// violation. Pre-RPC: no session was opened.
     #[error("plan-body read task failed: {0}")]
     ReadTaskFailed(#[source] JoinError),
-    /// [`read_plan_note`] returned an error. Distinct from
-    /// [`Self::PlanSubmissionMissing`] (which is the `Ok(None)`
-    /// case) so the operator can tell "bailiff's repo is broken"
-    /// from "this plan has no submission yet." Pre-RPC.
+    /// [`read_plan_note`] returned an error. The gate has already
+    /// passed by the time this read runs, so this is "bailiff's repo
+    /// broke between two reads", not "the plan is in the wrong
+    /// state" — that is [`Self::IllegalTransition`]. Pre-RPC.
     #[error("reading the plan submission note failed: {0}")]
     ReadPlanNote(#[source] ReadPlanError),
-    /// Bailiff was asked to review a plan with no submission note
-    /// recorded. The plan id may be wrong, or the operator may
-    /// have asked for a review before `bailiff plan submit` ran.
+    /// Reading the four notes to determine the plan's state failed.
+    /// Distinct from [`Self::IllegalTransition`] (the state was read
+    /// fine and forbids the stage) so the operator can tell
+    /// "bailiff's repo is broken" from "this plan is not ready".
     /// Pre-RPC.
-    #[error("no plan submission note recorded for plan {plan_id}")]
-    PlanSubmissionMissing { plan_id: PlanId },
+    #[error("reading the plan's state failed: {0}")]
+    ReadPlanState(#[source] SummarizePlanError),
+    /// The plan is not in a state from which `review` may run.
+    ///
+    /// Replaces `PlanSubmissionMissing`, and additionally catches the
+    /// case the old gate missed entirely: reviewing a plan whose
+    /// decision is `rejected`, or one with no verdict yet. Pre-RPC:
+    /// no session was opened.
+    #[error("plan {plan_id}: {source}")]
+    IllegalTransition {
+        plan_id: PlanId,
+        #[source]
+        source: IllegalTransition,
+    },
     /// The fetch / verify / decode chain that extracts the plan
     /// body from the planner envelope failed. The wrapped
     /// [`ReadPlanBodyError`] names the specific step. Pre-RPC.
@@ -448,9 +475,13 @@ mod end_to_end_tests {
     use wiremock::MockServer;
 
     use super::*;
-    use crate::bailiff_plan_note::{ReviewNote, plan_notes_ref};
+    use crate::bailiff_decision::{Decider, Decision};
+    use crate::bailiff_plan_note::{DecisionNote, ReviewNote, plan_notes_ref};
+    use crate::bailiff_plan_state::PlanState;
     use crate::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
+    use crate::bailiff_plan_write::write_decision_note;
     use writ::audit::AuditLog;
+    use writ::core::UnixMillis;
     use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
     use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
     use writ::notes_repo::NotesRepo;
@@ -559,8 +590,28 @@ mod end_to_end_tests {
     /// recorded in bailiff's repo. Returns the plan id and bailiff
     /// repo handle so the caller can drive a `submit_review` against
     /// the same plan.
+    /// Plant an accepted decision note so the plan reaches
+    /// `PlanState::Accepted`, the only state `review` is legal from.
+    /// Written through `write_decision_note` so the on-disk shape
+    /// matches what `bailiff plan decide` produces.
+    async fn record_acceptance(bailiff: &Arc<NotesRepo>, plan_id: PlanId) {
+        let bailiff = Arc::clone(bailiff);
+        let note = DecisionNote {
+            plan_id,
+            outcome: Decision::Accepted,
+            decider: Decider::try_new("cli:test").unwrap(),
+            decided_at: UnixMillis::from_millis(1_700_000_000_000),
+        };
+        tokio::task::spawn_blocking(move || {
+            write_decision_note(&bailiff, &note)
+                .expect("write_decision_note must succeed for the fixture");
+        })
+        .await
+        .unwrap();
+    }
+
     async fn record_submission(
-        bailiff: &Arc<AsyncMutex<NotesRepo>>,
+        bailiff: &Arc<NotesRepo>,
         client: &WritClient,
         writ_repo_path: &Path,
         allowed: &AllowedSigners,
@@ -605,7 +656,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -659,7 +710,7 @@ mod end_to_end_tests {
         let plan_ref = plan_notes_ref(plan_id);
         let oid = outcome.review_note_oid.clone();
         let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
+            let bailiff = &*bailiff_for_read;
             bailiff.read_note(&plan_ref, &oid)
         })
         .await
@@ -689,8 +740,101 @@ mod end_to_end_tests {
         let _ = broker_task.await;
     }
 
+    /// Behaviour delta (slice 1): a plan that already carries a
+    /// verdict is past `review`, and the refusal says so rather than
+    /// pointing at a later stage.
+    ///
+    /// This replaces a test asserting that reviewing a *rejected* plan
+    /// is refused. Under the shipped order (`review` → `decide`) that
+    /// scenario cannot be built: reaching `rejected` requires a review
+    /// note, so the second call is a repeat rather than a first
+    /// review. The property worth keeping is that the repeat is
+    /// refused pre-RPC with actionable guidance.
+    #[tokio::test]
+    async fn submit_review_refuses_a_decided_plan_before_opening_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
+
+        let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let bailiff = Arc::new(bailiff_repo);
+        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let client = WritClient::new(&socket_path);
+
+        let plan_body = "# Plan\n\nReplace bar with baz.\n";
+        let plan_id =
+            record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+
+        let inputs = || SubmitReviewInputs {
+            plan_id,
+            reviewer_instructions: AgentPrompt::try_new("Evaluate.").unwrap(),
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            purpose: "plan-review".into(),
+            writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_label: None,
+            session_agent_kind: Some(AgentKind::Claude),
+            session_agent_model: None,
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_review(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed.clone(),
+                inputs(),
+            ),
+        )
+        .await
+        .expect("the first review must return within 15s")
+        .expect("the first review must succeed");
+
+        record_acceptance(&bailiff, plan_id).await;
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_review(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed,
+                inputs(),
+            ),
+        )
+        .await
+        .expect("submit_review must return within 15s")
+        .expect_err("a decided plan must not be reviewable again");
+
+        match &err {
+            SubmitReviewError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
+                assert_eq!(*found, plan_id);
+                assert_eq!(source.state, PlanState::Accepted);
+                assert_eq!(source.stage, PlanStage::Review);
+                // Must not recommend a later stage; the remedy is a
+                // fresh plan.
+                let msg = source.to_string();
+                assert!(msg.contains("already past"), "{msg}");
+                assert!(!msg.contains("first"), "{msg}");
+            }
+            other => panic!("expected IllegalTransition, got: {other:?}"),
+        }
+
+        broker_task.abort();
+        let _ = broker_task.await;
+    }
+
     /// Pre-RPC: `submit_review` against a plan id that has no
-    /// submission note returns `PlanSubmissionMissing` *without
+    /// submission note returns `IllegalTransition` *without
     /// opening a session*. Verified by inspecting writ's audit log:
     /// no session row should exist for an id that was never opened.
     #[tokio::test]
@@ -700,7 +844,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -733,35 +877,53 @@ mod end_to_end_tests {
         )
         .await
         .expect("submit_review must return within 15s")
-        .expect_err("missing submission must surface as PlanSubmissionMissing");
+        .expect_err("missing submission must surface as IllegalTransition");
 
         match err {
-            SubmitReviewError::PlanSubmissionMissing { plan_id: found } => {
+            SubmitReviewError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
                 assert_eq!(found, plan_id);
+                assert_eq!(source.state, PlanState::Absent);
+                assert_eq!(source.stage, PlanStage::Review);
             }
-            other => panic!("expected PlanSubmissionMissing, got: {other:?}"),
+            other => panic!("expected IllegalTransition, got: {other:?}"),
         }
         // The variant alone witnesses that `open_session` was never
-        // reached: `submit_review` returns `PlanSubmissionMissing`
-        // strictly before the `client.open_session` call.
+        // reached: `submit_review` gates strictly before the
+        // `client.open_session` call.
 
         broker_task.abort();
         let _ = broker_task.await;
     }
 
-    /// Second `submit_review` against an already-reviewed plan
-    /// propagates `WriteReviewNote { source: ReviewAlreadyRecorded }`
-    /// and still closes the second reviewer's session. The first
-    /// review note remains intact (the idempotency guard rejects
-    /// the write rather than overwriting).
+    /// Second `submit_review` against an already-reviewed plan is
+    /// refused *before any RPC*, and the first review note survives.
+    ///
+    /// Before slice 1 this test asserted the weaker post-RPC
+    /// behaviour: the second reviewer agent ran, `write_review_note`
+    /// rejected the duplicate, and the assertion was that the wasted
+    /// session had at least been closed. The transition relation
+    /// subsumes that idempotency check — `Review` is illegal from
+    /// `Reviewed` — so the duplicate now costs no session and no
+    /// agent run at all, which is what this asserts instead.
+    ///
+    /// `SubmitReviewError::WriteReviewNote { source:
+    /// ReviewAlreadyRecorded }` is consequently no longer reachable
+    /// in-process: the workflow-held [`PlanGuard`] means nothing
+    /// can attach a review note between this gate and the write. It
+    /// remains reachable across processes, which is exactly the hole
+    /// slice 2's per-plan flock closes; the write-side check stays as
+    /// the backstop for it.
     #[tokio::test]
-    async fn submit_review_propagates_review_already_recorded_and_closes_session() {
+    async fn submit_review_refuses_a_duplicate_before_opening_a_session() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -814,32 +976,48 @@ mod end_to_end_tests {
         .expect("second submit_review must return within 15s")
         .expect_err("second submit_review must reject the duplicate");
 
-        let session_id = match &err {
-            SubmitReviewError::WriteReviewNote {
-                session_id,
-                source: WriteReviewNoteError::ReviewAlreadyRecorded { plan_id: rec, .. },
+        match &err {
+            SubmitReviewError::IllegalTransition {
+                plan_id: found,
+                source,
             } => {
-                assert_eq!(*rec, plan_id);
-                *session_id
+                assert_eq!(*found, plan_id);
+                assert_eq!(source.state, PlanState::Reviewed);
+                assert_eq!(source.stage, PlanStage::Review);
             }
-            other => panic!("expected WriteReviewNote{{ReviewAlreadyRecorded}}, got: {other:?}"),
-        };
-        assert_ne!(
-            session_id, first.reviewer_session_id,
-            "second submit_review must open a fresh session",
-        );
+            other => panic!("expected IllegalTransition, got: {other:?}"),
+        }
 
-        // The second reviewer's session must still close even
-        // though `write_review_note` rejected the duplicate.
+        // Witness that no second run happened: the first reviewer's
+        // session is still the only one, and it is closed. A
+        // post-RPC rejection would have left a second, distinct
+        // session id in the audit log.
+        let first_session = first.reviewer_session_id;
         let audit = Arc::clone(&state.audit);
-        let session_row = tokio::task::spawn_blocking(move || audit.get_session(session_id))
+        let session_row = tokio::task::spawn_blocking(move || audit.get_session(first_session))
             .await
             .unwrap()
             .expect("session row read must succeed")
-            .expect("second reviewer session must exist in audit log");
+            .expect("first reviewer session must exist in audit log");
         assert!(
             session_row.closed_at.is_some(),
-            "second submit_review must close its session on ReviewAlreadyRecorded",
+            "the first reviewer session must have closed cleanly",
+        );
+
+        // The first review note is untouched: the gate refused the
+        // duplicate rather than overwriting.
+        let bailiff_for_read = Arc::clone(&bailiff);
+        let note_after = tokio::task::spawn_blocking(move || {
+            let repo = &*bailiff_for_read;
+            crate::bailiff_plan_read::read_review_note(repo, plan_id)
+        })
+        .await
+        .unwrap()
+        .expect("reading the review note must succeed")
+        .expect("the first review note must still be present");
+        assert_eq!(
+            note_after.signed_metadata.session_id, first_session,
+            "the surviving review note must be the first one",
         );
 
         broker_task.abort();

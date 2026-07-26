@@ -56,7 +56,7 @@ Everything below is a consequence of holding those two invariants at once.
 | **`writ-vm-client`** (`crates/writ-vm-client/`) | The guest-side `writ-vm` command surface that runs inside the agent VM. Links no host-only dependency — enforced by the crate graph. Re-exported as `writ::vm_client` under the `vm-client` feature. | `writ-core`, `writ-vm-git`, `writ-agent-run` |
 | **`writ-audit`** (`crates/writ-audit/`) | The append-only SQLite audit log: schema/migrations, the typed row DAOs, and two-phase write helpers. Re-exported as `writ::audit` under the `host` feature. | `writ-core`, `writ-agent-run`, `writ-vm-git` |
 | **`writ`** (root) | The imperative shell: the daemon and all host effects. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git`, `writ-agent-run`, `writ-vm-client` (opt), `writ-audit` (opt) |
-| **`bailiff`** (`crates/bailiff/`) | A plan-workflow product (submit → decide → review → implement) built *on top of* writ. | `writ` |
+| **`bailiff`** (`crates/bailiff/`) | A plan-workflow product (submit → review → decide → implement) built *on top of* writ. | `writ` |
 
 Dependency direction is strict: `bailiff` → `writ` → {`writ-vm-git`,
 `writ-agent-run`, `writ-vm-client`, `writ-audit`, `writ-core`}. `writ` never
@@ -900,21 +900,47 @@ non-goals; both now exist in read-only form via `ui_http` (see the
 
 ### 5.11 bailiff — workflow on top of writ
 
-**Purpose.** A separate binary implementing a per-plan **submit → decide →
-review → implement** workflow layered on writ's `RunAgent`/`OpenSession` RPCs.
+**Purpose.** A separate binary implementing a per-plan **submit → review →
+decide → implement** workflow layered on writ's `RunAgent`/`OpenSession` RPCs.
 Each step verifies a broker-minted signed run envelope and records a
 bailiff-owned note in bailiff's own bare git repo, keeping product-level
 workflow out of the security-critical broker.
 
 **Lives in.** `crates/bailiff/` (`bailiff_plan_{submit,review,implement,write,
-read,view,note}.rs`, `bailiff_decision.rs`, `bailiff_repo_guard.rs`, `bin/`).
+read,view,note,state}.rs`, `bailiff_decision.rs`, `bailiff_repo_guard.rs`,
+`bin/`).
 
-**Workflow.** The state (`WorkflowState`: Submitted/Accepted/Rejected/Reviewed/
-Implemented, `bailiff_plan_view.rs:85`) is *derived* from which notes exist —
-"highest stage reached." Legal-transition gating is enforced at the implement
-step (`submit_implement` requires submission → decision → `Accepted` → no prior
-implement, `bailiff_plan_implement.rs:204`); decide and review deliberately do
-not gate on submission presence.
+**Workflow.** One transition relation, in `bailiff_plan_state.rs`. `NotePresence`
+is the observation (whether the plan's ref exists, which of the four notes exist,
+and the decision's outcome — ref existence is what keeps an untouched id apart
+from an existing-but-empty ref, which is an anomaly rather than a fresh plan),
+`derive_state` parses it into a `PlanState` (Absent/Submitted/Accepted/Rejected/
+Reviewed/Implemented/Corrupt), and `allows(state, stage)` is the gate every
+mutating verb calls — submit from `Absent`, review from `Submitted`, decide from
+`Reviewed`, implement from `Accepted`. Review precedes the decision because
+reviewer feedback is an input to it (`2026-05-11-agent-plans.md`: "the review →
+decide → execute cycle"; "reviewer feedback is for the decision, not for
+execution"). The four ad-hoc idempotency gates are
+subsumed: a stage is illegal from the state it produces, so "already decided /
+reviewed / implemented" needs no separate check (the write-side
+`write_note_if_absent` rejection remains as the backstop, in the same spirit as
+the approve path's SQL triggers).
+
+`Corrupt` is *defined by* the relation rather than listed separately: it is any
+note set no legal stage sequence could have produced. That makes the corruption
+detector and the gate two readings of one definition, checked by a reference
+implementation that walks the relation without consulting the state⇒presence map
+(`reachable_presences_are_exactly_the_non_corrupt_states`).
+
+**History.** Until 2026-07-26 this was four disagreeing encodings: `plan_decide`
+read no precondition at all (so it could stamp a verdict on an unsubmitted plan
+and *manufacture* the `Corrupt` row the display layer exists to report),
+`submit_review` gated on the submission alone, `submit_implement` gated on
+submission → `Accepted` → no prior implement but never read the review note at
+all, and `BailiffPlanSummary::state` derived a fourth relation for display whose
+"highest stage reached" rule assumed the opposite stage order. Unifying them
+tightened every gate; see `docs/plans/2026-07-26-bailiff-workflow-as-data.md`
+for the delta table.
 
 **Guarantees & invariants.** Each stage attaches a distinct note under one
 per-plan ref `refs/notes/bailiff/v1/plans/<id>` at deterministic per-stage seed
@@ -922,9 +948,41 @@ OIDs. Every signed stage runs fetch → verify: fetch writ's
 `refs/notes/writ/v1/*`, re-decode the envelope, check metadata+signature parity
 against the RPC reply, then `verify_run_envelope`. Append-only/idempotent via
 `NotesRepo::write_note_if_absent` (duplicate → `AlreadyRecorded`);
-`deny_unknown_fields` on all notes; cross-plan `PlanIdMismatch` guards;
-single-writer via an in-process `BailiffRepoGuard` plus a cross-process flock
-for `implement` (load-bearing because implement grants `WorkspaceWrite`).
+`deny_unknown_fields` on all notes; cross-plan `PlanIdMismatch` guards.
+
+**Locking.** Single-writer **per plan**, via `PlanGuard` (`bailiff_repo_guard.rs`):
+one `flock` on `<bailiff_repo>/bailiff-locks/<plan-id>.lock`, taken on a blocking
+thread and held for the whole workflow, so every gate-then-write sequence is
+atomic. `acquire` waits rather than failing — the holder is typically
+mid-LLM-run. All four mutating verbs take it, including `decide`, which before
+2026-07-26 took no lock at all.
+
+A **second, repo-wide** lock (`lock_repo_mutations`,
+`<repo>/bailiff-locks/_repo-mutation.lock`) serialises every mutation of the
+repo — fetches into the shared writ mirror and note writes alike. Per-plan locks
+are the wrong granularity for git's repo-level structures:
+`NotesRepo::fetch_from_remote` states that "Git's index / refs / objects writes
+are not safe under concurrent fetch+notes-add into the same destination" and
+enforces it with a *process-wide* mutex, which is the one scope that does not
+help two `bailiff` processes on different plans. Held across each
+fetch→read→write, inside the plan lock — the ordering is total (plan, then
+mutation), so the pair cannot deadlock.
+
+Waiting on a plan lock **polls with async backoff** rather than parking a
+`spawn_blocking` worker on a blocking `flock`: a plan lock can be held across an
+agent run, and a waiter occupying a pool worker for that long starves the holder
+of the worker it needs to write the note that would release the lock.
+
+One mechanism per scope, not two per scope: an `flock` binds to an *open file
+description*, so two `open` calls contend even inside one process, and the kernel
+supplies the in-process queueing that an earlier draft built a mutex registry to
+provide. `PlanGuard::run_blocking` hands its lockfile *to* the blocking task, so
+a cancelled workflow keeps the lock until its closure actually returns.
+Per-plan granularity is safe because each plan owns its ref and git updates refs
+through their own lockfiles (measured: 32 concurrent cross-process `git notes
+add` calls on distinct refs, all successful); concurrent *git invocations*
+against one repo are serialised a layer down by `NotesRepo`'s own per-path
+mutex.
 
 **Current-state note.** The bailiff *split* is **complete in code**: the writ
 root crate has no `agent_plan` module and no plan/decide CLI verb (top-level

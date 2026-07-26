@@ -1,6 +1,6 @@
 //! `bailiff`: the plan-workflow product built on top of `writ`.
 //!
-//! Bailiff drives the per-plan submit → decide → review → implement
+//! Bailiff drives the per-plan submit → review → decide → implement
 //! workflow, recording each step as a signed note in its own bare repo
 //! and verifying agent-run envelopes produced by the writ broker. It
 //! depends on `writ` for the broker client, run verification, git notes,
@@ -11,6 +11,7 @@ pub mod bailiff_plan_implement;
 pub mod bailiff_plan_note;
 pub mod bailiff_plan_read;
 pub mod bailiff_plan_review;
+pub mod bailiff_plan_state;
 pub mod bailiff_plan_submit;
 pub mod bailiff_plan_view;
 pub mod bailiff_plan_write;

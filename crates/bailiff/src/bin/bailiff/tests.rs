@@ -1133,40 +1133,17 @@ fn build_implement_workspace_bootstrap_rejects_non_utf8_destination() {
     );
 }
 
-/// Acquire → second acquire fails fast → drop → reacquire round-trips.
-/// Pins the cross-process invariant the helper exists to enforce:
-/// two concurrent `bailiff plan implement` invocations against the
-/// same `--bailiff-repo` cannot both pass the lockfile. A regression
-/// (e.g. swapping `try_lock` for `lock`, dropping the lockfile path
-/// to a process-shared temp directory that other tests reuse, or
-/// reopening the lock by path instead of holding the `File`) would
-/// fail this test: either the second acquire would block forever
-/// (and the test would time out) or the reacquire after drop would
-/// fail because the OS-level lock had leaked.
-#[test]
-fn implement_lock_blocks_concurrent_acquire_and_releases_on_drop() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_path = tmp.path();
-
-    let first = acquire_implement_lock(repo_path).expect("first acquire must succeed");
-
-    // The same process can hold an `flock` exclusive lock only once;
-    // an in-process re-acquire on a separately-opened handle must
-    // surface the `WouldBlock` translation. The point of the test is
-    // that the *operator-facing* error message names the contention
-    // (rather than e.g. blocking forever or surfacing an opaque IO
-    // error).
-    let err = acquire_implement_lock(repo_path)
-        .expect_err("second acquire must fail while first lock is held");
-    assert!(
-        err.contains("in progress"),
-        "expected operator-facing contention message, got: {err}",
-    );
-
-    drop(first);
-
-    // After the first guard drops the lock is released, so a fresh
-    // acquire on the same path must succeed.
-    let _second = acquire_implement_lock(repo_path)
-        .expect("reacquire must succeed after the first guard drops");
-}
+// The `implement_lock_blocks_concurrent_acquire_and_releases_on_drop`
+// test lived here until slice 2. It pinned the CLI-layer
+// `acquire_implement_lock` helper, which no longer exists: locking is
+// a library concern now, keyed per plan rather than per repo, and
+// taken by all four mutating verbs rather than by `implement` alone.
+//
+// Its own docstring predicted its removal — it listed "swapping
+// `try_lock` for `lock`" as a regression it would catch, and that is
+// precisely the deliberate change: `PlanGuard::acquire` waits instead
+// of failing fast, because the holder is typically mid-LLM-run and
+// "retry later" is not something a caller can act on. The equivalent
+// coverage is `bailiff_repo_guard::tests`, which asserts exclusion,
+// per-plan granularity, and release-then-reacquire against the real
+// guard.
