@@ -17,11 +17,7 @@ fn sample_object_id(nibble: char) -> GitObjectId {
 }
 
 fn client_against(server: &MockServer, token: &str) -> GitDataClient {
-    GitDataClient::new(
-        GitDataTimeouts::production(),
-        server.uri(),
-        token.to_string(),
-    )
+    GitDataClient::new(&GitDataHttp::production(), server.uri(), token.to_string())
 }
 
 /// A server that accepts the request and then never answers must
@@ -45,11 +41,11 @@ async fn git_data_request_against_a_withholding_server_times_out() {
         .mount(&server)
         .await;
     let client = GitDataClient::new(
-        GitDataTimeouts::new(
+        &GitDataHttp::new(GitDataTimeouts::new(
             Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_millis(500),
-        ),
+        )),
         server.uri(),
         "ghs_token".to_string(),
     );
@@ -99,11 +95,11 @@ async fn create_blob_survives_a_response_slower_than_the_small_call_budget() {
         .mount(&server)
         .await;
     let client = GitDataClient::new(
-        GitDataTimeouts::new(
+        &GitDataHttp::new(GitDataTimeouts::new(
             Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_secs(5),
-        ),
+        )),
         server.uri(),
         "ghs_token".to_string(),
     );
@@ -136,11 +132,11 @@ async fn create_commit_survives_a_response_slower_than_the_small_call_budget() {
         .mount(&server)
         .await;
     let client = GitDataClient::new(
-        GitDataTimeouts::new(
+        &GitDataHttp::new(GitDataTimeouts::new(
             Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_secs(5),
-        ),
+        )),
         server.uri(),
         "ghs_token".to_string(),
     );
@@ -176,11 +172,11 @@ async fn create_tree_survives_a_response_slower_than_the_small_call_budget() {
         .mount(&server)
         .await;
     let client = GitDataClient::new(
-        GitDataTimeouts::new(
+        &GitDataHttp::new(GitDataTimeouts::new(
             Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_secs(5),
-        ),
+        )),
         server.uri(),
         "ghs_token".to_string(),
     );
@@ -1108,7 +1104,7 @@ proptest::proptest! {
 #[test]
 fn debug_redacts_token() {
     let client = GitDataClient::new(
-        GitDataTimeouts::production(),
+        &GitDataHttp::production(),
         "https://api.example",
         "ghs_secret",
     );
@@ -1621,4 +1617,36 @@ async fn update_ref_passes_slashes_in_branch_name_through_url_path() {
         .update_ref(&sample_repo(), &branch, &new_head)
         .await
         .expect("nested branch ref must pass slashes through");
+}
+
+/// Building a `GitDataClient` must not build a `reqwest::Client`.
+///
+/// The transport is the expensive half: `reqwest`'s `rustls-tls-native-roots`
+/// backend reads and parses the platform root store on every
+/// `ClientBuilder::build()` — measured at ~7 s for the first build in a process
+/// on macOS and ~80 ms steady-state, versus effectively zero for a clone (the
+/// client is `Arc`-backed). The credentials are the cheap half, and they are
+/// what varies: an approve mints a fresh installation token, so it needs a
+/// fresh *client* but the same *transport*. Splitting [`GitDataHttp`] out is
+/// what lets the broker build the transport once and pay only the credential
+/// cost per approve.
+///
+/// Asserted by counting builds rather than by timing them: a timing
+/// assertion would be a benchmark wearing a test's clothes — slow (it has to
+/// build a transport to calibrate against) and load-dependent. The count is
+/// exact, and it states the property directly.
+#[test]
+fn a_client_borrows_its_transport_instead_of_building_one() {
+    let before = transports_built_on_this_thread();
+    let http = GitDataHttp::production();
+    let clients: Vec<GitDataClient> = (0..64)
+        .map(|i| GitDataClient::new(&http, "https://api.github.com", format!("ghs_token_{i}")))
+        .collect();
+
+    assert_eq!(clients.len(), 64);
+    assert_eq!(
+        transports_built_on_this_thread() - before,
+        1,
+        "64 clients over one transport must build exactly the one transport",
+    );
 }

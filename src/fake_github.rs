@@ -436,7 +436,7 @@ mod tests {
     use super::*;
     use crate::core::RepoRef;
     use crate::github_git_db::{
-        CommitIdentity, CommitRequest, GitDataClient, GitDataTimeouts, TreeEntry, TreeEntryKind,
+        CommitIdentity, CommitRequest, GitDataClient, GitDataHttp, TreeEntry, TreeEntryKind,
     };
     use crate::vm_git::{GitBranchName, GitObjectId};
     use std::str::FromStr;
@@ -447,7 +447,7 @@ mod tests {
     }
 
     fn client(fake: &FakeGitHub) -> GitDataClient {
-        GitDataClient::new(GitDataTimeouts::production(), fake.uri(), "ghs_fake")
+        GitDataClient::new(&GitDataHttp::production(), fake.uri(), "ghs_fake")
     }
 
     fn ident() -> CommitIdentity {

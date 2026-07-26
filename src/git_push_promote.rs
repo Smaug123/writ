@@ -647,7 +647,7 @@ mod tests {
     use super::*;
     use crate::git_push_walker::test_fixture::InMemoryGitObjectSource;
     use crate::git_push_walker::{ShaMap, StagingCommit, StagingTree};
-    use crate::github_git_db::{CommitIdentity, GitDataTimeouts};
+    use crate::github_git_db::{CommitIdentity, GitDataHttp};
 
     fn sample_repo() -> RepoRef {
         RepoRef::from_str("owner/name").unwrap()
@@ -667,11 +667,7 @@ mod tests {
     }
 
     fn client_against(server: &MockServer, token: &str) -> GitDataClient {
-        GitDataClient::new(
-            GitDataTimeouts::production(),
-            server.uri(),
-            token.to_string(),
-        )
+        GitDataClient::new(&GitDataHttp::production(), server.uri(), token.to_string())
     }
 
     /// Either half of the pipeline can fail, and the tests below care

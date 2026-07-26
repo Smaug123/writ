@@ -235,6 +235,7 @@ fn build_state(
         signing_key: Some(WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap()),
         run_agent_spawn: None,
         promote_runtime: Some(Arc::new(promote_runtime)),
+        git_data_http: std::sync::OnceLock::new(),
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     })
