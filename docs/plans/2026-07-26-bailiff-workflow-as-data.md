@@ -530,6 +530,194 @@ settled — precondition (a `PlanStage`, so slice 1 answers legality), capabilit
 set, prompt composition, note writer, and session ownership as a DU — and the
 regression net is now checked rather than hoped for.
 
+## Slice 3, revised: phases, not one interpreter over a union error
+
+The slice-3 sketch above says "`fn run_stage(client, guard, spec, inputs) ->
+Result<StageOutcome, StageError>` is the interpreter. The three verbs become
+three `StageSpec` values plus their CLI argument parsing." Writing it out
+against the actual error surface showed that shape costs more than it buys, in
+a way worth recording rather than silently working around.
+
+### The measurement
+
+`StageError` as a single union has to hold every failure any of the three
+stages can raise. Counting them against the three existing enums:
+
+| Failure group | Submit | Review | Implement |
+|---|---|---|---|
+| lock / read state / illegal transition | ✓ | ✓ | ✓ |
+| read submission note, verify envelope, compose prompt | — | ✓ | ✓ |
+| open session, session-id cross-check, close session | ✓ | ✓ | — |
+| run agent, write note, write-task join | ✓ | ✓ | ✓ |
+
+Three of the four groups are *not* universal, so a single union makes three
+illegal states representable at once: a `Submit` failure that names a planner
+envelope it never read; an `Implement` failure that names a session bailiff
+never opened; and — because the implement path has no bailiff-side session id
+before `RunAgent` returns — a `RunAgent` variant whose `session_id` has to
+widen to `Option<SessionId>` for one arm's benefit. The note-write error is a
+fourth: the three `write_*_note` helpers have three distinct error types, so
+`StageError::WriteNote` would carry a three-arm union of which each caller can
+reach exactly one.
+
+That is the same defect this plan exists to remove — one encoding that is
+wrong for every specific case — reintroduced at the error layer. Slice 1's own
+lesson applies: `PlanState::presence` returns `Option<NotePresence>` rather
+than a widened struct precisely so `Corrupt` cannot claim a note set.
+
+There is also a hard constraint. `tests/rpc_trace_baseline.rs` — the regression
+net this refactor is being run against — makes 18 assertions on the *variants*
+of `SubmitPlanError` / `SubmitReviewError` / `SubmitImplementError`. They are
+what distinguish the branch pairs that emit identical traces. Collapsing those
+three enums means rewriting the oracle in the same commit that changes the code
+it checks, which is how an assertion stops being able to fail. Checked rather
+than assumed: every one of the 18 is a variant-name-only pattern (`{ .. }` or
+`(_)`), so **variant names and enum names must survive; payload types may
+change.**
+
+### What ships instead
+
+The three workflows differ in **which phases run**, not in **how a phase runs**.
+So the data is a phase vocabulary, and each stage is the composition of its
+phases — short enough to read at a glance, and statically typed so that no
+stage can be handed a phase it has no error variant for.
+
+New `crates/bailiff/src/bailiff_stage.rs`:
+
+- `AgentStage` — `Submit | Review | Implement`. Deliberately *not* `PlanStage`:
+  `Decide` runs no agent, so "compose a prompt for the decide stage" is not
+  expressible. `precondition()` returns the `PlanStage` slice 1 gates on and
+  `plan_body_heading()` the framing, so the two static axes cannot disagree with
+  the stage or with each other.
+- `PlanBodyHeading` — `Proposed | Approved`, with `separator()` returning the
+  byte-identical strings the two modules held as private constants. An enum, not
+  a `&'static str` field, because the distinction is load-bearing (§7 above: the
+  inverted stage order turned `# Proposed plan` into a lie) and a third framing
+  should not be reachable by typo.
+- `open_plan_stage(repo, plan_id, stage) -> Result<PlanGuard, OpenPlanStageError>`
+  — take the lock, read the state, ask the relation. Takes a `PlanStage`, not an
+  `AgentStage`, because `decide` runs this phase too; four callers, all four
+  producing all four error variants.
+- `compose_with_plan_body(...) -> Result<AgentPrompt, ComposePlanPromptError>`
+  — read the submission note, fetch+verify the planner envelope, decode, splice
+  under the heading. Two callers, both producing all four variants.
+- `run_under_owned_session(...) -> Result<StageRun, OwnedSessionRunError<N>>`
+  and `run_under_broker_session(...) -> Result<StageRun, BrokerSessionRunError<N>>`.
+
+**Session ownership is a DU promoted to the type level.** Two functions rather
+than one function over a `SessionOwnership` tag: the close-session path is not
+*reachable* from the broker-managed stage, rather than merely unreached. The
+slice-3 sketch's stated goal — "a boolean here would make the illegal 'bailiff
+closes a broker-owned session' state representable" — is met more strongly by
+splitting the function than by tagging its argument. The two `session` argument
+types (`OwnedSession` carries a label and optional identity; `BrokerSession`
+carries the `AgentVmWorkspaceBootstrap` and required identity) are what route a
+caller to the right one, which matches what the broker already keys on.
+
+`N` is the note-write error, left generic so `bailiff_plan_write.rs` — 797
+lines with its own test suites — stays entirely out of this diff. The writer
+arrives as a closure built one line above the call; it is the tail of a linear
+pipeline, not a strategy selected at a distance.
+
+### Where this leaves the objection
+
+The objection asked for "an interpreter that executes steps via writ". What it
+was really asking for is that adding a stage must not mean copy-pasting 120
+lines of sequencing, and that is what the phase vocabulary delivers: slice 4's
+`FanOut` is `open_plan_stage` per child, one `compose_with_plan_body` against
+the parent, and `run_under_broker_session` per child. If a future stage really
+does want one dispatch point over `AgentStage`, `run_stage` is a thin cap over
+these phases whose union error is honest *because* the phases below it are
+precise. It is not built here: nothing calls it, and speculative generality is
+a non-goal.
+
+**Correctness oracle for this slice:**
+- The 24 RPC fixtures pass **unmodified**, and `rpc_trace_baseline.rs` is not
+  edited. This is the primary oracle and the reason the enums survive.
+- Every existing test in `bailiff_plan_{submit,review,implement,write}.rs`,
+  `bin/bailiff/tests.rs`, and `tests/properties.rs` passes untouched.
+- New property (`tests/stage_gate_zero_rpc.rs`): for every `AgentStage` and
+  every `PlanState` its precondition forbids, the workflow performs **zero**
+  writ RPCs. Plans are planted in each state by writing real notes at the four
+  seeds, so the property runs against `summarize_plan` rather than a model of
+  it. This generalises the three `*_refused` fixtures from one state each to
+  every forbidden state.
+- Mutation: reverting each phase extraction (or dropping the gate from one
+  stage) must fail a named test, asserted by observing the failure.
+
+## Slice 3 as built
+
+Shipped. `bailiff_stage.rs` holds the phase vocabulary; the three workflow
+bodies are now their phase compositions plus a total `From` per phase error, and
+`plan_decide` in the binary is the gate phase's fourth caller. All gates pass,
+and **the oracle held: `rpc_trace_baseline.rs` and all 24 fixtures are byte-for-
+byte unmodified**, which is the whole reason the enums survived.
+
+Four things are worth recording.
+
+**1. The refined type removed an `expect`, and merging two enums removed a
+disagreement.** `compose_with_plan_body` originally took an `AgentStage` and an
+`.expect("this stage consumes a plan body")`. Replacing that with
+`PlanBodyStage` — the two stages that consume one — makes the caller carry the
+proof. The first draft of that had `PlanBodyStage` *and* a separate
+`PlanBodyHeading { Proposed, Approved }`, which are bijective; a bijective pair
+of enums is a pair that can disagree, and disagreeing encodings are the entire
+subject of this plan. Collapsed to one, with the framing derived.
+
+**2. Two test blocks moved with the code they cover, and one grew a mirror.**
+`build_request_tests` and both `compose_tests` modules now live in
+`bailiff_stage/tests.rs`, because the functions they pinned became bindings over
+shared ones. Moving a test to follow its code is not the "rewriting a test is a
+finding" case the oracle warns about — the assertions are the same assertions on
+the same values — and a comment at each former site says where they went. While
+moving `build_request_tests`, its mirror image turned out never to have existed:
+nothing asserted that an *owned*-session request carries `workspace: None`. A
+bootstrap there would silently reroute the run into the VM arm, which then
+rejects it for carrying a session id, so the two fields are a pair.
+`owned_request_binds_the_session_and_carries_no_workspace` is new.
+
+**3. The new grid property caught the shadowed-assertion trap once more, and
+this time before review.** `tests/stage_gate_zero_rpc.rs` sweeps all 3 × 7
+(stage, state) pairs: forbidden ⇒ zero RPCs *and* an `IllegalTransition` naming
+the planted state; allowed ⇒ at least one RPC, as the control against a workflow
+that had stopped talking to writ at all. States are planted from
+`PlanState::presence()` and read back through `summarize_plan`, so the file
+cannot encode a fifth opinion about which notes a state has.
+
+The first version asserted the error variant *before* the RPC count. Every
+mutation then failed on the variant line, and the RPC-count assertion — the
+point of the file — was never once observed to catch anything. Swapping the
+order fixed it. Four mutations, each caught by the line it should be:
+
+| Mutation | Fails on |
+|---|---|
+| gate dropped for `submit` only | `Submit from corrupt is forbidden but emitted [OpenSession …]` |
+| gate dropped entirely | the variant line (review's post-gate `expect` panics first, zero RPCs) |
+| the two prompt framings swapped | 6 of 11 baseline trace tests |
+| happy-path `close_session` deleted | 4 of 11 baseline trace tests |
+
+The second row is the one to keep in mind: **removing a check is not the same as
+removing its effect.** Dropping the gate does not make review emit RPCs, because
+the `expect` that the gate discharges panics first. Only the stage with no
+post-gate read (`submit`) actually leaks an RPC, so a grid that omitted `submit`
+would have been much weaker than it looked.
+
+The `cargo doc -D warnings` gate caught two more stale intra-doc links — the
+third time in this plan it has been the only gate to notice something. `build`,
+`test`, and `clippy` were all green with them in the tree.
+
+**4. What this says about slice 4.** The plan's test for whether the descriptor
+was drawn at the right altitude was "if fan-out is one spec value plus one
+interpreter arm, slice 3's core was right." Under the phase vocabulary the
+question becomes: is a variant run a *new composition of existing phases*?
+It is — `open_plan_stage` per child, one `compose_with_plan_body` against the
+parent, `run_under_broker_session` per child — with no new phase and no change
+to an existing one. The axis that would break it is a stage whose precondition
+is not its own plan's state (a child gated on its parent's), which is exactly
+where `AgentStage::precondition`'s test
+(`each_agent_stage_gates_on_its_namesake_plan_stage`) is written to force a
+deliberate change rather than silently generalise.
+
 ## Non-goals
 
 - **No new note schema in slices 1–3.** The four seeds and their notes are

@@ -36,12 +36,12 @@ use bailiff::bailiff_plan_implement::{
 use bailiff::bailiff_plan_note::{DecisionNote, PlanId};
 use bailiff::bailiff_plan_read::{list_plan_ids, read_full_plan, summarize_plan};
 use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
-use bailiff::bailiff_plan_state::{PlanStage, allows};
+use bailiff::bailiff_plan_state::PlanStage;
 use bailiff::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
 use bailiff::bailiff_plan_write::{
     WriteDecisionNoteError, WriteImplementNoteError, WriteReviewNoteError, write_decision_note,
 };
-use bailiff::bailiff_repo_guard::PlanGuard;
+use bailiff::bailiff_stage::open_plan_stage;
 use bailiff::output::{write_bailiff_plan_list, write_bailiff_plan_show};
 use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
@@ -975,24 +975,26 @@ async fn plan_decide(
     // slice-1 gate and its write were not atomic against a concurrent
     // process. `write_decision_note`'s `DecisionAlreadyRecorded`
     // remains the backstop beneath both.
-    let mut guard = PlanGuard::acquire(Arc::new(repo), plan_id)
+    //
+    // Slice 3: the lock-then-gate pair is `open_plan_stage`, shared
+    // with the three agent-run workflows. `decide` is why that phase
+    // takes a `PlanStage` rather than an `AgentStage` — it is the one
+    // mutating verb that runs no agent, and the phase must still cover
+    // it or `decide` becomes the exception again.
+    //
+    // `decide` previously read no precondition at all, which is why it
+    // could write a verdict for a plan that was never submitted:
+    // `write_decision_note` creates the per-plan ref, `list_plan_ids`
+    // enumerates by ref existence, and the resulting row rendered as
+    // `corrupt` — the anomaly the display layer exists to *report*,
+    // manufactured by this verb in one command.
+    let mut guard = open_plan_stage(Arc::new(repo), plan_id, PlanStage::Decide)
         .await
         .map_err(|e| format!("{e}"))?;
 
     let result = guard
         .run_blocking(move |repo| {
-            // Slice 1's gate. `decide` previously read no precondition
-            // at all, which is why it could write a verdict for a plan
-            // that was never submitted: `write_decision_note` creates
-            // the per-plan ref, `list_plan_ids` enumerates by ref
-            // existence, and the resulting row rendered as `corrupt` —
-            // the anomaly the display layer exists to *report*,
-            // manufactured by this verb in one command.
-            let state = summarize_plan(repo, plan_id)
-                .map_err(DecideError::ReadPlanState)?
-                .state();
-            allows(state, PlanStage::Decide).map_err(DecideError::IllegalTransition)?;
-            // Stamped here, not before `acquire`. The lock waits, and
+            // Stamped here, not before the lock. The lock waits, and
             // it can wait for the length of another workflow's agent
             // run, so a timestamp taken at command start could claim
             // the verdict predates the submission it rules on. The
@@ -1004,27 +1006,21 @@ async fn plan_decide(
                 decider,
                 decided_at: UnixMillis::now(),
             };
-            write_decision_note(repo, &note).map_err(DecideError::Write)
+            write_decision_note(repo, &note)
         })
         .await
         .map_err(|e| format!("decide task failed: {e}"))?;
 
     match result {
         Ok(_target_oid) => Ok(()),
-        Err(DecideError::ReadPlanState(e)) => {
-            Err(format!("reading the state of plan {plan_id}: {e}").into())
-        }
-        // Renders its own remedy from the relation; see the note in
-        // `plan_implement`'s match.
-        Err(DecideError::IllegalTransition(e)) => Err(format!("plan {plan_id}: {e}").into()),
-        Err(DecideError::Write(WriteDecisionNoteError::DecisionAlreadyRecorded {
+        Err(WriteDecisionNoteError::DecisionAlreadyRecorded {
             plan_id,
             target_oid,
-        })) => Err(format!(
+        }) => Err(format!(
             "decision already recorded for plan {plan_id} at target {target_oid}; bailiff does not overwrite verdicts — submit a fresh plan if the operator wants to change course"
         )
         .into()),
-        Err(DecideError::Write(e)) => Err(format!("recording decision: {e}").into()),
+        Err(e) => Err(format!("recording decision: {e}").into()),
     }
 }
 
@@ -1069,7 +1065,7 @@ async fn plan_list(bailiff_repo: Option<PathBuf>) -> Result<(), Box<dyn std::err
 }
 
 /// Tagged failure modes for the `spawn_blocking` list closure.
-/// Mirrors `DecideError`'s pattern: tag enough to give the post-await
+/// Mirrors `ShowError`'s pattern: tag enough to give the post-await
 /// arm a specific error message rather than collapsing everything
 /// into a single string. Local to this binary; not a wire contract.
 enum ListError {
@@ -1138,7 +1134,7 @@ async fn plan_show(
 }
 
 /// Tagged failure modes for the `spawn_blocking` show closure. Mirrors
-/// `ListError` / `DecideError`'s pattern: tag enough to give the
+/// `ListError`'s pattern: tag enough to give the
 /// post-await arm a specific error message rather than collapsing
 /// everything into a single string. Local to this binary; not a wire
 /// contract.
@@ -1151,16 +1147,6 @@ impl From<writ::notes_repo::NotesRepoError> for ShowError {
     fn from(e: writ::notes_repo::NotesRepoError) -> Self {
         ShowError::OpenRepo(e)
     }
-}
-
-/// Tagged failure modes for the `spawn_blocking` decide closure.
-/// Lets the post-await arm distinguish "the repo path is bad" from
-/// "the duplicate-decide invariant fired" so the caller-facing stderr
-/// is specific. Local to this binary; not part of any wire contract.
-enum DecideError {
-    ReadPlanState(bailiff::bailiff_plan_read::SummarizePlanError),
-    IllegalTransition(bailiff::bailiff_plan_state::IllegalTransition),
-    Write(WriteDecisionNoteError),
 }
 
 /// Map the parsed `--accept` / `--reject` flags to a [`Decision`].

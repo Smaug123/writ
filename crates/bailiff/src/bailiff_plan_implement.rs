@@ -23,7 +23,8 @@
 //!    a hand-rolled chain, and it additionally requires a review — the
 //!    single `IllegalTransition` variant names the observed state, so
 //!    an operator still sees exactly which precondition tripped.
-//! 2. The composed prompt uses `PLAN_PROMPT_SEPARATOR`
+//! 2. The composed prompt uses the separator
+//!    [`crate::bailiff_stage::PlanBodyStage::Implement`] names
 //!    (`# Approved plan`), not the reviewer's `# Proposed plan`. The
 //!    implementer is acting on an accepted artefact and the prompt
 //!    framing makes that explicit so an LLM reading the combined
@@ -31,10 +32,10 @@
 //!
 //! # Composition
 //!
-//! The implementer prompt is `feature_prompt` + the
-//! `PLAN_PROMPT_SEPARATOR` string + the plan body bytes, joined
-//! inline (rather than re-wrapping the bytes in a structured
-//! plan-body type first) to avoid unwrapping them again for signing.
+//! The implementer prompt is `feature_prompt` + that separator + the
+//! plan body bytes, joined inline (rather than re-wrapping the bytes
+//! in a structured plan-body type first) to avoid unwrapping them
+//! again for signing.
 //!
 //! Reviewer feedback stays *out* of the composed prompt: per
 //! `docs/plans/2026-05-11-agent-plans.md` §"Implementer prompt
@@ -59,20 +60,22 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::JoinError;
 
-use crate::bailiff_plan_note::{PlanId, PlanNote};
-use crate::bailiff_plan_read::{
-    ReadPlanBodyError, ReadPlanError, SummarizePlanError, read_plan_body_bytes, read_plan_note,
-    summarize_plan,
-};
-use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
+use crate::bailiff_plan_note::PlanId;
+use crate::bailiff_plan_read::{ReadPlanBodyError, ReadPlanError, SummarizePlanError};
+use crate::bailiff_plan_state::IllegalTransition;
 use crate::bailiff_plan_write::{WriteImplementNoteError, write_implement_note};
-use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
+use crate::bailiff_repo_guard::PlanGuardError;
+use crate::bailiff_stage::{
+    BrokerSession, BrokerSessionRunError, ComposePlanPromptError, OpenPlanStageError,
+    PlanBodyStage, StageRunInputs, compose_with_plan_body, open_plan_stage,
+    run_under_broker_session,
+};
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
 use writ::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
-use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
+use writ::writ_client::{RunAgentCompleted, WritClient, WritClientError};
 
 /// Inputs to [`submit_implement`]. Mirror of
 /// [`crate::bailiff_plan_review::SubmitReviewInputs`] with
@@ -171,10 +174,18 @@ pub struct SubmitImplementOutcome {
 
 /// Drive the full plan-implement workflow against a live writ broker.
 ///
-/// `bailiff_repo` is an `Arc<NotesRepo>`; the workflow takes
-/// this plan's lock via [`PlanGuard`] before its first read and holds
-/// it until return, so the gate and the eventual note write cannot be
+/// Three phases from [`crate::bailiff_stage`], composed: gate, compose
+/// the prompt from the verified plan body, then run under a session
+/// **the broker** owns. The plan lock
+/// [`crate::bailiff_stage::open_plan_stage`] returns is held until this
+/// function returns, so the gate and the eventual note write cannot be
 /// interleaved by another workflow — in this process or another.
+///
+/// The third phase is [`run_under_broker_session`], not its
+/// owned-session sibling, and that is a type-level distinction rather
+/// than a runtime flag: there is no code path from here that could
+/// open or close a writ session, because the VM dispatch arm owns
+/// both ends.
 pub async fn submit_implement(
     client: &WritClient,
     bailiff_repo: Arc<NotesRepo>,
@@ -182,172 +193,140 @@ pub async fn submit_implement(
     allowed_signers: AllowedSigners,
     inputs: SubmitImplementInputs,
 ) -> Result<SubmitImplementOutcome, SubmitImplementError> {
-    // Hold the bailiff-repo lock across the entire workflow — pre-RPC
-    // gates, opens, run, write, close — so concurrent submit_*/bailiff
-    // workflows serialise instead of racing the gate-then-write
-    // sequence. Released on function return.
+    // One gate, one definition. This replaces a 25-line hand-rolled
+    // sequence (submission? decision? is it Accepted? no implement
+    // note yet?) that was one of four disagreeing encodings of the
+    // workflow's transition relation — see
+    // `docs/plans/2026-07-26-bailiff-workflow-as-data.md`. The old
+    // duplicate-implement check is subsumed: `Implement` is illegal
+    // from `Implemented`.
+    //
+    // The guard `open_plan_stage` returns is what makes the gate
+    // load-bearing rather than advisory: a second caller blocks on
+    // acquisition until the first either writes the implement note (so
+    // its read observes it) or fails and releases. Without it, both
+    // callers could pass the gate and both open `WorkspaceWrite`
+    // sessions whose side effects no later note-write rejection can
+    // undo.
     let plan_id = inputs.plan_id;
-    let mut bailiff = PlanGuard::acquire(bailiff_repo, plan_id)
-        .await
-        .map_err(SubmitImplementError::PlanLock)?;
+    let mut guard = open_plan_stage(
+        bailiff_repo,
+        plan_id,
+        PlanBodyStage::Implement.stage().precondition(),
+    )
+    .await?;
 
-    // Pre-RPC: read the submission note, read the decision note (and
-    // gate on it being an `accepted` verdict), gate on the absence of
-    // an existing implement note, fetch+verify+decode the planner
-    // envelope. Done before opening a session so any missing or
-    // unverifiable precondition never burns a writ audit row.
-    let plan_id = inputs.plan_id;
-    let writ_repo_path_owned = writ_repo_path.to_path_buf();
-    let writ_output_ref_for_read = inputs.writ_output_ref.clone();
-    let allowed_for_read = allowed_signers.clone();
-    let read_outcome = bailiff
-        .run_blocking(
-            move |repo| -> Result<(PlanNote, String), SubmitImplementError> {
-                // One gate, one definition. This replaces a 25-line
-                // hand-rolled sequence (submission? decision? is it
-                // Accepted? no implement note yet?) that was one of
-                // four disagreeing encodings of the workflow's
-                // transition relation — see
-                // `docs/plans/2026-07-26-bailiff-workflow-as-data.md`.
-                // The old duplicate-implement check is subsumed:
-                // `Implement` is illegal from `Implemented`.
-                //
-                // The workflow-held guard is what makes the gate
-                // load-bearing rather than advisory: a second caller
-                // blocks on `acquire` until the first either writes
-                // the implement note (so this read observes it) or
-                // fails and releases. Without it, both callers could
-                // pass here and both open `WorkspaceWrite` sessions
-                // whose side effects no later note-write rejection can
-                // undo.
-                let state = summarize_plan(repo, plan_id)
-                    .map_err(SubmitImplementError::ReadPlanState)?
-                    .state();
-                allows(state, PlanStage::Implement).map_err(|source| {
-                    SubmitImplementError::IllegalTransition { plan_id, source }
-                })?;
-
-                let plan_note = read_plan_note(repo, plan_id)
-                    .map_err(SubmitImplementError::ReadPlanNote)?
-                    .expect("gate passed, so a submission note exists");
-                let body = read_plan_body_bytes(
-                    repo,
-                    &writ_repo_path_owned,
-                    &writ_output_ref_for_read,
-                    &plan_note,
-                    &allowed_for_read,
-                )
-                .map_err(SubmitImplementError::ReadPlanEnvelope)?;
-                Ok((plan_note, body))
-            },
-        )
-        .await
-        .map_err(SubmitImplementError::ReadTaskFailed)?;
-    let (_plan_note, plan_body) = read_outcome?;
-
-    let implementer_prompt =
-        compose_implementer_prompt_bytes(inputs.feature_prompt.as_str(), plan_body.as_str())
-            .map_err(SubmitImplementError::ComposeImplementerPrompt)?;
+    // Pre-RPC: read the submission note, fetch+verify+decode the
+    // planner envelope, splice the plan body under `# Approved plan`.
+    // Done before invoking writ so any missing or unverifiable
+    // precondition never burns a writ audit row.
+    let implementer_prompt = compose_with_plan_body(
+        &mut guard,
+        writ_repo_path,
+        &inputs.writ_output_ref,
+        &allowed_signers,
+        plan_id,
+        inputs.feature_prompt,
+        PlanBodyStage::Implement,
+    )
+    .await?;
 
     // VM mode mints its own audit session (the broker rejects a
     // caller-supplied `session_id` alongside a workspace bootstrap),
     // and `agent_vm.stop_session` closes that session on the broker
-    // side before `RunAgent` returns. Bailiff therefore neither
-    // opens nor closes a session here: the run's audit window is
-    // entirely broker-managed. The session id surfaces back via the
-    // signed envelope's metadata, which is where the workflow's
+    // side before `RunAgent` returns. Bailiff therefore neither opens
+    // nor closes a session here: the run's audit window is entirely
+    // broker-managed. The session id surfaces back via the signed
+    // envelope's metadata, which is where the workflow's
     // `implementer_session_id` field comes from.
-    let run_agent_request = build_implementer_run_agent_request(implementer_prompt, &inputs);
-    let completed = client
-        .run_agent(run_agent_request)
-        .await
-        .map_err(SubmitImplementError::RunAgent)?;
-    let session_id = completed.signed_metadata.session_id;
-
-    // `write_implement_note` is blocking (shells out to git). Run
-    // under the workflow-held guard so the lock spans this section
-    // and the surrounding awaits without being re-acquired here.
-    let writ_repo_path_owned = writ_repo_path.to_path_buf();
-    let writ_output_ref_clone = inputs.writ_output_ref.clone();
-    let purpose_clone = inputs.purpose.clone();
-    let completed_clone = completed.clone();
-    let write_outcome = bailiff
-        .run_blocking(move |repo| {
+    let writ_repo_path = writ_repo_path.to_path_buf();
+    let writ_output_ref = inputs.writ_output_ref.clone();
+    let purpose = inputs.purpose.clone();
+    let stage = run_under_broker_session(
+        client,
+        &mut guard,
+        BrokerSession {
+            workspace: inputs.workspace,
+            agent_kind: inputs.session_agent_kind,
+            agent_model: inputs.session_agent_model,
+        },
+        StageRunInputs {
+            prompt: implementer_prompt,
+            capabilities: inputs.capabilities,
+            purpose: inputs.purpose,
+            writ_output_ref: inputs.writ_output_ref,
+        },
+        move |repo, completed| {
             write_implement_note(
                 repo,
-                &writ_repo_path_owned,
-                &writ_output_ref_clone,
+                &writ_repo_path,
+                &writ_output_ref,
                 plan_id,
-                purpose_clone,
-                &completed_clone,
+                purpose,
+                completed,
                 &allowed_signers,
             )
-        })
-        .await;
-    let implement_note_oid = match write_outcome {
-        Ok(Ok(oid)) => oid,
-        Ok(Err(source)) => {
-            return Err(SubmitImplementError::WriteImplementNote { session_id, source });
-        }
-        Err(source) => {
-            return Err(SubmitImplementError::WriteTaskFailed { session_id, source });
-        }
-    };
+        },
+    )
+    .await?;
 
     Ok(SubmitImplementOutcome {
         plan_id,
-        implement_note_oid,
-        implementer_session_id: session_id,
-        run: completed,
+        implement_note_oid: stage.note_oid,
+        implementer_session_id: stage.session_id,
+        run: stage.run,
     })
 }
 
-/// Pure binding from [`SubmitImplementInputs`] to the wire-level
-/// [`RunAgentRequest`] writd receives. Lifted out so the field-level
-/// invariants — the workspace bootstrap routes the run into writd's
-/// VM dispatch arm, `agent_kind` / `agent_model` carry the
-/// VM-required identity, and `session_id` stays `None` so writd's
-/// VM dispatch arm mints its own audit session — are testable
-/// without standing up a broker.
-fn build_implementer_run_agent_request(
-    composed_prompt: AgentPrompt,
-    inputs: &SubmitImplementInputs,
-) -> RunAgentRequest {
-    RunAgentRequest {
-        prompt: composed_prompt,
-        capabilities: inputs.capabilities.clone(),
-        purpose: inputs.purpose.clone(),
-        output_ref: inputs.writ_output_ref.clone(),
-        session_id: None,
-        workspace: Some(inputs.workspace.clone()),
-        agent_kind: Some(inputs.session_agent_kind),
-        agent_model: Some(inputs.session_agent_model.clone()),
+/// Total map from the gate phase's failures onto this workflow's. All
+/// four variants are produced by [`open_plan_stage`] for every caller,
+/// so the match is exhaustive with no unreachable arm.
+impl From<OpenPlanStageError> for SubmitImplementError {
+    fn from(source: OpenPlanStageError) -> Self {
+        match source {
+            OpenPlanStageError::PlanLock(source) => Self::PlanLock(source),
+            OpenPlanStageError::ReadTaskFailed(source) => Self::ReadTaskFailed(source),
+            OpenPlanStageError::ReadPlanState(source) => Self::ReadPlanState(source),
+            OpenPlanStageError::IllegalTransition { plan_id, source } => {
+                Self::IllegalTransition { plan_id, source }
+            }
+        }
     }
 }
 
-/// Separator the implementer's effective prompt uses between the
-/// feature-request prompt and the approved plan body. `# Approved
-/// plan` makes the artefact's status explicit so an LLM reading the
-/// combined prompt cannot mistake an accepted plan for a proposed
-/// one (the reviewer-side composer in `bailiff_plan_review.rs` uses
-/// a different heading for the same reason).
-const PLAN_PROMPT_SEPARATOR: &str = "\n\n---\n\n# Approved plan\n\n";
+/// Total map from the prompt-composition phase's failures onto this
+/// workflow's.
+impl From<ComposePlanPromptError> for SubmitImplementError {
+    fn from(source: ComposePlanPromptError) -> Self {
+        match source {
+            ComposePlanPromptError::ReadTaskFailed(source) => Self::ReadTaskFailed(source),
+            ComposePlanPromptError::ReadPlanNote(source) => Self::ReadPlanNote(source),
+            ComposePlanPromptError::ReadPlanEnvelope(source) => Self::ReadPlanEnvelope(source),
+            ComposePlanPromptError::ComposePrompt(source) => Self::ComposeImplementerPrompt(source),
+        }
+    }
+}
 
-/// Compose the implementer's effective prompt from the operator's
-/// feature prompt and the approved plan body. Takes raw `&str` rather
-/// than a structured plan-body type because the plan body has already
-/// been extracted from the signed planner envelope as bytes —
-/// re-wrapping it just to unwrap it again for signing would be churn.
-fn compose_implementer_prompt_bytes(
-    feature_prompt: &str,
-    plan_body: &str,
-) -> Result<AgentPrompt, AgentPromptError> {
-    let mut combined =
-        String::with_capacity(feature_prompt.len() + PLAN_PROMPT_SEPARATOR.len() + plan_body.len());
-    combined.push_str(feature_prompt);
-    combined.push_str(PLAN_PROMPT_SEPARATOR);
-    combined.push_str(plan_body);
-    AgentPrompt::try_new(combined)
+/// Total map from the broker-session run phase's failures onto this
+/// workflow's.
+///
+/// Three variants, not six: [`BrokerSessionRunError`] has no
+/// `OpenSession`, `SessionIdMismatch`, or `CloseSession`, because the
+/// path that would produce them does not exist on this side. A single
+/// shared run-phase error would have forced this workflow to name
+/// three failures it cannot have.
+impl From<BrokerSessionRunError<WriteImplementNoteError>> for SubmitImplementError {
+    fn from(source: BrokerSessionRunError<WriteImplementNoteError>) -> Self {
+        match source {
+            BrokerSessionRunError::RunAgent(source) => Self::RunAgent(source),
+            BrokerSessionRunError::WriteNote { session_id, source } => {
+                Self::WriteImplementNote { session_id, source }
+            }
+            BrokerSessionRunError::WriteTaskFailed { session_id, source } => {
+                Self::WriteTaskFailed { session_id, source }
+            }
+        }
+    }
 }
 
 /// Tagged failure modes of [`submit_implement`]. Pre-RPC variants
@@ -373,7 +352,8 @@ pub enum SubmitImplementError {
     /// opened.
     #[error("plan-body read task failed: {0}")]
     ReadTaskFailed(#[source] JoinError),
-    /// [`read_plan_note`] returned an error. The gate has already
+    /// [`crate::bailiff_plan_read::read_plan_note`] returned an error.
+    /// The gate has already
     /// passed by the time this read runs, so this is "bailiff's repo
     /// broke between two reads", not "the plan is in the wrong
     /// state" — that is [`Self::IllegalTransition`]. Pre-RPC.
@@ -443,136 +423,17 @@ pub enum SubmitImplementError {
     },
 }
 
-#[cfg(test)]
-mod compose_tests {
-    //! Tests for [`compose_implementer_prompt_bytes`]. The composer
-    //! is intentionally tiny; the unit tests pin the load-bearing
-    //! properties: the separator appears verbatim, and the byte cap
-    //! fires on the combined length. The proptest below additionally
-    //! checks that, for any feature/plan within range, the output is
-    //! exactly `feature || SEPARATOR || plan`.
-    use super::*;
-    use proptest::prelude::*;
+// `compose_tests` moved to `crate::bailiff_stage::tests` in slice 3,
+// along with the composer it covered. The implementer's framing is now
+// `PlanBodyStage::Implement`, and its exact-concatenation, byte-cap,
+// and three-segment property tests live beside the single definition.
 
-    #[test]
-    fn separator_appears_verbatim_between_feature_prompt_and_body() {
-        let composed =
-            compose_implementer_prompt_bytes("Rename foo to bar.", "# Plan\n\nDo a thing.\n")
-                .unwrap();
-        let expected = format!("Rename foo to bar.{PLAN_PROMPT_SEPARATOR}# Plan\n\nDo a thing.\n");
-        assert_eq!(composed.as_str(), expected);
-    }
-
-    #[test]
-    fn errors_when_combined_exceeds_agent_prompt_limit() {
-        // Feature prompt at the cap, non-empty plan body, plus the
-        // separator must overflow `AgentPrompt::try_new`.
-        let feature_prompt = "x".repeat(writ::agent_run::MAX_AGENT_PROMPT_BYTES);
-        let err = compose_implementer_prompt_bytes(&feature_prompt, "p").unwrap_err();
-        assert!(err.to_string().contains("exceeding"), "{err}");
-    }
-
-    proptest! {
-        /// `compose_implementer_prompt_bytes` is a structural
-        /// concatenation: the result starts with the feature prompt,
-        /// ends with the plan body, contains the separator between
-        /// them, and has byte length equal to the sum of the three
-        /// parts.
-        #[test]
-        fn compose_implementer_prompt_three_segments(
-            feature_text in "[ -~]{1,1024}",
-            plan_text in "[ -~]{1,1024}",
-        ) {
-            let combined = compose_implementer_prompt_bytes(&feature_text, &plan_text).unwrap();
-            let s = combined.as_str();
-            prop_assert!(s.starts_with(&feature_text), "missing prefix");
-            prop_assert!(s.ends_with(&plan_text), "missing suffix");
-            prop_assert!(s.contains(PLAN_PROMPT_SEPARATOR), "missing separator");
-            prop_assert_eq!(
-                s.len(),
-                feature_text.len() + PLAN_PROMPT_SEPARATOR.len() + plan_text.len(),
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod build_request_tests {
-    //! Unit tests for the pure `build_implementer_run_agent_request`
-    //! helper. The helper is the binding between `SubmitImplementInputs`
-    //! and the wire-level `RunAgentRequest` writd receives: every field
-    //! the implementer cares about (workspace bootstrap, agent kind,
-    //! agent model) must flow through verbatim, and the VM-mints-its-
-    //! own-session invariant (`session_id: None`) must hold.
-    use super::*;
-    use std::path::PathBuf;
-    use writ::core::{AgentKind, RepoRef};
-    use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
-
-    fn sample_workspace() -> AgentVmWorkspaceBootstrap {
-        AgentVmWorkspaceBootstrap {
-            repo: GitCloneRepo::new(RepoRef {
-                owner: "smaug123".into(),
-                name: "writ".into(),
-            })
-            .unwrap(),
-            destination: Some(PathBuf::from("/workspace/writ")),
-            warm: WorkspaceWarmMode::DevShell,
-        }
-    }
-
-    fn sample_inputs() -> SubmitImplementInputs {
-        SubmitImplementInputs {
-            plan_id: PlanId::new(),
-            feature_prompt: AgentPrompt::try_new("Implement feature X.").unwrap(),
-            capabilities: vec![CapabilitySet::WorkspaceWrite {
-                repo: RepoRef {
-                    owner: "smaug123".into(),
-                    name: "writ".into(),
-                },
-            }],
-            purpose: "plan-implement".into(),
-            writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
-            session_agent_kind: AgentKind::Claude,
-            session_agent_model: "claude-opus-4-7".into(),
-            workspace: sample_workspace(),
-        }
-    }
-
-    /// `build_implementer_run_agent_request` carries every VM-relevant
-    /// field of `SubmitImplementInputs` onto the `RunAgentRequest` writd
-    /// will see: the workspace bootstrap (so dispatch routes into the
-    /// VM arm), the agent kind and agent model (required by the VM arm
-    /// since the broker doesn't pick a default), and `session_id: None`
-    /// (VM mode mints its own audit session; passing a caller-supplied
-    /// id alongside a workspace bootstrap is what `run_agent_in_vm`
-    /// rejects with "VM mode mints its own audit session").
-    #[test]
-    fn build_implementer_run_agent_request_threads_workspace_and_agent_identity() {
-        let inputs = sample_inputs();
-        let prompt = AgentPrompt::try_new("composed-prompt").unwrap();
-        let req = build_implementer_run_agent_request(prompt.clone(), &inputs);
-
-        assert_eq!(req.prompt.as_str(), prompt.as_str());
-        assert_eq!(req.capabilities, inputs.capabilities);
-        assert_eq!(req.purpose, inputs.purpose);
-        assert_eq!(req.output_ref, inputs.writ_output_ref);
-        assert_eq!(
-            req.session_id, None,
-            "VM mode mints its own audit session; bailiff must not pre-open one",
-        );
-        assert_eq!(
-            req.workspace.as_ref(),
-            Some(&inputs.workspace),
-            "workspace bootstrap must thread through verbatim",
-        );
-        assert_eq!(req.agent_kind, Some(inputs.session_agent_kind));
-        assert_eq!(
-            req.agent_model.as_deref(),
-            Some(inputs.session_agent_model.as_str())
-        );
-    }
-}
+// `build_request_tests` moved to `crate::bailiff_stage::tests` in
+// slice 3, along with the binding it covered. The invariants it
+// asserted — workspace bootstrap threaded verbatim, agent kind and
+// model present, `session_id: None` — are now properties of
+// `broker_run_agent_request`, which is the only way a VM-dispatched
+// request gets built.
 
 #[cfg(test)]
 mod end_to_end_tests {
@@ -595,7 +456,7 @@ mod end_to_end_tests {
     use crate::bailiff_plan_note::{DecisionNote, ImplementNote, plan_notes_ref};
     use crate::bailiff_plan_note::{ReviewNote, plan_review_seed_blob_bytes};
     use crate::bailiff_plan_read::read_plan_note;
-    use crate::bailiff_plan_state::PlanState;
+    use crate::bailiff_plan_state::{PlanStage, PlanState};
     use crate::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
     use crate::bailiff_plan_write::write_decision_note;
     use writ::audit::AuditLog;

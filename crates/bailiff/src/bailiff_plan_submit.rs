@@ -42,16 +42,20 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::PlanId;
-use crate::bailiff_plan_read::{SummarizePlanError, summarize_plan};
-use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
+use crate::bailiff_plan_read::SummarizePlanError;
+use crate::bailiff_plan_state::IllegalTransition;
 use crate::bailiff_plan_write::{WritePlanNoteError, write_plan_note};
-use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
+use crate::bailiff_repo_guard::PlanGuardError;
+use crate::bailiff_stage::{
+    AgentStage, OpenPlanStageError, OwnedSession, OwnedSessionRunError, StageRunInputs,
+    open_plan_stage, run_under_owned_session,
+};
 use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
 use writ::vm_git::GitObjectId;
-use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
+use writ::writ_client::{RunAgentCompleted, WritClient, WritClientError};
 
 /// Inputs to [`submit_plan`]. An explicit struct keeps the call site
 /// readable when more fields land in slices D/E (review-plan id,
@@ -127,10 +131,17 @@ pub struct SubmitPlanOutcome {
 
 /// Drive the full plan-submit workflow against a live writ broker.
 ///
-/// `bailiff_repo` is an `Arc<NotesRepo>`; the workflow takes
-/// this plan's lock via [`PlanGuard`] before its first read and holds
-/// it until return, so the gate and the eventual note write cannot be
+/// Two phases from [`crate::bailiff_stage`], composed: gate, then run
+/// under a session bailiff owns. The plan lock
+/// [`crate::bailiff_stage::open_plan_stage`] returns is held until this
+/// function returns, so the gate and the eventual note write cannot be
 /// interleaved by another workflow — in this process or another.
+///
+/// `submit` is the stage with no prompt composition phase: it
+/// *produces* the plan body every later stage reads, so the operator's
+/// prompt goes to the planner verbatim. That is why
+/// [`AgentStage::Submit`] has no
+/// [`crate::bailiff_stage::PlanBodyStage`].
 pub async fn submit_plan(
     client: &WritClient,
     bailiff_repo: std::sync::Arc<NotesRepo>,
@@ -138,115 +149,99 @@ pub async fn submit_plan(
     allowed_signers: AllowedSigners,
     inputs: SubmitPlanInputs,
 ) -> Result<SubmitPlanOutcome, SubmitPlanError> {
-    // Hold the bailiff-repo lock across the entire workflow — opens,
-    // run, write, close — so concurrent submit_*/`bailiff` workflows
-    // serialise instead of racing the write step. Released on
-    // function return.
+    // Pre-RPC gate. `submit` had none before slice 1: it opened a
+    // session and ran the planner immediately, so submitting against
+    // an id that already had a plan note burned a full agent run
+    // before `write_plan_note` refused the duplicate. `Submit` is
+    // legal only from `Absent`, so that now costs nothing.
     let plan_id = inputs.plan_id;
-    let mut bailiff = PlanGuard::acquire(bailiff_repo, plan_id)
-        .await
-        .map_err(SubmitPlanError::PlanLock)?;
+    let mut guard =
+        open_plan_stage(bailiff_repo, plan_id, AgentStage::Submit.precondition()).await?;
 
-    // Pre-RPC gate. `submit` previously had none: it opened a session
-    // and ran the planner immediately, so submitting against an id
-    // that already had a plan note burned a full agent run before
-    // `write_plan_note` refused the duplicate. `Submit` is legal only
-    // from `Absent`, so that now costs nothing.
-    let state_outcome = bailiff
-        .run_blocking(move |repo| summarize_plan(repo, plan_id).map(|s| s.state()))
-        .await
-        .map_err(SubmitPlanError::ReadTaskFailed)?;
-    let state = state_outcome.map_err(SubmitPlanError::ReadPlanState)?;
-    allows(state, PlanStage::Submit)
-        .map_err(|source| SubmitPlanError::IllegalTransition { plan_id, source })?;
-
-    let session_id = client
-        .open_session(
-            inputs.session_label.clone(),
-            inputs.session_agent_kind,
-            inputs.session_agent_model.clone(),
-        )
-        .await
-        .map_err(SubmitPlanError::OpenSession)?;
-
-    // From here on, every early return must close the session.
-    let run_result = client
-        .run_agent(RunAgentRequest {
+    let writ_repo_path = writ_repo_path.to_path_buf();
+    let writ_output_ref = inputs.writ_output_ref.clone();
+    let purpose = inputs.purpose.clone();
+    let stage = run_under_owned_session(
+        client,
+        &mut guard,
+        OwnedSession {
+            label: inputs.session_label,
+            agent_kind: inputs.session_agent_kind,
+            agent_model: inputs.session_agent_model,
+        },
+        StageRunInputs {
             prompt: inputs.prompt,
             capabilities: inputs.capabilities,
-            purpose: inputs.purpose.clone(),
-            output_ref: inputs.writ_output_ref.clone(),
-            session_id: Some(session_id),
-            workspace: None,
-            agent_kind: None,
-            agent_model: None,
-        })
-        .await;
-    let completed = match run_result {
-        Ok(c) => c,
-        Err(source) => {
-            let _ = client.close_session(session_id).await;
-            return Err(SubmitPlanError::RunAgent { session_id, source });
-        }
-    };
-
-    // Cross-check the broker honoured the session binding we asked
-    // for: the signed metadata must stamp the same session id we
-    // opened. A mismatch means the broker minted its own id and the
-    // envelope can't be correlated with our audit row — refuse to
-    // persist the plan note.
-    if completed.signed_metadata.session_id != session_id {
-        let returned_session_id = completed.signed_metadata.session_id;
-        let _ = client.close_session(session_id).await;
-        return Err(SubmitPlanError::SessionIdMismatch {
-            session_id,
-            returned_session_id,
-        });
-    }
-
-    // `write_plan_note` is blocking (shells out to git). Run under
-    // the workflow-held guard so the lock spans this section and the
-    // surrounding awaits without being re-acquired here.
-    let writ_repo_path_owned = writ_repo_path.to_path_buf();
-    let writ_output_ref_clone = inputs.writ_output_ref.clone();
-    let purpose_clone = inputs.purpose.clone();
-    let plan_id = inputs.plan_id;
-    let completed_clone = completed.clone();
-    let write_outcome = bailiff
-        .run_blocking(move |repo| {
+            purpose: inputs.purpose,
+            writ_output_ref: inputs.writ_output_ref,
+        },
+        move |repo, completed| {
             write_plan_note(
                 repo,
-                &writ_repo_path_owned,
-                &writ_output_ref_clone,
+                &writ_repo_path,
+                &writ_output_ref,
                 plan_id,
-                purpose_clone,
-                &completed_clone,
+                purpose,
+                completed,
                 &allowed_signers,
             )
-        })
-        .await;
-    let plan_note_oid = match write_outcome {
-        Ok(Ok(oid)) => oid,
-        Ok(Err(source)) => {
-            let _ = client.close_session(session_id).await;
-            return Err(SubmitPlanError::WritePlanNote { session_id, source });
-        }
-        Err(source) => {
-            let _ = client.close_session(session_id).await;
-            return Err(SubmitPlanError::WriteTaskFailed { session_id, source });
-        }
-    };
-
-    if let Err(source) = client.close_session(session_id).await {
-        return Err(SubmitPlanError::CloseSession { session_id, source });
-    }
+        },
+    )
+    .await?;
 
     Ok(SubmitPlanOutcome {
         plan_id,
-        plan_note_oid,
-        planner_session_id: session_id,
-        run: completed,
+        plan_note_oid: stage.note_oid,
+        planner_session_id: stage.session_id,
+        run: stage.run,
     })
+}
+
+/// Total map from the gate phase's failures onto this workflow's. All
+/// four variants are produced by [`open_plan_stage`] for every caller,
+/// so the match is exhaustive with no unreachable arm — which is the
+/// property that made a phase vocabulary preferable to one union
+/// `StageError`.
+impl From<OpenPlanStageError> for SubmitPlanError {
+    fn from(source: OpenPlanStageError) -> Self {
+        match source {
+            OpenPlanStageError::PlanLock(source) => Self::PlanLock(source),
+            OpenPlanStageError::ReadTaskFailed(source) => Self::ReadTaskFailed(source),
+            OpenPlanStageError::ReadPlanState(source) => Self::ReadPlanState(source),
+            OpenPlanStageError::IllegalTransition { plan_id, source } => {
+                Self::IllegalTransition { plan_id, source }
+            }
+        }
+    }
+}
+
+/// Total map from the owned-session run phase's failures onto this
+/// workflow's. See [`From<OpenPlanStageError>`](SubmitPlanError).
+impl From<OwnedSessionRunError<WritePlanNoteError>> for SubmitPlanError {
+    fn from(source: OwnedSessionRunError<WritePlanNoteError>) -> Self {
+        match source {
+            OwnedSessionRunError::OpenSession(source) => Self::OpenSession(source),
+            OwnedSessionRunError::RunAgent { session_id, source } => {
+                Self::RunAgent { session_id, source }
+            }
+            OwnedSessionRunError::SessionIdMismatch {
+                session_id,
+                returned_session_id,
+            } => Self::SessionIdMismatch {
+                session_id,
+                returned_session_id,
+            },
+            OwnedSessionRunError::WriteNote { session_id, source } => {
+                Self::WritePlanNote { session_id, source }
+            }
+            OwnedSessionRunError::WriteTaskFailed { session_id, source } => {
+                Self::WriteTaskFailed { session_id, source }
+            }
+            OwnedSessionRunError::CloseSession { session_id, source } => {
+                Self::CloseSession { session_id, source }
+            }
+        }
+    }
 }
 
 /// Tagged failure modes of [`submit_plan`]. Each variant pins one
@@ -376,7 +371,7 @@ mod end_to_end_tests {
 
     use super::*;
     use crate::bailiff_plan_note::{PlanNote, plan_notes_ref};
-    use crate::bailiff_plan_state::PlanState;
+    use crate::bailiff_plan_state::{PlanStage, PlanState};
     use crate::bailiff_plan_write::FetchVerifyError;
     use writ::audit::AuditLog;
     use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};

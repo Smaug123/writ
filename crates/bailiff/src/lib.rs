@@ -16,4 +16,5 @@ pub mod bailiff_plan_submit;
 pub mod bailiff_plan_view;
 pub mod bailiff_plan_write;
 pub mod bailiff_repo_guard;
+pub mod bailiff_stage;
 pub mod output;
