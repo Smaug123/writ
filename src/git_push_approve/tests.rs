@@ -787,17 +787,29 @@ fn write_stalling_cat_file_wrapper(dir: &Path, git: &Path, sleep: &Path) -> Path
 /// traversal, whose `read_object_raw` pipe reads are unbounded. A
 /// child that stalls mid-response parked the whole approve — attempt
 /// row and operator approval still active — long after the CLI
-/// disconnected. `open` now carries `step_timeout` as a per-object
+/// disconnected. `open` now carries `cat_file_timeout` as a per-object
 /// read deadline, so a wedged read surfaces as a retryable
 /// `ExecuteError::Replay` (a `ReadTimedOut` under the hood) instead
 /// of hanging. (The per-object placement — verified directly in
 /// `git_push_objects_cat_file` — is what keeps a legitimate
 /// multi-object upload from being folded into one step's budget.)
 ///
-/// The outer `tokio::time::timeout` is the anti-hang guard: with the
+/// The step timeout is set *generously* here, and that is the second
+/// thing this test pins: the read deadline must be independent of it.
+/// While the two shared one field the test had to drive the shared
+/// value down to 500 ms to stay quick, which put the real `cat-file
+/// -t` subprocess in a race with the deadline under test — a race it
+/// lost under parallel-test load, so the test flaked with
+/// `ResolveBundleTip("Git command timed out")` instead of the read
+/// timeout. Now a generous step timeout costs nothing, and if the read
+/// deadline is ever re-derived from it this test fails on the outer
+/// guard rather than flaking.
+///
+/// That outer `tokio::time::timeout` is the anti-hang guard: with the
 /// fix the inner per-read deadline (500 ms) fires first and the call
-/// returns; without it the traversal blocks forever and the outer
-/// guard elapses, failing the test instead of wedging CI.
+/// returns; without it the traversal blocks for the step timeout (or
+/// forever) and the guard elapses, failing the test instead of wedging
+/// CI.
 #[tokio::test]
 async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
     let Some(git) = maybe_git() else {
@@ -812,9 +824,10 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
     let staging = StagingRepo::from_path_for_test(staging_path);
     let wrapper = write_stalling_cat_file_wrapper(tmp.path(), &git, &sleep);
 
-    // A short step timeout keeps the test quick; the cat-file read
-    // below stalls forever, so any positive per-object deadline
-    // exercises the fix.
+    // The step timeout is generous — the wrapper really does exec
+    // `git` for `cat-file -t` and `rev-list`, and those must not be
+    // racing anything. The cat-file read below stalls forever, so the
+    // short per-object deadline is what has to fire.
     let deadline = Duration::from_millis(500);
     let runtime = PromoteRuntimeConfig::new(
         wrapper,
@@ -825,8 +838,10 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
         )
         .unwrap(),
         tmp.path().to_path_buf(),
-        deadline,
+        Duration::from_secs(30),
     )
+    .unwrap()
+    .with_cat_file_timeout(deadline)
     .unwrap();
 
     let server = MockServer::start().await;
@@ -849,8 +864,16 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
         .mount(&server)
         .await;
 
+    // 60 s, and not tight: this guard exists to convert a hang into a
+    // failure, so its only job is to sit well clear of every legitimate
+    // cost in the call. One of those costs is large and has nothing to
+    // do with the deadline under test — `prepare_approve_with_staging_repo`
+    // constructs a `reqwest::Client`, which on macOS loads the system
+    // trust store and has been measured here at ~10 s. Sizing the guard
+    // against the 500 ms deadline instead would just re-introduce a
+    // race, with the client build as the thing that loses.
     let outcome = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         prepare_approve_with_staging_repo(
             &staging,
             &runtime,
