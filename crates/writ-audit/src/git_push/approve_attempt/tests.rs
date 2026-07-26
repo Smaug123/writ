@@ -1239,3 +1239,71 @@ fn reject_blocker_extends_blocks_resolution_by_success() {
 fn empty_position_set_is_refused() {
     position_predicate_sql(&[], "state", "outcome", 1);
 }
+
+/// The trigger message the crate matches on is the one the schema
+/// actually raises *now*.
+///
+/// SQLite gives a `RAISE(ABORT, …)` no machine-readable identity, so the
+/// text is load-bearing — and text shared between a `.sql` file and a
+/// Rust constant is exactly the drift the reviewer predicted. (The
+/// comment that used to accompany the shell-side copy of this literal
+/// cited `migrations/0005_approve_attempt_state_machine.sql`, a file that
+/// does not exist.)
+///
+/// Read from `sqlite_master`, not from the migration list: v5 created
+/// this trigger and v6 dropped and recreated it with a supersession
+/// filter, so the *old* definition's text is still sitting in the v5
+/// migration. A test that searched the migrations would go on passing
+/// after the live trigger was reworded — which is precisely the failure
+/// it exists to catch, and precisely what the first version of this test
+/// did when the message was mutated.
+#[test]
+fn trigger_message_matches_the_live_trigger() {
+    let (log, _) = staged_log();
+    let sql: String = log
+        .with_conn(|c| {
+            c.query_row(
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'trigger'
+                    AND name = 'git_push_resolution_refuses_active_approve'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(crate::AuditError::from)
+        })
+        .expect("the trigger must exist in the live schema");
+    assert!(
+        sql.contains(super::RESOLUTION_REFUSED_BY_ACTIVE_APPROVE),
+        "the live trigger does not raise {:?}; it was reworded and the \
+         constant was not.\ntrigger body: {sql}",
+        super::RESOLUTION_REFUSED_BY_ACTIVE_APPROVE,
+    );
+}
+
+/// End to end: a push with a live approve attempt refuses a resolution
+/// INSERT with the typed error, not with SQLite prose.
+#[test]
+fn a_blocked_resolution_insert_reports_the_typed_refusal() {
+    let (log, push_request_id) = staged_log();
+    let attempt_id = ApproveAttemptId::new();
+    seed_attempt(
+        &log,
+        push_request_id,
+        attempt_id,
+        &ApproveAttempt::new(GitPushApproveAttemptState::Started),
+    );
+
+    let err = log
+        .record_git_push_resolution(&crate::GitPushResolutionRecord {
+            push_request_id,
+            decided_at: writ_core::core::UnixMillis::from_millis(1_700_000_500),
+            decision: crate::GitPushResolution::Rejected,
+            operator: "alice",
+            reason: "no thanks",
+        })
+        .expect_err("a started attempt blocks the resolution");
+    assert!(
+        matches!(err, crate::AuditError::ResolutionRefusedByActiveApprove),
+        "got: {err:?}",
+    );
+}
