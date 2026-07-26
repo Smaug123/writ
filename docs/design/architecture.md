@@ -975,6 +975,18 @@ all, and `BailiffPlanSummary::state` derived a fourth relation for display whose
 tightened every gate; see `docs/plans/2026-07-26-bailiff-workflow-as-data.md`
 for the delta table.
 
+**Reading back.** `bailiff plan show` renders each note's metadata and
+verification status; `bailiff plan dossier` renders what the runs *produced* —
+the approved plan body once, then every implementer attempt's verified stdout —
+which is what makes N variants comparable. The dossier re-verifies against
+writ's current copy rather than trusting the note, withholds the bytes of any
+attempt that fails to verify (recording the failure per attempt, so one bad
+attempt does not hide the rest), and length-prefixes agent-controlled bytes
+(`stdout_bytes=<n>` then exactly `n` bytes) so the output stays parseable
+without escaping what a human needs to read. The shared fetch→verify→decode
+chain is `read_verified_output`; acceptance policy is the caller's, because the
+planner's stdout must be non-empty text while an implementer's need not be.
+
 **Guarantees & invariants.** Each stage attaches a distinct note under one
 per-plan ref `refs/notes/bailiff/v1/plans/<id>` at deterministic per-stage seed
 OIDs, projected from `AgentStage::note_seed`. Every signed stage runs
