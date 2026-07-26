@@ -194,6 +194,194 @@ impl ApproveAttempt {
     }
 }
 
+/// A row's *position* in the machine, as the two columns record it: the
+/// state, plus the outcome a `Resolved` row carries.
+///
+/// Every question the queries ask about an attempt — does it stand in the
+/// way of a rejection? must boot reconcile look at it? may an operator
+/// reconcile it? — is a function of this pair and nothing else. Naming it
+/// is what lets those questions be answered *once*, in Rust, and have the
+/// SQL that asks them be generated from the same answer (see
+/// [`position_predicate_sql`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct AttemptPosition {
+    pub state: ApproveAttemptStateName,
+    /// `Some` exactly when `state` is `Resolved`, mirroring the column's
+    /// NULL and the schema's `(state = 'resolved') = (outcome IS NOT NULL)`
+    /// CHECK.
+    pub outcome: Option<ApproveAttemptOutcomeName>,
+}
+
+impl AttemptPosition {
+    /// Every position a row can legally hold: the two non-terminal
+    /// states, plus one per terminal outcome. Derived from the two
+    /// discriminant enums, so a new state or outcome extends it
+    /// automatically.
+    pub fn all() -> Vec<Self> {
+        let mut out = Vec::new();
+        for state in ApproveAttemptStateName::ALL {
+            match state {
+                ApproveAttemptStateName::Started | ApproveAttemptStateName::Uncertain => {
+                    out.push(Self {
+                        state: *state,
+                        outcome: None,
+                    });
+                }
+                ApproveAttemptStateName::Resolved => {
+                    for outcome in ApproveAttemptOutcomeName::ALL {
+                        out.push(Self {
+                            state: *state,
+                            outcome: Some(*outcome),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The `outcome` column as the SQL predicates compare it: `coalesce`d
+    /// to the empty string, because `NULL = NULL` is NULL in SQL and a
+    /// non-terminal row would otherwise match nothing.
+    pub fn outcome_wire(self) -> &'static str {
+        self.outcome.map(|o| o.as_wire()).unwrap_or("")
+    }
+
+    /// A live attempt in this position forbids a `git_push_resolution`
+    /// row from landing against the push.
+    ///
+    /// `Started`/`Uncertain` because the approve may still be running (or
+    /// its PATCH may already be in flight); `Resolved(PostPatchFailure)`
+    /// because GitHub's state is unknown until an operator reconciles.
+    /// `Resolved(Succeeded)` is *not* here: the approve path's own joint
+    /// transaction writes the resolution row, so blocking it would block
+    /// the very write that records the approval.
+    ///
+    /// This is the predicate the `git_push_resolution_refuses_active_approve`
+    /// trigger enforces; `blocks_resolution_agrees_with_the_trigger` holds
+    /// the two together.
+    pub fn blocks_resolution(self) -> bool {
+        match (self.state, self.outcome) {
+            (ApproveAttemptStateName::Started | ApproveAttemptStateName::Uncertain, _) => true,
+            (
+                ApproveAttemptStateName::Resolved,
+                Some(ApproveAttemptOutcomeName::PostPatchFailure),
+            ) => true,
+            (ApproveAttemptStateName::Resolved, _) => false,
+        }
+    }
+
+    /// Boot reconcile must act on (or flag) an attempt in this position:
+    /// it was non-terminal when the daemon died.
+    pub fn is_in_flight(self) -> bool {
+        matches!(
+            self.state,
+            ApproveAttemptStateName::Started | ApproveAttemptStateName::Uncertain
+        )
+    }
+
+    /// A manual reconciliation may supersede an attempt in this position —
+    /// its GitHub outcome is genuinely unknown, so an operator's
+    /// inspection is the only way to settle it. (`Uncertain` additionally
+    /// requires a boot-observed marker, which is a fact about the row
+    /// rather than its position and stays with the DAO.)
+    pub fn is_reconcilable(self) -> bool {
+        matches!(
+            (self.state, self.outcome),
+            (ApproveAttemptStateName::Uncertain, _)
+                | (
+                    ApproveAttemptStateName::Resolved,
+                    Some(ApproveAttemptOutcomeName::PostPatchFailure),
+                )
+        )
+    }
+
+    /// Why a live attempt in this position prevents the push from being
+    /// rejected, if it does.
+    ///
+    /// Note this is *not* [`Self::blocks_resolution`]: an attempt that
+    /// already succeeded does not block the resolution row (it wrote one),
+    /// but it certainly blocks a rejection — the push is approved.
+    /// `reject_blocker_extends_blocks_resolution_by_success` states the
+    /// relationship between the two.
+    pub fn reject_blocker(self) -> Option<RejectBlockerKind> {
+        match (self.state, self.outcome) {
+            (ApproveAttemptStateName::Started | ApproveAttemptStateName::Uncertain, _) => {
+                Some(RejectBlockerKind::AttemptInFlight)
+            }
+            (ApproveAttemptStateName::Resolved, Some(outcome)) => match outcome {
+                ApproveAttemptOutcomeName::Succeeded => Some(RejectBlockerKind::AlreadyApproved),
+                ApproveAttemptOutcomeName::PostPatchFailure => {
+                    Some(RejectBlockerKind::PostPatchUncertain)
+                }
+                ApproveAttemptOutcomeName::PrePatchFailure => None,
+            },
+            (ApproveAttemptStateName::Resolved, None) => None,
+        }
+    }
+}
+
+/// The reason an attempt blocks a rejection, without the attempt id.
+/// Pairs with an id to make a [`RejectBlocker`](super::RejectBlocker).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RejectBlockerKind {
+    AttemptInFlight,
+    AlreadyApproved,
+    PostPatchUncertain,
+}
+
+impl GitPushApproveAttemptState {
+    /// The position this state records in the row's two columns.
+    pub fn position(&self) -> AttemptPosition {
+        AttemptPosition {
+            state: self.name(),
+            outcome: self.outcome_name(),
+        }
+    }
+}
+
+/// Render a set of positions as a SQL predicate, so a query can ask the
+/// same question the Rust predicates answer instead of restating it.
+///
+/// Returns `((state_col, coalesce(outcome_col, '')) IN (VALUES (?n, ?n+1),
+/// …), params)` where the parameters are the wire strings, in order,
+/// starting at `first_param`. Callers bind them after their own.
+///
+/// This is the mechanism that removes the duplication the reviewer
+/// named: `blocks_resolution` and `is_in_flight` are written once, and
+/// the two queries that used to spell them out in SQL now derive their
+/// clause from those functions. `sql_predicate_selects_what_rust_selects`
+/// checks a generated clause against the Rust predicate for every
+/// position.
+pub fn position_predicate_sql(
+    positions: &[AttemptPosition],
+    state_col: &str,
+    outcome_col: &str,
+    first_param: usize,
+) -> (String, Vec<&'static str>) {
+    assert!(
+        !positions.is_empty(),
+        "an empty position set would render `IN ()`, which SQLite rejects; \
+         a predicate matching nothing should short-circuit in Rust instead",
+    );
+    let mut params: Vec<&'static str> = Vec::with_capacity(positions.len() * 2);
+    let mut tuples: Vec<String> = Vec::with_capacity(positions.len());
+    for (index, position) in positions.iter().enumerate() {
+        let state_param = first_param + index * 2;
+        let outcome_param = state_param + 1;
+        tuples.push(format!("(?{state_param}, ?{outcome_param})"));
+        params.push(position.state.as_wire());
+        params.push(position.outcome_wire());
+    }
+    (
+        format!(
+            "({state_col}, coalesce({outcome_col}, '')) IN (VALUES {})",
+            tuples.join(", ")
+        ),
+        params,
+    )
+}
+
 /// A move the broker asks the machine to make. One variant per durable
 /// step of `approve_staged_push`, carrying exactly the data that step
 /// contributes.

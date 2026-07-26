@@ -7,7 +7,7 @@
 //! other fails here rather than at runtime against a real audit log.
 
 use proptest::prelude::*;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::super::test_support::*;
 use super::*;
@@ -1045,4 +1045,197 @@ fn legal_transitions_never_rewrite_a_recorded_mint() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The derived predicates, checked against the schema
+// ---------------------------------------------------------------------
+
+/// Positions enumerate exactly the (state, outcome) shapes the schema's
+/// `(state = 'resolved') = (outcome IS NOT NULL)` CHECK admits.
+#[test]
+fn positions_enumerate_the_legal_column_shapes() {
+    let positions = AttemptPosition::all();
+    assert_eq!(
+        positions.len(),
+        5,
+        "2 non-terminal + 3 outcomes: {positions:?}"
+    );
+    for position in &positions {
+        assert_eq!(
+            position.outcome.is_some(),
+            position.state == ApproveAttemptStateName::Resolved,
+            "{position:?} has an outcome iff it is resolved",
+        );
+    }
+    // And every state a row can actually hold maps into the set.
+    for (_, state) in every_state() {
+        assert!(
+            positions.contains(&state.position()),
+            "{:?} is not an enumerated position",
+            state.position(),
+        );
+    }
+}
+
+/// **The generated SQL selects exactly what the Rust predicate selects.**
+///
+/// This is what lets the two queries that used to spell out
+/// "started|uncertain|resolved+post_patch" in SQL derive their clause from
+/// `blocks_resolution` instead: seed one row per position, run the
+/// generated clause against it, and compare with the predicate.
+#[test]
+fn sql_predicate_selects_what_rust_selects() {
+    for predicate in [
+        (
+            "blocks_resolution",
+            AttemptPosition::blocks_resolution as fn(AttemptPosition) -> bool,
+        ),
+        ("is_in_flight", AttemptPosition::is_in_flight),
+        ("is_reconcilable", AttemptPosition::is_reconcilable),
+    ] {
+        let (label, rust_predicate) = predicate;
+        let selected: Vec<_> = AttemptPosition::all()
+            .into_iter()
+            .filter(|p| rust_predicate(*p))
+            .collect();
+        let (clause, params) = position_predicate_sql(&selected, "state", "outcome", 2);
+
+        for position in AttemptPosition::all() {
+            let (log, push_request_id) = staged_log();
+            let attempt_id = ApproveAttemptId::new();
+            seed_attempt(
+                &log,
+                push_request_id,
+                attempt_id,
+                &ApproveAttempt::new(state_at(position)),
+            );
+
+            let matched: Option<i64> = log
+                .with_conn(|c| {
+                    c.query_row(
+                        &format!(
+                            "SELECT 1 FROM git_push_approve_attempt
+                              WHERE attempt_id = ?1 AND {clause}"
+                        ),
+                        rusqlite::params_from_iter(
+                            std::iter::once(attempt_id.as_uuid().to_string())
+                                .chain(params.iter().map(|p| p.to_string())),
+                        ),
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(crate::AuditError::from)
+                })
+                .unwrap();
+
+            assert_eq!(
+                matched.is_some(),
+                rust_predicate(position),
+                "{label}: SQL and Rust disagree about {position:?}",
+            );
+        }
+    }
+}
+
+/// A representative state for a position, so the sweep above can seed a
+/// real row for each one.
+fn state_at(position: AttemptPosition) -> GitPushApproveAttemptState {
+    let completed_at = writ_core::core::UnixMillis::from_millis(1_700_000_300);
+    match (position.state, position.outcome) {
+        (ApproveAttemptStateName::Started, _) => GitPushApproveAttemptState::Started,
+        (ApproveAttemptStateName::Uncertain, _) => {
+            GitPushApproveAttemptState::Uncertain { mint: mint_a() }
+        }
+        (ApproveAttemptStateName::Resolved, Some(outcome)) => {
+            GitPushApproveAttemptState::Resolved {
+                outcome: match outcome {
+                    ApproveAttemptOutcomeName::Succeeded => {
+                        GitPushApproveAttemptOutcome::Succeeded {
+                            new_app_tip: git_oid('3'),
+                        }
+                    }
+                    ApproveAttemptOutcomeName::PrePatchFailure => {
+                        GitPushApproveAttemptOutcome::PrePatchFailure {
+                            detail: "walker refused".into(),
+                        }
+                    }
+                    ApproveAttemptOutcomeName::PostPatchFailure => {
+                        GitPushApproveAttemptOutcome::PostPatchFailure {
+                            detail: "transport drop".into(),
+                        }
+                    }
+                },
+                mint: Some(mint_a()),
+                completed_at,
+            }
+        }
+        (ApproveAttemptStateName::Resolved, None) => {
+            unreachable!("a resolved position always names an outcome")
+        }
+    }
+}
+
+/// **`blocks_resolution` agrees with the trigger that enforces it.**
+///
+/// `git_push_resolution_refuses_active_approve` is the schema's version of
+/// this predicate. Seed one attempt per position, try to write a
+/// resolution row, and require the refusal to match the Rust answer.
+#[test]
+fn blocks_resolution_agrees_with_the_trigger() {
+    for position in AttemptPosition::all() {
+        let (log, push_request_id) = staged_log();
+        let attempt_id = ApproveAttemptId::new();
+        seed_attempt(
+            &log,
+            push_request_id,
+            attempt_id,
+            &ApproveAttempt::new(state_at(position)),
+        );
+
+        let accepted = log
+            .with_conn_mut(|c| {
+                c.execute(
+                    "INSERT INTO git_push_resolution (
+                         push_request_id, decided_at, decision, operator, reason,
+                         mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
+                     ) VALUES (?1, 1700000500, 'rejected', 'alice', 'no thanks',
+                               NULL, NULL, NULL, NULL)",
+                    params![push_request_id.as_uuid().to_string()],
+                )
+                .map(|_| ())
+                .map_err(crate::AuditError::from)
+            })
+            .is_ok();
+
+        assert_eq!(
+            !accepted,
+            position.blocks_resolution(),
+            "trigger and blocks_resolution disagree about {position:?}",
+        );
+    }
+}
+
+/// The relationship between the two predicates, stated rather than left
+/// to be rediscovered: rejecting is blocked by everything that blocks a
+/// resolution, *plus* an attempt that already succeeded — which does not
+/// block the resolution row because the approve path writes one itself.
+#[test]
+fn reject_blocker_extends_blocks_resolution_by_success() {
+    for position in AttemptPosition::all() {
+        let already_approved = position.outcome == Some(ApproveAttemptOutcomeName::Succeeded);
+        assert_eq!(
+            position.reject_blocker().is_some(),
+            position.blocks_resolution() || already_approved,
+            "{position:?}",
+        );
+    }
+}
+
+/// An empty position set would render `IN ()`, which SQLite rejects; the
+/// builder refuses rather than emitting a query that fails at runtime.
+#[test]
+#[should_panic(expected = "empty position set")]
+fn empty_position_set_is_refused() {
+    position_predicate_sql(&[], "state", "outcome", 1);
 }
