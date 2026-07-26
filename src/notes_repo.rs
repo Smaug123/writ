@@ -914,6 +914,14 @@ fn supervisor_error_to_notes_error(err: SupervisorError, args: Vec<String>) -> N
     match err {
         SupervisorError::Spawn(source) => NotesRepoError::GitSpawn { source },
         SupervisorError::Wait(source) => NotesRepoError::GitWait { source },
+        // Preserve the pre-supervisor error shapes for these two, because callers
+        // (and tests) distinguish them: a partial stdin delivery was
+        // `GitStdinWrite`, and a failed output read was `GitWait`. Both mean the
+        // command's data is incomplete, which must never look like success —
+        // `hash-object --stdin` returning the id of a truncated body would
+        // silently corrupt what the note attests.
+        SupervisorError::StdinWrite { source, .. } => NotesRepoError::GitStdinWrite { source },
+        SupervisorError::CaptureRead(source) => NotesRepoError::GitWait { source },
         other => NotesRepoError::GitSupervision {
             args,
             detail: other.to_string(),

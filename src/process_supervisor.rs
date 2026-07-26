@@ -135,6 +135,14 @@ pub(crate) enum SupervisorError {
         pgid: libc::pid_t,
         source: std::io::Error,
     },
+    #[error("writing the child's stdin failed after {written} of {total} bytes: {source}")]
+    StdinWrite {
+        written: usize,
+        total: usize,
+        source: std::io::Error,
+    },
+    #[error("reading the child's captured stdout failed: {0}")]
+    CaptureRead(std::io::Error),
 }
 
 /// Spawn `command` as a process-group leader, wait up to `timeout` for it to
@@ -481,7 +489,14 @@ pub(crate) fn run_supervised_blocking_probed(
         stdin_input,
         stdout_byte_cap,
     );
-    let (observation, stdout_buf, stderr_buf, child_exited) = match outcome {
+    let BlockingRunState {
+        observation,
+        stdout_buf,
+        stderr_buf,
+        child_exited,
+        stdin_write_error,
+        stdout_read_error,
+    } = match outcome {
         Ok(state) => state,
         Err(err) => {
             // Kill the group and reap before surfacing, so a supervision failure
@@ -528,8 +543,23 @@ pub(crate) fn run_supervised_blocking_probed(
                     cap: stdout_byte_cap.expect("cap only set under Capture"),
                 });
             }
+            let ran_nothing = child_ran_nothing(vanished_before_running, &status);
+            // A born-dead child is retried by the caller, and its `EPIPE` on stdin
+            // is a symptom of that rather than a delivery failure — so the held
+            // error is discarded in exactly that case and surfaced in every other.
+            if !ran_nothing && let Some((written, source)) = stdin_write_error {
+                return Err(SupervisorError::StdinWrite {
+                    written,
+                    total: stdin_input.map_or(0, |b| b.len()),
+                    source,
+                });
+            }
+            // A failed stdout read means the capture is a prefix, not an answer.
+            if let Some(err) = stdout_read_error {
+                return Err(SupervisorError::CaptureRead(err));
+            }
             Ok(SupervisedOutcome::Exited {
-                ran_nothing: child_ran_nothing(vanished_before_running, &status),
+                ran_nothing,
                 status,
                 stdout: stdout_buf.finish(),
                 stderr: stderr_buf.finish(),
@@ -555,7 +585,7 @@ fn supervise_blocking_child(
     timeout: Duration,
     stdin_input: Option<&[u8]>,
     stdout_byte_cap: Option<usize>,
-) -> Result<(ChildExitObservation, CaptureBuffer, CaptureBuffer, bool), SupervisorError> {
+) -> Result<BlockingRunState, SupervisorError> {
     let pgid = process_group_id(child.id())?;
 
     // `Option` is the "still live" marker for each stream: taking a handle out
@@ -582,6 +612,11 @@ fn supervise_blocking_child(
         cap: STDERR_CAPTURE_TAIL_CAP,
     });
     let mut stdin_remaining = stdin_input.unwrap_or(&[]);
+    // Bytes written so far, plus the failure, when a stdin write did not
+    // complete. Settled after the wait, because a born-dead child surfaces here
+    // first as `EPIPE`.
+    let mut stdin_write_error: Option<(usize, std::io::Error)> = None;
+    let mut stdout_read_error: Option<std::io::Error> = None;
 
     let deadline = std::time::Instant::now() + timeout;
     let observation: ChildExitObservation;
@@ -600,14 +635,18 @@ fn supervise_blocking_child(
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            observation = if child_exited {
-                // The child is reaped-and-gone; only a stray pipe holder kept us
-                // here. Report the exit we actually observed rather than a
-                // timeout, so the caller sees the command's real status.
-                ChildExitObservation::Exited
-            } else {
-                ChildExitObservation::TimedOut
-            };
+            // Reaching here means we did *not* finish: the arm above already
+            // broke out with `Exited` if the child was gone and both captures had
+            // hit EOF. So either the child is still alive, or something still
+            // holds a capture pipe open and its output is incomplete.
+            //
+            // Report a timeout in both cases. An earlier version returned
+            // `Exited` when the leader had been seen to exit, reasoning that the
+            // caller should get the command's real status — but that hands back a
+            // *truncated* stdout as a successful result, and `for-each-ref`
+            // output one refname per line is indistinguishable from a complete,
+            // shorter listing. Losing notes silently is far worse than a timeout.
+            observation = ChildExitObservation::TimedOut;
             break;
         }
         let slice = std::cmp::min(CHILD_EXIT_POLL_INTERVAL, deadline - now);
@@ -645,10 +684,18 @@ fn supervise_blocking_child(
             && let Some(pipe) = stdin_pipe.as_mut()
         {
             match write_available(pipe, stdin_remaining) {
-                // A closed stdin (EPIPE — the child exited without reading) is
-                // not an error for us: the command's own exit status is the
-                // verdict on whether that mattered.
-                Err(_) => {
+                // Hold the error rather than treating a short write as EOF. A
+                // child that closed stdin early (EPIPE) may still exit 0, and
+                // reporting that as success would mean `git hash-object --stdin`
+                // returning the id of a *truncated* body — silent corruption of
+                // the very data the note is meant to attest. Whether this is the
+                // born-dead flake or a real broken pipe is not decidable yet; the
+                // wait below settles it (same reasoning as f36b4c0).
+                Err(source) => {
+                    stdin_write_error = Some((
+                        stdin_input.map_or(0, |b| b.len()) - stdin_remaining.len(),
+                        source,
+                    ));
                     stdin_remaining = &[];
                     stdin_pipe = None;
                 }
@@ -661,10 +708,18 @@ fn supervise_blocking_child(
         }
 
         if stdout_slot >= 0 && fds[stdout_slot as usize].revents != 0 {
-            drain_available(&mut stdout_pipe, &mut stdout_buf);
+            // A read failure on *captured stdout* is fatal: the caller parses
+            // these bytes, so a short buffer is a wrong answer, not a degraded
+            // one. (Before this branch, `wait_with_output` surfaced such failures
+            // as `GitWait`; preserve that rather than silently truncating.)
+            if let Some(err) = drain_available(&mut stdout_pipe, &mut stdout_buf) {
+                stdout_read_error = Some(err);
+            }
         }
         if stderr_slot >= 0 && fds[stderr_slot as usize].revents != 0 {
-            drain_available(&mut stderr_pipe, &mut stderr_buf);
+            // Stderr stays best-effort: it is a diagnostic, and losing part of one
+            // must not fail an otherwise-successful command.
+            let _ = drain_available(&mut stderr_pipe, &mut stderr_buf);
         }
 
         if !child_exited && child_has_exited_without_reaping(pgid)? {
@@ -677,7 +732,27 @@ fn supervise_blocking_child(
         }
     }
 
-    Ok((observation, stdout_buf, stderr_buf, child_exited))
+    Ok(BlockingRunState {
+        observation,
+        stdout_buf,
+        stderr_buf,
+        child_exited,
+        stdin_write_error,
+        stdout_read_error,
+    })
+}
+
+/// How a supervised child left [`supervise_blocking_child`]'s event loop.
+struct BlockingRunState {
+    observation: ChildExitObservation,
+    stdout_buf: CaptureBuffer,
+    stderr_buf: CaptureBuffer,
+    child_exited: bool,
+    /// Set when stdin was not fully delivered; settled by the caller, because a
+    /// born-dead child shows up here first and must be retried, not reported.
+    stdin_write_error: Option<(usize, std::io::Error)>,
+    /// Set when reading captured stdout failed, which invalidates the capture.
+    stdout_read_error: Option<std::io::Error>,
 }
 
 fn as_raw<T: std::os::fd::AsRawFd>(handle: &T) -> libc::c_int {
@@ -748,10 +823,11 @@ const MAX_READS_PER_DRAIN: usize = 64;
 /// Returning with data still buffered is safe: the caller's `poll` reports the fd
 /// ready again immediately, so the only effect is that the deadline and exit
 /// probes get a turn in between.
-fn drain_available<R: std::io::Read>(pipe: &mut Option<R>, buffer: &mut CaptureBuffer) {
-    let Some(reader) = pipe.as_mut() else {
-        return;
-    };
+fn drain_available<R: std::io::Read>(
+    pipe: &mut Option<R>,
+    buffer: &mut CaptureBuffer,
+) -> Option<std::io::Error> {
+    let reader = pipe.as_mut()?;
     let mut chunk = [0u8; 8192];
     let mut reads = 0;
     while reads < MAX_READS_PER_DRAIN {
@@ -759,28 +835,30 @@ fn drain_available<R: std::io::Read>(pipe: &mut Option<R>, buffer: &mut CaptureB
         match reader.read(&mut chunk) {
             Ok(0) => {
                 *pipe = None;
-                return;
+                return None;
             }
             Ok(n) => {
                 if buffer.push(&chunk[..n]) == Absorb::Stop {
                     *pipe = None;
-                    return;
+                    return None;
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return None,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 // Retry without consuming the budget: no progress was made.
                 reads -= 1;
                 continue;
             }
-            // Best-effort, matching the async drain: a lost diagnostic must not
-            // fail an otherwise-successful command.
-            Err(_) => {
+            // Report the failure and stop; the caller decides whether losing
+            // bytes on this stream invalidates the run (it does for captured
+            // stdout, which is parsed; it does not for stderr diagnostics).
+            Err(err) => {
                 *pipe = None;
-                return;
+                return Some(err);
             }
         }
     }
+    None
 }
 
 /// Write as much of `bytes` as the pipe will currently accept, returning the
@@ -1568,6 +1646,46 @@ mod blocking_tests {
             "a drain that reads until the pipe runs dry starves the deadline              check; took {:?}",
             started.elapsed()
         );
+    }
+
+    /// A child that exits without reading its stdin must not be reported as a
+    /// success when we only delivered a prefix.
+    ///
+    /// This is the sharpest edge in the whole module. `notes_repo` pipes note
+    /// bodies and seed blobs into `git hash-object --stdin`, which exits 0 and
+    /// prints the id of *whatever it read*. Treating the resulting `EPIPE` as a
+    /// benign early EOF — which an earlier version of this loop did, with a
+    /// comment saying the exit status was the verdict — means persisting an object
+    /// id that attests to truncated content. Silent corruption of the audit trail,
+    /// from a write error we already held in our hand.
+    #[test]
+    fn a_partially_delivered_stdin_is_never_reported_as_success() {
+        // Far more than any pipe buffer, against a child that reads none of it.
+        let payload = vec![b'z'; 4 * 1024 * 1024];
+        let outcome = run_supervised_blocking(
+            &mut sh("exit 0"),
+            Duration::from_secs(30),
+            Some(&payload),
+            StdoutMode::Capture { byte_cap: 4096 },
+            StderrMode::Capture,
+        );
+        match outcome {
+            Err(SupervisorError::StdinWrite { written, total, .. }) => {
+                assert_eq!(total, payload.len());
+                assert!(
+                    written < total,
+                    "the failure only makes sense for a short write; wrote {written} of {total}"
+                );
+            }
+            Err(other) => panic!("expected StdinWrite, got {other:?}"),
+            Ok(SupervisedOutcome::Exited { status, .. }) => panic!(
+                "a child that read none of a {} byte payload and exited {:?} must \
+                 not be reported as success",
+                payload.len(),
+                status.code()
+            ),
+            Ok(other) => panic!("expected StdinWrite, got {}", outcome_name(&other)),
+        }
     }
 
     /// A helper the child forks into its own process group must not outlive the

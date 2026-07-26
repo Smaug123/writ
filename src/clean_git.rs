@@ -119,6 +119,12 @@ impl From<SupervisorError> for CleanGitError {
             SupervisorError::KillProcessGroup { pgid, source } => {
                 CleanGitError::KillProcessGroup { pgid, source }
             }
+            // The async supervisor never writes stdin nor treats a stdout read
+            // failure as fatal, so these cannot arise on this path; map them to
+            // the nearest existing variant rather than widening the public enum.
+            SupervisorError::StdinWrite { source, .. } | SupervisorError::CaptureRead(source) => {
+                CleanGitError::Wait(source)
+            }
         }
     }
 }
