@@ -38,6 +38,10 @@ use writ::vm_git::GitObjectId;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BailiffPlanSummary {
     pub plan_id: PlanId,
+    /// Whether the plan's ref exists on disk. `false` for an id that
+    /// has never been submitted; `true` for every row `bailiff plan
+    /// list` reports, since that command enumerates by ref existence.
+    pub ref_exists: bool,
     pub submission: Option<SubmissionSummary>,
     pub decision: Option<DecisionSummary>,
     pub reviewed_at: Option<UnixMillis>,
@@ -74,6 +78,7 @@ impl BailiffPlanSummary {
     /// the display layer needs and the machine does not.
     pub fn presence(&self) -> NotePresence {
         NotePresence {
+            ref_exists: self.ref_exists,
             submission: self.submission.is_some(),
             decision: self.decision.as_ref().map(|d| d.outcome),
             review: self.reviewed_at.is_some(),

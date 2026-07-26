@@ -805,8 +805,10 @@ read,view,note,state}.rs`, `bailiff_decision.rs`, `bailiff_repo_guard.rs`,
 `bin/`).
 
 **Workflow.** One transition relation, in `bailiff_plan_state.rs`. `NotePresence`
-is the observation (which of the four notes exist, plus the decision's outcome),
-`derive` parses it into a `PlanState` (Absent/Submitted/Accepted/Rejected/
+is the observation (whether the plan's ref exists, which of the four notes exist,
+and the decision's outcome — ref existence is what keeps an untouched id apart
+from an existing-but-empty ref, which is an anomaly rather than a fresh plan),
+`derive_state` parses it into a `PlanState` (Absent/Submitted/Accepted/Rejected/
 Reviewed/Implemented/Corrupt), and `allows(state, stage)` is the gate every
 mutating verb calls — submit from `Absent`, review from `Submitted`, decide from
 `Reviewed`, implement from `Accepted`. Review precedes the decision because
@@ -849,12 +851,21 @@ atomic. `acquire` waits rather than failing — the holder is typically
 mid-LLM-run. All four mutating verbs take it, including `decide`, which before
 2026-07-26 took no lock at all.
 
-A **second, repo-wide** lock (`lock_writ_mirror`, `<repo>/bailiff-locks/_writ-mirror.lock`)
-guards the one thing that is *not* per-plan: every workflow force-fetches
-`refs/notes/writ/v1/*` into the same destination, so per-plan locks would let a
-fetch for one plan roll the shared mirror back between another plan's fetch and
-its read. It is held only across each fetch→read pair, inside the plan lock —
-the ordering is total (plan, then mirror), so the pair cannot deadlock.
+A **second, repo-wide** lock (`lock_repo_mutations`,
+`<repo>/bailiff-locks/_repo-mutation.lock`) serialises every mutation of the
+repo — fetches into the shared writ mirror and note writes alike. Per-plan locks
+are the wrong granularity for git's repo-level structures:
+`NotesRepo::fetch_from_remote` states that "Git's index / refs / objects writes
+are not safe under concurrent fetch+notes-add into the same destination" and
+enforces it with a *process-wide* mutex, which is the one scope that does not
+help two `bailiff` processes on different plans. Held across each
+fetch→read→write, inside the plan lock — the ordering is total (plan, then
+mutation), so the pair cannot deadlock.
+
+Waiting on a plan lock **polls with async backoff** rather than parking a
+`spawn_blocking` worker on a blocking `flock`: a plan lock can be held across an
+agent run, and a waiter occupying a pool worker for that long starves the holder
+of the worker it needs to write the note that would release the lock.
 
 One mechanism per scope, not two per scope: an `flock` binds to an *open file
 description*, so two `open` calls contend even inside one process, and the kernel

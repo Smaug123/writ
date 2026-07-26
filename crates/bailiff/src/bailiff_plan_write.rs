@@ -45,7 +45,7 @@ use crate::bailiff_plan_note::{
     plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
     plan_submission_seed_blob_bytes,
 };
-use crate::bailiff_repo_guard::lock_writ_mirror;
+use crate::bailiff_repo_guard::lock_repo_mutations;
 use writ::core::NotesRef;
 use writ::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
 use writ::run_envelope::SignedRunEnvelope;
@@ -78,10 +78,6 @@ fn fetch_and_verify(
     completed: &RunAgentCompleted,
     allowed_signers: &AllowedSigners,
 ) -> Result<SignedRunEnvelope, FetchVerifyError> {
-    // The fetch destination is shared by every plan, so the caller's
-    // per-plan lock does not serialise this pair. Held only across
-    // fetch→read; see `lock_writ_mirror`.
-    let _mirror = lock_writ_mirror(bailiff_repo).map_err(FetchVerifyError::MirrorLock)?;
     bailiff_repo
         .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
         .map_err(FetchVerifyError::Fetch)?;
@@ -114,10 +110,6 @@ fn fetch_and_verify(
 /// problems.
 #[derive(Debug, Error)]
 pub enum FetchVerifyError {
-    /// The shared writ-mirror lock could not be taken. A filesystem
-    /// problem, not contention — the lock waits.
-    #[error("locking the writ notes mirror failed: {0}")]
-    MirrorLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
     /// `git fetch` against writ's repo failed. Usually a wrong
     /// `writ_repo_path` or filesystem permission problem.
     #[error("fetching writ's notes ref failed: {0}")]
@@ -178,6 +170,11 @@ pub fn write_plan_note(
     completed: &RunAgentCompleted,
     allowed_signers: &AllowedSigners,
 ) -> Result<GitObjectId, WritePlanNoteError> {
+    // Repo-wide, and held across the note write as well as the fetch:
+    // git refuses to make concurrent fetch+notes-add safe, and the
+    // per-plan lock does not span two processes on different plans.
+    // See `lock_repo_mutations`.
+    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(WritePlanNoteError::RepoLock)?;
     let envelope = fetch_and_verify(
         bailiff_repo,
         writ_repo_path,
@@ -207,6 +204,10 @@ pub fn write_plan_note(
 /// plan-note write itself is specific to this verb.
 #[derive(Debug, Error)]
 pub enum WritePlanNoteError {
+    /// The repo-wide mutation lock could not be taken. A filesystem
+    /// problem, not contention — the lock waits.
+    #[error("locking bailiff's repo for mutation failed: {0}")]
+    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
     /// The shared fetch→verify phase failed before any plan note was
     /// written. See [`FetchVerifyError`] for the step-by-step matrix.
     #[error(transparent)]
@@ -270,6 +271,10 @@ pub fn write_decision_note(
 /// emit a stable exit code for "this plan already has a verdict."
 #[derive(Debug, Error)]
 pub enum WriteDecisionNoteError {
+    /// The repo-wide mutation lock could not be taken. A filesystem
+    /// problem, not contention — the lock waits.
+    #[error("locking bailiff's repo for mutation failed: {0}")]
+    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
     /// A decision note for this plan already exists under
     /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. D1 does not
     /// overwrite; the operator's recourse is to submit a fresh plan.
@@ -327,6 +332,11 @@ pub fn write_review_note(
     completed: &RunAgentCompleted,
     allowed_signers: &AllowedSigners,
 ) -> Result<GitObjectId, WriteReviewNoteError> {
+    // Repo-wide, and held across the note write as well as the fetch:
+    // git refuses to make concurrent fetch+notes-add safe, and the
+    // per-plan lock does not span two processes on different plans.
+    // See `lock_repo_mutations`.
+    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(WriteReviewNoteError::RepoLock)?;
     let envelope = fetch_and_verify(
         bailiff_repo,
         writ_repo_path,
@@ -366,6 +376,10 @@ pub fn write_review_note(
 /// (`ReviewAlreadyRecorded` distinct from a generic `WriteReviewNote`).
 #[derive(Debug, Error)]
 pub enum WriteReviewNoteError {
+    /// The repo-wide mutation lock could not be taken. A filesystem
+    /// problem, not contention — the lock waits.
+    #[error("locking bailiff's repo for mutation failed: {0}")]
+    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
     /// The shared fetch→verify phase failed before any review note was
     /// written. See [`FetchVerifyError`] for the step-by-step matrix.
     #[error(transparent)]
@@ -430,6 +444,12 @@ pub fn write_implement_note(
     completed: &RunAgentCompleted,
     allowed_signers: &AllowedSigners,
 ) -> Result<GitObjectId, WriteImplementNoteError> {
+    // Repo-wide, and held across the note write as well as the fetch:
+    // git refuses to make concurrent fetch+notes-add safe, and the
+    // per-plan lock does not span two processes on different plans.
+    // See `lock_repo_mutations`.
+    let _repo_lock =
+        lock_repo_mutations(bailiff_repo).map_err(WriteImplementNoteError::RepoLock)?;
     let envelope = fetch_and_verify(
         bailiff_repo,
         writ_repo_path,
@@ -471,6 +491,10 @@ pub fn write_implement_note(
 /// [`WriteDecisionNoteError`].
 #[derive(Debug, Error)]
 pub enum WriteImplementNoteError {
+    /// The repo-wide mutation lock could not be taken. A filesystem
+    /// problem, not contention — the lock waits.
+    #[error("locking bailiff's repo for mutation failed: {0}")]
+    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
     /// The shared fetch→verify phase failed before any implement note
     /// was written. See [`FetchVerifyError`] for the step-by-step matrix.
     #[error(transparent)]

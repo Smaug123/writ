@@ -68,15 +68,28 @@
 //! queueing the mutex layer was built to add. One primitive, no
 //! registry, no ordering subtlety, and the same guarantee.
 //!
-//! # Waiting, not failing
+//! # Waiting, not failing — and not on a blocking thread
 //!
 //! `acquire` waits. A caller that finds a plan busy logs once and
-//! blocks rather than erroring, because the holder is typically
+//! waits rather than erroring, because the holder is typically
 //! mid-LLM-run and "come back later" is not something a caller can act
 //! on any better than the kernel can. This matches the in-process
 //! semantics workflows always had (`Mutex::lock` waits) and extends
 //! them across processes, replacing the CLI-layer `try_lock` that
 //! failed fast for `implement` alone.
+//!
+//! It waits by **polling `try_lock` with async backoff**, not by
+//! parking a `spawn_blocking` worker on a blocking `flock`. The
+//! difference is a deadlock: a plan lock can be held for the length of
+//! an agent run, so a waiter parked on a pool thread occupies it for
+//! that whole time, and the holder needs a pool thread of its own to
+//! run the note write that would release the lock. Enough waiters and
+//! nobody can finish. Each poll occupies a worker only for one
+//! non-blocking syscall; the wait itself is a timer.
+//!
+//! `lock_repo_mutations` keeps a plain blocking `lock()` because its
+//! critical section is a handful of git invocations — never an agent
+//! run — so its waiters drain promptly.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -129,17 +142,41 @@ impl PlanGuard {
     ///
     /// Errors only if the lockfile cannot be created or locked — a
     /// filesystem problem, not contention.
+    ///
+    /// Waits by polling with async backoff so that a waiter never
+    /// occupies a `spawn_blocking` worker for the length of the
+    /// holder's agent run; see the module docs.
     pub async fn acquire(repo: Arc<NotesRepo>, plan_id: PlanId) -> Result<Self, PlanGuardError> {
         let repo_path = repo.path().to_path_buf();
-        // `flock` blocks, so it must not run on a runtime thread.
-        let lockfile =
-            tokio::task::spawn_blocking(move || acquire_plan_lockfile(&repo_path, plan_id))
-                .await
-                .map_err(|source| PlanGuardError::LockTaskFailed { plan_id, source })??;
-        Ok(Self {
-            lockfile: Some(lockfile),
-            repo,
-        })
+        let mut backoff = POLL_INITIAL;
+        let mut announced = false;
+        loop {
+            let path = repo_path.clone();
+            let attempt =
+                tokio::task::spawn_blocking(move || try_acquire_plan_lockfile(&path, plan_id))
+                    .await
+                    .map_err(|source| PlanGuardError::LockTaskFailed { plan_id, source })??;
+            if let Some(lockfile) = attempt {
+                return Ok(Self {
+                    lockfile: Some(lockfile),
+                    repo,
+                });
+            }
+            if !announced {
+                // Once, not per poll. `warn`, not `info`: the
+                // `bailiff` binary initialises telemetry at `warn`
+                // (`bin/bailiff.rs`), so an `info` event here is
+                // filtered out and the command just looks hung for the
+                // length of an agent run.
+                tracing::warn!(
+                    %plan_id,
+                    "waiting for another bailiff workflow to release this plan",
+                );
+                announced = true;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(POLL_MAX);
+        }
     }
 
     /// Run `work` against the repo in a `spawn_blocking` task under
@@ -178,12 +215,22 @@ impl PlanGuard {
     }
 }
 
-/// Open this plan's lockfile and take the `flock`, waiting for it.
+/// Poll backoff bounds for [`PlanGuard::acquire`]. The cap bounds the
+/// latency a poll adds once a plan frees up; against a critical
+/// section measured in agent-run minutes it is noise, and it keeps an
+/// idle waiter down to two wakeups a second.
+const POLL_INITIAL: std::time::Duration = std::time::Duration::from_millis(20);
+const POLL_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Try once to open this plan's lockfile and take the `flock`.
 ///
-/// Blocking; callers run it on a blocking thread. Distinct
-/// `--bailiff-repo` paths do not contend, and neither do distinct plan
-/// ids within one repo.
-fn acquire_plan_lockfile(repo_path: &Path, plan_id: PlanId) -> Result<File, PlanGuardError> {
+/// `Ok(None)` means another holder has it — the caller backs off and
+/// retries rather than blocking here. Distinct `--bailiff-repo` paths
+/// do not contend, and neither do distinct plan ids within one repo.
+fn try_acquire_plan_lockfile(
+    repo_path: &Path,
+    plan_id: PlanId,
+) -> Result<Option<File>, PlanGuardError> {
     let dir = repo_path.join(LOCK_DIR);
     std::fs::create_dir_all(&dir).map_err(|source| PlanGuardError::OpenLockfile {
         path: dir.clone(),
@@ -199,61 +246,57 @@ fn acquire_plan_lockfile(repo_path: &Path, plan_id: PlanId) -> Result<File, Plan
             path: path.clone(),
             source,
         })?;
-    // Report contention once before settling in to wait, so an
-    // operator staring at an idle CLI knows why. `warn`, not `info`:
-    // the `bailiff` binary initialises telemetry at `warn`
-    // (`bin/bailiff.rs`), so an `info` event here is filtered out and
-    // the command just looks hung for the length of an LLM run.
     match file.try_lock() {
-        Ok(()) => return Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            tracing::warn!(
-                %plan_id,
-                lockfile = %path.display(),
-                "waiting for another bailiff workflow to release this plan",
-            );
-        }
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(source)) => {
-            return Err(PlanGuardError::OpenLockfile { path, source });
+            Err(PlanGuardError::OpenLockfile { path, source })
         }
     }
-    file.lock()
-        .map_err(|source| PlanGuardError::OpenLockfile { path, source })?;
-    Ok(file)
 }
 
-/// Lockfile name for the shared writ-notes mirror. Cannot collide
-/// with a plan lockfile: those are named by UUID.
-const MIRROR_LOCK: &str = "_writ-mirror.lock";
+/// Lockfile name for the repo-wide mutation lock. Cannot collide with
+/// a plan lockfile: those are named by UUID.
+const REPO_MUTATION_LOCK: &str = "_repo-mutation.lock";
 
-/// Take the repo-wide lock guarding bailiff's mirror of writ's notes,
-/// waiting for it. Blocking; call from inside a [`PlanGuard::run_blocking`]
-/// section, which is already on a blocking thread.
+/// Take the repo-wide lock serialising *every* mutation of bailiff's
+/// repo — fetches into the shared writ mirror and note writes alike —
+/// waiting for it. Blocking; call from inside a
+/// [`PlanGuard::run_blocking`] section, which is already on a blocking
+/// thread.
 ///
-/// Per-plan locks are the right granularity for *plan* state, because
-/// each plan owns its ref. They are the wrong granularity for the
-/// writ mirror, which every workflow fetches into the same
-/// destination (`refs/notes/writ/v1/*`, force-fetched). Two workflows
-/// for different plans do not contend on their plan locks, so without
-/// this a fetch from one can roll the shared mirror back between
-/// another's fetch and its read — and on the implement path that can
-/// happen *after* the agent has already pushed, leaving the run
-/// without its `ImplementNote`.
+/// Per-plan locks are the right granularity for *plan state*, because
+/// each plan owns its ref. They are the wrong granularity for git's
+/// repo-level structures. [`NotesRepo::fetch_from_remote`] states the
+/// constraint outright: "Git's index / refs / objects writes are not
+/// safe under concurrent fetch+notes-add into the same destination".
+/// It enforces that with a process-wide mutex — which is exactly the
+/// scope that does not help here, because two `bailiff` *processes*
+/// working on different plans hold different plan flocks and share
+/// nothing else.
 ///
-/// `NotesRepo`'s own mutex does not cover this: it serialises each git
-/// invocation, not the fetch-then-read pair, and it is process-wide
-/// where this hazard is not.
+/// The window this closes is not hypothetical on the implement path: a
+/// fetch in one process racing the `git notes add` in another can lose
+/// the implement note for a run whose agent has **already pushed**.
+///
+/// Scope is therefore fetch→read→write, held across the whole of each
+/// `write_*_note`, not just the fetch. An earlier draft covered only
+/// fetch→read and left the write outside; the justification offered
+/// for it — a 32-way concurrent `git notes add` experiment — had only
+/// ever exercised notes-add against notes-add, never against a fetch.
 ///
 /// **Lock ordering: plan lock first, then this one.** Every caller
 /// takes it inside a held [`PlanGuard`] and releases it before the
-/// guard drops, so the order is total and cannot deadlock.
-pub(crate) fn lock_writ_mirror(repo: &NotesRepo) -> Result<File, PlanGuardError> {
+/// guard drops, so the order is total and cannot deadlock. It is held
+/// only for git invocations, never across an agent run, so waiting on
+/// it does not park a blocking thread for long.
+pub(crate) fn lock_repo_mutations(repo: &NotesRepo) -> Result<File, PlanGuardError> {
     let dir = repo.path().join(LOCK_DIR);
     std::fs::create_dir_all(&dir).map_err(|source| PlanGuardError::OpenLockfile {
         path: dir.clone(),
         source,
     })?;
-    let path = dir.join(MIRROR_LOCK);
+    let path = dir.join(REPO_MUTATION_LOCK);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)

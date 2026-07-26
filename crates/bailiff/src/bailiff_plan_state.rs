@@ -110,6 +110,17 @@ macro_rules! plan_enum {
 /// positions, not one position with a flag.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct NotePresence {
+    /// Whether the plan's ref exists at all.
+    ///
+    /// Distinguishes "this id has never been touched" from "a ref
+    /// exists but carries none of the four recognised notes" — an
+    /// empty notes commit left by manual repair, say. Both have an
+    /// empty note set, but only the first is [`PlanState::Absent`];
+    /// the second is an anomaly, and letting `submit` run against it
+    /// would write into a ref whose existing contents nobody has
+    /// explained. Without this field the two collapse, which is the
+    /// regression `derive_state` shipped with until review caught it.
+    pub ref_exists: bool,
     pub submission: bool,
     pub decision: Option<Decision>,
     pub review: bool,
@@ -117,8 +128,10 @@ pub struct NotePresence {
 }
 
 impl NotePresence {
-    /// Nothing recorded — the position a plan occupies before `submit`.
+    /// Nothing recorded at all, not even a ref — the position a plan
+    /// id occupies before `submit`.
     pub const NONE: Self = Self {
+        ref_exists: false,
         submission: false,
         decision: None,
         review: false,
@@ -198,6 +211,7 @@ impl PlanState {
             implement: bool,
         ) -> Option<NotePresence> {
             Some(NotePresence {
+                ref_exists: true,
                 submission: true,
                 decision,
                 review,
@@ -285,8 +299,8 @@ impl PlanStage {
 
 /// Parse a note set into the plan's position.
 ///
-/// Total: every one of the 24 possible `NotePresence` values maps to
-/// exactly one [`PlanState`], and the 18 that no legal stage sequence
+/// Total: every one of the 48 possible `NotePresence` values maps to
+/// exactly one [`PlanState`], and the 42 that no legal stage sequence
 /// can produce map to [`PlanState::Corrupt`].
 pub fn derive_state(presence: &NotePresence) -> PlanState {
     PlanState::ALL

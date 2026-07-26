@@ -20,20 +20,23 @@ use std::collections::BTreeSet;
 
 use super::*;
 
-/// Every possible note set: 2 submission × 3 decision × 2 review × 2
-/// implement.
+/// Every possible observation: 2 ref × 2 submission × 3 decision × 2
+/// review × 2 implement.
 fn all_presences() -> Vec<NotePresence> {
-    let mut out = Vec::with_capacity(24);
-    for submission in [false, true] {
-        for decision in [None, Some(Decision::Accepted), Some(Decision::Rejected)] {
-            for review in [false, true] {
-                for implement in [false, true] {
-                    out.push(NotePresence {
-                        submission,
-                        decision,
-                        review,
-                        implement,
-                    });
+    let mut out = Vec::with_capacity(48);
+    for ref_exists in [false, true] {
+        for submission in [false, true] {
+            for decision in [None, Some(Decision::Accepted), Some(Decision::Rejected)] {
+                for review in [false, true] {
+                    for implement in [false, true] {
+                        out.push(NotePresence {
+                            ref_exists,
+                            submission,
+                            decision,
+                            review,
+                            implement,
+                        });
+                    }
                 }
             }
         }
@@ -68,7 +71,9 @@ fn pre_slice1_state(p: &NotePresence) -> &'static str {
 /// the relation walk below is independent of what it checks.
 fn write_note(p: NotePresence, stage: PlanStage, outcome: Decision) -> NotePresence {
     match stage {
+        // Attaching the first note is what brings the ref into being.
         PlanStage::Submit => NotePresence {
+            ref_exists: true,
             submission: true,
             ..p
         },
@@ -177,17 +182,25 @@ fn presence_agrees_with_the_transition_relation() {
 /// The deliberate behaviour change, as data. Every note set on which
 /// slice 1 disagrees with the old derivation, and no others.
 ///
+/// Compared over existing refs only, because that is all the old
+/// derivation ever saw: `summarize_plan` was reached through
+/// `list_plan_ids`, which enumerates by ref existence.
+///
 /// Two kinds of entry. Most are note sets the old code labelled with a
 /// workflow stage even though no legal sequence produces them —
 /// implement-without-review, a verdict recorded before any review, and
 /// so on. Two are *relabellings*: `{sub, rev, decision}` used to read
 /// as `reviewed` under the old "highest stage reached" rule, and now
 /// reads as the verdict it carries, because the decision is the later
-/// step. The remaining one is the empty set, which the old code called
-/// `Corrupt` because a plan ref could not exist without a note; the
-/// machine needs it as `Absent` for `submit` to start from.
+/// step.
+///
+/// An existing-but-empty ref is deliberately *not* here: it was
+/// `Corrupt` before and still is. It only stopped being so in a draft
+/// that had dropped ref existence from the observation, which is the
+/// regression `an_existing_but_empty_ref_is_corrupt_not_absent` pins.
 fn behaviour_delta_table() -> Vec<(NotePresence, &'static str, PlanState)> {
     let p = |submission, decision, review, implement| NotePresence {
+        ref_exists: true,
         submission,
         decision,
         review,
@@ -196,8 +209,6 @@ fn behaviour_delta_table() -> Vec<(NotePresence, &'static str, PlanState)> {
     let acc = Some(Decision::Accepted);
     let rej = Some(Decision::Rejected);
     vec![
-        // Nothing recorded: was the corrupt bucket, now the start.
-        (NotePresence::NONE, "corrupt", PlanState::Absent),
         // A verdict recorded before any review — the ordering the
         // design doc rules out, and the gap the old `decide` verb left
         // wide open.
@@ -244,7 +255,8 @@ fn derive_matches_the_old_derivation_except_on_the_delta_table() {
     // makes the table a *complete* account of the behaviour change.
     let changed: BTreeSet<NotePresence> = table.iter().map(|(p, _, _)| *p).collect();
     for presence in all_presences() {
-        if changed.contains(&presence) {
+        // The old derivation only ever ran on refs that exist.
+        if !presence.ref_exists || changed.contains(&presence) {
             continue;
         }
         assert_eq!(
@@ -253,7 +265,7 @@ fn derive_matches_the_old_derivation_except_on_the_delta_table() {
             "undeclared behaviour change at {presence:?}",
         );
     }
-    assert_eq!(table.len(), 10);
+    assert_eq!(table.len(), 9);
 }
 
 /// `derive` is defined on the whole observation space, and the states
@@ -266,7 +278,7 @@ fn derive_is_total_over_the_observation_space() {
         produced, expected,
         "some state is unreachable by derivation"
     );
-    assert_eq!(all_presences().len(), 24);
+    assert_eq!(all_presences().len(), 48);
 }
 
 /// `allows` is total, and agrees with the relation it is defined from.
@@ -511,5 +523,50 @@ fn rank_is_defined_for_every_state_on_the_progression() {
                 );
             }
         }
+    }
+}
+
+/// A ref that exists but carries none of the four recognised notes —
+/// an empty notes commit from manual repair — is an anomaly, not a
+/// fresh plan id.
+///
+/// Collapsing the two would let `submit` run against a ref whose
+/// existing contents nobody has explained. A draft that modelled the
+/// observation as four booleans did exactly that; ref existence is in
+/// `NotePresence` to keep them apart.
+#[test]
+fn an_existing_but_empty_ref_is_corrupt_not_absent() {
+    let untouched = NotePresence::NONE;
+    assert!(!untouched.ref_exists);
+    assert_eq!(derive_state(&untouched), PlanState::Absent);
+    assert!(allows(PlanState::Absent, PlanStage::Submit).is_ok());
+
+    let empty_ref = NotePresence {
+        ref_exists: true,
+        ..NotePresence::NONE
+    };
+    assert_eq!(derive_state(&empty_ref), PlanState::Corrupt);
+    for &stage in PlanStage::ALL {
+        assert!(
+            allows(PlanState::Corrupt, stage).is_err(),
+            "an unexplained ref must not accept {stage}",
+        );
+    }
+}
+
+/// Every state except `Absent` implies the ref exists — `Absent` is
+/// precisely "nothing on disk", and a stage write is what creates the
+/// ref.
+#[test]
+fn only_absent_lacks_a_ref() {
+    for &state in PlanState::ALL {
+        let Some(presence) = state.presence() else {
+            continue;
+        };
+        assert_eq!(
+            presence.ref_exists,
+            state != PlanState::Absent,
+            "{state} disagrees with its ref existence",
+        );
     }
 }

@@ -32,7 +32,7 @@ use crate::bailiff_plan_note::{
     plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC;
-use crate::bailiff_repo_guard::lock_writ_mirror;
+use crate::bailiff_repo_guard::lock_repo_mutations;
 use writ::core::NotesRef;
 use writ::notes_repo::{NotesRepo, NotesRepoError};
 use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
@@ -467,6 +467,7 @@ pub fn summarize_plan(
     bailiff_repo: &NotesRepo,
     plan_id: PlanId,
 ) -> Result<BailiffPlanSummary, SummarizePlanError> {
+    let ref_exists = plan_ref_exists(bailiff_repo, plan_id)?;
     let submission = read_plan_note(bailiff_repo, plan_id)?.map(|note| SubmissionSummary {
         purpose: note.purpose,
         submitted_at: note.signed_metadata.completed_at,
@@ -482,6 +483,7 @@ pub fn summarize_plan(
         read_implement_note(bailiff_repo, plan_id)?.map(|note| note.signed_metadata.completed_at);
     Ok(BailiffPlanSummary {
         plan_id,
+        ref_exists,
         submission,
         decision,
         reviewed_at,
@@ -489,11 +491,36 @@ pub fn summarize_plan(
     })
 }
 
+/// Does this plan's ref exist on disk?
+///
+/// Asked as a prefix query on the ref's own full name, which
+/// `list_refs_under_prefix` answers with at most one entry, rather
+/// than by enumerating the whole plan namespace.
+///
+/// Separate from the four note reads because a ref with *no*
+/// recognised note is a real on-disk state — an empty notes commit
+/// from manual repair — and it must not be confused with an id nobody
+/// has ever submitted. Only the latter is
+/// [`crate::bailiff_plan_state::PlanState::Absent`].
+pub fn plan_ref_exists(
+    bailiff_repo: &NotesRepo,
+    plan_id: PlanId,
+) -> Result<bool, SummarizePlanError> {
+    let name = plan_notes_ref(plan_id);
+    let refs = bailiff_repo
+        .list_refs_under_prefix(name.as_str())
+        .map_err(SummarizePlanError::RefExists)?;
+    Ok(refs.iter().any(|r| r.as_str() == name.as_str()))
+}
+
 /// Tagged failure modes of [`summarize_plan`]. Each variant is a
 /// straight pass-through of the underlying `Read*Error`, so an
 /// operator sees the same diagnostic the per-note read would produce.
 #[derive(Debug, Error)]
 pub enum SummarizePlanError {
+    /// Listing the plan's own ref failed.
+    #[error("checking whether the plan ref exists: {0}")]
+    RefExists(#[source] NotesRepoError),
     #[error("reading plan submission note: {0}")]
     ReadPlan(#[from] ReadPlanError),
     #[error("reading decision note: {0}")]
@@ -753,9 +780,9 @@ pub(crate) fn read_plan_body_bytes(
     plan_note: &PlanNote,
     allowed_signers: &AllowedSigners,
 ) -> Result<String, ReadPlanBodyError> {
-    // Shared across every plan, so the caller's per-plan lock does not
-    // cover it; held only across fetch→read. See `lock_writ_mirror`.
-    let _mirror = lock_writ_mirror(bailiff_repo).map_err(ReadPlanBodyError::MirrorLock)?;
+    // Repo-wide: the caller's per-plan lock does not serialise a fetch
+    // against another process's note write. See `lock_repo_mutations`.
+    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(ReadPlanBodyError::RepoLock)?;
     bailiff_repo
         .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
         .map_err(ReadPlanBodyError::Fetch)?;
@@ -793,10 +820,10 @@ pub(crate) fn read_plan_body_bytes(
 /// isn't text" are all distinct problems.
 #[derive(Debug, Error)]
 pub enum ReadPlanBodyError {
-    /// The shared writ-mirror lock could not be taken. A filesystem
+    /// The repo-wide mutation lock could not be taken. A filesystem
     /// problem, not contention — the lock waits.
-    #[error("locking the writ notes mirror failed: {0}")]
-    MirrorLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
+    #[error("locking bailiff's repo for mutation failed: {0}")]
+    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
     /// `git fetch` against writ's repo failed. Usually a wrong
     /// `writ_repo_path` or a filesystem permission problem.
     #[error("fetching writ's notes ref failed: {0}")]

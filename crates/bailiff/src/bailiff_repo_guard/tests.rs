@@ -322,19 +322,20 @@ async fn cancelling_run_blocking_holds_the_lock_until_the_closure_returns() {
     .expect("re-acquiring a released plan must succeed");
 }
 
-/// The writ-mirror lock is repo-wide, unlike the plan locks.
+/// The repo-mutation lock is repo-wide, unlike the plan locks.
 ///
-/// Every workflow force-fetches `refs/notes/writ/v1/*` into the *same*
-/// destination, so per-plan locks — correct for plan state, which is
-/// per-ref — do not serialise it. Without a repo-wide lock around the
-/// fetch→read pair, a fetch for one plan can roll the shared mirror
-/// back between another plan's fetch and its read; on the implement
-/// path that can strike after the agent has already pushed.
+/// `NotesRepo::fetch_from_remote` states that "Git's index / refs /
+/// objects writes are not safe under concurrent fetch+notes-add into
+/// the same destination" and enforces it with a *process-wide* mutex —
+/// which is the one scope that does not help two `bailiff` processes
+/// on different plans. This lock covers every repo mutation, fetches
+/// and note writes alike; on the implement path a collision can
+/// otherwise lose the note for a run whose agent has already pushed.
 ///
 /// Probed synchronously, for the reason given on
 /// `cancelling_run_blocking_holds_the_lock_until_the_closure_returns`.
 #[test]
-fn the_writ_mirror_lock_is_repo_wide_while_plan_locks_are_not() {
+fn the_repo_mutation_lock_is_repo_wide_while_plan_locks_are_not() {
     let tmp = TempDir::new().unwrap();
     let repo = NotesRepo::init_or_open(tmp.path().join("bare")).unwrap();
 
@@ -348,13 +349,13 @@ fn the_writ_mirror_lock_is_repo_wide_while_plan_locks_are_not() {
             .unwrap()
     };
 
-    let held = lock_writ_mirror(&repo).expect("first mirror lock must succeed");
+    let held = lock_repo_mutations(&repo).expect("first mutation lock must succeed");
 
     // A second holder — of any plan, in any process — must wait.
-    let probe = open("_writ-mirror.lock".to_string());
+    let probe = open("_repo-mutation.lock".to_string());
     assert!(
         matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-        "the mirror lock must exclude every other holder repo-wide",
+        "the mutation lock must exclude every other holder repo-wide",
     );
     drop(probe);
 
@@ -363,9 +364,77 @@ fn the_writ_mirror_lock_is_repo_wide_while_plan_locks_are_not() {
     let plan_probe = open(format!("{}.lock", PlanId::new()));
     assert!(
         plan_probe.try_lock().is_ok(),
-        "the mirror lock must not contend with per-plan locks",
+        "the mutation lock must not contend with per-plan locks",
     );
 
     drop(held);
-    lock_writ_mirror(&repo).expect("the mirror lock must be reacquirable once released");
+    lock_repo_mutations(&repo).expect("the mutation lock must be reacquirable once released");
+}
+
+/// A waiter must not consume a blocking worker for the duration of the
+/// holder's critical section.
+///
+/// A plan lock can be held across an entire agent run. If waiting on
+/// it parked a `spawn_blocking` worker, a waiter would occupy that
+/// worker for the whole run — while the holder needs a worker of its
+/// own to perform the note write that would release the lock. With a
+/// one-worker pool that is an immediate deadlock, and the default pool
+/// deadlocks too once enough waiters fill it.
+///
+/// The runtime is built by hand because `#[tokio::test]` gives no way
+/// to cap the blocking pool, and the cap is the whole point: it turns
+/// a latent, load-dependent hang into a deterministic one.
+///
+/// **Under regression this test hangs rather than failing.** Restoring
+/// the blocking `flock` was tried, and the inner `timeout` does fire —
+/// but tokio then blocks on runtime shutdown waiting for the parked
+/// blocking task, which cannot return because nothing will release the
+/// lock. A deadlock is not a value a test can observe and report; a
+/// stuck run is the signal.
+#[test]
+fn a_waiter_does_not_starve_the_holder_of_blocking_workers() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo(&tmp);
+        let plan_id = PlanId::new();
+
+        let mut holder = PlanGuard::acquire(Arc::clone(&repo), plan_id)
+            .await
+            .unwrap();
+
+        let repo_for_waiter = Arc::clone(&repo);
+        let waiter =
+            tokio::spawn(
+                async move { PlanGuard::acquire(repo_for_waiter, plan_id).await.unwrap() },
+            );
+
+        // Let the waiter reach its wait.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        // The holder must still be able to run blocking work. This is
+        // the assertion that hangs if the waiter parked the only
+        // worker.
+        let observed = tokio::time::timeout(
+            Duration::from_secs(10),
+            holder.run_blocking(|r| r.path().to_path_buf()),
+        )
+        .await
+        .expect("the holder must still get a blocking worker while a waiter waits")
+        .unwrap();
+        assert_eq!(observed, repo.path());
+
+        drop(holder);
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the waiter must proceed once the holder releases")
+            .unwrap();
+    });
 }
