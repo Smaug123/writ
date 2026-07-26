@@ -38,6 +38,7 @@ use bailiff::bailiff_plan_implement::{
 use bailiff::bailiff_plan_note::{DecisionNote, PlanId};
 use bailiff::bailiff_plan_read::{list_plan_ids, read_full_plan, summarize_plan};
 use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
+use bailiff::bailiff_plan_state::{PlanStage, allows};
 use bailiff::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
 use bailiff::bailiff_plan_write::{
     WriteDecisionNoteError, WriteImplementNoteError, WriteReviewNoteError, write_decision_note,
@@ -144,12 +145,13 @@ enum PlanCmd {
     /// Record an operator verdict on a previously-submitted plan.
     /// Exactly one of `--accept` / `--reject` is required.
     ///
-    /// D1.3 deliberately decoupled the decision write from submission
-    /// presence — the verb succeeds even when no submission note
-    /// exists yet under the plan's ref. The only typed failure is
-    /// `DecisionAlreadyRecorded` (a duplicate decide for the same
-    /// plan id); the read-side `read_decision_note` is the predicate
-    /// future acceptance gates consult.
+    /// Legal only from `submitted`. D1.3 originally decoupled the
+    /// decision write from submission presence, which let this verb
+    /// create a plan ref carrying a verdict for a plan that was never
+    /// submitted — a `corrupt` row in `bailiff plan list`. Slice 1
+    /// re-coupled them: the gate is
+    /// [`bailiff::bailiff_plan_state::allows`], the same relation
+    /// every other verb consults.
     #[command(group(
         ArgGroup::new("decide_outcome")
             .required(true)
@@ -792,7 +794,7 @@ async fn plan_review(
 /// invariant via [`bailiff::bailiff_repo_guard::BailiffRepoGuard`], but
 /// the CLI constructs a fresh `Arc` per invocation, so two CLI
 /// processes against the same `--bailiff-repo` can each pass the
-/// in-process pre-RPC `AlreadyImplemented` gate, both kick off
+/// in-process pre-RPC state gate, both kick off
 /// `WorkspaceWrite`-capable agent runs (with `git push` side effects
 /// minted by writ), and only the second's notes-add loses the
 /// duplicate-implement race. The `BailiffRepoGuard` module docstring
@@ -911,7 +913,7 @@ async fn plan_implement(
     // Cross-process flock: distinct from the in-process `Arc<AsyncMutex>`
     // above, which only serialises callers sharing this CLI process.
     // Two concurrent `bailiff plan implement` processes would both pass
-    // `submit_implement`'s pre-RPC `AlreadyImplemented` gate and both
+    // `submit_implement`'s pre-RPC state gate and both
     // launch `WorkspaceWrite` agent runs before either reached the final
     // notes-add. Held to scope end (Drop releases) so the lock spans the
     // entire workflow.
@@ -946,32 +948,18 @@ async fn plan_implement(
             println!("{}", outcome.implement_note_oid);
             Ok(())
         }
-        // The four pre-RPC gates each get a message that names the
-        // operator's next step. Same shape `plan_review` uses for
-        // `ReviewAlreadyRecorded`.
-        Err(SubmitImplementError::PlanSubmissionMissing { plan_id }) => Err(format!(
-            "no plan submission note recorded for plan {plan_id}; run `bailiff plan submit` first"
-        )
-        .into()),
-        Err(SubmitImplementError::PlanNotDecided { plan_id }) => Err(format!(
-            "no decision recorded for plan {plan_id}; run `bailiff plan decide --accept` first"
-        )
-        .into()),
-        Err(SubmitImplementError::PlanRejected { plan_id }) => Err(format!(
-            "plan {plan_id} was rejected; refusing to implement a rejected plan — submit a fresh \
-             plan if the operator wants to try a different approach"
-        )
-        .into()),
-        Err(SubmitImplementError::AlreadyImplemented { plan_id }) => Err(format!(
-            "implement already recorded for plan {plan_id}; bailiff does not re-run the \
-             implementer — submit a fresh plan if a re-implement is needed (multi-attempt \
-             implement history is a future v1 → v2 migration)"
-        )
-        .into()),
-        // Post-RPC variant of the same idempotency invariant: the
+        // The four hand-written pre-RPC gate messages that used to
+        // live here are gone. `IllegalTransition` renders its own —
+        // observed state, blocked stage, and the operator's next
+        // command, all derived from the transition relation — so it
+        // falls through to the passthrough arm below. That is the
+        // point of slice 1: the remedy text cannot drift from the
+        // gate, because the gate generates it.
+        //
+        // Post-RPC variant of the idempotency invariant: the
         // implementer agent ran and writ stamped an envelope, but
         // bailiff's note-write lost a race against another caller.
-        // Recourse is identical to the pre-RPC `AlreadyImplemented`
+        // Recourse is identical to the pre-RPC `IllegalTransition`
         // case — same message, surfaced verbatim.
         Err(SubmitImplementError::WriteImplementNote {
             session_id: _,
@@ -1034,6 +1022,23 @@ async fn plan_decide(
     let bailiff_repo_path_for_init = bailiff_repo_path.clone();
     let result = tokio::task::spawn_blocking(move || {
         let repo = NotesRepo::init_or_open(bailiff_repo_path_for_init)?;
+        // Slice 1's gate. `decide` previously read no precondition at
+        // all, which is why it could write a verdict for a plan that
+        // was never submitted: `write_decision_note` creates the
+        // per-plan ref, `list_plan_ids` enumerates by ref existence,
+        // and the resulting row rendered as `corrupt` — the anomaly
+        // the display layer exists to *report*, manufactured by this
+        // verb in one command.
+        //
+        // The gate and the write share this one blocking section, but
+        // `decide` still takes no lock, so the pair is not yet atomic
+        // against a concurrent process. Slice 2 fixes that; until
+        // then `write_decision_note`'s `DecisionAlreadyRecorded` is
+        // the backstop, as it always was.
+        let state = summarize_plan(&repo, plan_id)
+            .map_err(DecideError::ReadPlanState)?
+            .state();
+        allows(state, PlanStage::Decide).map_err(DecideError::IllegalTransition)?;
         write_decision_note(&repo, &note).map_err(DecideError::Write)
     })
     .await
@@ -1046,6 +1051,12 @@ async fn plan_decide(
             bailiff_repo_path.display()
         )
         .into()),
+        Err(DecideError::ReadPlanState(e)) => {
+            Err(format!("reading the state of plan {plan_id}: {e}").into())
+        }
+        // Renders its own remedy from the relation; see the note in
+        // `plan_implement`'s match.
+        Err(DecideError::IllegalTransition(e)) => Err(format!("plan {plan_id}: {e}").into()),
         Err(DecideError::Write(WriteDecisionNoteError::DecisionAlreadyRecorded {
             plan_id,
             target_oid,
@@ -1188,6 +1199,8 @@ impl From<writ::notes_repo::NotesRepoError> for ShowError {
 /// is specific. Local to this binary; not part of any wire contract.
 enum DecideError {
     OpenRepo(writ::notes_repo::NotesRepoError),
+    ReadPlanState(bailiff::bailiff_plan_read::SummarizePlanError),
+    IllegalTransition(bailiff::bailiff_plan_state::IllegalTransition),
     Write(WriteDecisionNoteError),
 }
 

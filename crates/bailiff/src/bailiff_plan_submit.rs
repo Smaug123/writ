@@ -43,6 +43,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::PlanId;
+use crate::bailiff_plan_read::{SummarizePlanError, summarize_plan};
+use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
 use crate::bailiff_plan_write::{WritePlanNoteError, write_plan_note};
 use crate::bailiff_repo_guard::BailiffRepoGuard;
 use writ::agent_run::AgentPrompt;
@@ -144,6 +146,20 @@ pub async fn submit_plan(
     // serialise instead of racing the write step. Released on
     // function return.
     let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+
+    // Pre-RPC gate. `submit` previously had none: it opened a session
+    // and ran the planner immediately, so submitting against an id
+    // that already had a plan note burned a full agent run before
+    // `write_plan_note` refused the duplicate. `Submit` is legal only
+    // from `Absent`, so that now costs nothing.
+    let plan_id = inputs.plan_id;
+    let state_outcome = bailiff
+        .run_blocking(move |repo| summarize_plan(repo, plan_id).map(|s| s.state()))
+        .await
+        .map_err(SubmitPlanError::ReadTaskFailed)?;
+    let state = state_outcome.map_err(SubmitPlanError::ReadPlanState)?;
+    allows(state, PlanStage::Submit)
+        .map_err(|source| SubmitPlanError::IllegalTransition { plan_id, source })?;
 
     let session_id = client
         .open_session(
@@ -249,6 +265,24 @@ pub async fn submit_plan(
 /// that case.
 #[derive(Debug, Error)]
 pub enum SubmitPlanError {
+    /// The `spawn_blocking` task that owns the pre-RPC state read
+    /// panicked or was cancelled. Pre-RPC: no session was opened.
+    #[error("plan-state read task failed: {0}")]
+    ReadTaskFailed(#[source] JoinError),
+    /// Reading the four notes to determine the plan's state failed.
+    /// Distinct from [`Self::IllegalTransition`] (the state was read
+    /// fine and forbids the stage). Pre-RPC.
+    #[error("reading the plan's state failed: {0}")]
+    ReadPlanState(#[source] SummarizePlanError),
+    /// The plan id already has notes attached, so `submit` may not
+    /// run against it. Pre-RPC — the point of the gate is that this
+    /// costs no agent run, which the pre-slice-1 code could not say.
+    #[error("plan {plan_id}: {source}")]
+    IllegalTransition {
+        plan_id: PlanId,
+        #[source]
+        source: IllegalTransition,
+    },
     /// The initial `OpenSession` RPC failed. Workflow never started;
     /// no cleanup needed.
     #[error("opening writ session failed: {0}")]
@@ -338,6 +372,7 @@ mod end_to_end_tests {
 
     use super::*;
     use crate::bailiff_plan_note::{PlanNote, plan_notes_ref};
+    use crate::bailiff_plan_state::PlanState;
     use crate::bailiff_plan_write::FetchVerifyError;
     use writ::audit::AuditLog;
     use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
@@ -538,6 +573,99 @@ mod end_to_end_tests {
             session_row.closed_at.is_some(),
             "session must be closed after submit_plan returns"
         );
+
+        broker_task.abort();
+        let _ = broker_task.await;
+    }
+
+    /// Behaviour delta (slice 1): re-submitting against a plan id
+    /// that already has notes is refused *before* the planner runs.
+    ///
+    /// `submit_plan` previously had no pre-RPC gate at all — it
+    /// opened a session and ran the planner immediately, so a
+    /// repeated `--plan-id` burned a full agent run before
+    /// `write_plan_note`'s idempotency check refused the duplicate.
+    /// `Submit` is legal only from `Absent`, so the same mistake is
+    /// now free. Witnessed against writ's audit log: the second call
+    /// leaves no new session row.
+    #[tokio::test]
+    async fn submit_plan_refuses_a_duplicate_plan_id_before_running_the_planner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
+
+        let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
+        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let plan_id = PlanId::new();
+        let inputs = || SubmitPlanInputs {
+            prompt: AgentPrompt::try_new("noop\n").unwrap(),
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            purpose: "plan-submit".into(),
+            writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_label: None,
+            session_agent_kind: Some(AgentKind::Claude),
+            session_agent_model: None,
+            plan_id,
+        };
+
+        let client = WritClient::new(&socket_path);
+        let first = tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_plan(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed.clone(),
+                inputs(),
+            ),
+        )
+        .await
+        .expect("first submit_plan must return within 15s")
+        .expect("first submit_plan must succeed");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_plan(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed,
+                inputs(),
+            ),
+        )
+        .await
+        .expect("second submit_plan must return within 15s")
+        .expect_err("a duplicate plan id must be refused");
+
+        match &err {
+            SubmitPlanError::IllegalTransition {
+                plan_id: found,
+                source,
+            } => {
+                assert_eq!(*found, plan_id);
+                assert_eq!(source.state, PlanState::Submitted);
+                assert_eq!(source.stage, PlanStage::Submit);
+            }
+            other => panic!("expected IllegalTransition, got: {other:?}"),
+        }
+
+        // The first planner session is the only one, and it closed
+        // cleanly. A pre-slice-1 binary would have opened a second.
+        let first_session = first.planner_session_id;
+        let audit = Arc::clone(&state.audit);
+        let row = tokio::task::spawn_blocking(move || audit.get_session(first_session))
+            .await
+            .unwrap()
+            .expect("session row read must succeed")
+            .expect("first planner session must exist");
+        assert!(row.closed_at.is_some());
 
         broker_task.abort();
         let _ = broker_task.await;

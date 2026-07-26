@@ -6,6 +6,7 @@
 
 use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote};
+use crate::bailiff_plan_state::{NotePresence, PlanState, derive_state};
 use writ::core::{SshSignature, UnixMillis};
 use writ::protocol::SignedRunMetadata;
 use writ::run_envelope::SignedRunEnvelope;
@@ -20,10 +21,11 @@ use writ::vm_git::GitObjectId;
 /// requires no schema beyond the seed-OID convention they already
 /// share.
 ///
-/// Workflow state is derived from the field set via [`Self::state`];
-/// the formatter pins the rendering. Keeping state as a method rather
-/// than a stored field means a future caller (e.g. `bailiff plan
-/// show`) can recompute it without going through the formatter.
+/// Workflow state is derived from the field set via [`Self::presence`]
+/// and [`crate::bailiff_plan_state::derive_state`]; the formatter pins the
+/// rendering. Keeping state as a method rather than a stored field
+/// means a future caller (e.g. `bailiff plan show`) can recompute it
+/// without going through the formatter.
 ///
 /// Submission absent (`submission.is_none()`) is a possible-but-rare
 /// state: the plan's ref exists (otherwise [`crate::bailiff_plan_read::list_plan_ids`] wouldn't
@@ -31,7 +33,7 @@ use writ::vm_git::GitObjectId;
 /// Reachable only when a non-submission note was attached first (e.g.
 /// a decision written before the plan submission landed) or when a
 /// submission note was manually deleted after the fact. Surfaced as
-/// [`WorkflowState::Corrupt`] so an operator sees the anomaly rather
+/// [`PlanState::Corrupt`] so an operator sees the anomaly rather
 /// than silently rendering an incomplete row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BailiffPlanSummary {
@@ -66,83 +68,31 @@ pub struct DecisionSummary {
     pub decided_at: UnixMillis,
 }
 
-/// High-level workflow state derived from the presence and content of
-/// the four per-plan notes. The variant tree matches the workflow
-/// progression — `Submitted` → (`Accepted` | `Rejected`) → `Reviewed`
-/// → `Implemented` — except for `Corrupt`, which is the
-/// ref-exists-without-submission anomaly.
-///
-/// State is "the highest workflow step reached," with one caveat:
-/// `Rejected` is terminal in the sense that reviewer/implementer
-/// stages should not run on a rejected plan, but the repo doesn't
-/// enforce the workflow ordering — a manual write could attach a
-/// review note to a rejected plan. The derivation prefers to surface
-/// the latest stage present in the underlying data; that's why
-/// `Implemented` overrides everything else, and `Reviewed` overrides
-/// `Rejected` if both are present. The decision field stays visible
-/// on the summary so the operator sees the conflict directly.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum WorkflowState {
-    /// Plan ref exists but no submission note is attached. Indicates
-    /// either a workflow-ordering anomaly (non-submission note written
-    /// first) or manual repo repair.
-    Corrupt,
-    /// Submission attached; no decision, review, or implement yet.
-    Submitted,
-    /// Submission + `Decision::Accepted`; no review or implement yet.
-    Accepted,
-    /// Submission + `Decision::Rejected`; no review or implement yet.
-    Rejected,
-    /// Submission + review note attached; no implement note yet.
-    /// Decision may or may not be present — the derivation prefers
-    /// the latest stage in the data.
-    Reviewed,
-    /// Implement note attached. Highest stage; overrides all others.
-    Implemented,
-}
-
-impl WorkflowState {
-    /// Stable lowercase string for CLI output. Mirrors the convention
-    /// used by [`Decision::as_str`] so the rendered state column reads
-    /// naturally next to `decision_outcome=accepted`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WorkflowState::Corrupt => "corrupt",
-            WorkflowState::Submitted => "submitted",
-            WorkflowState::Accepted => "accepted",
-            WorkflowState::Rejected => "rejected",
-            WorkflowState::Reviewed => "reviewed",
-            WorkflowState::Implemented => "implemented",
-        }
-    }
-}
-
-impl std::fmt::Display for WorkflowState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 impl BailiffPlanSummary {
-    /// Derived workflow state. See [`WorkflowState`] for the
-    /// progression rule.
-    pub fn state(&self) -> WorkflowState {
-        if self.submission.is_none() {
-            return WorkflowState::Corrupt;
+    /// Project this summary down to the observation the transition
+    /// relation reasons about. Discards the timestamps and attribution
+    /// the display layer needs and the machine does not.
+    pub fn presence(&self) -> NotePresence {
+        NotePresence {
+            submission: self.submission.is_some(),
+            decision: self.decision.as_ref().map(|d| d.outcome),
+            review: self.reviewed_at.is_some(),
+            implement: self.implemented_at.is_some(),
         }
-        if self.implemented_at.is_some() {
-            return WorkflowState::Implemented;
-        }
-        if self.reviewed_at.is_some() {
-            return WorkflowState::Reviewed;
-        }
-        match &self.decision {
-            Some(d) => match d.outcome {
-                Decision::Accepted => WorkflowState::Accepted,
-                Decision::Rejected => WorkflowState::Rejected,
-            },
-            None => WorkflowState::Submitted,
-        }
+    }
+
+    /// Derived workflow state.
+    ///
+    /// Before slice 1 this method held its own derivation — "the
+    /// highest workflow step reached" — which was a fourth encoding of
+    /// the transition relation and disagreed with the three gates in
+    /// the workflows. It now delegates, so a note set the workflows
+    /// would refuse to produce renders as [`PlanState::Corrupt`]
+    /// instead of being silently labelled with a stage it never
+    /// legally reached. See
+    /// `docs/plans/2026-07-26-bailiff-workflow-as-data.md`.
+    pub fn state(&self) -> PlanState {
+        derive_state(&self.presence())
     }
 }
 
@@ -157,7 +107,7 @@ impl BailiffPlanSummary {
 /// every field set, but each can independently be absent. The plan
 /// note is `Option<VerifiedSection<PlanNote>>` rather than bare
 /// `VerifiedSection<PlanNote>` so the corrupt-state anomaly F2
-/// surfaces in [`WorkflowState::Corrupt`] (ref exists, submission
+/// surfaces in [`PlanState::Corrupt`] (ref exists, submission
 /// note never attached) keeps being representable here. The decision
 /// is `Option<DecisionNote>` because decision notes are bailiff-owned
 /// and unsigned in this slice — no envelope to verify.

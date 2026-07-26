@@ -801,14 +801,34 @@ bailiff-owned note in bailiff's own bare git repo, keeping product-level
 workflow out of the security-critical broker.
 
 **Lives in.** `crates/bailiff/` (`bailiff_plan_{submit,review,implement,write,
-read,view,note}.rs`, `bailiff_decision.rs`, `bailiff_repo_guard.rs`, `bin/`).
+read,view,note,state}.rs`, `bailiff_decision.rs`, `bailiff_repo_guard.rs`,
+`bin/`).
 
-**Workflow.** The state (`WorkflowState`: Submitted/Accepted/Rejected/Reviewed/
-Implemented, `bailiff_plan_view.rs:85`) is *derived* from which notes exist —
-"highest stage reached." Legal-transition gating is enforced at the implement
-step (`submit_implement` requires submission → decision → `Accepted` → no prior
-implement, `bailiff_plan_implement.rs:204`); decide and review deliberately do
-not gate on submission presence.
+**Workflow.** One transition relation, in `bailiff_plan_state.rs`. `NotePresence`
+is the observation (which of the four notes exist, plus the decision's outcome),
+`derive` parses it into a `PlanState` (Absent/Submitted/Accepted/Rejected/
+Reviewed/Implemented/Corrupt), and `allows(state, stage)` is the gate every
+mutating verb calls — submit from `Absent`, decide from `Submitted`, review from
+`Accepted`, implement from `Reviewed`. The four ad-hoc idempotency gates are
+subsumed: a stage is illegal from the state it produces, so "already decided /
+reviewed / implemented" needs no separate check (the write-side
+`write_note_if_absent` rejection remains as the backstop, in the same spirit as
+the approve path's SQL triggers).
+
+`Corrupt` is *defined by* the relation rather than listed separately: it is any
+note set no legal stage sequence could have produced. That makes the corruption
+detector and the gate two readings of one definition, checked by a reference
+implementation that walks the relation without consulting the state⇒presence map
+(`reachable_presences_are_exactly_the_non_corrupt_states`).
+
+**History.** Until 2026-07-26 this was four disagreeing encodings: `plan_decide`
+read no precondition at all (so it could stamp a verdict on an unsubmitted plan
+and *manufacture* the `Corrupt` row the display layer exists to report),
+`submit_review` gated on the submission alone (so rejected plans reviewed
+happily), `submit_implement` gated on submission → `Accepted` → no prior
+implement but never read the review, and `BailiffPlanSummary::state` derived a
+fourth relation for display. Unifying them tightened three gates; see
+`docs/plans/2026-07-26-bailiff-workflow-as-data.md` for the delta table.
 
 **Guarantees & invariants.** Each stage attaches a distinct note under one
 per-plan ref `refs/notes/bailiff/v1/plans/<id>` at deterministic per-stage seed

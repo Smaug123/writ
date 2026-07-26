@@ -11,6 +11,7 @@ pub mod bailiff_plan_implement;
 pub mod bailiff_plan_note;
 pub mod bailiff_plan_read;
 pub mod bailiff_plan_review;
+pub mod bailiff_plan_state;
 pub mod bailiff_plan_submit;
 pub mod bailiff_plan_view;
 pub mod bailiff_plan_write;

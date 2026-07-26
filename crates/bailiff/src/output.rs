@@ -18,10 +18,10 @@ use writ::protocol::SignedRunMetadata;
 /// key=value block separated by blank lines. Per-plan keys:
 ///
 /// - `plan_id` — UUID.
-/// - `state` — derived [`crate::bailiff_plan_view::WorkflowState`].
+/// - `state` — derived [`crate::bailiff_plan_state::PlanState`].
 /// - `purpose` / `submitted_at` — submission projection (or `<none>`
 ///   when no submission has been recorded, the
-///   [`crate::bailiff_plan_view::WorkflowState::Corrupt`] case).
+///   [`crate::bailiff_plan_state::PlanState::Corrupt`] case).
 /// - `decision_outcome` / `decision_decider` / `decided_at` — decision
 ///   projection (or `<none>` when no decision has been recorded).
 /// - `reviewed_at` / `implemented_at` — timestamps from the matching

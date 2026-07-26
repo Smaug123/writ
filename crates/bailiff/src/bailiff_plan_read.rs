@@ -46,7 +46,6 @@ use writ::vm_git::GitObjectId;
 pub(crate) use crate::bailiff_plan_view::SignedBailiffNote;
 pub use crate::bailiff_plan_view::{
     BailiffPlanSummary, DecisionSummary, PlanFullView, SubmissionSummary, VerifiedSection,
-    WorkflowState,
 };
 
 /// Bailiff's local copy of writ's per-run signed-output notes ref.
@@ -461,7 +460,7 @@ pub enum ListPlanIdsError {
 /// Returns a summary with all four note projections folded in. A
 /// missing submission folds into `submission: None` rather than an
 /// error: the list view's job is to render what's there, and the
-/// derived [`WorkflowState::Corrupt`] flag surfaces the anomaly
+/// derived [`crate::bailiff_plan_state::PlanState::Corrupt`] flag surfaces the anomaly
 /// instead.
 pub fn summarize_plan(
     bailiff_repo: &NotesRepo,

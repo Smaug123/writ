@@ -7,7 +7,7 @@
 //!   ordering, parse failure on a non-UUID tail.
 //! - summary aggregation: each subset of the four notes maps to
 //!   the expected `BailiffPlanSummary` field set.
-//! - workflow-state derivation: every variant of [`WorkflowState`]
+//! - workflow-state derivation: every variant of [`PlanState`]
 //!   is reachable from a corresponding fixture.
 //!
 //! Notes are planted directly via [`NotesRepo::write_note`] rather
@@ -23,6 +23,7 @@ use crate::bailiff_plan_note::{
     plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
     plan_submission_seed_blob_bytes,
 };
+use crate::bailiff_plan_state::PlanState;
 use tempfile::TempDir;
 use writ::agent_run::{AgentRunId, sha256_hex};
 use writ::core::{
@@ -274,7 +275,7 @@ fn list_plan_ids_rejects_unhyphenated_uuid_tail() {
 /// (decision attached first, manual repo state) folds into
 /// `submission: None` rather than an error. Pin the surface so
 /// `bailiff plan list` keeps rendering the row instead of failing
-/// the whole command — the [`WorkflowState::Corrupt`] derivation
+/// the whole command — the [`PlanState::Corrupt`] derivation
 /// is how the operator sees the anomaly.
 #[test]
 fn summarize_plan_returns_corrupt_state_when_only_decision_present() {
@@ -288,7 +289,7 @@ fn summarize_plan_returns_corrupt_state_when_only_decision_present() {
     assert!(summary.decision.is_some());
     assert!(summary.reviewed_at.is_none());
     assert!(summary.implemented_at.is_none());
-    assert_eq!(summary.state(), WorkflowState::Corrupt);
+    assert_eq!(summary.state(), PlanState::Corrupt);
 }
 
 /// Submission only: the four optionals are submission=Some,
@@ -311,7 +312,7 @@ fn summarize_plan_returns_submission_only_when_just_submitted() {
     assert!(summary.decision.is_none());
     assert!(summary.reviewed_at.is_none());
     assert!(summary.implemented_at.is_none());
-    assert_eq!(summary.state(), WorkflowState::Submitted);
+    assert_eq!(summary.state(), PlanState::Submitted);
 }
 
 /// Submission + accept decision → state=accepted, decision fields
@@ -330,7 +331,7 @@ fn summarize_plan_projects_accepted_decision() {
     assert_eq!(decision.outcome, Decision::Accepted);
     assert_eq!(decision.decider.as_str(), "cli:alice");
     assert_eq!(decision.decided_at.as_millis(), 2);
-    assert_eq!(summary.state(), WorkflowState::Accepted);
+    assert_eq!(summary.state(), PlanState::Accepted);
 }
 
 /// Submission + reject decision → state=rejected.
@@ -346,7 +347,7 @@ fn summarize_plan_projects_rejected_decision() {
         summary.decision.as_ref().map(|d| d.outcome),
         Some(Decision::Rejected),
     );
-    assert_eq!(summary.state(), WorkflowState::Rejected);
+    assert_eq!(summary.state(), PlanState::Rejected);
 }
 
 /// Submission + accept + review → state=reviewed; `reviewed_at`
@@ -365,7 +366,7 @@ fn summarize_plan_projects_reviewed_at_when_reviewed() {
         Some(1_700_000_001_000),
     );
     assert!(summary.implemented_at.is_none());
-    assert_eq!(summary.state(), WorkflowState::Reviewed);
+    assert_eq!(summary.state(), PlanState::Reviewed);
 }
 
 /// All four notes present → state=implemented; every projection
@@ -390,20 +391,10 @@ fn summarize_plan_projects_implemented_at_when_implemented() {
         Some(3),
         "reviewed_at must still surface even though state overrides to implemented",
     );
-    assert_eq!(summary.state(), WorkflowState::Implemented);
+    assert_eq!(summary.state(), PlanState::Implemented);
 }
 
-/// `WorkflowState::as_str` pins the lowercase string the formatter
-/// writes; a rename would surface here rather than as a test-snapshot
-/// drift somewhere far from the source.
-#[test]
-fn workflow_state_as_str_is_stable_lowercase() {
-    assert_eq!(WorkflowState::Corrupt.as_str(), "corrupt");
-    assert_eq!(WorkflowState::Submitted.as_str(), "submitted");
-    assert_eq!(WorkflowState::Accepted.as_str(), "accepted");
-    assert_eq!(WorkflowState::Rejected.as_str(), "rejected");
-    assert_eq!(WorkflowState::Reviewed.as_str(), "reviewed");
-    assert_eq!(WorkflowState::Implemented.as_str(), "implemented");
-    // Display must agree with as_str.
-    assert_eq!(WorkflowState::Submitted.to_string(), "submitted");
-}
+// The `PlanState::as_str` pinning test moved to
+// `bailiff_plan_state::tests::state_and_stage_strings_are_stable` in
+// slice 1: the strings are a property of the enum, not of the reader
+// that happens to produce one.
