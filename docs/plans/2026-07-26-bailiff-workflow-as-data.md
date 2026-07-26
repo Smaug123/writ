@@ -321,12 +321,80 @@ renderer.
 
 ---
 
+## Slice 3b — one note, one writer, one error
+
+**Dependencies**: slice 3.
+
+**Implements**: the last triplication in the subsystem, and the precondition
+that makes slice 4's schema change a one-place edit.
+
+Slice 3 deliberately kept `bailiff_plan_write.rs` out of its diff by leaving the
+note-write error generic (`N`) in the two runner phases. Measured afterwards,
+what that left behind is a triplication at **four** levels:
+
+| Level | Evidence |
+|---|---|
+| the note body | `PlanNote`, `ReviewNote`, `ImplementNote` are field-for-field identical |
+| the writer | `write_review_note` and `write_implement_note` are byte-identical modulo names and one line wrap; `write_plan_note` differs only in its storage call |
+| the error | three enums, three of whose four variants are the same, differing in one noun |
+| the tests | 1,168 lines across three modules with the same test names modulo the noun |
+
+`AgentStage` already *is* the three-way distinction, so no new vocabulary is
+needed: it gains a seed projection, and the three structs become one.
+
+What ships:
+
+- One `StageNote` body. Its canonical bytes must be **identical** to what the
+  three structs produce today or existing notes stop parsing — pinned by keeping
+  the three old structs in the test module as reference implementations and
+  asserting byte-equality, not by inspection.
+- `write_stage_note(repo, writ_repo_path, writ_notes_ref, stage, plan_id,
+  purpose, completed, allowed_signers)`, and one `WriteStageNoteError
+  { RepoLock, FetchVerify, AlreadyRecorded { stage, .. }, Write { stage, .. } }`.
+- The generic `N` disappears from `run_under_owned_session` /
+  `run_under_broker_session`, and with it the closure: the runners take an
+  `AgentStage` and call the one writer.
+- Three test modules become one, parameterised over `AgentStage::ALL`.
+
+**One behaviour delta, and it is a strengthening.** `write_plan_note` calls
+`write_note`; the other two call `write_note_if_absent`. Both refuse a
+duplicate, but the submission's refusal arrives as a generic
+`WritePlanNote(NotesRepoError)` — a git failure — where the other two arrive as
+the typed `AlreadyRecorded`. Collapsing onto `write_note_if_absent` makes the
+submission's duplicate typed like its siblings.
+`write_plan_note_refuses_to_overwrite_existing_plan_id` changes from asserting
+the generic variant to asserting the typed one, and that edit *is* the record of
+the delta. Unreachable through the workflow either way, since slice 1 gates
+`Submit` to `Absent`.
+
+**Correctness oracle**:
+- The 24 RPC fixtures and `rpc_trace_baseline.rs` unmodified again. Checked
+  rather than hoped: all six of its `Write*Note` assertions are variant-name
+  patterns with `..`, so changing the `source` *type* is invisible to them —
+  which is exactly why this slice is safe and slice 3's enum collapse was not.
+- Property: for each `AgentStage`, `StageNote`'s canonical bytes equal the
+  pre-collapse struct's for the same field values. A reference implementation,
+  not an eyeball.
+- Property: the four seeds stay pairwise distinct and unchanged (extends
+  `bailiff_submission_and_decision_seeds_differ_for_every_plan_id` to all four).
+- Mutation: swapping two stages' seeds must fail a named test; observe it.
+- `tests/stage_gate_zero_rpc.rs` passes unmodified — it plants notes at all four
+  seeds, so a seed regression fails there too, independently.
+
+---
+
 ## Slice 4 — fan-out, designed and not built
 
 **Dependencies**: slice 3 (this section is written as part of slice 3's docs; no
 code ships).
 
 **Implements**: the objection's end goal, recorded so it is not re-derived.
+
+> **Superseded 2026-07-26 by "Slice 4, revised" below.** The recommendation in
+> this section was written before `bailiff_plan_state.rs` existed, and its
+> central claim — "the state machine works per-plan unchanged" — is false
+> against the state machine slice 1 actually shipped. Kept in place because the
+> reasoning that overturns it is only legible next to it.
 
 **Recommendation: a variant is a child `PlanId`**, with `parent: Option<PlanId>`
 added to `PlanNote`, rather than a variant discriminator in the seed suffix.
@@ -348,6 +416,102 @@ one interpreter arm, slice 3's core was right. **If either requires changing
 `StageSpec` itself, that is the signal the descriptor was drawn at the wrong
 altitude** — record which axis was missing rather than widening the type in
 place.
+
+---
+
+## Slice 4, revised — N runs under one plan
+
+**Dependencies**: slice 3b.
+
+**Implements**: the objection's end goal. Replaces the recommendation above.
+
+### Why the child-plan recommendation does not survive slice 1
+
+A child plan carrying only an implement note has `NotePresence
+{ ref_exists: true, submission: false, …, implement: true }`, which
+`derive_state` reads as `Corrupt` — and before its run it is `Absent`.
+`Implement` is illegal from both. So the child's gate cannot be
+`allows(child_state, Implement)`; it has to consult the *parent*.
+
+That means one of:
+
+- `derive_state` takes a second input (the parent's state), so the parse is no
+  longer a function of the plan's own notes; or
+- a second relation, `allows_child(parent_state, child_state, stage)`, beside
+  the first.
+
+The second is the four-disagreeing-encodings defect, re-created deliberately.
+The first is defensible but drags a further cost: a fan-out workflow then holds
+**two** plan locks, so `PlanGuard` needs a documented acquisition order (by id)
+to stay deadlock-free — a hazard slice 2 does not currently have, since every
+workflow holds exactly one.
+
+This is precisely the signal the section above asked for: *"if either requires
+changing `StageSpec` itself, that is the signal the descriptor was drawn at the
+wrong altitude — record which axis was missing."* **The missing axis is: whose
+state does the precondition read?** Every stage so far reads the plan it writes
+to. `AgentStage::precondition`'s test
+(`each_agent_stage_gates_on_its_namesake_plan_stage`) exists to make that
+assumption fail loudly rather than generalise silently, and here it fires.
+
+### What ships instead
+
+The `::implement::<n>` seed scheme the section above rejected. Its stated cost
+was that it "touches seed derivation, all four readers, the duplicate gate's
+meaning, and the one-note-per-kind assumption the ref scheme rests on" — but
+slice 1 centralised three of those four into one definition, so the same change
+is now local:
+
+- `plan_implement_seed_blob_bytes(plan_id, attempt)`. Attempt 0 must hash to the
+  **current** seed's bytes, or every existing implement note is orphaned.
+- `NotePresence.implement` becomes a count rather than a bool. `derive_state`
+  reads `Implemented` iff the count is ≥ 1 — one line, one definition.
+- `Implement` becomes legal from `Implemented` as well as `Accepted`.
+
+That last change **deletes
+`legal_stages_never_repeat_from_the_state_they_produce` for one stage**, and
+that is the honest headline of this slice rather than a regrettable side effect:
+the property asserts every stage is one-shot, and fan-out means implement
+deliberately is not. The property survives for `Submit`, `Review`, and `Decide`;
+`Implement` gets a named replacement asserting the *bounded* thing instead — that
+repeating it adds an attempt and never overwrites one.
+
+Nothing else moves. One plan, one ref, one lock, one relation, one state
+machine. There is no `parent` field, no second gate, and no lock ordering rule.
+
+**What varies between variants needs no schema at all.** Agent kind and model
+are already on the signed metadata each run's envelope carries, via the writ
+session; the prompt is already hashed into it. So "which variant was this?" is
+answerable from the notes bailiff already stores, and `Collect` is a read-side
+projection over the attempts rather than a new record.
+
+**Correctness oracle**:
+- Property: `plan_implement_seed_blob_bytes(id, 0)` equals the pre-slice-4 seed
+  for every plan id. Written against the old function kept as a reference
+  implementation, so it cannot drift.
+- Property: the four seed families stay pairwise distinct across all
+  `(plan_id, attempt)` pairs — the invariant the whole per-plan ref scheme rests
+  on, and the one an attempt suffix could break by colliding with another
+  family's bytes.
+- Property (replaces the deleted one for `Implement`): from `Implemented`,
+  `Implement` is legal, and running it yields `Implemented` with the count
+  incremented by exactly one and no existing attempt's bytes changed.
+- Every other slice-1 property passes **unmodified**, including
+  `reachable_presences_are_exactly_the_non_corrupt_states` — a count-valued
+  field widens that enumeration, so its bound needs stating rather than
+  silently growing.
+- `tests/stage_gate_zero_rpc.rs` extends: `Implement` moves from the forbidden
+  half to the allowed half for `Implemented`, which is the behaviour delta
+  written as a test rather than as a diff.
+- The 24 RPC fixtures unmodified: a first attempt emits the same trace it does
+  today.
+
+**Non-goals for this slice**: no `Collect`/dossier verb, and no concurrency
+across attempts. Attempts under one plan share one lock, so N runs on one plan
+**serialise** — which is a real limitation and the reason to state it rather
+than discover it. If parallel variants are wanted, that is a follow-on that
+needs the lock keyed by `(plan, attempt)` for the write and by `plan` for the
+gate, and it should be measured before being assumed necessary.
 
 ---
 
