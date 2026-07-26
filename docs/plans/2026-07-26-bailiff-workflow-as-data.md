@@ -333,6 +333,72 @@ place.
 
 ---
 
+## Outcome so far
+
+**Slices 1 and 2 shipped** (`4e35069`, `e850e9d`); slice 3 not started. Both
+passed the full gate set — `fmt`, `clippy --all-targets --all-features -D
+warnings`, `test`, the `vm-client` feature build, and `cargo doc -D warnings`.
+
+Four things are worth recording because they change what the remaining slices
+should assume.
+
+**1. The `cargo doc` gate earned its keep twice.** It caught `derive` colliding
+with the derive attribute macro (fixed by renaming to `derive_state`, which is
+better at call sites anyway) and every stale intra-doc link left by the error
+variants slice 1 deleted. `build`, `test`, and `clippy` all passed throughout.
+
+**2. Mutation-testing the properties was not ceremony.** Five mutations —
+widening the relation, reverting a tightening, and three wrong state⇒presence
+pairings — were each caught by two or more properties. That is the only reason
+to believe them.
+
+**3. Slice 2's design was wrong twice, and the tests found both.** The first
+draft layered a per-plan async mutex over the flock, which forced a process-wide
+registry, lifetime bookkeeping, and a field order chosen so the layers released
+in reverse acquisition order. The eviction sweep read `Arc::strong_count` on a
+map-held strong reference, so its threshold counted the map itself and it
+evicted mutexes callers were still blocked on; and the field order released the
+mutex before the flock, so a woken waiter hit a still-held lockfile. Neither
+layer was needed: `flock` binds to an *open file description*, so two `open`
+calls contend inside one process too. **The lesson for slice 3: prefer the
+primitive that already has the property over the abstraction that reconstructs
+it.**
+
+**4. Two assumptions in this plan were wrong, both in slice 2's favour.**
+
+- The plan said the per-git-invocation fallback lock might be needed. It already
+  exists: `NotesRepo` serialises each note write behind a per-canonical-path
+  mutex. Nothing to add.
+- The plan proposed keeping *two* lock layers because "a single process can hold
+  a given flock only once" (quoting `bin/bailiff/tests.rs:1153`). That comment
+  describes the behaviour accurately but the conclusion drawn from it was
+  backwards — same-process contention is what makes the single mechanism
+  sufficient, not what rules it out.
+
+The stress test the plan demanded was run and is recorded in the guard's module
+docs: 32 concurrent cross-process `git notes add` calls on 32 distinct refs in
+one bare repo, all successful, every note readable.
+
+**One test was deleted rather than migrated.**
+`implement_lock_blocks_concurrent_acquire_and_releases_on_drop` pinned the
+CLI-layer flock helper, including its fail-fast behaviour. Its own docstring
+listed "swapping `try_lock` for `lock`" as a regression it would catch — which
+is precisely the deliberate change. A comment at its former site records that,
+and points at the guard-module tests that replace it.
+
+## Slice 3 has not started
+
+The next action is **capturing the recorded RPC traces on the pre-refactor
+code**, before any interpreter exists. Captured afterwards they prove nothing,
+and they are the only thing that makes "no behaviour change" a checked claim
+across a collapse of three bespoke workflows into three `StageSpec` values.
+
+One input for slice 3 that slices 1–2 supplied: `PlanStage` already exists and
+already names its own precondition, so `StageSpec`'s gate field is a `PlanStage`
+rather than anything new. The remaining axes are capabilities, prompt
+composition, note writer, and session ownership — the last being a DU, not a
+flag, per the verdict above.
+
 ## Non-goals
 
 - **No new note schema in slices 1–3.** The four seeds and their notes are
