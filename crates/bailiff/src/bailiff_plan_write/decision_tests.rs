@@ -177,3 +177,49 @@ fn write_decision_note_does_not_require_pre_existing_submission() {
     let body = bailiff.read_note(&plan_notes_ref(plan_id), &oid).unwrap();
     assert_eq!(DecisionNote::from_canonical_bytes(&body).unwrap(), note);
 }
+
+/// Every note writer must take the repo-wide mutation lock.
+///
+/// Asserted by making the lock *unobtainable* — `bailiff-locks` is
+/// planted as a regular file, so `create_dir_all` inside
+/// `lock_repo_mutations` fails — and requiring the write to surface
+/// `RepoLock`. A writer that skipped the lock would sail past and
+/// succeed.
+///
+/// This is deliberately structural rather than a concurrency race: a
+/// timing test can pass merely because the other party was slow, which
+/// is how two earlier attempts in this PR proved nothing. Here the
+/// only way to return `RepoLock` is to have asked for the lock.
+///
+/// It exists because `write_decision_note` shipped for one round with
+/// a `RepoLock` variant it could never produce: the error was added,
+/// the call was not, and nothing failed. Note-loss for a run whose
+/// agent had already pushed was the exposure.
+#[test]
+fn write_decision_note_takes_the_repo_mutation_lock() {
+    let tmp = TempDir::new().unwrap();
+    let bailiff = bailiff_repo(&tmp);
+    let plan_id = PlanId::new();
+
+    // Occupy the lock directory's path with a regular file.
+    std::fs::write(bailiff.path().join("bailiff-locks"), b"not a directory").unwrap();
+
+    let note = sample_decision_note(plan_id, Decision::Accepted);
+    match write_decision_note(&bailiff, &note) {
+        Err(WriteDecisionNoteError::RepoLock(_)) => {}
+        Ok(oid) => {
+            panic!("write_decision_note wrote at {oid} without taking the repo mutation lock",)
+        }
+        Err(other) => panic!("expected RepoLock, got: {other:?}"),
+    }
+
+    // ... and nothing was written: this would have been the plan's
+    // first note, so its ref must not exist.
+    let refs = bailiff
+        .list_refs_under_prefix(plan_notes_ref(plan_id).as_str())
+        .unwrap();
+    assert!(
+        refs.is_empty(),
+        "a locked-out write must not persist: {refs:?}"
+    );
+}

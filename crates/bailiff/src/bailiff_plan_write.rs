@@ -246,6 +246,10 @@ pub fn write_decision_note(
     bailiff_repo: &NotesRepo,
     decision_note: &DecisionNote,
 ) -> Result<GitObjectId, WriteDecisionNoteError> {
+    // Decision notes do not fetch, but a `git notes add` still races
+    // another *process*'s fetch or note write for a different plan;
+    // per-plan flocks do not cover that. See `lock_repo_mutations`.
+    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(WriteDecisionNoteError::RepoLock)?;
     let plan_id = decision_note.plan_id;
     let plan_ref = plan_notes_ref(plan_id);
     let seed = plan_decision_seed_blob_bytes(plan_id);

@@ -144,11 +144,12 @@ enum PlanCmd {
     /// Record an operator verdict on a previously-submitted plan.
     /// Exactly one of `--accept` / `--reject` is required.
     ///
-    /// Legal only from `submitted`. D1.3 originally decoupled the
-    /// decision write from submission presence, which let this verb
-    /// create a plan ref carrying a verdict for a plan that was never
-    /// submitted — a `corrupt` row in `bailiff plan list`. Slice 1
-    /// re-coupled them: the gate is
+    /// Legal only from `reviewed`: reviewer feedback is an input to
+    /// the verdict, so `bailiff plan review` runs first. D1.3
+    /// originally decoupled the decision write from any precondition,
+    /// which let this verb create a plan ref carrying a verdict for a
+    /// plan that was never submitted — a `corrupt` row in `bailiff
+    /// plan list`. The gate is now
     /// [`bailiff::bailiff_plan_state::allows`], the same relation
     /// every other verb consults.
     #[command(group(
