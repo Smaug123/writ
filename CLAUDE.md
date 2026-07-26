@@ -42,6 +42,13 @@ Run a single test: `cargo test <substring>` or, scoped to a member crate,
 `cargo test -p bailiff <substring>` (workspace members are `writ`, `writ-core`,
 `writ-vm-git`, `bailiff`).
 
+Do **not** raise `--test-threads` (or `RUST_TEST_THREADS`) above the core count.
+Much of this suite spawns real subprocesses and waits on real deadlines, so
+oversubscribing the machine makes scheduling latency — not the code — decide
+whether a timeout fires. The default (one thread per core) is the right setting;
+if the machine is otherwise busy, run with *fewer*. See
+`docs/known-test-flakes.md`.
+
 After raising a PR, run `codex review --base main` to get a Codex review. It
 prints a great deal to stdout before the freeform review text at the end.
 

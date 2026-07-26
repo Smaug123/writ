@@ -357,6 +357,20 @@ pub(crate) async fn resolve_program_for_clean_env(
 mod tests {
     use super::*;
 
+    /// The step timeout to hand a probe whose *timing* is not what the test is
+    /// about — which is every probe below: they are two-line shell scripts that
+    /// exit at once, and each test asserts on the resulting error variant or
+    /// captured output.
+    ///
+    /// It is set absurdly high on purpose. A timeout that looks generous against
+    /// a trivial script (the previous 10s) is not generous at all when the test
+    /// harness is oversubscribed — 40 test threads on 18 cores, each spawning
+    /// real subprocesses — and `expected Failed, got TimedOut(10s)` is then a
+    /// routine failure with nothing wrong in the code under test (issue #355).
+    /// Nothing here is waiting for this deadline in the passing case, so its only
+    /// job is to stop a genuinely wedged probe from hanging the suite for ever.
+    const UNHURRIED_STEP_TIMEOUT: Duration = Duration::from_secs(120);
+
     #[test]
     fn clean_git_config_env_pins_known_entries() {
         let env = clean_git_config_env();
@@ -443,7 +457,7 @@ mod tests {
         );
         let stdout = run_clean_git_capture_stdout(
             &invocation,
-            Duration::from_secs(10),
+            UNHURRIED_STEP_TIMEOUT,
             SMALL_STDOUT_CAP,
             None,
         )
@@ -532,7 +546,7 @@ mod tests {
             clean_git_config_env(),
             vec!["SEKRIT".to_string()],
         );
-        let err = run_clean_git(&invocation, Duration::from_secs(10), Some("s3cr3t-token"))
+        let err = run_clean_git(&invocation, UNHURRIED_STEP_TIMEOUT, Some("s3cr3t-token"))
             .await
             .expect_err("probe exits non-zero");
         match err {
@@ -557,8 +571,8 @@ mod tests {
 
     /// A child that streams unbounded stdout is rejected with
     /// `StdoutCapExceeded` (not buffered to exhaustion), and the run returns
-    /// promptly — a 30s timeout against a child that never stops writing proves
-    /// the cap, not the clock, ends it.
+    /// promptly — a two-minute timeout against a child that never stops writing
+    /// proves the cap, not the clock, ends it.
     #[tokio::test]
     async fn run_clean_git_capture_rejects_unbounded_stdout() {
         let sh = locate_on_path("sh");
@@ -574,7 +588,7 @@ mod tests {
             Vec::new(),
         );
         let err =
-            run_clean_git_capture_stdout(&invocation, Duration::from_secs(30), 64 * 1024, None)
+            run_clean_git_capture_stdout(&invocation, UNHURRIED_STEP_TIMEOUT, 64 * 1024, None)
                 .await
                 .expect_err("unbounded stdout must be rejected");
         match err {
@@ -621,7 +635,7 @@ mod tests {
             vec!["SEKRIT".to_string()],
         );
         let secret = "s3cr3t-boundary-xyz";
-        let err = run_clean_git(&invocation, Duration::from_secs(20), Some(secret))
+        let err = run_clean_git(&invocation, UNHURRIED_STEP_TIMEOUT, Some(secret))
             .await
             .expect_err("probe exits non-zero");
         match err {

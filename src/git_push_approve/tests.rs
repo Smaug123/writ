@@ -847,7 +847,9 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
         )
         .unwrap(),
         tmp.path().to_path_buf(),
-        Duration::from_secs(30),
+        // Generous, and nothing here waits on it: the whole point is that the
+        // per-object read deadline is independent of the step timeout.
+        Duration::from_secs(120),
     )
     .unwrap()
     .with_cat_file_timeout(deadline)
@@ -876,14 +878,15 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
     // This guard exists to convert a hang into a failure, so it only has
     // to sit well clear of the legitimate costs inside the call: two real
     // `git` execs (via the stalling wrapper) and the 500 ms deadline under
-    // test. It used to need 60 s because the call also built a
-    // `reqwest::Client` — ~7 s on macOS, which loads the system trust
-    // store — but the transport is now built by the caller: the
-    // `sample_client(…)` below is an argument expression, so it is
-    // evaluated before `timeout` arms its timer, exactly as the broker
-    // pays that cost once at boot rather than once per approve.
+    // test. It is deliberately far larger than those costs. A 10s guard was
+    // reached on an oversubscribed harness — where two real `git` execs are
+    // not the sub-second affair they are on a quiet machine — and it then
+    // reported a regression in the deadline under test, which is precisely
+    // backwards (issue #355). Nothing waits on this in the passing case, and
+    // the failure it exists to catch is an unbounded read, so two minutes of
+    // headroom costs nothing and is worth the certainty.
     let outcome = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(120),
         prepare_approve_with_staging_repo(
             &staging,
             &runtime,
