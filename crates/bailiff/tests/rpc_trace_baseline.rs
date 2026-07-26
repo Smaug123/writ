@@ -62,6 +62,9 @@ use writ::writ_client::WritClient;
 
 const SIGNING_PEM: &str = include_str!("fixtures/ed25519_test_signing.key");
 const SIGNING_PUB: &str = include_str!("fixtures/ed25519_test_signing.key.pub");
+/// A key bailiff does not trust, used to force note verification to
+/// fail after an otherwise-successful run.
+const OTHER_PEM: &str = include_str!("fixtures/ed25519_test_signing_other.key");
 
 /// The plan body every scenario uses. Also the agent's stdout, since
 /// the planner's stdout *is* the plan body.
@@ -164,6 +167,9 @@ struct WritSide {
     oid: GitObjectId,
     metadata: SignedRunMetadata,
     signature: writ::core::SshSignature,
+    untrusted_oid: GitObjectId,
+    untrusted_metadata: SignedRunMetadata,
+    untrusted_signature: writ::core::SshSignature,
 }
 
 fn build_writ_side(dir: &Path) -> WritSide {
@@ -192,7 +198,7 @@ fn build_writ_side(dir: &Path) -> WritSide {
     let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
     let envelope = SignedRunEnvelope {
         metadata: metadata.clone(),
-        output: output_bytes,
+        output: output_bytes.clone(),
         signature: signature.clone(),
     };
 
@@ -204,11 +210,35 @@ fn build_writ_side(dir: &Path) -> WritSide {
         )
         .unwrap();
 
+    // A second, identically-shaped envelope signed by a key bailiff
+    // does not trust.
+    let other_key = WritSigningKey::from_openssh_pem(OTHER_PEM).unwrap();
+    let mut untrusted_metadata = metadata.clone();
+    untrusted_metadata.signing_key_fingerprint = other_key.fingerprint();
+    let untrusted_signature = other_key
+        .sign(&untrusted_metadata.canonical_bytes())
+        .unwrap();
+    let untrusted_envelope = SignedRunEnvelope {
+        metadata: untrusted_metadata.clone(),
+        output: output_bytes,
+        signature: untrusted_signature.clone(),
+    };
+    let untrusted_oid = repo
+        .write_note(
+            &writ_output_ref(),
+            b"trace-baseline-untrusted-seed",
+            &serde_json::to_vec(&untrusted_envelope).unwrap(),
+        )
+        .unwrap();
+
     WritSide {
         repo_path: repo.path().to_path_buf(),
         oid,
         metadata,
         signature,
+        untrusted_oid,
+        untrusted_metadata,
+        untrusted_signature,
     }
 }
 
@@ -219,6 +249,36 @@ impl WritSide {
         ServerMessage::RunAgentCompleted {
             output_oid: self.oid.clone(),
             signed_metadata: self.metadata.clone(),
+            signature: self.signature.clone(),
+        }
+    }
+
+    /// A reply whose signed metadata names a *different* session than
+    /// the one bailiff opened. The mismatch check runs before envelope
+    /// verification, so the signature deliberately no longer matches —
+    /// this scenario is about the earlier branch.
+    /// A reply pointing at an envelope signed by a key bailiff does
+    /// not trust, attached in the same writ repo.
+    ///
+    /// This is how a *post-run* note-write failure is provoked for
+    /// `review`: narrowing `allowed_signers` instead would fail the
+    /// planner envelope during the pre-RPC read, so no session would
+    /// ever open and the trace would be empty — which is what a first
+    /// attempt at this scenario actually recorded.
+    fn untrusted_run_agent_completed(&self) -> ServerMessage {
+        ServerMessage::RunAgentCompleted {
+            output_oid: self.untrusted_oid.clone(),
+            signed_metadata: self.untrusted_metadata.clone(),
+            signature: self.untrusted_signature.clone(),
+        }
+    }
+
+    fn run_agent_completed_for_other_session(&self) -> ServerMessage {
+        let mut metadata = self.metadata.clone();
+        metadata.session_id = "9f8e7d6c-5b4a-4392-8180-706f5e4d3c2b".parse().unwrap();
+        ServerMessage::RunAgentCompleted {
+            output_oid: self.oid.clone(),
+            signed_metadata: metadata,
             signature: self.signature.clone(),
         }
     }
@@ -604,5 +664,166 @@ async fn a_failed_run_still_closes_the_session() {
         .expect_err("a broker error must surface");
 
         assert_trace("review_run_agent_error", &broker.observed().await);
+    }
+}
+
+/// The remaining post-`OpenSession` branches, one fixture each.
+///
+/// `submit_plan` and `submit_review` can each fail in four distinct
+/// places after the session opens — the run itself, the session-id
+/// cross-check, the note fetch/verify/write, and the final close — and
+/// every one of them must still emit `CloseSession`. A shared
+/// interpreter that gets any single branch wrong leaks a session while
+/// the happy-path and zero-RPC fixtures stay green, which is exactly
+/// the hole this suite exists to close.
+///
+/// `OpenSession` failing is the one branch with a *different* shape:
+/// there is no session to clean up, so the trace is one message long.
+/// Pinning it stops an interpreter from "helpfully" closing a session
+/// it never opened.
+#[tokio::test]
+async fn every_post_open_failure_branch_has_a_trace() {
+    // --- OpenSession refused: one message, no cleanup. ---
+    for (name, is_review) in [
+        ("submit_open_session_error", false),
+        ("review_open_session_error", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![ServerMessage::Error {
+            message: "no agent kind configured".into(),
+        }])
+        .await;
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        let client = WritClient::new(&broker.socket_path);
+        if is_review {
+            plant(
+                &bailiff,
+                plan_id,
+                plan_submission_seed_blob_bytes(plan_id),
+                writ.plan_note(plan_id).canonical_bytes(),
+            );
+            submit_review(
+                &client,
+                bailiff,
+                &writ.repo_path,
+                allowed_signers(),
+                review_inputs(plan_id),
+            )
+            .await
+            .expect_err("a refused OpenSession must surface");
+        } else {
+            submit_plan(
+                &client,
+                bailiff,
+                &writ.repo_path,
+                allowed_signers(),
+                submit_inputs(plan_id),
+            )
+            .await
+            .expect_err("a refused OpenSession must surface");
+        }
+        assert_trace(name, &broker.observed().await);
+    }
+
+    // --- Session-id cross-check fails after a successful run. ---
+    for (name, is_review) in [
+        ("submit_session_id_mismatch", false),
+        ("review_session_id_mismatch", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: stub_session_id(),
+            },
+            writ.run_agent_completed_for_other_session(),
+            ServerMessage::SessionClosed,
+        ])
+        .await;
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        let client = WritClient::new(&broker.socket_path);
+        if is_review {
+            plant(
+                &bailiff,
+                plan_id,
+                plan_submission_seed_blob_bytes(plan_id),
+                writ.plan_note(plan_id).canonical_bytes(),
+            );
+            submit_review(
+                &client,
+                bailiff,
+                &writ.repo_path,
+                allowed_signers(),
+                review_inputs(plan_id),
+            )
+            .await
+            .expect_err("a session-id mismatch must surface");
+        } else {
+            submit_plan(
+                &client,
+                bailiff,
+                &writ.repo_path,
+                allowed_signers(),
+                submit_inputs(plan_id),
+            )
+            .await
+            .expect_err("a session-id mismatch must surface");
+        }
+        assert_trace(name, &broker.observed().await);
+    }
+
+    // --- Note verify/write fails after a successful run: the run is
+    // --- fine, but its envelope is signed by a key bailiff does not
+    // --- trust. `allowed_signers` stays trusted so that review's
+    // --- pre-RPC read of the *planner* envelope still succeeds and a
+    // --- session really does open.
+    for (name, is_review) in [
+        ("submit_write_note_failure", false),
+        ("review_write_note_failure", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: stub_session_id(),
+            },
+            writ.untrusted_run_agent_completed(),
+            ServerMessage::SessionClosed,
+        ])
+        .await;
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        let client = WritClient::new(&broker.socket_path);
+        if is_review {
+            plant(
+                &bailiff,
+                plan_id,
+                plan_submission_seed_blob_bytes(plan_id),
+                writ.plan_note(plan_id).canonical_bytes(),
+            );
+            submit_review(
+                &client,
+                bailiff,
+                &writ.repo_path,
+                allowed_signers(),
+                review_inputs(plan_id),
+            )
+            .await
+            .expect_err("an untrusted signer must fail the note write");
+        } else {
+            submit_plan(
+                &client,
+                bailiff,
+                &writ.repo_path,
+                allowed_signers(),
+                submit_inputs(plan_id),
+            )
+            .await
+            .expect_err("an untrusted signer must fail the note write");
+        }
+        assert_trace(name, &broker.observed().await);
     }
 }
