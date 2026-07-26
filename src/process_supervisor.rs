@@ -238,7 +238,7 @@ pub(crate) async fn run_supervised(
     let mut cleanup_guard = ProcessGroupCleanupGuard::new(pgid);
     match wait_for_child_exit_before_reap(pgid, deadline, &stdout_capped).await? {
         ChildExitObservation::Exited => {
-            cleanup_guard.mark_child_exit_observed();
+            cleanup_guard.tolerate_empty_group();
             cleanup_guard.kill_now()?;
             let status = child.wait().await;
             cleanup_guard.disarm();
@@ -302,7 +302,7 @@ pub(crate) async fn run_supervised(
             // tolerated: we own this group (we created it with `process_group(0)`)
             // and can always signal a live member, so EPERM here can only mean
             // the group is already empty, never a real permission failure.
-            cleanup_guard.mark_child_exit_observed();
+            cleanup_guard.tolerate_empty_group();
             let kill = cleanup_guard.kill_now_io();
             let _ = child.wait().await;
             cleanup_guard.disarm();
@@ -318,6 +318,11 @@ pub(crate) async fn run_supervised(
             })
         }
         ChildExitObservation::TimedOut => {
+            // Same exposure as the blocking timeout arm: the child may exit of its
+            // own accord between the deadline and this kill, emptying the group.
+            // We have not reaped it, so an empty group is the only thing `EPERM`
+            // can mean, and a timeout must not surface as a kill failure.
+            cleanup_guard.tolerate_empty_group();
             let kill = cleanup_guard.kill_now_io();
             let _ = child.wait().await;
             cleanup_guard.disarm();
@@ -624,6 +629,7 @@ pub(crate) fn run_supervised_blocking_probed(
         stdout_buf,
         stderr_buf,
         child_exited,
+        retained_captures,
         stdin_write_error,
         stdout_read_error,
     } = match outcome {
@@ -639,17 +645,12 @@ pub(crate) fn run_supervised_blocking_probed(
     };
 
     if !child_exited {
-        if matches!(observation, ChildExitObservation::StdoutCapExceeded) {
-            // The over-cap rejection closed the read end of stdout, so a child
-            // mid-write takes SIGPIPE and can already be dead — in which case
-            // `killpg` finds no signalable member and reports a benign EPERM on
-            // macOS. Mark the exit as observed so that EPERM is tolerated: we own
-            // this group (we created it with `process_group(0)`) and can always
-            // signal a live member, so EPERM here can only mean the group is
-            // already empty, never a real permission failure. Same reasoning as
-            // the async twin's `StdoutCapExceeded` arm.
-            cleanup_guard.mark_child_exit_observed();
-        }
+        // We are about to signal a group we have not reaped, so an empty group is
+        // benign here however we arrived: the child may have raced us between the
+        // deadline and this kill, and an over-cap rejection has already closed
+        // stdout and may have SIGPIPE'd it. See `kill_process_group` for why
+        // "empty" is the only thing EPERM can mean while the leader is unreaped.
+        cleanup_guard.tolerate_empty_group();
         // Hold a kill failure rather than returning on it: we still owe the child
         // a `wait`, and `std::process::Child::drop` does not reap. Returning here
         // would surface the right error and leak a process — the same trap as the
@@ -660,6 +661,8 @@ pub(crate) fn run_supervised_blocking_probed(
             return Err(err);
         }
     }
+    // The group is dead; nothing is left to SIGPIPE, so the captures may close.
+    drop(retained_captures);
     let status = child.wait();
     cleanup_guard.disarm();
 
@@ -858,7 +861,7 @@ fn supervise_blocking_child(
             // Kill the group the moment the leader is gone: any helper it forked
             // into the group holds a copy of the stdout/stderr write end, and
             // until those close the pipes never reach EOF.
-            cleanup_guard.mark_child_exit_observed();
+            cleanup_guard.tolerate_empty_group();
             cleanup_guard.kill_now()?;
         }
     }
@@ -868,6 +871,7 @@ fn supervise_blocking_child(
         stdout_buf,
         stderr_buf,
         child_exited,
+        retained_captures: (stdout_pipe, stderr_pipe),
         stdin_write_error,
         stdout_read_error,
     })
@@ -879,6 +883,20 @@ struct BlockingRunState {
     stdout_buf: CaptureBuffer,
     stderr_buf: CaptureBuffer,
     child_exited: bool,
+    /// The capture read ends, still open, handed back so the *caller* decides when
+    /// they close.
+    ///
+    /// They used to be locals, dropped when this function returned — which closed
+    /// them before the caller's `killpg`. A child still writing then took
+    /// `SIGPIPE` and died in that window, leaving an empty process group, and
+    /// macOS answers `EPERM` for a `killpg` on an empty group: a plain timeout was
+    /// reported as `KillProcessGroup` instead. Reproduced at roughly 1 run in 24
+    /// of `times_out_a_child_that_floods_stderr_forever`. There is no reason to
+    /// SIGPIPE a child we are about to SIGKILL.
+    retained_captures: (
+        Option<std::process::ChildStdout>,
+        Option<std::process::ChildStderr>,
+    ),
     /// Set when stdin was not fully delivered; settled by the caller, because a
     /// born-dead child shows up here first and must be retried, not reported.
     stdin_write_error: Option<(usize, std::io::Error)>,
@@ -1188,7 +1206,7 @@ fn process_group_id(pid: u32) -> Result<libc::pid_t, SupervisorError> {
 /// leader's pid, and the guard's `killpg` could land on a recycled group.
 pub(crate) struct ProcessGroupCleanupGuard {
     pgid: libc::pid_t,
-    child_exit_observed: bool,
+    empty_group_is_benign: bool,
     armed: bool,
 }
 
@@ -1196,26 +1214,28 @@ impl ProcessGroupCleanupGuard {
     pub(crate) fn new(pgid: libc::pid_t) -> Self {
         Self {
             pgid,
-            child_exit_observed: false,
+            empty_group_is_benign: false,
             armed: true,
         }
     }
 
-    /// Record that the leader's exit has been observed via
-    /// [`pid_has_exited_without_reaping`], which is the only condition under
-    /// which a macOS `EPERM` from `killpg` is safe to treat as success.
-    pub(crate) fn mark_child_exit_observed(&mut self) {
-        self.child_exit_observed = true;
+    /// Accept an already-empty group as success for this guard's kill.
+    ///
+    /// Sound wherever the caller still holds the leader unreaped — see
+    /// [`kill_process_group`] for the argument, which does not require having
+    /// observed the exit.
+    pub(crate) fn tolerate_empty_group(&mut self) {
+        self.empty_group_is_benign = true;
     }
 
     pub(crate) fn kill_now(&self) -> Result<(), SupervisorError> {
-        kill_process_group_inner(self.pgid, self.child_exit_observed)
+        kill_process_group_inner(self.pgid, self.empty_group_is_benign)
     }
 
     /// Kill the group, reporting failure as an `io::Error` for callers outside
     /// the [`SupervisorError`] world.
     pub(crate) fn kill_now_io(&self) -> std::io::Result<()> {
-        kill_process_group(self.pgid, self.child_exit_observed)
+        kill_process_group(self.pgid, self.empty_group_is_benign)
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -1226,7 +1246,7 @@ impl ProcessGroupCleanupGuard {
 impl Drop for ProcessGroupCleanupGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = kill_process_group_inner(self.pgid, self.child_exit_observed);
+            let _ = kill_process_group_inner(self.pgid, self.empty_group_is_benign);
         }
     }
 }
@@ -1247,9 +1267,9 @@ fn current_supplementary_groups() -> Vec<libc::gid_t> {
 
 fn kill_process_group_inner(
     pgid: libc::pid_t,
-    child_exit_observed: bool,
+    empty_group_is_benign: bool,
 ) -> Result<(), SupervisorError> {
-    kill_process_group(pgid, child_exit_observed)
+    kill_process_group(pgid, empty_group_is_benign)
         .map_err(|source| SupervisorError::KillProcessGroup { pgid, source })
 }
 
@@ -1262,14 +1282,27 @@ fn kill_process_group_inner(
 /// error:
 ///
 /// * `ESRCH` — the group is already gone. Always fine.
-/// * `EPERM` — macOS reports this once the leader has exited and no signalable
-///   member remains. Tolerated **only** when `child_exit_observed`, because we
-///   own this group (created with `process_group(0)`) and can always signal a
-///   live member: with the exit observed, `EPERM` can only mean "already empty".
-///   Without it, `EPERM` means something else and must surface.
+/// * `EPERM` — macOS reports this, rather than `ESRCH`, for a group with no
+///   signalable member left. Tolerated when `empty_group_is_benign`.
+///
+/// The condition that makes `EPERM` safe to accept is that the caller still holds
+/// the group's **leader unreaped**. The leader's pid is then still claimed, so the
+/// pgid — which equals it — cannot have been recycled onto a group we do not own;
+/// and since we created this group with `process_group(0)`, the only way we can
+/// fail to signal our own group is that every member has already exited. Every
+/// group kill in this codebase is ordered observe-then-kill-then-reap, so the
+/// condition holds at each of them.
+///
+/// This was previously gated on having *observed* the leader exit, which is a
+/// strictly narrower condition than the argument requires, and it left the timeout
+/// arms exposed: a child that exits between the deadline and the kill — or that
+/// takes `SIGPIPE` when a capture pipe closes — empties the group, and a plain
+/// timeout surfaced as `KillProcessGroup`. Reproduced at roughly 1 run in 24
+/// before the fix. Two earlier rounds of review each fixed one arm of this;
+/// naming the real precondition is what stops it recurring in a third.
 pub(crate) fn kill_process_group(
     pgid: libc::pid_t,
-    child_exit_observed: bool,
+    empty_group_is_benign: bool,
 ) -> std::io::Result<()> {
     // The child was spawned with process_group(0), making its pid the process
     // group id inherited by any ordinary helpers it starts.
@@ -1279,7 +1312,7 @@ pub(crate) fn kill_process_group(
     let source = std::io::Error::last_os_error();
     match source.raw_os_error() {
         Some(libc::ESRCH) => Ok(()),
-        Some(libc::EPERM) if child_exit_observed => Ok(()),
+        Some(libc::EPERM) if empty_group_is_benign => Ok(()),
         _ => Err(source),
     }
 }
@@ -1953,6 +1986,56 @@ mod blocking_tests {
             !matches_born_dead_signature(false, &clean_exit),
             "an ordinary successful child never matches"
         );
+    }
+
+    /// Killing a group whose every member has exited succeeds when the caller says
+    /// an empty group is benign, and only then.
+    ///
+    /// The soak that found the bug this guards (1 failure in 24 runs of
+    /// `times_out_a_child_that_floods_stderr_forever`) is evidence about a race;
+    /// this is the deterministic statement of the semantics underneath it. Written
+    /// to be platform-agnostic on purpose: macOS answers `EPERM` for an empty
+    /// group, Linux still counts an unreaped zombie as a member and succeeds
+    /// outright, and the property to pin is not which of those happens but that
+    /// tolerating it is what turns it into success.
+    #[test]
+    fn an_empty_process_group_is_tolerated_only_when_the_caller_says_so() {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            // Its own group, exactly as the supervisor spawns children.
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let pgid = pid as libc::pid_t;
+
+        // Leave it unreaped, which is the precondition that makes the tolerance
+        // sound: the pid stays claimed, so this pgid cannot be another group's.
+        loop {
+            if pid_has_exited_without_reaping(pgid).expect("waitid") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let strict = kill_process_group(pgid, false);
+        let tolerant = kill_process_group(pgid, true);
+        child.wait().expect("reap");
+
+        assert!(
+            tolerant.is_ok(),
+            "an empty group must be success when tolerated, got {tolerant:?}"
+        );
+        if let Err(error) = strict {
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EPERM),
+                "the only error an empty group may produce here is EPERM; anything \
+                 else means this test is measuring something other than emptiness"
+            );
+        }
     }
 
     /// `getpgid` answering `ESRCH` does **not** mean the child never ran.

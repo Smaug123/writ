@@ -248,7 +248,7 @@ impl CatFileObjectSource {
         // remains claimed, the pgid is stable, so the subsequent
         // killpg cannot hit an unrelated recycled group.
         if wait_for_pid_exit_no_reap(pgid).await? {
-            guard.mark_child_exit_observed();
+            guard.tolerate_empty_group();
         }
         // Send SIGKILL to the whole group: helpers (if any) die,
         // and the leader (already exited) is a no-op.
