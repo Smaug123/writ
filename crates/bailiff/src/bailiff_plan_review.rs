@@ -46,7 +46,7 @@ use crate::bailiff_plan_write::WriteStageNoteError;
 use crate::bailiff_repo_guard::PlanGuardError;
 use crate::bailiff_stage::{
     ComposePlanPromptError, OpenPlanStageError, OwnedSession, OwnedSessionRunError, PlanBodyStage,
-    StageNoteTarget, StageRunInputs, compose_with_plan_body, open_plan_stage,
+    StageNoteSlot, StageNoteTarget, StageRunInputs, compose_with_plan_body, open_plan_stage,
     run_under_owned_session,
 };
 use writ::agent_run::{AgentPrompt, AgentPromptError};
@@ -182,7 +182,7 @@ pub async fn submit_review(
             agent_model: inputs.session_agent_model,
         },
         StageNoteTarget {
-            stage: PlanBodyStage::Review.stage(),
+            slot: StageNoteSlot::Review,
             plan_id,
             writ_repo_path: writ_repo_path.to_path_buf(),
             allowed_signers,

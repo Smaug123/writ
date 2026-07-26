@@ -30,7 +30,7 @@
 //!    writ-side seed OID — *not* the envelope blob; see the
 //!    `writ_output_oid` docstring in [`crate::bailiff_plan_note`])
 //!    and write it to [`plan_notes_ref`]`(plan_id)` in
-//!    bailiff's repo with seed [`crate::bailiff_stage::AgentStage::note_seed`]`(plan_id)`.
+//!    bailiff's repo with seed [`crate::bailiff_stage::StageNoteSlot::seed`]`(plan_id)`.
 //!    Returns the bailiff-side target OID.
 //!
 //! Every failure mode is a tagged variant of [`WriteStageNoteError`]
@@ -47,7 +47,7 @@ use crate::bailiff_plan_note::{
     plan_notes_ref,
 };
 use crate::bailiff_repo_guard::lock_repo_mutations;
-use crate::bailiff_stage::AgentStage;
+use crate::bailiff_stage::{AgentStage, StageNoteSlot};
 use writ::core::NotesRef;
 use writ::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
 use writ::run_envelope::SignedRunEnvelope;
@@ -241,7 +241,7 @@ pub enum WriteDecisionNoteError {
 /// The stage varies exactly three things, and each is a projection of
 /// [`AgentStage`] rather than a parameter a caller could get wrong:
 /// which note body is built, which seed it attaches at
-/// ([`AgentStage::note_seed`]), and which noun the error names.
+/// ([`StageNoteSlot::seed`]), and which noun the error names.
 ///
 /// Returns the bailiff-side target OID — the deterministic seed-blob
 /// OID the stage's seed hashes to — so a caller can hand it to
@@ -268,12 +268,13 @@ pub fn write_stage_note(
     completed: &RunAgentCompleted,
 ) -> Result<GitObjectId, WriteStageNoteError> {
     let StageNoteTarget {
-        stage,
+        slot,
         plan_id,
         writ_repo_path,
         allowed_signers,
     } = target;
-    let (stage, plan_id) = (*stage, *plan_id);
+    let (slot, plan_id) = (*slot, *plan_id);
+    let stage = slot.stage();
     // Repo-wide, and held across the note write as well as the fetch:
     // git refuses to make concurrent fetch+notes-add safe, and the
     // per-plan lock does not span two processes on different plans.
@@ -289,7 +290,7 @@ pub fn write_stage_note(
 
     let body = stage_note_body(stage, plan_id, purpose, completed, envelope);
     match bailiff_repo
-        .write_note_if_absent(&plan_notes_ref(plan_id), &stage.note_seed(plan_id), &body)
+        .write_note_if_absent(&plan_notes_ref(plan_id), &slot.seed(plan_id), &body)
         .map_err(|source| WriteStageNoteError::Write { stage, source })?
     {
         WriteOutcome::Written(oid) => Ok(oid),
@@ -317,9 +318,9 @@ pub fn write_stage_note(
 /// place for them to disagree.
 #[derive(Clone, Debug)]
 pub struct StageNoteTarget {
-    /// Which note to write. Also selects the seed it attaches at and
-    /// the noun its errors name.
-    pub stage: AgentStage,
+    /// Which slot to write. Selects the seed the note attaches at, the
+    /// body type built for it, and the noun its errors name.
+    pub slot: StageNoteSlot,
     /// Plan the note belongs to.
     pub plan_id: PlanId,
     /// Path to writ's bare repo, fetched from to re-read and verify
@@ -557,7 +558,7 @@ mod spec {
             let purpose = "spec".to_string();
 
             let target = StageNoteTarget {
-                stage,
+                slot: stage.first_slot(),
                 plan_id,
                 writ_repo_path: writ_repo.path().to_path_buf(),
                 allowed_signers: allowed.clone(),
@@ -566,7 +567,7 @@ mod spec {
                 &bailiff, &target, &writ_notes_ref(), purpose.clone(), &completed,
             ).expect("a trusted-signer write must succeed");
 
-            prop_assert!(!stage.note_seed(plan_id).is_empty());
+            prop_assert!(!stage.first_slot().seed(plan_id).is_empty());
             let body = bailiff
                 .read_note(&plan_notes_ref(plan_id), &returned_oid)
                 .expect("bailiff-side note must be readable at the returned OID");
@@ -625,7 +626,7 @@ mod spec {
             }
 
             let target = StageNoteTarget {
-                stage: AgentStage::Submit,
+                slot: StageNoteSlot::Submission,
                 plan_id: PlanId::new(),
                 writ_repo_path: writ_repo.path().to_path_buf(),
                 allowed_signers: allowed.clone(),
@@ -669,7 +670,7 @@ mod spec {
             let plan_id = PlanId::new();
 
             let target = StageNoteTarget {
-                stage,
+                slot: stage.first_slot(),
                 plan_id,
                 writ_repo_path: writ_repo.path().to_path_buf(),
                 allowed_signers: allowed.clone(),

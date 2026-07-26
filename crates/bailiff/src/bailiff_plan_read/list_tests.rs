@@ -19,9 +19,9 @@ use super::test_support::*;
 use super::*;
 use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{
-    DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
-    plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
-    plan_submission_seed_blob_bytes,
+    DecisionNote, ImplementAttempt, ImplementNote, PlanId, PlanNote, ReviewNote,
+    plan_decision_seed_blob_bytes, plan_implement_seed_blob_bytes, plan_notes_ref,
+    plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_state::PlanState;
 use tempfile::TempDir;
@@ -141,7 +141,7 @@ fn plant_implement_note(bailiff: &NotesRepo, plan_id: PlanId, implemented_at_mil
     bailiff
         .write_note(
             &plan_notes_ref(plan_id),
-            &plan_implement_seed_blob_bytes(plan_id),
+            &plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST),
             &note.canonical_bytes(),
         )
         .unwrap();

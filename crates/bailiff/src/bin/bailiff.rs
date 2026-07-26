@@ -268,8 +268,12 @@ enum PlanCmd {
     /// - missing submission note → "run `bailiff plan submit` first"
     /// - missing decision note → "run `bailiff plan decide --accept` first"
     /// - rejected decision → "submit a fresh plan"
-    /// - already-implemented → "submit a fresh plan if a re-implement
-    ///   is needed"
+    ///
+    /// **Repeatable.** Since slice 4 an accepted plan may take any
+    /// number of implementer runs — that is fan-out — so running this
+    /// verb again on an already-implemented plan starts a new attempt
+    /// rather than being refused. The attempt index is chosen by
+    /// bailiff under the plan lock, never named by the operator.
     ///
     /// Mirrors [`PlanCmd::Review`] minus auto-allocation of
     /// `--plan-id` (implement needs an existing, decided plan), with
@@ -781,8 +785,9 @@ async fn plan_review(
                 },
         }) => Err(format!(
             "{stage} already recorded for plan {plan_id} at target {target_oid}; bailiff does not \
-             overwrite it — submit a fresh plan if the operator wants another (repeat attempts \
-             are a future v1 → v2 migration)"
+             overwrite it. Submission and review are one per plan, so the recourse there is a \
+             fresh plan; implementer attempts are repeatable, so seeing this for one means two \
+             writers raced for the same attempt index and the other won"
         )
         .into()),
         Err(e) => Err(format!("{e}").into()),
@@ -918,8 +923,9 @@ async fn plan_implement(
                 },
         }) => Err(format!(
             "{stage} already recorded for plan {plan_id} at target {target_oid}; bailiff does not \
-             overwrite it — submit a fresh plan if the operator wants another (repeat attempts \
-             are a future v1 → v2 migration)"
+             overwrite it. Submission and review are one per plan, so the recourse there is a \
+             fresh plan; implementer attempts are repeatable, so seeing this for one means two \
+             writers raced for the same attempt index and the other won"
         )
         .into()),
         Err(e) => Err(format!("{e}").into()),

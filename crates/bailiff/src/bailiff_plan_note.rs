@@ -183,13 +183,68 @@ pub fn plan_review_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
 /// than `/implement` so a reader scanning the seed bytes cannot
 /// mistake the value for a ref subpath.
 ///
-/// Slice E is single-implement-per-plan and idempotent — the writer
-/// rejects a second implement for the same id rather than
-/// overwriting. Per-implement UUIDs (multi-implement history) is the
-/// same documented `v1` → `v2` ref-prefix migration the review note
-/// describes; the seed convention pinned here is the migration target.
-pub fn plan_implement_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
-    format!("{plan_id}::implement").into_bytes()
+/// Since slice 4 a plan may carry **several** implementer attempts —
+/// that is the fan-out story — so the seed is indexed by
+/// [`ImplementAttempt`]. Attempt zero keeps the original bytes exactly,
+/// because every implement note already in an operator's repo is
+/// attached at them; a change there would orphan all of them.
+pub fn plan_implement_seed_blob_bytes(plan_id: PlanId, attempt: ImplementAttempt) -> Vec<u8> {
+    match attempt.index() {
+        0 => format!("{plan_id}::implement").into_bytes(),
+        n => format!("{plan_id}::implement::{n}").into_bytes(),
+    }
+}
+
+/// Which implementer run on a plan: the index distinguishing one
+/// variant from its siblings.
+///
+/// A newtype rather than a bare `u32` because the zero case is
+/// load-bearing in a way a number does not advertise — attempt zero
+/// hashes to the pre-slice-4 seed, so it is the only value that can
+/// name a note written before attempts existed.
+///
+/// Attempts are **dense from zero**. Readers rely on it:
+/// [`crate::bailiff_plan_state::NotePresence::implement`] asks only
+/// whether attempt zero exists, which is equivalent to "any attempt
+/// exists" exactly while density holds, and that is what keeps the
+/// gate's cost at one note read rather than a scan.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ImplementAttempt(u32);
+
+impl ImplementAttempt {
+    /// The first attempt on a plan, whose seed is the pre-slice-4
+    /// implement seed.
+    pub const FIRST: Self = Self(0);
+
+    /// How many attempts one plan may carry.
+    ///
+    /// Bounded because the next free attempt is found by probing
+    /// upwards, and an unbounded probe over a corrupted ref is an
+    /// unbounded number of git invocations. Far above any plausible
+    /// fan-out width; the point is that the failure is a typed refusal
+    /// rather than a hang.
+    pub const MAX: u32 = 256;
+
+    /// The attempt after this one, or `None` at [`Self::MAX`].
+    pub fn next(self) -> Option<Self> {
+        (self.0 + 1 < Self::MAX).then_some(Self(self.0 + 1))
+    }
+
+    /// Zero-based position of this attempt.
+    pub fn index(self) -> u32 {
+        self.0
+    }
+
+    /// Every attempt from the first up to `count`, in order.
+    pub fn first_n(count: u32) -> impl Iterator<Item = Self> {
+        (0..count.min(Self::MAX)).map(Self)
+    }
+}
+
+impl fmt::Display for ImplementAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// Define one envelope-bearing stage note body.
@@ -1111,7 +1166,7 @@ mod tests {
     fn submission_and_implement_seed_bytes_are_distinct_for_same_plan_id() {
         let plan_id = PlanId::new();
         let submission = plan_submission_seed_blob_bytes(plan_id);
-        let implement = plan_implement_seed_blob_bytes(plan_id);
+        let implement = plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST);
         assert_ne!(
             submission, implement,
             "submission and implement seed bytes collided for {plan_id}",
@@ -1124,7 +1179,7 @@ mod tests {
     fn decision_and_implement_seed_bytes_are_distinct_for_same_plan_id() {
         let plan_id = PlanId::new();
         let decision = plan_decision_seed_blob_bytes(plan_id);
-        let implement = plan_implement_seed_blob_bytes(plan_id);
+        let implement = plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST);
         assert_ne!(
             decision, implement,
             "decision and implement seed bytes collided for {plan_id}",
@@ -1138,7 +1193,7 @@ mod tests {
     fn review_and_implement_seed_bytes_are_distinct_for_same_plan_id() {
         let plan_id = PlanId::new();
         let review = plan_review_seed_blob_bytes(plan_id);
-        let implement = plan_implement_seed_blob_bytes(plan_id);
+        let implement = plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST);
         assert_ne!(
             review, implement,
             "review and implement seed bytes collided for {plan_id}",
@@ -1152,7 +1207,7 @@ mod tests {
     #[test]
     fn plan_implement_seed_blob_bytes_is_plan_id_with_implement_suffix() {
         let plan_id = PlanId::new();
-        let bytes = plan_implement_seed_blob_bytes(plan_id);
+        let bytes = plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST);
         assert_eq!(
             std::str::from_utf8(&bytes).unwrap(),
             format!("{plan_id}::implement"),
@@ -1168,8 +1223,8 @@ mod tests {
         let b = PlanId::new();
         assert_ne!(a, b, "PlanId::new must not collide");
         assert_ne!(
-            plan_implement_seed_blob_bytes(a),
-            plan_implement_seed_blob_bytes(b),
+            plan_implement_seed_blob_bytes(a, ImplementAttempt::FIRST),
+            plan_implement_seed_blob_bytes(b, ImplementAttempt::FIRST),
         );
     }
 
@@ -1380,5 +1435,91 @@ mod tests {
         };
         assert_eq!(plan.canonical_bytes(), review.canonical_bytes());
         assert_eq!(review.canonical_bytes(), implement.canonical_bytes());
+    }
+
+    /// Attempt zero's seed is *byte-identical* to the pre-slice-4
+    /// implement seed, for every plan id.
+    ///
+    /// Checked against a reference implementation — the exact
+    /// expression the function had before it took an attempt — rather
+    /// than against the function itself, because the whole point is
+    /// that the two agree. Every implement note already in an
+    /// operator's repo is attached at these bytes; if attempt zero
+    /// moved, all of them would be orphaned, and no test that asked
+    /// the new function where they live could notice.
+    #[test]
+    fn attempt_zero_keeps_the_pre_slice_4_seed() {
+        /// `plan_implement_seed_blob_bytes` as it stood before slice 4.
+        fn pre_slice_4_seed(plan_id: PlanId) -> Vec<u8> {
+            format!("{plan_id}::implement").into_bytes()
+        }
+        for _ in 0..64 {
+            let plan_id = PlanId::new();
+            assert_eq!(
+                plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST),
+                pre_slice_4_seed(plan_id),
+            );
+        }
+    }
+
+    /// Every seed a plan can produce is distinct from every other,
+    /// across all four families and all attempts.
+    ///
+    /// This is the invariant the whole one-ref-per-plan design rests
+    /// on: the notes coexist only because their seed blobs hash to
+    /// different objects. Slice 4 added a *family* of implement seeds,
+    /// so the risk is no longer just "two suffixes collide" but "an
+    /// indexed suffix collides with a fixed one" — `::implement::1`
+    /// against some future `::implement::retry`, say.
+    #[test]
+    fn every_seed_a_plan_can_produce_is_distinct() {
+        for _ in 0..8 {
+            let plan_id = PlanId::new();
+            let mut seeds = vec![
+                plan_submission_seed_blob_bytes(plan_id),
+                plan_decision_seed_blob_bytes(plan_id),
+                plan_review_seed_blob_bytes(plan_id),
+            ];
+            seeds.extend(
+                ImplementAttempt::first_n(32).map(|a| plan_implement_seed_blob_bytes(plan_id, a)),
+            );
+            let total = seeds.len();
+            seeds.sort();
+            seeds.dedup();
+            assert_eq!(total, seeds.len(), "two seeds for plan {plan_id} collide");
+        }
+    }
+
+    /// Two different plans never share a seed, at any attempt.
+    ///
+    /// Plan ids are fixed-width, so a suffix cannot slide one id's
+    /// bytes into another's — but that is an argument, and this is the
+    /// check.
+    #[test]
+    fn seeds_of_distinct_plans_never_collide() {
+        let (a, b) = (PlanId::new(), PlanId::new());
+        assert_ne!(a, b);
+        for attempt in ImplementAttempt::first_n(8) {
+            for other in ImplementAttempt::first_n(8) {
+                assert_ne!(
+                    plan_implement_seed_blob_bytes(a, attempt),
+                    plan_implement_seed_blob_bytes(b, other),
+                );
+            }
+        }
+    }
+
+    /// `next` walks the attempts and stops at the bound, so the probe
+    /// loop that finds a free attempt is finite.
+    #[test]
+    fn attempts_are_bounded() {
+        let mut attempt = ImplementAttempt::FIRST;
+        let mut count = 1;
+        while let Some(next) = attempt.next() {
+            attempt = next;
+            count += 1;
+        }
+        assert_eq!(count, ImplementAttempt::MAX);
+        assert_eq!(attempt.index(), ImplementAttempt::MAX - 1);
     }
 }

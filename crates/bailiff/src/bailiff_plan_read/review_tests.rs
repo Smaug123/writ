@@ -12,7 +12,7 @@ use crate::bailiff_plan_note::{
     plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::{StageNoteTarget, write_stage_note};
-use crate::bailiff_stage::AgentStage;
+use crate::bailiff_stage::StageNoteSlot;
 use tempfile::TempDir;
 use writ::core::{CapabilitySet, RepoRef};
 use writ::run_envelope::SignedRunEnvelope;
@@ -122,7 +122,7 @@ fn read_review_note_round_trips_through_write_review_note() {
     write_stage_note(
         &bailiff,
         &StageNoteTarget {
-            stage: AgentStage::Review,
+            slot: StageNoteSlot::Review,
             plan_id,
             writ_repo_path: writ_repo.path().to_path_buf(),
             allowed_signers: allowed.clone(),

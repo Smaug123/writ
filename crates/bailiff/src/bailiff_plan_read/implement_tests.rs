@@ -9,11 +9,11 @@
 use super::test_support::*;
 use super::*;
 use crate::bailiff_plan_note::{
-    ImplementNote, PlanId, plan_implement_seed_blob_bytes, plan_notes_ref,
+    ImplementAttempt, ImplementNote, PlanId, plan_implement_seed_blob_bytes, plan_notes_ref,
     plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::{StageNoteTarget, write_stage_note};
-use crate::bailiff_stage::AgentStage;
+use crate::bailiff_stage::StageNoteSlot;
 use tempfile::TempDir;
 use writ::core::{CapabilitySet, RepoRef};
 use writ::run_envelope::SignedRunEnvelope;
@@ -71,7 +71,7 @@ fn writ_repo_with_envelope(
 /// failures.
 fn plant_implement_note(bailiff: &NotesRepo, plan_id: PlanId, note: &ImplementNote) -> GitObjectId {
     let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_implement_seed_blob_bytes(plan_id);
+    let seed = plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST);
     bailiff
         .write_note(&plan_ref, &seed, &note.canonical_bytes())
         .unwrap()
@@ -98,7 +98,7 @@ fn read_implement_note_returns_none_when_no_implement_recorded() {
     let tmp = TempDir::new().unwrap();
     let bailiff = bailiff_repo(&tmp);
     let plan_id = PlanId::new();
-    let result = read_implement_note(&bailiff, plan_id).unwrap();
+    let result = read_implement_note(&bailiff, plan_id, ImplementAttempt::FIRST).unwrap();
     assert!(
         result.is_none(),
         "expected None for an unimplemented plan, got: {result:?}",
@@ -123,7 +123,7 @@ fn read_implement_note_round_trips_through_write_implement_note() {
     write_stage_note(
         &bailiff,
         &StageNoteTarget {
-            stage: AgentStage::Implement,
+            slot: StageNoteSlot::Implement(ImplementAttempt::FIRST),
             plan_id,
             writ_repo_path: writ_repo.path().to_path_buf(),
             allowed_signers: allowed.clone(),
@@ -134,7 +134,7 @@ fn read_implement_note_round_trips_through_write_implement_note() {
     )
     .expect("write_implement_note must succeed");
 
-    let read_back = read_implement_note(&bailiff, plan_id)
+    let read_back = read_implement_note(&bailiff, plan_id, ImplementAttempt::FIRST)
         .expect("read_implement_note must succeed")
         .expect("read_implement_note must return Some after a successful write");
     assert_eq!(read_back.plan_id, plan_id);
@@ -162,7 +162,7 @@ fn read_implement_note_returns_none_when_only_submission_is_present() {
         .write_note(&plan_ref, &submission_seed, b"submission-body")
         .unwrap();
 
-    let result = read_implement_note(&bailiff, plan_id).unwrap();
+    let result = read_implement_note(&bailiff, plan_id, ImplementAttempt::FIRST).unwrap();
     assert!(
         result.is_none(),
         "expected None with only submission present, got: {result:?}",
@@ -184,7 +184,7 @@ fn read_implement_note_returns_none_when_only_decision_is_present() {
         .write_note(&plan_ref, &decision_seed, b"decision-body")
         .unwrap();
 
-    let result = read_implement_note(&bailiff, plan_id).unwrap();
+    let result = read_implement_note(&bailiff, plan_id, ImplementAttempt::FIRST).unwrap();
     assert!(
         result.is_none(),
         "expected None with only decision present, got: {result:?}",
@@ -208,7 +208,7 @@ fn read_implement_note_returns_none_when_only_review_is_present() {
         .write_note(&plan_ref, &review_seed, b"review-body")
         .unwrap();
 
-    let result = read_implement_note(&bailiff, plan_id).unwrap();
+    let result = read_implement_note(&bailiff, plan_id, ImplementAttempt::FIRST).unwrap();
     assert!(
         result.is_none(),
         "expected None with only review present, got: {result:?}",
@@ -233,8 +233,12 @@ fn read_implement_note_does_not_cross_read_between_plans() {
     plant_implement_note(&bailiff, p1, &note1);
     plant_implement_note(&bailiff, p2, &note2);
 
-    let r1 = read_implement_note(&bailiff, p1).unwrap().unwrap();
-    let r2 = read_implement_note(&bailiff, p2).unwrap().unwrap();
+    let r1 = read_implement_note(&bailiff, p1, ImplementAttempt::FIRST)
+        .unwrap()
+        .unwrap();
+    let r2 = read_implement_note(&bailiff, p2, ImplementAttempt::FIRST)
+        .unwrap()
+        .unwrap();
     assert_eq!(r1.plan_id, p1);
     assert_eq!(r1.purpose, "first");
     assert_eq!(r2.plan_id, p2);
@@ -264,13 +268,13 @@ fn read_implement_note_returns_plan_id_mismatch_when_body_carries_other_plan_id(
     // seed from the `plan_id` it embeds in the note), so go
     // through the low-level `write_note` API.
     let queried_ref = plan_notes_ref(queried);
-    let queried_seed = plan_implement_seed_blob_bytes(queried);
+    let queried_seed = plan_implement_seed_blob_bytes(queried, ImplementAttempt::FIRST);
     let foreign_note = sample_implement_note(other);
     bailiff
         .write_note(&queried_ref, &queried_seed, &foreign_note.canonical_bytes())
         .unwrap();
 
-    let err = read_implement_note(&bailiff, queried).unwrap_err();
+    let err = read_implement_note(&bailiff, queried, ImplementAttempt::FIRST).unwrap_err();
     match err {
         ReadImplementError::PlanIdMismatch { requested, found } => {
             assert_eq!(requested, queried);
@@ -293,12 +297,12 @@ fn read_implement_note_returns_decode_error_on_corrupt_body() {
     let bailiff = bailiff_repo(&tmp);
     let plan_id = PlanId::new();
     let plan_ref = plan_notes_ref(plan_id);
-    let implement_seed = plan_implement_seed_blob_bytes(plan_id);
+    let implement_seed = plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST);
     bailiff
         .write_note(&plan_ref, &implement_seed, b"not json at all")
         .unwrap();
 
-    let err = read_implement_note(&bailiff, plan_id).unwrap_err();
+    let err = read_implement_note(&bailiff, plan_id, ImplementAttempt::FIRST).unwrap_err();
     assert!(
         matches!(err, ReadImplementError::Decode(_)),
         "expected Decode error, got: {err:?}",

@@ -61,14 +61,17 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::PlanId;
-use crate::bailiff_plan_read::{ReadPlanBodyError, ReadPlanError, SummarizePlanError};
+use crate::bailiff_plan_read::{
+    ReadImplementError, ReadPlanBodyError, ReadPlanError, SummarizePlanError,
+    read_implement_attempts,
+};
 use crate::bailiff_plan_state::IllegalTransition;
 use crate::bailiff_plan_write::WriteStageNoteError;
 use crate::bailiff_repo_guard::PlanGuardError;
 use crate::bailiff_stage::{
     BrokerSession, BrokerSessionRunError, ComposePlanPromptError, OpenPlanStageError,
-    PlanBodyStage, StageNoteTarget, StageRunInputs, compose_with_plan_body, open_plan_stage,
-    run_under_broker_session,
+    PlanBodyStage, StageNoteSlot, StageNoteTarget, StageRunInputs, compose_with_plan_body,
+    open_plan_stage, run_under_broker_session,
 };
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
@@ -231,6 +234,21 @@ pub async fn submit_implement(
     )
     .await?;
 
+    // Which attempt this run is. Chosen here, under the same guard the
+    // gate ran under, so "read the attempts, then write the next one"
+    // is atomic against another process — the same reason the gate and
+    // the note write share a lock. An operator never names an index:
+    // tracking them by hand is exactly the bookkeeping the plan lock
+    // already does correctly.
+    let attempts = guard
+        .run_blocking(move |repo| read_implement_attempts(repo, plan_id))
+        .await
+        .map_err(SubmitImplementError::ReadTaskFailed)?
+        .map_err(SubmitImplementError::ReadImplementAttempts)?;
+    let attempt = attempts
+        .next_free
+        .ok_or(SubmitImplementError::AttemptsExhausted { plan_id })?;
+
     // VM mode mints its own audit session (the broker rejects a
     // caller-supplied `session_id` alongside a workspace bootstrap),
     // and `agent_vm.stop_session` closes that session on the broker
@@ -248,7 +266,7 @@ pub async fn submit_implement(
             agent_model: inputs.session_agent_model,
         },
         StageNoteTarget {
-            stage: PlanBodyStage::Implement.stage(),
+            slot: StageNoteSlot::Implement(attempt),
             plan_id,
             writ_repo_path: writ_repo_path.to_path_buf(),
             allowed_signers,
@@ -373,6 +391,18 @@ pub enum SubmitImplementError {
         #[source]
         source: IllegalTransition,
     },
+    /// Scanning the plan's existing implementer attempts failed, so
+    /// which attempt this run would be is unknown. Includes the
+    /// not-dense anomaly, where a gap in the sequence makes the count
+    /// untrustworthy. Pre-RPC.
+    #[error("reading the plan's implementer attempts failed: {0}")]
+    ReadImplementAttempts(#[source] ReadImplementError),
+    /// The plan already carries [`crate::bailiff_plan_note::ImplementAttempt::MAX`]
+    /// attempts. The bound exists so the upward probe for a free
+    /// attempt is finite; hitting it means fan-out on this plan is
+    /// over, and the recourse is a fresh plan. Pre-RPC.
+    #[error("plan {plan_id} has no free implementer attempt left")]
+    AttemptsExhausted { plan_id: PlanId },
     /// The fetch / verify / decode chain that extracts the plan
     /// body from the planner envelope failed. The wrapped
     /// [`ReadPlanBodyError`] names the specific step. Pre-RPC.
@@ -445,6 +475,7 @@ mod end_to_end_tests {
 
     use super::*;
     use crate::bailiff_decision::{Decider, Decision};
+    use crate::bailiff_plan_note::ImplementAttempt;
     use crate::bailiff_plan_note::{DecisionNote, ImplementNote, plan_notes_ref};
     use crate::bailiff_plan_note::{ReviewNote, plan_review_seed_blob_bytes};
     use crate::bailiff_plan_read::read_plan_note;
@@ -985,7 +1016,7 @@ mod end_to_end_tests {
         let bailiff_for_read = Arc::clone(&bailiff);
         let implement_note = tokio::task::spawn_blocking(move || {
             let repo = &*bailiff_for_read;
-            crate::bailiff_plan_read::read_implement_note(repo, plan_id)
+            crate::bailiff_plan_read::read_implement_note(repo, plan_id, ImplementAttempt::FIRST)
         })
         .await
         .unwrap()

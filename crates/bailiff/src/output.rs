@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use crate::bailiff_plan_note::DecisionNote;
+use crate::bailiff_plan_note::{DecisionNote, ImplementNote};
 use crate::bailiff_plan_view::{
     BailiffPlanSummary, PlanFullView, SignedBailiffNote, VerifiedSection,
 };
@@ -178,9 +178,21 @@ pub fn write_bailiff_plan_show(out: &mut dyn Write, view: &PlanFullView) -> std:
     writeln!(out)?;
     writeln!(out, "-- review --")?;
     write_signed_section(out, view.review.as_ref())?;
-    writeln!(out)?;
-    writeln!(out, "-- implement --")?;
-    write_signed_section(out, view.implement.as_ref())?;
+    // One section per implementer attempt. A plan may carry several
+    // since slice 4 made `implement` repeatable, and this is the read
+    // path where that becomes visible; a plan with none still prints a
+    // single `verification=<none>` section, so the shape an operator
+    // (or a script) sees for the common case is unchanged.
+    if view.implement.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "-- implement --")?;
+        write_signed_section::<ImplementNote>(out, None)?;
+    }
+    for (attempt, section) in &view.implement {
+        writeln!(out)?;
+        writeln!(out, "-- implement attempt={attempt} --")?;
+        write_signed_section(out, Some(section))?;
+    }
     Ok(())
 }
 
@@ -615,7 +627,9 @@ mod tests {
     mod show_tests {
         use super::*;
         use crate::bailiff_decision::{Decider, Decision};
-        use crate::bailiff_plan_note::{DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote};
+        use crate::bailiff_plan_note::{
+            DecisionNote, ImplementAttempt, PlanId, PlanNote, ReviewNote,
+        };
         use crate::bailiff_plan_view::{PlanFullView, VerifiedSection};
         use writ::core::{
             CapabilitySet, RepoRef, Sha256Hex, SshKeyFingerprint, SshSignature, UnixMillis,
@@ -707,7 +721,7 @@ mod tests {
                 plan: None,
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             }
         }
 
@@ -761,7 +775,7 @@ mod tests {
                 }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             let plan_block = concat!(
@@ -809,7 +823,7 @@ mod tests {
                 }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             assert!(rendered.contains("verification=note_envelope_mismatch\n"));
@@ -866,7 +880,7 @@ mod tests {
                 plan: Some(VerifiedSection::NoteEnvelopeMismatch { note, envelope }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             let envelope_digest =
@@ -899,7 +913,7 @@ mod tests {
                 }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             assert!(rendered.contains("verification=writ_envelope_missing\n"));
@@ -931,7 +945,7 @@ mod tests {
                 }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             assert!(rendered.contains("verification=envelope_malformed\n"));
@@ -978,7 +992,7 @@ mod tests {
                 }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             assert!(rendered.contains("verification=signature_failure\n"));
@@ -1005,7 +1019,7 @@ mod tests {
                     decided_at: UnixMillis::from_millis(1_700_000_001_000),
                 }),
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             let block = concat!(
@@ -1031,7 +1045,7 @@ mod tests {
                 plan: Some(VerifiedSection::WritEnvelopeMissing { note: hostile_note }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             // The forged "verification=forged" survives inside the
@@ -1068,7 +1082,7 @@ mod tests {
                     decided_at: UnixMillis::from_millis(1),
                 }),
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             assert!(
@@ -1096,15 +1110,18 @@ mod tests {
                 review: Some(VerifiedSection::WritEnvelopeMissing {
                     note: sample_review_note(),
                 }),
-                implement: Some(VerifiedSection::WritEnvelopeMissing {
-                    note: sample_implement_note(),
-                }),
+                implement: vec![(
+                    ImplementAttempt::FIRST,
+                    VerifiedSection::WritEnvelopeMissing {
+                        note: sample_implement_note(),
+                    },
+                )],
             };
             let rendered = render(&view);
             let plan_at = rendered.find("-- plan --").unwrap();
             let decision_at = rendered.find("-- decision --").unwrap();
             let review_at = rendered.find("-- review --").unwrap();
-            let implement_at = rendered.find("-- implement --").unwrap();
+            let implement_at = rendered.find("-- implement attempt=0 --").unwrap();
             assert!(plan_at < decision_at);
             assert!(decision_at < review_at);
             assert!(review_at < implement_at);
@@ -1143,7 +1160,7 @@ mod tests {
                 plan: Some(VerifiedSection::Verified { note, envelope }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             let lines: Vec<&str> = rendered
@@ -1187,7 +1204,7 @@ mod tests {
                 plan: Some(VerifiedSection::Verified { note, envelope }),
                 decision: None,
                 review: None,
-                implement: None,
+                implement: Vec::new(),
             };
             let rendered = render(&view);
             assert!(

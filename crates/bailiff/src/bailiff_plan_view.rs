@@ -5,7 +5,9 @@
 //! (which pulls in `notes_repo`, `run_verify`, and git IO).
 
 use crate::bailiff_decision::{Decider, Decision};
-use crate::bailiff_plan_note::{DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote};
+use crate::bailiff_plan_note::{
+    DecisionNote, ImplementAttempt, ImplementNote, PlanId, PlanNote, ReviewNote,
+};
 use crate::bailiff_plan_state::{NotePresence, PlanState, derive_state};
 use writ::core::{SshSignature, UnixMillis};
 use writ::protocol::SignedRunMetadata;
@@ -122,7 +124,11 @@ pub struct PlanFullView {
     pub plan: Option<VerifiedSection<PlanNote>>,
     pub decision: Option<DecisionNote>,
     pub review: Option<VerifiedSection<ReviewNote>>,
-    pub implement: Option<VerifiedSection<ImplementNote>>,
+    /// Every implementer attempt, in order. A list since slice 4
+    /// made `implement` repeatable: fan-out is N implementer runs on
+    /// one accepted plan, and this is the read path where that becomes
+    /// visible. Empty for a plan that has not been implemented.
+    pub implement: Vec<(ImplementAttempt, VerifiedSection<ImplementNote>)>,
 }
 
 /// Pairs a bailiff-side signed note with the outcome of verifying its

@@ -580,6 +580,79 @@ than discover it. If parallel variants are wanted, that is a follow-on that
 needs the lock keyed by `(plan, attempt)` for the write and by `plan` for the
 gate, and it should be measured before being assumed necessary.
 
+### Slice 4 as built
+
+Shipped. All gates pass; **the 24 RPC fixtures are byte-for-byte unmodified**,
+as predicted — a first attempt puts exactly what it always did on the wire.
+
+**1. `NotePresence.implement` stayed a `bool`.** The plan said "becomes a count".
+Writing it out, the count is not what the relation needs: `derive_state` asks
+only "is this plan implemented at all", and a count would have widened slice 1's
+48-element enumeration — the domain every property there quantifies over — to
+carry a number none of them read. Parse-don't-validate cuts the other way here:
+the observation the relation takes should be exactly what the relation uses.
+The count lives where it is *used* instead, in the workflow choosing its next
+attempt and in `plan show`.
+
+That has a load-bearing consequence, so it is stated rather than assumed:
+**attempts are dense from zero**, which is what makes "attempt zero exists"
+equivalent to "any attempt exists". Density is why the gate still costs one note
+read rather than a scan, and `read_implement_attempts` refuses a gap
+(`NonDenseAttempts`) rather than truncating at it — a gap would otherwise hide
+every attempt past it from every reader while the next write happily filled the
+hole, leaving two live notes nobody had reconciled.
+
+**2. The attempt lives on a new `StageNoteSlot`, not on `AgentStage`.** Putting
+it on `AgentStage` would have made "the third submission" representable. The slot
+is a refinement — `Submission | Review | Implement(ImplementAttempt)` — with
+`stage()` projecting back; the inverse is not a function, which is exactly the
+fan-out shape. `AgentStage` keeps answering the gate and the prompt, neither of
+which has an attempt.
+
+**3. Five slice-1 properties failed, and only two were the planned deltas.** The
+plan named `legal_stages_never_repeat_from_the_state_they_produce`. The other
+three were found by running:
+
+| Property | What it turned out to say |
+|---|---|
+| `implement_now_requires_an_accepted_verdict` | asserted `Implement` is illegal from `Implemented` — the old duplicate gate, now the feature |
+| `next_stage_follows_the_chain_and_stops_at_terminals` | `Implemented` was a terminal; it no longer is |
+| `rank_is_defined_for_every_state_on_the_progression` | **every legal move strictly increases rank** |
+
+The third is the interesting one. Rank monotonicity is what makes
+`already_passed_from` — defined as "beyond every legal predecessor" — mean
+"already passed", and a repeatable stage is a self-loop, so monotonicity cannot
+hold universally any more. Rather than dropping the property, it now names the
+**exact pair** that is exempt (`Implement` from `Implemented`, landing on
+`Implemented`), so any *other* move that stops advancing rank still fails. Same
+treatment for the one-shot property: scoped to the other three stages, with
+`implement_is_the_one_repeatable_stage` pinning that the exemption set has
+exactly one member — computed from the relation, not written down beside it.
+
+`already_passed_from` needed no edit at all: it derives from
+`legal_predecessors`, so adding `Implemented` to that list flipped it for free.
+That is slice 1's design paying off, and it is the reason this slice is one
+entry in a table rather than a new shape.
+
+**4. Two stale operator surfaces.** `plan implement`'s clap help still listed
+"already-implemented → submit a fresh plan if a re-implement is needed", and the
+`AlreadyRecorded` message still called repeat attempts "a future v1 → v2
+migration". Both were true when written and are now the opposite of the feature.
+Same class as the `decide` clap help found in slice 1's fourth review round —
+help text does not fail a build.
+
+Four mutations, each caught by the intended assertion:
+
+| Mutation | Fails on |
+|---|---|
+| attempt zero gets an indexed suffix | `attempt_zero_keeps_the_pre_slice_4_seed` (+2) |
+| the gap check is dropped | `a_gap_in_the_attempt_sequence_is_refused` |
+| `Implement` stops being repeatable | 3 state properties **and** the grid-count assertion in `stage_gate_zero_rpc` |
+
+The grid test derives both halves from `allows`, so a widened relation would
+have silently moved cases across it. It now asserts the split as a number: four
+permitted pairs, one of which — `Implement` from `Implemented` — is this slice.
+
 ---
 
 ## Outcome so far
