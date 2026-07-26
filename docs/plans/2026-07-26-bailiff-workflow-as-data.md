@@ -641,12 +641,31 @@ migration". Both were true when written and are now the opposite of the feature.
 Same class as the `decide` clap help found in slice 1's fourth review round —
 help text does not fail a build.
 
-Four mutations, each caught by the intended assertion:
+**5. Codex found the gap check only catching gaps of width one.** The first
+version probed a single slot past the first miss. That is enough for `{0, 2}`
+and useless for `{0, 3}`: the scan returned `next_free = 1` and attempt 3 stayed
+invisible to every reader while the next run refilled slot 1. The test I had
+written used width one, so it passed.
+
+The rule the fix follows: **a check that samples cannot establish an invariant
+that quantifies.** Density is a claim about *every* slot, so the scan now reads
+every slot in the bounded range and refuses on the first note that follows a
+hole. That costs `MAX` probes at two git invocations each, which is why `MAX`
+came down from 256 to 32 — it is a *cost* bound, not a product opinion about
+fan-out width, and the docstring now says so. Neither caller is on the gate's
+path: one is about to run an agent for minutes, the other is `plan show`.
+
+The replacement test is parameterised over gap widths that straddle the old
+check's reach (`{0,2}`, `{0,3}`, `{0,1,5}`, `{0,9}`), and an early-stopping scan
+is caught by `{0,3}` — Codex's own example.
+
+Five mutations, each caught by the intended assertion:
 
 | Mutation | Fails on |
 |---|---|
 | attempt zero gets an indexed suffix | `attempt_zero_keeps_the_pre_slice_4_seed` (+2) |
-| the gap check is dropped | `a_gap_in_the_attempt_sequence_is_refused` |
+| the scan stops after two consecutive misses | `a_gap_in_the_attempt_sequence_is_refused_at_any_width`, on `{0,3}` |
+| the gap check is dropped entirely | the same test, on `{0,2}` |
 | `Implement` stops being repeatable | 3 state properties **and** the grid-count assertion in `stage_gate_zero_rpc` |
 
 The grid test derives both halves from `allows`, so a widened relation would

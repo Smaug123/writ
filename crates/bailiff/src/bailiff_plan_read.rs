@@ -321,51 +321,59 @@ pub fn read_implement_note(
 /// Every implementer attempt on `plan_id`, in order, and the first
 /// free attempt after them.
 ///
-/// Attempts are dense from zero, so this probes upwards and stops at
-/// the first miss — which is what keeps the *gate* cheap: it needs
-/// only "does any attempt exist", and under density that is attempt
-/// zero alone, one note read rather than a scan.
+/// **Scans the whole bounded range** rather than stopping at the first
+/// miss. Stopping early is what a dense sequence would allow, but it
+/// cannot *establish* density: attempts `{0, 3}` look identical to
+/// `{0}` to a scan that halts at the first hole, so every attempt past
+/// the hole would be invisible to `plan show` while the next run
+/// happily refilled the hole — leaving two live notes nobody had
+/// reconciled. That is the "silently truncated" failure this function
+/// exists to avoid, so it does not sample; it looks everywhere it
+/// could be wrong. (A first version probed one slot past the miss,
+/// which catches a gap of width one and no more. Codex review caught
+/// it, correctly.)
 ///
-/// A gap (attempt 2 present while attempt 1 is not) can only come from
-/// manual repo surgery, and it is refused rather than silently
-/// truncated: without the check, the attempts past the gap would be
-/// invisible to every reader while the next write happily filled the
-/// hole, leaving two live notes nobody had reconciled. That is the
-/// same class of anomaly [`crate::bailiff_plan_state::PlanState::Corrupt`]
-/// exists to report, so it is reported rather than absorbed.
+/// A gap can only come from manual repo surgery — bailiff only ever
+/// writes at the first free index — and is refused rather than
+/// absorbed, the same treatment
+/// [`crate::bailiff_plan_state::PlanState::Corrupt`] gets for the same
+/// reason.
+///
+/// # Cost
+///
+/// [`ImplementAttempt::MAX`] probes, each two git invocations
+/// (`hash-object` for the seed, then the note read). That is why this
+/// is **not** on the gate's path: `summarize_plan` reads attempt zero
+/// alone, which is equivalent to "any attempt exists" exactly while
+/// density holds, and density is what this function is here to check.
+/// Its two callers — the implementer workflow, which is about to run
+/// an agent for minutes, and `bailiff plan show` — can both afford it.
 pub fn read_implement_attempts(
     bailiff_repo: &NotesRepo,
     plan_id: PlanId,
 ) -> Result<ImplementAttempts, ReadImplementError> {
     let mut notes = Vec::new();
-    let mut attempt = Some(ImplementAttempt::FIRST);
-    while let Some(current) = attempt {
-        match read_implement_note(bailiff_repo, plan_id, current)? {
+    let mut first_free: Option<ImplementAttempt> = None;
+    for attempt in ImplementAttempt::first_n(ImplementAttempt::MAX) {
+        match read_implement_note(bailiff_repo, plan_id, attempt)? {
             Some(note) => {
-                notes.push((current, note));
-                attempt = current.next();
+                // A note *after* a hole: the sequence is not a prefix,
+                // so no count over it is trustworthy.
+                if let Some(missing) = first_free {
+                    return Err(ReadImplementError::NonDenseAttempts { plan_id, missing });
+                }
+                notes.push((attempt, note));
             }
             None => {
-                // One probe past the end. A note here means the run is
-                // not dense, so the count below it is not the count.
-                if let Some(beyond) = current.next()
-                    && read_implement_note(bailiff_repo, plan_id, beyond)?.is_some()
-                {
-                    return Err(ReadImplementError::NonDenseAttempts {
-                        plan_id,
-                        missing: current,
-                    });
+                if first_free.is_none() {
+                    first_free = Some(attempt);
                 }
-                return Ok(ImplementAttempts {
-                    notes,
-                    next_free: Some(current),
-                });
             }
         }
     }
     Ok(ImplementAttempts {
         notes,
-        next_free: None,
+        next_free: first_free,
     })
 }
 

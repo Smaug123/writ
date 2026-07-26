@@ -218,12 +218,17 @@ impl ImplementAttempt {
 
     /// How many attempts one plan may carry.
     ///
-    /// Bounded because the next free attempt is found by probing
-    /// upwards, and an unbounded probe over a corrupted ref is an
-    /// unbounded number of git invocations. Far above any plausible
-    /// fan-out width; the point is that the failure is a typed refusal
-    /// rather than a hang.
-    pub const MAX: u32 = 256;
+    /// This is a *cost* bound, not a product opinion.
+    /// [`crate::bailiff_plan_read::read_implement_attempts`] cannot
+    /// establish that the sequence has no holes without looking at
+    /// every slot, and each look is two git invocations — so the bound
+    /// is set where a full scan stays cheap enough for the two paths
+    /// that run it (an implementer run, and `bailiff plan show`) rather
+    /// than as high as it could go. Raising it makes both slower in
+    /// direct proportion.
+    ///
+    /// Hitting it is a typed refusal, never a hang or an overwrite.
+    pub const MAX: u32 = 32;
 
     /// The attempt after this one, or `None` at [`Self::MAX`].
     pub fn next(self) -> Option<Self> {

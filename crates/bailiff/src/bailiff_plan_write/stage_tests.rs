@@ -544,49 +544,60 @@ fn several_implementer_attempts_coexist_on_one_plan() {
     );
 }
 
-/// A gap in the attempt sequence is refused, not silently truncated.
+/// A gap in the attempt sequence is refused, not silently truncated —
+/// **at every width**, and however far past the hole the next note is.
 ///
-/// Only manual repo surgery can produce one. Without the check the
-/// attempts past the gap would be invisible to every reader while the
-/// next write happily filled the hole — leaving two live notes nobody
-/// had reconciled, which is worse than the refusal.
+/// Parameterised over the gap width because the first version of the
+/// scanner probed exactly one slot past the miss, which catches width
+/// one and nothing else: `{0, 3}` looked identical to `{0}`, so
+/// attempt 3 was invisible to every reader while the next run refilled
+/// slot 1. Codex review caught that; a width-1-only test could not
+/// have. The widths here straddle the old check's reach on both sides.
 #[test]
-fn a_gap_in_the_attempt_sequence_is_refused() {
-    let tmp = TempDir::new().unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-    let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
-    let bailiff = bailiff_repo(&tmp);
-    let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
-    let plan_id = PlanId::new();
+fn a_gap_in_the_attempt_sequence_is_refused_at_any_width() {
+    for present in [vec![0u32, 2], vec![0, 3], vec![0, 1, 5], vec![0, 9]] {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let plan_id = PlanId::new();
 
-    // Attempts 0 and 2, but not 1.
-    for index in [0u32, 2] {
-        let attempt = ImplementAttempt::first_n(index + 1).last().unwrap();
-        write_stage_note(
-            &bailiff,
-            &StageNoteTarget {
-                slot: StageNoteSlot::Implement(attempt),
-                plan_id,
-                writ_repo_path: writ_repo.path().to_path_buf(),
-                allowed_signers: allowed.clone(),
-            },
-            &writ_notes_ref(),
-            format!("attempt-{index}"),
-            &completed,
-        )
-        .unwrap_or_else(|e| panic!("planting attempt {index}: {e}"));
-    }
-
-    let err = crate::bailiff_plan_read::read_implement_attempts(&bailiff, plan_id)
-        .expect_err("a gap must be refused");
-    match err {
-        crate::bailiff_plan_read::ReadImplementError::NonDenseAttempts {
-            plan_id: p,
-            missing,
-        } => {
-            assert_eq!(p, plan_id);
-            assert_eq!(missing.index(), 1);
+        for index in &present {
+            let attempt = ImplementAttempt::first_n(index + 1).last().unwrap();
+            write_stage_note(
+                &bailiff,
+                &StageNoteTarget {
+                    slot: StageNoteSlot::Implement(attempt),
+                    plan_id,
+                    writ_repo_path: writ_repo.path().to_path_buf(),
+                    allowed_signers: allowed.clone(),
+                },
+                &writ_notes_ref(),
+                format!("attempt-{index}"),
+                &completed,
+            )
+            .unwrap_or_else(|e| panic!("planting attempt {index}: {e}"));
         }
-        other => panic!("expected NonDenseAttempts, got {other:?}"),
+
+        let expected_missing = (0u32..)
+            .find(|i| !present.contains(i))
+            .expect("a gap exists by construction");
+        let err = crate::bailiff_plan_read::read_implement_attempts(&bailiff, plan_id)
+            .expect_err(&format!("{present:?} must be refused"));
+        match err {
+            crate::bailiff_plan_read::ReadImplementError::NonDenseAttempts {
+                plan_id: p,
+                missing,
+            } => {
+                assert_eq!(p, plan_id);
+                assert_eq!(
+                    missing.index(),
+                    expected_missing,
+                    "{present:?} must name the first hole",
+                );
+            }
+            other => panic!("expected NonDenseAttempts for {present:?}, got {other:?}"),
+        }
     }
 }
