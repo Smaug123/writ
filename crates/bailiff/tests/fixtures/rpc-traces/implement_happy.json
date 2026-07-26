@@ -1,0 +1,20 @@
+[
+  {
+    "type": "run_agent",
+    "prompt": "Build it.\n\n---\n\n# Approved plan\n\n# Plan\n\nReplace bar with baz.\n",
+    "capabilities": [
+      {
+        "kind": "workspace_write",
+        "repo": "smaug123/writ"
+      }
+    ],
+    "purpose": "plan-implement",
+    "output_ref": "refs/notes/writ/v1/agent-outputs",
+    "workspace": {
+      "repo": "smaug123/writ",
+      "warm": "none"
+    },
+    "agent_kind": "claude",
+    "agent_model": "claude-test"
+  }
+]

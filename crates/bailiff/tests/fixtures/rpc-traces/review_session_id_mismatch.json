@@ -1,0 +1,25 @@
+[
+  {
+    "type": "open_session",
+    "label": "plan-review:trace",
+    "agent_kind": "claude",
+    "agent_model": "claude-test"
+  },
+  {
+    "type": "run_agent",
+    "prompt": "Evaluate.\n\n---\n\n# Proposed plan\n\n# Plan\n\nReplace bar with baz.\n",
+    "capabilities": [
+      {
+        "kind": "workspace_read",
+        "repo": "smaug123/writ"
+      }
+    ],
+    "purpose": "plan-review",
+    "output_ref": "refs/notes/writ/v1/agent-outputs",
+    "session_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+  },
+  {
+    "type": "close_session",
+    "session_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+  }
+]

@@ -482,18 +482,53 @@ An unreachable error variant sat in the tree for a full round without any gate
 noticing. `clippy` does not warn on one, and it was the only trace that a call
 site had been dropped.
 
-## Slice 3 has not started
+## Slice 3: the baseline is captured; the interpreter is not built
 
-The next action is **capturing the recorded RPC traces on the pre-refactor
-code**, before any interpreter exists. Captured afterwards they prove nothing,
-and they are the only thing that makes "no behaviour change" a checked claim
-across a collapse of three bespoke workflows into three `StageSpec` values.
+The plan's precondition is met. `crates/bailiff/tests/rpc_trace_baseline.rs`
+records **24 traces** — the exact `ClientMessage` sequence each workflow puts on
+the wire — taken against the pre-refactor code, which is the only moment they
+could have been taken. Every control-flow-distinct path is covered: happy,
+pre-RPC refusal, post-gate/pre-session failure, and each post-session failure,
+for all three workflows.
 
-One input for slice 3 that slices 1–2 supplied: `PlanStage` already exists and
-already names its own precondition, so `StageSpec`'s gate field is a `PlanStage`
-rather than anything new. The remaining axes are capabilities, prompt
-composition, note writer, and session ownership — the last being a DU, not a
-flag, per the verdict above.
+Three of them carry most of the weight:
+
+- **`implement_happy` has no `session_id`** and carries workspace and agent
+  identity inline, because the VM arm mints and closes the audit session
+  broker-side. Session ownership is therefore a **DU, not a boolean**, in
+  `StageSpec` — now pinned rather than merely argued.
+- **The zero-RPC fixtures** are what stop a rejected workflow burning an audit
+  row, and there are six of them, because "before the gate" and "after the gate
+  but before the session" are different failures.
+- **`*_close_session_error` vs `*_cleanup_close_error`** emit *identical* traces
+  and differ only in which error survives. Where two branches share a trace, the
+  assertion is on the returned variant instead — the baseline pins outcomes as
+  well as messages.
+
+**Six Codex rounds on the baseline, ten findings, all valid.** Five were the same
+defect wearing different clothes: *an assertion that could not fail for the
+reason it claimed.* The stub returned before reading, so zero-RPC fixtures passed
+on an emitted RPC; `UPDATE_RPC_TRACES` was tested with `is_ok()`, so `=0` silently
+disabled all comparison; the review note-failure scenario failed pre-RPC and
+recorded an empty trace under a name promising a post-run branch; the
+session-mismatch scenarios accepted any error, and a stale signature meant
+deleting the check would fail later with the same trace.
+
+The rule that finally covers all of them: **a trace pins what was sent and
+nothing about which branch sent it.** Wherever two branches can produce the same
+trace, only the outcome distinguishes them.
+
+Each property was then checked by mutation rather than by going green — prompt
+drift, a deleted `close_session`, a genuinely-emitted RPC against an empty
+fixture, and a corrupted fixture under `UPDATE_RPC_TRACES=0`. One of those
+mutations initially matched nothing (the constant is private; the pattern
+required `pub`), and the assertion that the mutation had applied is what caught
+it.
+
+**What remains:** the `StageSpec` descriptor and its interpreter. The axes are
+settled — precondition (a `PlanStage`, so slice 1 answers legality), capability
+set, prompt composition, note writer, and session ownership as a DU — and the
+regression net is now checked rather than hoped for.
 
 ## Non-goals
 

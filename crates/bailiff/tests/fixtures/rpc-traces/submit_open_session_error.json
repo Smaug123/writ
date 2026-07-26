@@ -1,0 +1,8 @@
+[
+  {
+    "type": "open_session",
+    "label": "plan-submit:trace",
+    "agent_kind": "claude",
+    "agent_model": "claude-test"
+  }
+]
