@@ -550,11 +550,16 @@ mod tests {
 
     // ============== Integration test (real git) ==============
 
-    /// Helper for sync git invocations from tests: avoids the
-    /// hardened-env machinery and just runs git with default env
-    /// rooted at the test tempdir.
+    /// Helper for sync git invocations from tests.
+    ///
+    /// Hardened like the production path: these tests build real repos and then
+    /// assert on the object graph the walker reports, so an operator's
+    /// `/etc/gitconfig` (a `core.hooksPath`, an `init.defaultObjectFormat`) can
+    /// change what they observe. This used to run git with the ambient
+    /// environment on purpose, which made the fixture's results partly a
+    /// property of the developer's machine.
     fn run_git(repo: &Path, args: &[&str]) -> String {
-        let output = StdCommand::new("git")
+        let output = writ_core::git_env::apply_clean_git_config(&mut StdCommand::new("git"))
             .arg("-C")
             .arg(repo)
             .args(args)
@@ -574,7 +579,7 @@ mod tests {
 
     fn run_git_stdin(repo: &Path, args: &[&str], stdin: &[u8]) -> String {
         use std::io::Write as _;
-        let mut child = StdCommand::new("git")
+        let mut child = writ_core::git_env::apply_clean_git_config(&mut StdCommand::new("git"))
             .arg("-C")
             .arg(repo)
             .args(args)

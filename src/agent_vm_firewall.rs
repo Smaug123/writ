@@ -381,7 +381,7 @@ fn capture_output_with_timeout(
             // pfctl/ifconfig are idempotent status queries and rule loads; a
             // born-dead retry belongs with the caller that needs it (notes_repo),
             // not here.
-            ran_nothing: _,
+            born_dead_signature: _,
         } => Ok(Output {
             status,
             stdout,

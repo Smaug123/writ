@@ -140,6 +140,20 @@ These hold across subsystems and are the reason to trust the whole:
   reasoning — because a recipe that is only safe when callers happen to do
   something else as well is not a recipe you can reason about locally.
 
+  **What these guards do and do not establish.** They ask "is this discipline
+  defined twice?", which is not the same question as "is it applied everywhere?".
+  A helper that simply never mentions the recipe passes all of them, and several
+  did — including `writ-vm-client`'s four guest-side git runners, which
+  `git_env`'s own module doc named as consumers while they ran git with no
+  hardening at all. A sixth guard now flags any `git`-named helper that builds and
+  runs a process `Command` without applying the recipe. That is still a
+  name-keyed heuristic; the durable form of the invariant is a **construction
+  boundary** — a type from which the only obtainable runnable git `Command` is a
+  hardened one, so the recipe is enforced by construction rather than by the
+  author remembering. `clean_git`'s `CleanGitInvocation` is the closest existing
+  thing (it carries the recipe as validated `CleanGitEnv` values and is the
+  guard's one recorded exemption); generalising it is not yet done.
+
 ---
 
 ## 5. Subsystems
@@ -423,7 +437,7 @@ a root PF helper (`writ-agent-vm-pf-helper`, pins `/sbin/pfctl` +
 under `BrokerPlacement::Vm` — a dedicated broker VM running `writd broker` on a
 shared `--internal` network.
 
-`process_supervisor.rs` (1554, byte-cap policy in
+`process_supervisor.rs` (2069, byte-cap policy in
 `process_supervisor/capture.rs`) is filed under this subsystem for historical
 reasons but is **workspace-wide**: it supervises every bounded child (agent-VM
 and broker lifecycle, `clean_git`'s git replay, `flake_provision`'s nix,
@@ -436,10 +450,29 @@ policy, the `waitid(WNOWAIT)`-then-`killpg`-then-reap ordering, and the cleanup
 guard, so the pair cannot drift. The blocking arm additionally owns **stdin**,
 because a single-threaded caller that writes stdin to completion before draining
 stdout deadlocks against a child that fills its stdout pipe; it drives all three
-streams from one non-blocking `poll(2)` loop, which is also what makes its
-timeout cover the post-exit drain. `git_push_objects_cat_file`'s long-lived
-`cat-file --batch` session is not spawn-and-wait, so it uses neither arm, but it
-shares the group-kill primitives rather than re-deriving them.
+streams from one non-blocking `poll(2)` loop. `git_push_objects_cat_file`'s
+long-lived `cat-file --batch` session is not spawn-and-wait, so it uses neither
+arm, but it shares the group-kill primitives rather than re-deriving them.
+
+Two properties are stated jointly for both arms because having them in only one
+was a live defect in each case. **The timeout bounds the whole call, not just the
+child**: a capture drain reaches EOF only when every fd on the pipe's write end
+closes, and a descendant that called `setsid` has left the process group, survives
+the SIGKILL, and holds it open indefinitely — so the drain joins are bounded by the
+same deadline, and a capture that cannot complete is reported as `TimedOut` rather
+than as a short but plausible-looking stdout. **A failed capture is never a
+capture**: a read error, or a drain task that dies, surfaces as
+`SupervisorError::CaptureRead` instead of being folded into EOF, because callers
+parse stdout as data (one object id per `rev-list` line) where a truncated prefix
+reads as a complete, shorter answer.
+
+**What the supervisor does not decide.** It reports a `born_dead_signature` — pid
+absent when probed, and killed by `SIGKILL` (§`docs/known-test-flakes.md`) — as
+*evidence*, not as permission to re-run. The probe cannot prove non-execution:
+`getpgid` answers `ESRCH` for an exited-but-unreaped child on macOS, so a child
+that ran, took effect, and was then killed matches the same signature. Replay
+safety is therefore a fact about the command, decided at the call site
+(`notes_repo::OnBornDead`), not a boolean the supervisor hands out.
 
 **Primitives.** `AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`

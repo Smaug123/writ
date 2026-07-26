@@ -1038,6 +1038,7 @@ fn run_git_times_out_on_a_child_that_never_exits() {
             timeout: Duration::from_millis(300),
             stdout_cap: 64 * 1024,
         },
+        OnBornDead::Retry,
     )
     .expect_err("a child that never exits must not be waited on forever");
     assert!(
@@ -1072,6 +1073,7 @@ fn run_git_rejects_a_child_that_floods_stdout() {
             timeout: Duration::from_secs(30),
             stdout_cap: 64 * 1024,
         },
+        OnBornDead::Retry,
     )
     .expect_err("unbounded stdout must be rejected, not buffered");
     assert!(
@@ -1101,6 +1103,7 @@ fn run_git_tail_caps_a_flooding_stderr_without_deadlocking() {
         CaptureOutput::Capture,
         &env,
         GitLimits::production(),
+        OnBornDead::Retry,
     )
     .expect("a clean exit with verbose stderr must succeed");
     assert_eq!(stdout, b"refs/notes/ok\n");
@@ -1137,6 +1140,7 @@ fn run_git_kills_a_lingering_helper_in_the_process_group() {
         CaptureOutput::Capture,
         &env,
         GitLimits::production(),
+        OnBornDead::Retry,
     )
     .expect("the fake git exits 0");
     let pid: i32 = fs::read_to_string(&marker)
@@ -1201,6 +1205,7 @@ fn a_child_that_ran_is_not_retried_even_when_sigkilled() {
         None,
         CaptureOutput::Discard,
         &env,
+        OnBornDead::Retry,
     )
     .expect_err("a child that ran and then died must be surfaced, not retried");
 
@@ -1257,12 +1262,13 @@ fn a_child_proven_never_to_have_existed_is_retried() {
             byte_cap: 64 * 1024,
         },
         || vec!["rev-parse".to_string()],
+        OnBornDead::Retry,
         |_pid| {
             probes.set(probes.get() + 1);
             probes.get() == 1
         },
     )
-    .expect("a child proven never to have run is retried");
+    .expect("a replay-safe command is retried on the born-dead signature");
 
     assert!(status.success(), "the retry must reach a live child");
     assert_eq!(

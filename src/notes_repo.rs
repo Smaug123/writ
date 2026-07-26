@@ -74,6 +74,17 @@
 //! now comes from `crate::process_spawn` and the supervision from
 //! `process_supervisor`, so neither can drift from the other callers
 //! again.
+//!
+//! ## Replaying a killed invocation
+//!
+//! macOS occasionally discards a freshly spawned child (see `FLAKE.md`), and
+//! `process_supervisor` reports the signature of that event. It is only a
+//! signature: the probe behind it cannot distinguish a child that never started
+//! from one that ran, took effect, and was killed unreaped. So every invocation
+//! here passes an explicit `OnBornDead`, and each `Retry` is justified where it is
+//! written by a property of that argv — content-addressed, convergent, or refused
+//! outright on a second run. Adding a mutating invocation means making that
+//! judgement, because the argument is never "this child did nothing".
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -113,8 +124,8 @@ const NOTES_GIT_STDOUT_CAP: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 use crate::process_supervisor::STDERR_CAPTURE_TAIL_CAP as NOTES_GIT_STDERR_TAIL_CAP;
 
-/// Attempts allowed for a child that died before it ran anything (see
-/// [`crate::process_supervisor::child_ran_nothing`]).
+/// Attempts allowed for a child matching the phantom-SIGKILL signature (see
+/// [`crate::process_supervisor::matches_born_dead_signature`]).
 ///
 /// An attempt count is right here, where a deadline is right for a transient
 /// spawn *refusal*: a refusal clears on the host's schedule, so we wait it out;
@@ -122,6 +133,37 @@ use crate::process_supervisor::STDERR_CAPTURE_TAIL_CAP as NOTES_GIT_STDERR_TAIL_
 /// want is another ticket, not a wait. Three attempts put the residual odds past
 /// 1-in-10^10.
 const BORN_DEAD_RETRY_ATTEMPTS: usize = 3;
+
+/// What to do when an invocation comes back matching the phantom-SIGKILL
+/// signature.
+///
+/// This exists as an explicit per-invocation argument because the signature is
+/// evidence, not proof: `getpgid` answers `ESRCH` for an exited-but-unreaped
+/// child on this platform, so a child that ran, took effect, and was then killed
+/// is indistinguishable from one discarded before it started. See
+/// [`crate::process_supervisor::matches_born_dead_signature`].
+///
+/// Consequently the decision cannot live in the supervisor, which knows nothing
+/// about the command, and it must not default: a future mutating invocation added
+/// to this module has to choose, and the compiler makes it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum OnBornDead {
+    /// Re-run, up to [`BORN_DEAD_RETRY_ATTEMPTS`].
+    ///
+    /// Only for an invocation whose replay is harmless *on its own merits* —
+    /// either idempotent, or one git refuses outright the second time so a
+    /// double-apply is impossible. The justification belongs at the call site,
+    /// because it is a fact about that argv and not about this module.
+    Retry,
+    /// Report [`NotesRepoError::GitKilledBeforeCompletion`] instead of re-running.
+    ///
+    /// For an invocation that could double-apply. Unused today — every invocation
+    /// below is replay-safe — but the variant is what makes `Retry` a claim
+    /// rather than a default, and gives the next mutating command somewhere
+    /// correct to land.
+    #[expect(dead_code, reason = "the safe choice for a future mutating invocation")]
+    Fail,
+}
 
 /// The bounds applied to one supervised `git` invocation.
 ///
@@ -266,6 +308,9 @@ impl NotesRepo {
                 None,
                 CaptureOutput::Discard,
                 &inherited_env,
+                // `git init` on an existing repo re-initialises it: same refs,
+                // same objects, same config. Replay reaches the same state.
+                OnBornDead::Retry,
             )?;
         }
         Self::open_with_env(path, inherited_env)
@@ -352,6 +397,14 @@ impl NotesRepo {
             None,
             CaptureOutput::Discard,
             &self.inherited_env,
+            // `notes add` without `-f` refuses when an annotation already
+            // exists ("Cannot add notes. Found existing notes..."), so a
+            // replay cannot double-apply: it either writes the note the
+            // killed child did not, or fails loudly. Note the guarantee is
+            // *no silent double-apply*, not *no spurious failure* — a child
+            // killed between committing the ref and exiting would report the
+            // replay's refusal. That is the safe direction.
+            OnBornDead::Retry,
         )?;
         Ok(target_oid)
     }
@@ -420,6 +473,14 @@ impl NotesRepo {
             None,
             CaptureOutput::Discard,
             &self.inherited_env,
+            // `notes add` without `-f` refuses when an annotation already
+            // exists ("Cannot add notes. Found existing notes..."), so a
+            // replay cannot double-apply: it either writes the note the
+            // killed child did not, or fails loudly. Note the guarantee is
+            // *no silent double-apply*, not *no spurious failure* — a child
+            // killed between committing the ref and exiting would report the
+            // replay's refusal. That is the safe direction.
+            OnBornDead::Retry,
         )?;
         Ok(WriteOutcome::Written(target_oid))
     }
@@ -468,6 +529,9 @@ impl NotesRepo {
             None,
             CaptureOutput::Discard,
             &self.inherited_env,
+            // A fetch of the same refspecs converges: it writes the same refs to
+            // the same object ids, so a second run is a no-op.
+            OnBornDead::Retry,
         )?;
         Ok(())
     }
@@ -498,6 +562,8 @@ impl NotesRepo {
             None,
             CaptureOutput::Capture,
             &self.inherited_env,
+            // Read-only: nothing to double-apply.
+            OnBornDead::Retry,
         )
     }
 
@@ -586,6 +652,8 @@ impl NotesRepo {
             None,
             CaptureOutput::Capture,
             &self.inherited_env,
+            // Read-only: nothing to double-apply.
+            OnBornDead::Retry,
         )?;
         // `git for-each-ref --format=%(refname)` drops a row from
         // stdout (no `<missing>` placeholder) while writing a
@@ -729,11 +797,13 @@ fn run_git<'a, I>(
     stdin_input: Option<&[u8]>,
     capture: CaptureOutput,
     env: &InheritedEnv,
+    on_born_dead: OnBornDead,
 ) -> Result<Vec<u8>, NotesRepoError>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    run_git_capturing_stderr(repo, args, stdin_input, capture, env).map(|(stdout, _stderr)| stdout)
+    run_git_capturing_stderr(repo, args, stdin_input, capture, env, on_born_dead)
+        .map(|(stdout, _stderr)| stdout)
 }
 
 /// [`run_git`] under caller-chosen bounds. Only tests need anything other than
@@ -746,12 +816,21 @@ fn run_git_with_limits<'a, I>(
     capture: CaptureOutput,
     env: &InheritedEnv,
     limits: GitLimits,
+    on_born_dead: OnBornDead,
 ) -> Result<Vec<u8>, NotesRepoError>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    run_git_capturing_stderr_with_limits(repo, args, stdin_input, capture, env, limits)
-        .map(|(stdout, _stderr)| stdout)
+    run_git_capturing_stderr_with_limits(
+        repo,
+        args,
+        stdin_input,
+        capture,
+        env,
+        limits,
+        on_born_dead,
+    )
+    .map(|(stdout, _stderr)| stdout)
 }
 
 /// Variant of [`run_git`] that hands the caller both stdout and the
@@ -779,6 +858,7 @@ fn run_git_capturing_stderr<'a, I>(
     stdin_input: Option<&[u8]>,
     capture: CaptureOutput,
     env: &InheritedEnv,
+    on_born_dead: OnBornDead,
 ) -> Result<(Vec<u8>, Vec<u8>), NotesRepoError>
 where
     I: IntoIterator<Item = &'a str>,
@@ -790,6 +870,7 @@ where
         capture,
         env,
         GitLimits::production(),
+        on_born_dead,
     )
 }
 
@@ -800,6 +881,7 @@ fn run_git_capturing_stderr_with_limits<'a, I>(
     capture: CaptureOutput,
     env: &InheritedEnv,
     limits: GitLimits,
+    on_born_dead: OnBornDead,
 ) -> Result<(Vec<u8>, Vec<u8>), NotesRepoError>
 where
     I: IntoIterator<Item = &'a str>,
@@ -815,8 +897,14 @@ where
     };
 
     let owned_args = || -> Vec<String> { args.iter().map(|s| (*s).to_string()).collect() };
-    let (status, stdout, stderr) =
-        supervised_git(&mut command, limits, stdin_input, stdout_mode, owned_args)?;
+    let (status, stdout, stderr) = supervised_git(
+        &mut command,
+        limits,
+        stdin_input,
+        stdout_mode,
+        owned_args,
+        on_born_dead,
+    )?;
     if !status.success() {
         return Err(NotesRepoError::GitFailed {
             args: owned_args(),
@@ -842,6 +930,7 @@ fn supervised_git(
     stdin_input: Option<&[u8]>,
     stdout_mode: StdoutMode,
     args: impl Fn() -> Vec<String>,
+    on_born_dead: OnBornDead,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), NotesRepoError> {
     supervised_git_probed(
         command,
@@ -849,11 +938,12 @@ fn supervised_git(
         stdin_input,
         stdout_mode,
         args,
-        process_supervisor::child_vanished_before_running,
+        on_born_dead,
+        process_supervisor::pid_absent_when_probed,
     )
 }
 
-/// [`supervised_git`] with an injectable proof-of-life probe.
+/// [`supervised_git`] with an injectable born-dead probe.
 ///
 /// A genuinely born-dead child cannot be forged on demand — the kernel decides —
 /// so a test that wants to drive the retry supplies its own probe. Explicit
@@ -865,13 +955,9 @@ fn supervised_git_probed(
     stdin_input: Option<&[u8]>,
     stdout_mode: StdoutMode,
     args: impl Fn() -> Vec<String>,
+    on_born_dead: OnBornDead,
     mut probe: impl FnMut(u32) -> bool,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), NotesRepoError> {
-    // The supervisor takes a proof-of-life probe between spawn and reap and
-    // reports it as `ran_nothing`; see `process_supervisor::child_ran_nothing`
-    // for why re-running is safe even for a *mutating* command like `notes add`
-    // (the claim is not that the command may be repeated, but that this child had
-    // no effect to repeat).
     for attempt in 0..BORN_DEAD_RETRY_ATTEMPTS {
         let outcome = process_supervisor::run_supervised_blocking_probed(
             command,
@@ -888,10 +974,19 @@ fn supervised_git_probed(
                 status,
                 stdout,
                 stderr,
-                ran_nothing,
+                born_dead_signature,
             } => {
-                if ran_nothing && attempt + 1 < BORN_DEAD_RETRY_ATTEMPTS {
-                    continue;
+                if born_dead_signature {
+                    match on_born_dead {
+                        OnBornDead::Retry if attempt + 1 < BORN_DEAD_RETRY_ATTEMPTS => continue,
+                        OnBornDead::Retry => {}
+                        // We cannot tell whether this child took effect, so we
+                        // decline to guess in either direction: not a silent
+                        // replay, and not a success either.
+                        OnBornDead::Fail => {
+                            return Err(NotesRepoError::GitKilledBeforeCompletion { args: args() });
+                        }
+                    }
                 }
                 Ok((status, stdout, stderr))
             }
@@ -987,6 +1082,8 @@ fn run_git_config<'a>(
             byte_cap: limits.stdout_cap,
         },
         args,
+        // `config --get` only reads.
+        OnBornDead::Retry,
     )?;
 
     if status.success() {
@@ -1040,6 +1137,9 @@ fn hash_object_stdin(
         Some(bytes),
         CaptureOutput::Capture,
         env,
+        // Content-addressed: `hash-object -w` on the same bytes writes the same
+        // object at the same id, so a replay is idempotent by construction.
+        OnBornDead::Retry,
     )?;
     let s =
         String::from_utf8(stdout).map_err(|source| NotesRepoError::HashObjectNonUtf8 { source })?;
@@ -1142,6 +1242,10 @@ pub enum NotesRepoError {
         args: Vec<String>,
         timeout: Duration,
     },
+    #[error(
+        "git {args:?} was killed before it could report an outcome, and whether it took effect is unknown; not replaying it"
+    )]
+    GitKilledBeforeCompletion { args: Vec<String> },
     #[error(
         "git {args:?} wrote more than the {cap}-byte stdout capture cap; its process group was killed and the output discarded"
     )]

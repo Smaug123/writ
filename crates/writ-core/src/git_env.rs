@@ -31,6 +31,17 @@
 //! the same constant. A recipe that some crates cannot reach is a recipe those
 //! crates will re-type.
 //!
+//! Being *reachable* turned out not to be the same as being *reached*. When this
+//! module was introduced, the sentence above described the guest client as a
+//! consumer while `writ-vm-client`'s four git runners applied no recipe at all —
+//! and every duplication guard passed, because none of them asks whether a given
+//! git spawn is hardened; they ask whether the recipe is spelled out twice. That
+//! is what `a_git_named_helper_must_apply_the_recipe_to_its_own_command` in
+//! `tests/shared_hardening_helpers.rs` now checks, and its doc comment is honest
+//! about remaining a backstop: the durable form of this invariant is a
+//! construction boundary, where a runnable git `Command` cannot be obtained
+//! without the recipe having been applied.
+//!
 //! ## What each variable denies
 //!
 //! * `GIT_CONFIG_NOSYSTEM=1` — `/etc/gitconfig`. Preferred over

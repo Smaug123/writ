@@ -293,7 +293,7 @@ async fn run_clean_git_inner(
             status,
             stdout,
             stderr,
-            ran_nothing: _,
+            born_dead_signature: _,
         } => {
             if status.success() {
                 Ok(stdout)

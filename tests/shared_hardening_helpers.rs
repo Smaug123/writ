@@ -216,6 +216,146 @@ fn only_process_supervisor_kills_process_groups() {
     );
 }
 
+/// Does this source text construct a *process* `Command`?
+///
+/// The naive needle `"Command::new("` also matches this workspace's own wire
+/// types — `VmGitCloneCommand::new`, `VmGitPushCommand::new`,
+/// `VmWorkspaceInitCommand::new` — which are inert request structs that spawn
+/// nothing. Left unfixed it reported eleven such call sites, and a guard whose
+/// output is mostly noise gets an allowlist entry rather than a fix. So the
+/// identifier is resolved and only the real thing counts, under any of the
+/// spellings in use here (`Command`, `std::process::Command`, and the
+/// `StdCommand` alias used where tokio's `Command` is also in scope).
+fn builds_a_process_command(body: &str) -> bool {
+    body.match_indices("Command::new(").any(|(at, _)| {
+        let path_start = body[..at]
+            .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+            .map_or(0, |i| i + 1);
+        let path = &body[path_start..at + "Command".len()];
+        matches!(
+            path.rsplit("::").next(),
+            Some("Command") | Some("StdCommand")
+        )
+    })
+}
+
+/// Does this source text actually *run* the command it built?
+///
+/// A body that constructs a `Command` only to inspect its argv or environment
+/// (several guest tests do exactly that) hardens nothing and needs nothing, so
+/// flagging it would only teach the reader to add allowlist entries.
+fn spawns_it(body: &str) -> bool {
+    [
+        ".output()",
+        ".status()",
+        ".spawn()",
+        "process_spawn::",
+        "run_supervised",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
+/// A helper named after `git` that builds its own process `Command` must apply
+/// the recipe.
+///
+/// The two guards above ask "is the recipe re-typed anywhere?" and "are the raw
+/// constants applied anywhere?". Neither asks the question that actually matters
+/// — *does every git invocation get hardened?* — so both pass cleanly over a
+/// helper that simply never mentions the recipe at all. Several did: two
+/// `git_stdout` test fixtures, a pair of `cat-file` test helpers, and, worse,
+/// four **production** guest-side runners in `writ-vm-client`, which
+/// `git_env`'s own module doc named as a consumer.
+///
+/// Keying on the function name is a heuristic, and a deliberately stated one: it
+/// catches a helper written to run git, which is how every bypass so far was
+/// introduced, and it cannot catch a git spawn inside a differently-named
+/// function. The durable version of this invariant is a construction boundary —
+/// a `CleanGitInvocation` that is the only way to obtain a runnable git
+/// `Command`, so the recipe is applied by the type rather than remembered by the
+/// author. Until that exists, treat this as a backstop, not a proof.
+#[test]
+fn a_git_named_helper_must_apply_the_recipe_to_its_own_command() {
+    const APPLIERS: &[&str] = &["apply_clean_git_config", "apply_git_config_denials"];
+    /// `file::function` pairs that build and run git without calling an applier,
+    /// for a reason recorded here.
+    const EXEMPT: &[&str] = &[
+        // The broker's hardened path, and the closest thing the workspace has to
+        // the construction boundary this guard approximates: the recipe arrives
+        // as already-validated `CleanGitEnv` values carried by the
+        // `CleanGitInvocation` (from `clean_git_config_env`, built from
+        // `CLEAN_GIT_CONFIG_ENV`), with `GIT_CONFIG_REMOVE_ENV` applied
+        // alongside. Hardened by construction rather than by remembering to
+        // call a function — which is why it is the exception and not the gap.
+        "src/clean_git.rs::run_clean_git_inner",
+    ];
+    let mut hits = Vec::new();
+    for path in workspace_rust_sources() {
+        let rel = relative(&path);
+        if rel == THIS_FILE {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (offset, _) in text.match_indices("fn ") {
+            let after = &text[offset + 3..];
+            let name_len = after
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(0);
+            let name = &after[..name_len];
+            if !name.contains("git") {
+                continue;
+            }
+            // Only the *body* matters: a caller that hardens the command before
+            // passing it in is fine, and so is a test asserting on argv.
+            let Some(body_start) = text[offset..].find('{').map(|at| offset + at) else {
+                continue;
+            };
+            let mut depth = 0usize;
+            let mut body_end = None;
+            for (at, ch) in text[body_start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            body_end = Some(body_start + at);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(body_end) = body_end else { continue };
+            let body = &text[body_start..body_end];
+            if !builds_a_process_command(body) || !spawns_it(body) {
+                continue;
+            }
+            if APPLIERS.iter().any(|applier| body.contains(applier)) {
+                continue;
+            }
+            if EXEMPT.contains(&format!("{rel}::{name}").as_str()) {
+                continue;
+            }
+            hits.push(format!(
+                "{rel}: fn {name} builds and runs git without the recipe"
+            ));
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    assert!(
+        hits.is_empty(),
+        "a helper that runs `git` must apply the hardened recipe to the Command \
+         it builds (`writ_core::git_env::apply_clean_git_config`, or \
+         `apply_git_config_denials` where HOME must be left alone). If a helper \
+         genuinely must not be hardened, that is a decision worth writing down \
+         here rather than leaving to the reader.\n  {}",
+        hits.join("\n  ")
+    );
+}
+
 /// `env_clear` must not follow the recipe in the same statement.
 ///
 /// `Command::env_clear` wipes entries already set, so

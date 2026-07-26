@@ -190,7 +190,7 @@ mod tests {
     }
 
     fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
-        let out = std::process::Command::new(program)
+        let out = apply_clean_git_config(&mut std::process::Command::new(program))
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())
