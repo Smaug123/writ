@@ -429,14 +429,58 @@ of the thing it protected.
   `warn!`. (Codex's stated reason — that the binary installs no subscriber — was
   wrong; it calls `telemetry::init("warn")`. The conclusion held.)
 
-**6. The cancellation test took three attempts to become evidence.**
-`!contender.is_finished()` passed with the bug reintroduced; so did a
-sequence-number ordering assertion. Both confused "the contender was correctly
-blocked" with "the contender had not been scheduled yet". Only a *synchronous*
-`try_lock` probe from the test thread — which depends on no scheduling at all —
-actually failed against the bug. Two spawned-contender assertions that looked
-rigorous were worth nothing, which is the sharpest instance yet of the rule that
-a property test never watched to fail is a claim.
+**6. Codex review ran four rounds; nine findings, all valid.** The two locking
+bugs above were found by my own tests; the rest by review. Grouped by what they
+have in common rather than by round:
+
+*Scope mismatches (4).* The shared writ mirror left per-plan; the mutation lock
+covering fetch→read but not the note write; `write_decision_note` missing the
+lock entirely; `run_blocking` releasing the lock on cancellation. Each is the
+same error — a lock whose scope did not match the scope of the thing it
+protected — and the last two are *regressions introduced while fixing the first
+two*.
+
+*Wrong-by-construction evidence (1).* The 32-way concurrency experiment I used
+to justify per-plan locking only ever ran notes-add against notes-add.
+`NotesRepo::fetch_from_remote`'s docstring states the constraint that actually
+mattered — "Git's index / refs / objects writes are not safe under concurrent
+fetch+notes-add into the same destination" — and I had read that file without
+reading that paragraph.
+
+*Resource exhaustion (1).* Waiting on a plan flock parked a `spawn_blocking`
+worker for the length of an agent run, starving the holder of the worker it
+needed to release the lock.
+
+*Model errors (3).* The stage order (below); `decided_at` stamped before a lock
+that now waits; ref existence dropped from the observation, collapsing "never
+touched" into "empty ref left by manual repair".
+
+*Stale surfaces (1).* The `decide` verb's clap help kept advertising the old
+predecessor.
+
+**7. The stage order was wrong, and the options I offered concealed it.** Slice 1
+shipped `decide` → `review`. `2026-05-11-agent-plans.md` specifies the opposite
+three times over, and `submit_implement`'s own docstring cites one of those lines
+as the reason it keeps the review note out of the implementer prompt. The options
+put to the repo owner were derived from the *shipped gate code*, so the design
+doc never entered the decision. Review caught the symptom — the reviewer prompt
+says `# Proposed plan`, which the inverted order turned into a lie — and the
+literal fix on offer was to relabel the prompt, which would have cemented the
+inversion. **Deriving a "principled" choice from current behaviour reproduces
+current behaviour's mistakes.**
+
+**8. Three attempts to test one locking property, two of which proved nothing.**
+`!contender.is_finished()` and a sequence-number ordering assertion both passed
+with the bug deliberately reintroduced: "the contender did not get there" is
+indistinguishable from "the contender was correctly blocked". What worked was
+abandoning concurrency in the test entirely — a synchronous `try_lock` probe for
+cancellation, and for the missing decision-note lock, making the lock
+*unobtainable* and requiring the error. The rule that emerged: **to test that a
+lock is taken, break the lock, not the timing.**
+
+An unreachable error variant sat in the tree for a full round without any gate
+noticing. `clippy` does not warn on one, and it was the only trace that a call
+site had been dropped.
 
 ## Slice 3 has not started
 
