@@ -42,13 +42,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use bailiff::bailiff_decision::{Decider, Decision};
-use bailiff::bailiff_plan_implement::{SubmitImplementInputs, submit_implement};
+use bailiff::bailiff_plan_implement::{
+    SubmitImplementError, SubmitImplementInputs, submit_implement,
+};
 use bailiff::bailiff_plan_note::{
     DecisionNote, PlanId, PlanNote, ReviewNote, plan_notes_ref, plan_review_seed_blob_bytes,
     plan_submission_seed_blob_bytes,
 };
-use bailiff::bailiff_plan_review::{SubmitReviewInputs, submit_review};
-use bailiff::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
+use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
+use bailiff::bailiff_plan_submit::{SubmitPlanError, SubmitPlanInputs, submit_plan};
 use bailiff::bailiff_plan_write::write_decision_note;
 use writ::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
@@ -825,5 +827,237 @@ async fn every_post_open_failure_branch_has_a_trace() {
             .expect_err("an untrusted signer must fail the note write");
         }
         assert_trace(name, &broker.observed().await);
+    }
+}
+
+/// The implementer's post-RPC failures still emit `RunAgent` alone.
+///
+/// Session ownership is the axis slice 3 must model as a DU, and the
+/// happy path alone does not pin it: an interpreter could plausibly
+/// add caller-side `OpenSession`/`CloseSession` cleanup on the *error*
+/// branch only — precisely where a broker-managed session most looks
+/// like it needs tidying up — and every other implement fixture would
+/// stay green.
+#[tokio::test]
+async fn implement_failures_still_own_no_session() {
+    for (name, reply) in [
+        (
+            "implement_run_agent_error",
+            ServerMessage::Error {
+                message: "agent runner unavailable".into(),
+            },
+        ),
+        ("implement_write_note_failure", ServerMessage::SessionClosed),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        // The second case replies with an envelope bailiff will not
+        // accept, so the failure lands in the note write.
+        let reply = match name {
+            "implement_write_note_failure" => writ.untrusted_run_agent_completed(),
+            _ => reply,
+        };
+        let broker = StubBroker::start(vec![reply]).await;
+
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        plant(
+            &bailiff,
+            plan_id,
+            plan_submission_seed_blob_bytes(plan_id),
+            writ.plan_note(plan_id).canonical_bytes(),
+        );
+        plant(
+            &bailiff,
+            plan_id,
+            plan_review_seed_blob_bytes(plan_id),
+            writ.review_note(plan_id).canonical_bytes(),
+        );
+        write_decision_note(
+            &bailiff,
+            &DecisionNote {
+                plan_id,
+                outcome: Decision::Accepted,
+                decider: Decider::try_new("cli:trace").unwrap(),
+                decided_at: UnixMillis::from_millis(1_700_000_000_000),
+            },
+        )
+        .unwrap();
+
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_implement(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            implement_inputs(plan_id),
+        )
+        .await
+        .expect_err("this scenario must fail");
+        assert!(
+            !matches!(err, SubmitImplementError::IllegalTransition { .. }),
+            "the gate must have passed; got {err:?}",
+        );
+
+        assert_trace(name, &broker.observed().await);
+    }
+}
+
+/// Failures *after* the gate but *before* `OpenSession` must still emit
+/// nothing.
+///
+/// `review_refused` only covers exiting at the gate itself. Between the
+/// gate and the session there are two more ways to fail — the planner
+/// envelope not verifying, and the composed prompt exceeding the byte
+/// cap — and an interpreter that opened the session immediately after
+/// the gate would burn an audit row on both while `review_refused`
+/// stayed green.
+#[tokio::test]
+async fn review_failures_before_open_session_emit_nothing() {
+    // Legal state, but the planner envelope does not verify.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![]).await;
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        // The submission note points at the *untrusted* envelope, so
+        // the state is `Submitted` and the gate passes.
+        plant(
+            &bailiff,
+            plan_id,
+            plan_submission_seed_blob_bytes(plan_id),
+            PlanNote {
+                plan_id,
+                purpose: "plan-submit".into(),
+                writ_output_oid: writ.untrusted_oid.clone(),
+                signed_metadata: writ.untrusted_metadata.clone(),
+                signature: writ.untrusted_signature.clone(),
+            }
+            .canonical_bytes(),
+        );
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_review(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            review_inputs(plan_id),
+        )
+        .await
+        .expect_err("an unverifiable planner envelope must fail");
+        assert!(
+            matches!(err, SubmitReviewError::ReadPlanEnvelope(_)),
+            "expected ReadPlanEnvelope, got {err:?}",
+        );
+        assert_trace("review_envelope_unverifiable", &broker.observed().await);
+    }
+
+    // Legal state and a verifiable envelope, but the composed prompt
+    // overflows the cap.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![]).await;
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        plant(
+            &bailiff,
+            plan_id,
+            plan_submission_seed_blob_bytes(plan_id),
+            writ.plan_note(plan_id).canonical_bytes(),
+        );
+        let mut inputs = review_inputs(plan_id);
+        // Just under the cap on its own; over it once the separator and
+        // plan body are appended.
+        inputs.reviewer_instructions =
+            AgentPrompt::try_new("x".repeat(writ::agent_run::MAX_AGENT_PROMPT_BYTES - 16)).unwrap();
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_review(&client, bailiff, &writ.repo_path, allowed_signers(), inputs)
+            .await
+            .expect_err("an oversized composed prompt must fail");
+        assert!(
+            matches!(err, SubmitReviewError::ComposeReviewerPrompt(_)),
+            "expected ComposeReviewerPrompt, got {err:?}",
+        );
+        assert_trace("review_prompt_too_large", &broker.observed().await);
+    }
+}
+
+/// A failing `CloseSession` is the one branch the request trace alone
+/// cannot distinguish, so these assert the *returned error* as well.
+///
+/// The two cases differ in a way an interpreter can easily get
+/// backwards. On the happy path a close failure is the only thing that
+/// went wrong, so it is surfaced. During cleanup after an earlier
+/// failure it is deliberately swallowed, because the original error is
+/// the actionable one. Both emit an identical open→run→close trace, so
+/// only the error variant tells them apart.
+#[tokio::test]
+async fn close_session_failures_surface_the_right_error() {
+    // Happy run, failing close: the close error is what the caller sees.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: stub_session_id(),
+            },
+            writ.run_agent_completed(),
+            ServerMessage::Error {
+                message: "close failed".into(),
+            },
+        ])
+        .await;
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_plan(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            submit_inputs(fixed_plan_id()),
+        )
+        .await
+        .expect_err("a failing close must surface");
+        assert!(
+            matches!(err, SubmitPlanError::CloseSession { .. }),
+            "a close failure on the happy path must surface as CloseSession, got {err:?}",
+        );
+        assert_trace("submit_close_session_error", &broker.observed().await);
+    }
+
+    // Failing run *and* failing close: the run error wins.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: stub_session_id(),
+            },
+            ServerMessage::Error {
+                message: "agent runner unavailable".into(),
+            },
+            ServerMessage::Error {
+                message: "close failed".into(),
+            },
+        ])
+        .await;
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_plan(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            submit_inputs(fixed_plan_id()),
+        )
+        .await
+        .expect_err("the run failure must surface");
+        assert!(
+            matches!(err, SubmitPlanError::RunAgent { .. }),
+            "a cleanup close failure must not replace the original error, got {err:?}",
+        );
+        assert_trace("submit_cleanup_close_error", &broker.observed().await);
     }
 }
