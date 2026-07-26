@@ -1038,3 +1038,100 @@ fn list_refs_under_prefix_surfaces_corruption_as_error() {
         other => panic!("expected corruption-surfaced error, got: {other:?}"),
     }
 }
+
+/// A child that dies before executing anything is retried, not reported.
+///
+/// This is the "phantom SIGKILL" that made the parallel test suite flaky on
+/// macOS: `spawn()` returns a pid whose process is already gone (`getpgid`
+/// reports `ESRCH` microseconds later), so the child produces no output and
+/// never reads stdin. Measured at ~1 spawn in 2000 under the suite's load, it
+/// correlated 1:1 with the failures — zero occurrences in passing runs.
+///
+/// The signature is forged deterministically rather than raced for: the fake
+/// `git` SIGKILLs *itself*, producing no output, on its first invocation only
+/// (recorded with a marker file), then succeeds. Without the retry this fails
+/// with exactly the reported shape, `GitFailed { status: unix_wait_status(9),
+/// stderr: "" }`.
+#[test]
+fn a_child_that_died_before_running_is_retried_not_reported() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("died-once-already");
+    let fake_git = dir.path().join("git");
+    std::fs::write(
+        &fake_git,
+        format!(
+            "#!/bin/sh\nif [ ! -f {m} ]; then : > {m}; kill -9 $$; fi\nprintf survived\n",
+            m = marker.display()
+        ),
+    )
+    .expect("write fake git");
+    let mut perms = std::fs::metadata(&fake_git).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_git, perms).expect("chmod");
+
+    let env = synthetic_env(dir.path().to_str().expect("utf8 tempdir"));
+    let (stdout, _stderr) = run_git_capturing_stderr(
+        dir.path(),
+        ["rev-parse"],
+        None,
+        CaptureOutput::Capture,
+        &env,
+    )
+    .expect("a born-dead child must be retried, not surfaced as GitFailed");
+
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "survived",
+        "the retry must return the successful attempt's output"
+    );
+    assert!(marker.exists(), "the first attempt really did die");
+}
+
+/// The retry is bounded to children that ran *nothing*. A child that produced
+/// output before dying by the same signal is a real failure and is reported —
+/// otherwise the retry would silently re-run commands that had already taken
+/// effect, which is exactly what makes retrying safe here and not elsewhere.
+#[test]
+fn a_child_that_died_after_writing_output_is_reported_not_retried() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let attempts = dir.path().join("attempts");
+    let fake_git = dir.path().join("git");
+    // Always writes to stderr, then SIGKILLs itself: same signal, but it
+    // demonstrably ran, so it must NOT be retried.
+    std::fs::write(
+        &fake_git,
+        format!(
+            "#!/bin/sh\nprintf x >> {a}\nprintf 'did work' 1>&2\nkill -9 $$\n",
+            a = attempts.display()
+        ),
+    )
+    .expect("write fake git");
+    let mut perms = std::fs::metadata(&fake_git).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_git, perms).expect("chmod");
+
+    let env = synthetic_env(dir.path().to_str().expect("utf8 tempdir"));
+    let err = run_git_capturing_stderr(
+        dir.path(),
+        ["rev-parse"],
+        None,
+        CaptureOutput::Capture,
+        &env,
+    )
+    .expect_err("a child that ran and then died must be surfaced");
+
+    assert!(
+        matches!(err, NotesRepoError::GitFailed { .. }),
+        "expected GitFailed, got {err:?}"
+    );
+    let ran = std::fs::read(&attempts).expect("attempts marker");
+    assert_eq!(
+        ran.len(),
+        1,
+        "a child that produced output must be run exactly once, not retried"
+    );
+}

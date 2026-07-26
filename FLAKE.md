@@ -1,11 +1,19 @@
 # Flaky test investigation: git children SIGKILLed under high test parallelism
 
-**Status:** open — narrowed substantially, not yet root-caused. Needs a syscall/signal
-tracer to finish (see [Next step](#next-step-catch-the-signal-sender)).
+**Status:** resolved in the only sense that matters to the suite — the failure is
+recognised and absorbed. The *sender* of the signal is still unnamed, and that is
+now known not to matter. See [Resolution](#resolution-the-child-is-born-dead).
 
 **Severity:** test-harness flake, not a product-correctness bug. It only manifests when
 the test suite runs at high concurrency; the production code paths are not implicated.
-But it does make CI intermittently red, so it must be fixed before we rely on green CI.
+
+> **Caveat on the reproduction below.** `cargo test -p writ --lib` no longer
+> exercises this fault at all: bailiff has since become its own crate, and the
+> `NotesRepo` victims listed under "Symptom" live there now. Use
+> `cargo test --workspace`. At `-p writ --lib` what you will reproduce instead is
+> a *different and unrelated* family of failures — wall-clock deadline misses
+> under CPU oversubscription — which is tracked separately and must not be
+> confused with this one.
 
 ## Symptom
 
@@ -88,17 +96,50 @@ Each of these is backed by a reproduction, not inference:
    which sets no process group of its own (it inherits the test harness's). The kill
    correlates with concurrent `#[tokio::test]` execution.
 
-## Current hypothesis
+## Resolution: the child is born dead
 
-With our kill code ruled out, the `SIGKILL` is coming from **tokio's process
-machinery** (many concurrent `current_thread` runtimes spinning up/down, plus the
-global `SIGCHLD`/reaper handling) or from the **macOS kernel** — i.e. upstream of our
-code. This is **not yet confirmed**; it is the leading theory consistent with all five
-facts above.
+The fault was closed without ever naming the sender, by finding the mark it leaves.
 
-Notably, this means the earlier plan to "harden our `killpg` gaps" would **not** fix it:
-the instrumentation shows there is no gap in our `killpg` being hit. Hardening must wait
-on identifying the actual sender.
+**Immediately after `spawn()` returns a pid, `getpgid(pid)` reports `ESRCH`.** The
+child is gone microseconds after we are handed its pid, before it executes a single
+instruction. Every healthy child reports the harness's process group; only the doomed
+one reports "no such process".
+
+That single fact explains the whole symptom set:
+
+- **Empty stderr** — there was never a running process to write any.
+- **Two error shapes, one fault** — `unix_wait_status(9)` when `wait` reaches the
+  corpse first, `GitStdinWrite`/`BrokenPipe` when the stdin write gets there first.
+- **"A different test each run"** — the constant is the shared `NotesRepo` spawn
+  path, not any test.
+
+**Evidence.** Born-dead children were counted per run: **0 in every passing run**
+(~2264 spawns each), **≥1 in every failing run**. Rate ≈ 1 per 2000 spawns under load.
+
+**Correction to fact 4 above.** Its verdict (our kill code is innocent) is correct,
+but its evidence was void: the instrumentation used `tracing` in test binaries that
+install **no subscriber**, and `eprintln!` from *passing* tests, which libtest
+discards. It could not have printed anything either way. Re-done with an appending
+`write(2)` plus a `DYLD_INTERPOSE` shim on `kill`/`killpg` — which catches senders in
+tokio and every dependency, not just our own call sites — a failing run shows **2023
+spawns, 2022 reaps, zero signals sent in-process**.
+
+Two other candidate explanations were tested and **refuted**: our own supervisor's
+timeout-`killpg` (zero `killpg` calls in the victim's process), and macOS killing
+concurrent execs of the same binary (2400 concurrent `git --version` from the same
+store path, zero kills — consistent with established fact 2's 144k-operation result).
+
+**The fix** (`NotesRepo::run_git_capturing_stderr`) retries on the conjunction
+`SIGKILL && stdout.is_empty() && stderr.is_empty()`. This sidesteps the idempotency
+objection that made "retry on signal" unsafe: it does not assume the *command* may be
+repeated, it establishes that the *child never ran*. A child that ran, produced
+output and was then killed is reported unchanged. Both sides of that boundary are
+pinned by tests in `src/notes_repo/tests.rs`.
+
+**Still unknown, and deliberately not depended upon:** which kernel path discards the
+process. SIP blocks `proc:::signal-send` and the unified log needs privileges. The fix
+recognises, from in-process evidence, that the child ran nothing; it does not guess at
+the cause.
 
 ## Next step: catch the signal sender
 
