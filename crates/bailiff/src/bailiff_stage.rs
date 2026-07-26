@@ -60,12 +60,17 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::JoinError;
 
-use crate::bailiff_plan_note::PlanId;
+use crate::bailiff_plan_note::{
+    PlanId, plan_implement_seed_blob_bytes, plan_review_seed_blob_bytes,
+    plan_submission_seed_blob_bytes,
+};
 use crate::bailiff_plan_read::{
     ReadPlanBodyError, ReadPlanError, SummarizePlanError, read_plan_body_bytes, read_plan_note,
     summarize_plan,
 };
 use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
+pub use crate::bailiff_plan_write::StageNoteTarget;
+use crate::bailiff_plan_write::{WriteStageNoteError, write_stage_note};
 use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
@@ -118,6 +123,23 @@ impl AgentStage {
         }
     }
 
+    /// The deterministic seed blob this stage's note attaches at,
+    /// under [`crate::bailiff_plan_note::plan_notes_ref`]`(plan_id)`.
+    ///
+    /// The four seed families are disjoint by construction, which is
+    /// what lets all of a plan's notes coexist under one ref. Routing
+    /// the three envelope-bearing ones through this projection is what
+    /// lets `write_stage_note` be one function: before slice 3b each
+    /// write helper named its own seed, so the seed and the note body
+    /// were chosen in two places that could disagree.
+    pub fn note_seed(self, plan_id: PlanId) -> Vec<u8> {
+        match self {
+            AgentStage::Submit => plan_submission_seed_blob_bytes(plan_id),
+            AgentStage::Review => plan_review_seed_blob_bytes(plan_id),
+            AgentStage::Implement => plan_implement_seed_blob_bytes(plan_id),
+        }
+    }
+
     /// `Some` iff this stage's prompt splices in a plan body.
     ///
     /// `None` for [`AgentStage::Submit`], which *produces* the plan
@@ -156,6 +178,20 @@ pub enum PlanBodyStage {
     /// The implementer. It acts on a plan that carries an accepted
     /// verdict.
     Implement,
+}
+
+/// Names the stage in operator-facing text — the noun
+/// `WriteStageNoteError` puts in "already recorded for plan …".
+/// Matches the wire words `PlanState` / `PlanStage` use.
+impl std::fmt::Display for AgentStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let word = match self {
+            AgentStage::Submit => "submission",
+            AgentStage::Review => "review",
+            AgentStage::Implement => "implement",
+        };
+        f.write_str(word)
+    }
 }
 
 impl PlanBodyStage {
@@ -466,17 +502,17 @@ pub fn broker_run_agent_request(inputs: StageRunInputs, session: BrokerSession) 
 ///
 /// All six [`OwnedSessionRunError`] variants are reachable from both
 /// callers.
-pub async fn run_under_owned_session<N, W>(
+pub async fn run_under_owned_session(
     client: &WritClient,
     guard: &mut PlanGuard,
     session: OwnedSession,
+    note: StageNoteTarget,
     inputs: StageRunInputs,
-    write_note: W,
-) -> Result<StageRun, OwnedSessionRunError<N>>
-where
-    W: FnOnce(&NotesRepo, &RunAgentCompleted) -> Result<GitObjectId, N> + Send + 'static,
-    N: std::error::Error + Send + 'static,
-{
+) -> Result<StageRun, OwnedSessionRunError> {
+    // The same `purpose` and output ref go to writ and onto the note.
+    let purpose = inputs.purpose.clone();
+    let writ_output_ref = inputs.writ_output_ref.clone();
+
     let session_id = client
         .open_session(session.label, session.agent_kind, session.agent_model)
         .await
@@ -510,7 +546,9 @@ where
 
     let completed_for_write = completed.clone();
     let write_outcome = guard
-        .run_blocking(move |repo| write_note(repo, &completed_for_write))
+        .run_blocking(move |repo| {
+            write_stage_note(repo, &note, &writ_output_ref, purpose, &completed_for_write)
+        })
         .await;
     let note_oid = match write_outcome {
         Ok(Ok(note_oid)) => note_oid,
@@ -542,7 +580,7 @@ where
 /// *attempted*. [`Self::CloseSession`] is the one variant where the
 /// close itself failed, so the session may still be open.
 #[derive(Debug, Error)]
-pub enum OwnedSessionRunError<N: std::error::Error + 'static> {
+pub enum OwnedSessionRunError {
     /// The initial `OpenSession` RPC failed. Nothing to clean up.
     #[error("opening writ session failed: {0}")]
     OpenSession(#[source] WritClientError),
@@ -574,7 +612,7 @@ pub enum OwnedSessionRunError<N: std::error::Error + 'static> {
     WriteNote {
         session_id: SessionId,
         #[source]
-        source: N,
+        source: WriteStageNoteError,
     },
     /// The `spawn_blocking` task owning the note write panicked or was
     /// cancelled. A tokio-runtime condition, not a contract violation.
@@ -607,17 +645,16 @@ pub enum OwnedSessionRunError<N: std::error::Error + 'static> {
 ///
 /// All three [`BrokerSessionRunError`] variants are reachable from its
 /// one caller.
-pub async fn run_under_broker_session<N, W>(
+pub async fn run_under_broker_session(
     client: &WritClient,
     guard: &mut PlanGuard,
     session: BrokerSession,
+    note: StageNoteTarget,
     inputs: StageRunInputs,
-    write_note: W,
-) -> Result<StageRun, BrokerSessionRunError<N>>
-where
-    W: FnOnce(&NotesRepo, &RunAgentCompleted) -> Result<GitObjectId, N> + Send + 'static,
-    N: std::error::Error + Send + 'static,
-{
+) -> Result<StageRun, BrokerSessionRunError> {
+    let purpose = inputs.purpose.clone();
+    let writ_output_ref = inputs.writ_output_ref.clone();
+
     let completed = client
         .run_agent(broker_run_agent_request(inputs, session))
         .await
@@ -626,7 +663,9 @@ where
 
     let completed_for_write = completed.clone();
     let note_oid = guard
-        .run_blocking(move |repo| write_note(repo, &completed_for_write))
+        .run_blocking(move |repo| {
+            write_stage_note(repo, &note, &writ_output_ref, purpose, &completed_for_write)
+        })
         .await
         .map_err(|source| BrokerSessionRunError::WriteTaskFailed { session_id, source })?
         .map_err(|source| BrokerSessionRunError::WriteNote { session_id, source })?;
@@ -645,7 +684,7 @@ where
 /// The broker-side session is already closed by the time any variant
 /// returns.
 #[derive(Debug, Error)]
-pub enum BrokerSessionRunError<N: std::error::Error + 'static> {
+pub enum BrokerSessionRunError {
     /// The `RunAgent` RPC failed. No session id is available — the VM
     /// arm mints its own and closes it before returning — and no
     /// caller-side cleanup is needed.
@@ -658,7 +697,7 @@ pub enum BrokerSessionRunError<N: std::error::Error + 'static> {
     WriteNote {
         session_id: SessionId,
         #[source]
-        source: N,
+        source: WriteStageNoteError,
     },
     /// The `spawn_blocking` task owning the note write panicked or was
     /// cancelled. A tokio-runtime condition, not a contract violation.

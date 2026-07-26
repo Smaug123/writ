@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6467d2f48b94e4aa8da94ec205a8827b37fb40749dd2c8eaf4758877f58228b6 # shrinks to stage_index = 0, payload = Payload { stdout: [], stderr: [], prompt: [213, 160, 67, 59, 161], capabilities: [WorkspaceRead { repo: RepoRef { owner: "-86-f0x-q9f_", name: "ya__..u8" } }, WorkspaceRead { repo: RepoRef { owner: "a_----_-", name: "_0_sx-2_" } }], exit_code: -997567127, completed_at_millis: 8109538695546630849 }

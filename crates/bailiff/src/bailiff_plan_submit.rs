@@ -44,11 +44,12 @@ use tokio::task::JoinError;
 use crate::bailiff_plan_note::PlanId;
 use crate::bailiff_plan_read::SummarizePlanError;
 use crate::bailiff_plan_state::IllegalTransition;
-use crate::bailiff_plan_write::{WritePlanNoteError, write_plan_note};
+
+use crate::bailiff_plan_write::WriteStageNoteError;
 use crate::bailiff_repo_guard::PlanGuardError;
 use crate::bailiff_stage::{
-    AgentStage, OpenPlanStageError, OwnedSession, OwnedSessionRunError, StageRunInputs,
-    open_plan_stage, run_under_owned_session,
+    AgentStage, OpenPlanStageError, OwnedSession, OwnedSessionRunError, StageNoteTarget,
+    StageRunInputs, open_plan_stage, run_under_owned_session,
 };
 use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
@@ -80,7 +81,7 @@ pub struct SubmitPlanInputs {
     /// this is always `refs/notes/writ/v1/agent-outputs`; surfacing
     /// it as a parameter (rather than a constant) keeps the function
     /// honest about the same ref bailiff later passes to
-    /// [`write_plan_note`].
+    /// [`crate::bailiff_plan_write::write_stage_note`].
     pub writ_output_ref: NotesRef,
     /// Optional human-readable session label. Stored on writ's audit
     /// session row; informational only.
@@ -158,9 +159,6 @@ pub async fn submit_plan(
     let mut guard =
         open_plan_stage(bailiff_repo, plan_id, AgentStage::Submit.precondition()).await?;
 
-    let writ_repo_path = writ_repo_path.to_path_buf();
-    let writ_output_ref = inputs.writ_output_ref.clone();
-    let purpose = inputs.purpose.clone();
     let stage = run_under_owned_session(
         client,
         &mut guard,
@@ -169,22 +167,17 @@ pub async fn submit_plan(
             agent_kind: inputs.session_agent_kind,
             agent_model: inputs.session_agent_model,
         },
+        StageNoteTarget {
+            stage: AgentStage::Submit,
+            plan_id,
+            writ_repo_path: writ_repo_path.to_path_buf(),
+            allowed_signers,
+        },
         StageRunInputs {
             prompt: inputs.prompt,
             capabilities: inputs.capabilities,
             purpose: inputs.purpose,
             writ_output_ref: inputs.writ_output_ref,
-        },
-        move |repo, completed| {
-            write_plan_note(
-                repo,
-                &writ_repo_path,
-                &writ_output_ref,
-                plan_id,
-                purpose,
-                completed,
-                &allowed_signers,
-            )
         },
     )
     .await?;
@@ -217,8 +210,8 @@ impl From<OpenPlanStageError> for SubmitPlanError {
 
 /// Total map from the owned-session run phase's failures onto this
 /// workflow's. See [`From<OpenPlanStageError>`](SubmitPlanError).
-impl From<OwnedSessionRunError<WritePlanNoteError>> for SubmitPlanError {
-    fn from(source: OwnedSessionRunError<WritePlanNoteError>) -> Self {
+impl From<OwnedSessionRunError> for SubmitPlanError {
+    fn from(source: OwnedSessionRunError) -> Self {
         match source {
             OwnedSessionRunError::OpenSession(source) => Self::OpenSession(source),
             OwnedSessionRunError::RunAgent { session_id, source } => {
@@ -303,7 +296,7 @@ pub enum SubmitPlanError {
     WritePlanNote {
         session_id: SessionId,
         #[source]
-        source: WritePlanNoteError,
+        source: WriteStageNoteError,
     },
     /// The `spawn_blocking` task that owns the `write_plan_note`
     /// call panicked or was cancelled. Surfaces separately from
@@ -372,7 +365,7 @@ mod end_to_end_tests {
     use super::*;
     use crate::bailiff_plan_note::{PlanNote, plan_notes_ref};
     use crate::bailiff_plan_state::{PlanStage, PlanState};
-    use crate::bailiff_plan_write::FetchVerifyError;
+    use crate::bailiff_plan_write::{FetchVerifyError, WriteStageNoteError};
     use writ::audit::AuditLog;
     use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
     use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
@@ -729,7 +722,7 @@ mod end_to_end_tests {
         let session_id = match &err {
             SubmitPlanError::WritePlanNote {
                 session_id,
-                source: WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(_)),
+                source: WriteStageNoteError::FetchVerify(FetchVerifyError::Verify(_)),
             } => *session_id,
             other => panic!("expected WritePlanNote{{Verify}}, got {other:?}"),
         };

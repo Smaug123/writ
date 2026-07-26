@@ -192,81 +192,123 @@ pub fn plan_implement_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
     format!("{plan_id}::implement").into_bytes()
 }
 
-/// A bailiff-owned attestation that writ ran an agent for `plan_id`
-/// and produced the signed output reachable at `writ_output_oid` in
-/// writ's repo. Stored as the body of one note under
-/// [`plan_notes_ref`].
+/// Define one envelope-bearing stage note body.
 ///
-/// What this carries:
-/// - `plan_id`: bailiff's identifier for the workflow.
-/// - `purpose`: the opaque tag bailiff sent on `RunAgent`; recorded
-///   verbatim for cross-correlation with writ's audit row.
-/// - `writ_output_oid`: the *notes-target* OID inside writ's
-///   `refs/notes/writ/v1/agent-outputs` ref — a per-run seed object
-///   the writ-side `RunAgent` handler hashed from the run id. The
-///   signed envelope itself lives in the *note body* attached at
-///   this target (per slice B's "envelope in note body, not a
-///   separate blob" decision), so a reader fetches
-///   `refs/notes/writ/v1/agent-outputs` into bailiff's repo and runs
-///   `git notes --ref=refs/notes/writ/v1/agent-outputs show
-///   <writ_output_oid>` to retrieve the envelope bytes. `cat-file
-///   <writ_output_oid>` returns the seed object, not the envelope.
-/// - `signed_metadata`: the full `SignedRunMetadata` writ returned.
-///   Carries the originating prompt hash, output envelope hash,
-///   granted capabilities, exit code, completion time, session id,
-///   and the fingerprint of writ's signing key.
-/// - `signature`: detached SSH signature over `signed_metadata`'s
-///   canonical bytes. Verifies against the keyring entry resolved by
-///   `signed_metadata.signing_key_fingerprint`.
+/// The submission, review, and implement notes are field-for-field
+/// identical — same five fields, same `deny_unknown_fields`, same
+/// canonicalisation, same one-variant parse error. Before slice 3b
+/// that was three hand-written copies of each, which is three places
+/// for a schema change to land and two places for it to be forgotten.
 ///
-/// The prompt hash and output envelope hash live in
-/// `signed_metadata` (writ signed them), so the plan note does not
-/// duplicate them at the top level — a verifier reads the metadata
-/// to learn them.
+/// They stay **three distinct types** rather than collapsing into one,
+/// and that is deliberate: [`crate::bailiff_plan_read::read_plan_body_bytes`]
+/// takes the *submission* note specifically, because its body is what
+/// gets spliced into the reviewer's and implementer's prompts. Under a
+/// single shared type, handing it the review note would compile, and
+/// the implementer would receive the review as its approved plan. The
+/// macro removes the duplication at the source; the type system keeps
+/// the distinction at the call sites.
 ///
-/// `deny_unknown_fields` catches an unexpected key at parse time
-/// rather than silently dropping it. A future field addition is a
-/// schema bump (`v1` → `v2` in the ref prefix); silently accepting
-/// extra fields would let a writer-side regression sneak past the
-/// reader.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanNote {
-    pub plan_id: PlanId,
-    pub purpose: String,
-    pub writ_output_oid: GitObjectId,
-    pub signed_metadata: SignedRunMetadata,
-    pub signature: SshSignature,
+/// Follows `plan_enum!` in `bailiff_plan_state.rs`, and slice 1's
+/// recorded lesson behind it: emit the family from one definition so
+/// its members cannot disagree.
+macro_rules! stage_note {
+    (
+        $(#[$doc:meta])*
+        $Note:ident,
+        $Err:ident,
+        $serialise_expect:literal,
+        $parse_error:literal $(,)?
+    ) => {
+        $(#[$doc])*
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct $Note {
+            pub plan_id: PlanId,
+            pub purpose: String,
+            pub writ_output_oid: GitObjectId,
+            pub signed_metadata: SignedRunMetadata,
+            pub signature: SshSignature,
+        }
+
+        impl $Note {
+            /// Canonical byte representation of the note body. Compact
+            /// JSON (no whitespace) with keys emitted in
+            /// struct-declaration order — the same canonicalisation
+            /// `SignedRunMetadata::canonical_bytes` uses, so a reader
+            /// can rely on identical parse/re-emit semantics across
+            /// both layers.
+            ///
+            /// The bytes returned here are what gets written as the
+            /// body of the git note. They are *not* covered by writ's
+            /// signature — writ signs only `signed_metadata`'s
+            /// canonical bytes; the note's framing (this struct) is
+            /// bailiff's own.
+            pub fn canonical_bytes(&self) -> Vec<u8> {
+                serde_json::to_vec(self).expect($serialise_expect)
+            }
+
+            /// Inverse of [`Self::canonical_bytes`]. Fails on
+            /// malformed JSON, on any unknown top-level field
+            /// (`deny_unknown_fields`), or on any nested validation
+            /// error from the field types ([`PlanId`],
+            /// [`GitObjectId`], [`SshSignature`],
+            /// [`SignedRunMetadata`]).
+            pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, $Err> {
+                serde_json::from_slice(bytes).map_err($Err::Json)
+            }
+        }
+
+        #[derive(Debug, thiserror::Error)]
+        pub enum $Err {
+            #[error($parse_error)]
+            Json(#[source] serde_json::Error),
+        }
+    };
 }
 
-impl PlanNote {
-    /// Canonical byte representation of the note body. Compact JSON
-    /// (no whitespace) with keys emitted in struct-declaration order
-    /// — the same canonicalisation `SignedRunMetadata::canonical_bytes`
-    /// uses, so a reader can rely on identical parse/re-emit
-    /// semantics across both layers.
+stage_note! {
+    /// A bailiff-owned attestation that writ ran an agent for `plan_id`
+    /// and produced the signed output reachable at `writ_output_oid` in
+    /// writ's repo. Stored as the body of one note under
+    /// [`plan_notes_ref`].
     ///
-    /// The bytes returned here are what gets written as the body of
-    /// the git note. They are *not* covered by writ's signature —
-    /// writ signs only `signed_metadata`'s canonical bytes; the
-    /// note's framing (this struct) is bailiff's own.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("PlanNote serialises to JSON without IO; cannot fail")
-    }
-
-    /// Inverse of [`Self::canonical_bytes`]. Fails on malformed JSON,
-    /// on any unknown top-level field (`deny_unknown_fields`), or on
-    /// any nested validation error from the field types (`PlanId`,
-    /// `GitObjectId`, `SshSignature`, `SignedRunMetadata`).
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, PlanNoteParseError> {
-        serde_json::from_slice(bytes).map_err(PlanNoteParseError::Json)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PlanNoteParseError {
-    #[error("plan-note body is not valid canonical JSON: {0}")]
-    Json(#[source] serde_json::Error),
+    /// What this carries:
+    /// - `plan_id`: bailiff's identifier for the workflow.
+    /// - `purpose`: the opaque tag bailiff sent on `RunAgent`; recorded
+    ///   verbatim for cross-correlation with writ's audit row.
+    /// - `writ_output_oid`: the *notes-target* OID inside writ's
+    ///   `refs/notes/writ/v1/agent-outputs` ref — a per-run seed object
+    ///   the writ-side `RunAgent` handler hashed from the run id. The
+    ///   signed envelope itself lives in the *note body* attached at
+    ///   this target (per slice B's "envelope in note body, not a
+    ///   separate blob" decision), so a reader fetches
+    ///   `refs/notes/writ/v1/agent-outputs` into bailiff's repo and runs
+    ///   `git notes --ref=refs/notes/writ/v1/agent-outputs show
+    ///   <writ_output_oid>` to retrieve the envelope bytes. `cat-file
+    ///   <writ_output_oid>` returns the seed object, not the envelope.
+    /// - `signed_metadata`: the full `SignedRunMetadata` writ returned.
+    ///   Carries the originating prompt hash, output envelope hash,
+    ///   granted capabilities, exit code, completion time, session id,
+    ///   and the fingerprint of writ's signing key.
+    /// - `signature`: detached SSH signature over `signed_metadata`'s
+    ///   canonical bytes. Verifies against the keyring entry resolved by
+    ///   `signed_metadata.signing_key_fingerprint`.
+    ///
+    /// The prompt hash and output envelope hash live in
+    /// `signed_metadata` (writ signed them), so the plan note does not
+    /// duplicate them at the top level — a verifier reads the metadata
+    /// to learn them.
+    ///
+    /// `deny_unknown_fields` catches an unexpected key at parse time
+    /// rather than silently dropping it. A future field addition is a
+    /// schema bump (`v1` → `v2` in the ref prefix); silently accepting
+    /// extra fields would let a writer-side regression sneak past the
+    /// reader.
+    PlanNote,
+    PlanNoteParseError,
+    "PlanNote serialises to JSON without IO; cannot fail",
+    "plan-note body is not valid canonical JSON: {0}",
 }
 
 /// A bailiff-owned record of one operator verdict on `plan_id`.
@@ -346,179 +388,112 @@ pub enum DecisionNoteParseError {
     Json(#[source] serde_json::Error),
 }
 
-/// A bailiff-owned attestation that writ ran a reviewer agent against
-/// `plan_id` and produced the signed output reachable at
-/// `writ_output_oid` in writ's repo. Stored as the body of one note
-/// under [`plan_notes_ref`] at the seed OID derived from
-/// [`plan_review_seed_blob_bytes`] — distinct from both the [`PlanNote`]
-/// (submission) and [`DecisionNote`] (verdict) targets, so all three
-/// notes coexist under one per-plan ref.
-///
-/// What this carries:
-/// - `plan_id`: bailiff's identifier for the workflow this review
-///   applies to. The same id whose [`PlanNote`] lives next door under
-///   the same notes ref.
-/// - `purpose`: the opaque tag bailiff sent on `RunAgent`. Recorded
-///   verbatim for cross-correlation with writ's audit row.
-/// - `writ_output_oid`: notes-target OID inside writ's
-///   `refs/notes/writ/v1/agent-outputs` ref — the per-run seed object
-///   writ-side `RunAgent` hashed from the reviewer run id. The signed
-///   envelope (carrying the reviewer's prose stdout) lives in the
-///   *note body* attached at this target, per slice B's "envelope in
-///   note body" decision.
-/// - `signed_metadata`: the full [`SignedRunMetadata`] writ returned
-///   for the reviewer run. Carries the prompt hash, output envelope
-///   hash, granted capabilities, exit code, completion time, session
-///   id, and the fingerprint of writ's signing key.
-/// - `signature`: detached SSH signature over `signed_metadata`'s
-///   canonical bytes. Verifies against the keyring entry resolved by
-///   `signed_metadata.signing_key_fingerprint`.
-///
-/// Field-for-field identical to [`PlanNote`] — the two carry the same
-/// shape because both are "writ ran an agent for this plan and signed
-/// the result" attestations. They are kept as parallel types rather
-/// than unified under a shared struct so a future schema bump on one
-/// (e.g. a structured verdict field on `ReviewNote`) does not force
-/// a parallel migration on the other. See
-/// `docs/plans/2026-05-16-slice-d2-review.md` §"Risks and tradeoffs."
-///
-/// **D2 ships unsigned.** Same as [`PlanNote`] and [`DecisionNote`]:
-/// the parent split doc defers bailiff's own signing primitives.
-/// Writ's submission signature on the embedded envelope remains the
-/// trust anchor for the reviewer run.
-///
-/// **D2 is idempotent.** The write helper rejects a second review for
-/// the same plan id rather than silently overwriting. Multi-review
-/// history is the documented `v1` → `v2` ref-prefix migration; the
-/// seed-OID convention pinned by [`plan_review_seed_blob_bytes`] is
-/// the migration target.
-///
-/// `deny_unknown_fields` catches an unexpected key at parse time
-/// rather than silently dropping it. Same defence the sibling notes
-/// use: a future field addition is a schema bump (`v1` → `v2` in the
-/// ref prefix); silently accepting extra fields would let a
-/// writer-side regression sneak past the reader.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewNote {
-    pub plan_id: PlanId,
-    pub purpose: String,
-    pub writ_output_oid: GitObjectId,
-    pub signed_metadata: SignedRunMetadata,
-    pub signature: SshSignature,
-}
-
-impl ReviewNote {
-    /// Canonical byte representation of the note body. Compact JSON
-    /// (no whitespace) with keys emitted in struct-declaration order
-    /// — the same canonicalisation [`PlanNote::canonical_bytes`] and
-    /// [`DecisionNote::canonical_bytes`] use, so a reader can
-    /// re-compute the canonical form locally and compare.
+stage_note! {
+    /// A bailiff-owned attestation that writ ran a reviewer agent against
+    /// `plan_id` and produced the signed output reachable at
+    /// `writ_output_oid` in writ's repo. Stored as the body of one note
+    /// under [`plan_notes_ref`] at the seed OID derived from
+    /// [`plan_review_seed_blob_bytes`] — distinct from both the [`PlanNote`]
+    /// (submission) and [`DecisionNote`] (verdict) targets, so all three
+    /// notes coexist under one per-plan ref.
     ///
-    /// The bytes returned here are what gets written as the body of
-    /// the git note. They are *not* covered by writ's signature —
-    /// writ signs only `signed_metadata`'s canonical bytes; the
-    /// note's framing (this struct) is bailiff's own.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("ReviewNote serialises to JSON without IO; cannot fail")
-    }
-
-    /// Inverse of [`Self::canonical_bytes`]. Fails on malformed JSON,
-    /// on any unknown top-level field (`deny_unknown_fields`), or on
-    /// any nested validation error from the field types ([`PlanId`],
-    /// [`GitObjectId`], [`SshSignature`], [`SignedRunMetadata`]).
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ReviewNoteParseError> {
-        serde_json::from_slice(bytes).map_err(ReviewNoteParseError::Json)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ReviewNoteParseError {
-    #[error("review-note body is not valid canonical JSON: {0}")]
-    Json(#[source] serde_json::Error),
-}
-
-/// A bailiff-owned attestation that writ ran an implementer agent
-/// against (the accepted) `plan_id` and produced the signed output
-/// reachable at `writ_output_oid` in writ's repo. Stored as the body
-/// of one note under [`plan_notes_ref`] at the seed OID derived from
-/// [`plan_implement_seed_blob_bytes`] — distinct from the three
-/// older targets (submission, decision, review) so all four notes
-/// coexist under one per-plan ref.
-///
-/// What this carries: same field set as [`PlanNote`] and
-/// [`ReviewNote`] — `plan_id`, `purpose`, `writ_output_oid`,
-/// `signed_metadata`, `signature`. The implementer's effect on the
-/// workspace is *not* part of this note: those mutations flow
-/// through writ's git-push staging pipeline (existing infrastructure)
-/// and are observable via the resulting branch / PR. This note is
-/// the audit trail for the agent run itself.
-///
-/// Field-for-field identical to [`PlanNote`] / [`ReviewNote`] — all
-/// three carry the same shape because all three are "writ ran an
-/// agent for this plan and signed the result" attestations. They are
-/// kept as parallel types rather than unified under a shared struct
-/// so a future schema bump on one (e.g. a structured side-effect
-/// field on `ImplementNote` recording the branch the agent pushed)
-/// does not force a parallel migration on the others. Same rationale
-/// `ReviewNote`'s docstring records, repeated here so the rule is
-/// visible at each declaration site.
-///
-/// **Slice E ships unsigned by bailiff.** Same as the older three
-/// notes: writ's submission signature on the embedded envelope is the
-/// trust anchor for the implementer run. The parent split doc defers
-/// bailiff's own signing primitives.
-///
-/// **Slice E is idempotent.** The write helper rejects a second
-/// implement for the same plan id rather than silently overwriting.
-/// Multi-implement history is the documented `v1` → `v2` ref-prefix
-/// migration; the seed-OID convention pinned by
-/// [`plan_implement_seed_blob_bytes`] is the migration target.
-///
-/// `deny_unknown_fields` catches an unexpected key at parse time
-/// rather than silently dropping it. Same defence the sibling notes
-/// use: a future field addition is a schema bump (`v1` → `v2` in the
-/// ref prefix); silently accepting extra fields would let a
-/// writer-side regression sneak past the reader.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementNote {
-    pub plan_id: PlanId,
-    pub purpose: String,
-    pub writ_output_oid: GitObjectId,
-    pub signed_metadata: SignedRunMetadata,
-    pub signature: SshSignature,
-}
-
-impl ImplementNote {
-    /// Canonical byte representation of the note body. Compact JSON
-    /// (no whitespace) with keys emitted in struct-declaration order
-    /// — the same canonicalisation [`PlanNote::canonical_bytes`],
-    /// [`DecisionNote::canonical_bytes`], and
-    /// [`ReviewNote::canonical_bytes`] use, so a reader can re-compute
-    /// the canonical form locally and compare.
+    /// What this carries:
+    /// - `plan_id`: bailiff's identifier for the workflow this review
+    ///   applies to. The same id whose [`PlanNote`] lives next door under
+    ///   the same notes ref.
+    /// - `purpose`: the opaque tag bailiff sent on `RunAgent`. Recorded
+    ///   verbatim for cross-correlation with writ's audit row.
+    /// - `writ_output_oid`: notes-target OID inside writ's
+    ///   `refs/notes/writ/v1/agent-outputs` ref — the per-run seed object
+    ///   writ-side `RunAgent` hashed from the reviewer run id. The signed
+    ///   envelope (carrying the reviewer's prose stdout) lives in the
+    ///   *note body* attached at this target, per slice B's "envelope in
+    ///   note body" decision.
+    /// - `signed_metadata`: the full [`SignedRunMetadata`] writ returned
+    ///   for the reviewer run. Carries the prompt hash, output envelope
+    ///   hash, granted capabilities, exit code, completion time, session
+    ///   id, and the fingerprint of writ's signing key.
+    /// - `signature`: detached SSH signature over `signed_metadata`'s
+    ///   canonical bytes. Verifies against the keyring entry resolved by
+    ///   `signed_metadata.signing_key_fingerprint`.
     ///
-    /// The bytes returned here are what gets written as the body of
-    /// the git note. They are *not* covered by writ's signature —
-    /// writ signs only `signed_metadata`'s canonical bytes; the
-    /// note's framing (this struct) is bailiff's own.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("ImplementNote serialises to JSON without IO; cannot fail")
-    }
-
-    /// Inverse of [`Self::canonical_bytes`]. Fails on malformed JSON,
-    /// on any unknown top-level field (`deny_unknown_fields`), or on
-    /// any nested validation error from the field types ([`PlanId`],
-    /// [`GitObjectId`], [`SshSignature`], [`SignedRunMetadata`]).
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ImplementNoteParseError> {
-        serde_json::from_slice(bytes).map_err(ImplementNoteParseError::Json)
-    }
+    /// Field-for-field identical to [`PlanNote`] — the two carry the same
+    /// shape because both are "writ ran an agent for this plan and signed
+    /// the result" attestations. They are kept as parallel types rather
+    /// than unified under a shared struct so a future schema bump on one
+    /// (e.g. a structured verdict field on `ReviewNote`) does not force
+    /// a parallel migration on the other. See
+    /// `docs/plans/2026-05-16-slice-d2-review.md` §"Risks and tradeoffs."
+    ///
+    /// **D2 ships unsigned.** Same as [`PlanNote`] and [`DecisionNote`]:
+    /// the parent split doc defers bailiff's own signing primitives.
+    /// Writ's submission signature on the embedded envelope remains the
+    /// trust anchor for the reviewer run.
+    ///
+    /// **D2 is idempotent.** The write helper rejects a second review for
+    /// the same plan id rather than silently overwriting. Multi-review
+    /// history is the documented `v1` → `v2` ref-prefix migration; the
+    /// seed-OID convention pinned by [`plan_review_seed_blob_bytes`] is
+    /// the migration target.
+    ///
+    /// `deny_unknown_fields` catches an unexpected key at parse time
+    /// rather than silently dropping it. Same defence the sibling notes
+    /// use: a future field addition is a schema bump (`v1` → `v2` in the
+    /// ref prefix); silently accepting extra fields would let a
+    /// writer-side regression sneak past the reader.
+    ReviewNote,
+    ReviewNoteParseError,
+    "ReviewNote serialises to JSON without IO; cannot fail",
+    "review-note body is not valid canonical JSON: {0}",
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ImplementNoteParseError {
-    #[error("implement-note body is not valid canonical JSON: {0}")]
-    Json(#[source] serde_json::Error),
+stage_note! {
+    /// A bailiff-owned attestation that writ ran an implementer agent
+    /// against (the accepted) `plan_id` and produced the signed output
+    /// reachable at `writ_output_oid` in writ's repo. Stored as the body
+    /// of one note under [`plan_notes_ref`] at the seed OID derived from
+    /// [`plan_implement_seed_blob_bytes`] — distinct from the three
+    /// older targets (submission, decision, review) so all four notes
+    /// coexist under one per-plan ref.
+    ///
+    /// What this carries: same field set as [`PlanNote`] and
+    /// [`ReviewNote`] — `plan_id`, `purpose`, `writ_output_oid`,
+    /// `signed_metadata`, `signature`. The implementer's effect on the
+    /// workspace is *not* part of this note: those mutations flow
+    /// through writ's git-push staging pipeline (existing infrastructure)
+    /// and are observable via the resulting branch / PR. This note is
+    /// the audit trail for the agent run itself.
+    ///
+    /// Field-for-field identical to [`PlanNote`] / [`ReviewNote`] — all
+    /// three carry the same shape because all three are "writ ran an
+    /// agent for this plan and signed the result" attestations. They are
+    /// kept as parallel types rather than unified under a shared struct
+    /// so a future schema bump on one (e.g. a structured side-effect
+    /// field on `ImplementNote` recording the branch the agent pushed)
+    /// does not force a parallel migration on the others. Same rationale
+    /// `ReviewNote`'s docstring records, repeated here so the rule is
+    /// visible at each declaration site.
+    ///
+    /// **Slice E ships unsigned by bailiff.** Same as the older three
+    /// notes: writ's submission signature on the embedded envelope is the
+    /// trust anchor for the implementer run. The parent split doc defers
+    /// bailiff's own signing primitives.
+    ///
+    /// **Slice E is idempotent.** The write helper rejects a second
+    /// implement for the same plan id rather than silently overwriting.
+    /// Multi-implement history is the documented `v1` → `v2` ref-prefix
+    /// migration; the seed-OID convention pinned by
+    /// [`plan_implement_seed_blob_bytes`] is the migration target.
+    ///
+    /// `deny_unknown_fields` catches an unexpected key at parse time
+    /// rather than silently dropping it. Same defence the sibling notes
+    /// use: a future field addition is a schema bump (`v1` → `v2` in the
+    /// ref prefix); silently accepting extra fields would let a
+    /// writer-side regression sneak past the reader.
+    ImplementNote,
+    ImplementNoteParseError,
+    "ImplementNote serialises to JSON without IO; cannot fail",
+    "implement-note body is not valid canonical JSON: {0}",
 }
 
 /// Reasons [`plan_notes_ref`] would fail to construct a
@@ -1312,6 +1287,98 @@ mod tests {
             signature,
         };
         assert_eq!(plan.canonical_bytes(), implement.canonical_bytes());
+        assert_eq!(review.canonical_bytes(), implement.canonical_bytes());
+    }
+
+    /// A note whose every field is fixed, so its canonical bytes are
+    /// too. Distinct from `sample_plan_note`, which mints fresh ids.
+    fn golden_fields() -> (PlanId, GitObjectId, SignedRunMetadata, SshSignature) {
+        let plan_id = PlanId::from_uuid("11111111-2222-4333-8444-555555555555".parse().unwrap());
+        let metadata = SignedRunMetadata {
+            run_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                .parse::<AgentRunId>()
+                .unwrap(),
+            session_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+                .parse::<SessionId>()
+                .unwrap(),
+            prompt_sha256: sample_sha256('a'),
+            output_envelope_sha256: sample_sha256('b'),
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: sample_repo(),
+            }],
+            exit_code: 0,
+            completed_at: UnixMillis::from_millis(1_700_000_000_000),
+            signing_key_fingerprint: sample_ssh_fingerprint(),
+        };
+        (plan_id, sample_output_oid(), metadata, sample_signature())
+    }
+
+    /// The exact bytes a stage note serialises to, checked in as a
+    /// literal.
+    ///
+    /// The round-trip tests elsewhere in this module write and read
+    /// with the *same* code, so they pass unchanged through a wire
+    /// format change — and a wire format change orphans every note
+    /// already in an operator's repo, which for an append-only audit
+    /// substrate is the expensive kind of mistake.
+    ///
+    /// Complements `*_canonical_bytes_pin_field_order`, which pins the
+    /// *positions* of the five top-level keys and deliberately stops
+    /// there ("leaving inner-value canonicalisation to each field
+    /// type's own round-trip test"). That leaves a gap this closes: a
+    /// serde rename inside `SignedRunMetadata`, a changed number
+    /// format, or a stray space keeps every key in its position and
+    /// still rewrites the bytes on disk.
+    ///
+    /// Slice 3b generated the three note types from one macro; this
+    /// pins that the generated form is byte-identical to the three
+    /// hand-written ones it replaced.
+    #[test]
+    fn stage_note_canonical_bytes_are_the_checked_in_wire_form() {
+        const GOLDEN: &str = "{\"plan_id\":\"11111111-2222-4333-8444-555555555555\",\"purpose\":\"plan-stage\",\"writ_output_oid\":\"cccccccccccccccccccccccccccccccccccccccc\",\"signed_metadata\":{\"run_id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"session_id\":\"3f2504e0-4f89-41d3-9a0c-0305e82c3301\",\"prompt_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"output_envelope_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"capabilities\":[{\"kind\":\"workspace_read\",\"repo\":\"smaug123/writ\"}],\"exit_code\":0,\"completed_at\":1700000000000,\"signing_key_fingerprint\":\"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"signature\":\"-----BEGIN SSH SIGNATURE-----\\nU1NIU0lHAAAAAQ...\\n-----END SSH SIGNATURE-----\"}";
+        let (plan_id, writ_output_oid, signed_metadata, signature) = golden_fields();
+        let note = PlanNote {
+            plan_id,
+            purpose: "plan-stage".into(),
+            writ_output_oid,
+            signed_metadata,
+            signature,
+        };
+        assert_eq!(String::from_utf8(note.canonical_bytes()).unwrap(), GOLDEN);
+    }
+
+    /// The three generated types agree byte-for-byte on the same field
+    /// values.
+    ///
+    /// Vacuous today — one macro emits all three — and that is the
+    /// point: it becomes load-bearing the moment someone adds a field
+    /// to one of them by hand instead of to the macro, which is
+    /// exactly the drift the macro exists to prevent.
+    #[test]
+    fn the_three_stage_notes_share_one_wire_form() {
+        let (plan_id, oid, metadata, signature) = golden_fields();
+        let plan = PlanNote {
+            plan_id,
+            purpose: "p".into(),
+            writ_output_oid: oid.clone(),
+            signed_metadata: metadata.clone(),
+            signature: signature.clone(),
+        };
+        let review = ReviewNote {
+            plan_id,
+            purpose: "p".into(),
+            writ_output_oid: oid.clone(),
+            signed_metadata: metadata.clone(),
+            signature: signature.clone(),
+        };
+        let implement = ImplementNote {
+            plan_id,
+            purpose: "p".into(),
+            writ_output_oid: oid,
+            signed_metadata: metadata,
+            signature,
+        };
+        assert_eq!(plan.canonical_bytes(), review.canonical_bytes());
         assert_eq!(review.canonical_bytes(), implement.canonical_bytes());
     }
 }

@@ -1,6 +1,6 @@
 //! Bailiff-side write helper that completes the slice-C handshake:
-//! fetch writ's signed envelope, verify it, and persist a [`PlanNote`]
-//! at the plan's notes ref in bailiff's own bare repo.
+//! fetch writ's signed envelope, verify it, and persist the stage's
+//! note at the plan's notes ref in bailiff's own bare repo.
 //!
 //! This is slice C2 of `docs/plans/2026-05-14-bailiff-split.md`. The
 //! data layer ([`crate::bailiff_plan_note`]) is slice C1; the CLI
@@ -30,11 +30,13 @@
 //!    writ-side seed OID — *not* the envelope blob; see the
 //!    `writ_output_oid` docstring in [`crate::bailiff_plan_note`])
 //!    and write it to [`plan_notes_ref`]`(plan_id)` in
-//!    bailiff's repo with seed [`plan_submission_seed_blob_bytes`]`(plan_id)`.
+//!    bailiff's repo with seed [`crate::bailiff_stage::AgentStage::note_seed`]`(plan_id)`.
 //!    Returns the bailiff-side target OID.
 //!
-//! Every failure mode is a tagged variant of [`WritePlanNoteError`]
-//! so the slice-C3 CLI verb can react without parsing prose.
+//! Every failure mode is a tagged variant of [`WriteStageNoteError`]
+//! so the CLI verbs can react without parsing prose. Since slice 3b
+//! one function serves all three envelope-bearing stages; only the
+//! decision note, which carries no envelope, has its own writer.
 
 use std::path::Path;
 
@@ -42,10 +44,10 @@ use thiserror::Error;
 
 use crate::bailiff_plan_note::{
     DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
-    plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
-    plan_submission_seed_blob_bytes,
+    plan_notes_ref,
 };
 use crate::bailiff_repo_guard::lock_repo_mutations;
+use crate::bailiff_stage::AgentStage;
 use writ::core::NotesRef;
 use writ::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
 use writ::run_envelope::SignedRunEnvelope;
@@ -66,8 +68,8 @@ pub(crate) const WRIT_V1_NOTES_REFSPEC: &str = "+refs/notes/writ/v1/*:refs/notes
 /// [`SignedRunEnvelope`].
 ///
 /// This is the fetch→verify phase shared byte-for-byte by
-/// [`write_plan_note`], [`write_review_note`], and
-/// [`write_implement_note`]; only the subsequent attach — note type,
+/// [`crate::bailiff_plan_write::write_stage_note`], [`crate::bailiff_plan_write::write_stage_note`], and
+/// [`crate::bailiff_plan_write::write_stage_note`]; only the subsequent attach — note type,
 /// seed, and storage policy — differs between the three verbs. See the
 /// module docstring for the step-by-step flow and [`FetchVerifyError`]
 /// for the failure shape.
@@ -100,8 +102,8 @@ fn fetch_and_verify(
 
 /// Tagged failure modes of `fetch_and_verify` — the fetch→read→
 /// decode→parity-check→verify phase that precedes the attach in
-/// [`write_plan_note`], [`write_review_note`], and
-/// [`write_implement_note`]. Each verb's error type embeds this via a
+/// [`crate::bailiff_plan_write::write_stage_note`], [`crate::bailiff_plan_write::write_stage_note`], and
+/// [`crate::bailiff_plan_write::write_stage_note`]. Each verb's error type embeds this via a
 /// transparent `FetchVerify` variant, so the six pre-storage failure
 /// modes are named once rather than copied per verb. Each maps to one
 /// specific step so a caller can surface the right operator action:
@@ -151,74 +153,6 @@ pub enum FetchVerifyError {
     Verify(#[source] VerifyError),
 }
 
-/// Fetch writ's signed envelope, verify it end-to-end, and attach a
-/// [`PlanNote`] for `plan_id` to bailiff's per-plan notes ref.
-///
-/// Returns the bailiff-side target OID — the deterministic seed-blob
-/// OID that [`plan_submission_seed_blob_bytes`] hashes to, which a caller can
-/// hold onto for diagnostics or to read the freshly-written note back
-/// without recomputing it.
-///
-/// See the module docstring for the step-by-step flow and the
-/// [`WritePlanNoteError`] variants for the failure shape.
-pub fn write_plan_note(
-    bailiff_repo: &NotesRepo,
-    writ_repo_path: &Path,
-    writ_notes_ref: &NotesRef,
-    plan_id: PlanId,
-    purpose: String,
-    completed: &RunAgentCompleted,
-    allowed_signers: &AllowedSigners,
-) -> Result<GitObjectId, WritePlanNoteError> {
-    // Repo-wide, and held across the note write as well as the fetch:
-    // git refuses to make concurrent fetch+notes-add safe, and the
-    // per-plan lock does not span two processes on different plans.
-    // See `lock_repo_mutations`.
-    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(WritePlanNoteError::RepoLock)?;
-    let envelope = fetch_and_verify(
-        bailiff_repo,
-        writ_repo_path,
-        writ_notes_ref,
-        completed,
-        allowed_signers,
-    )?;
-
-    let note = PlanNote {
-        plan_id,
-        purpose,
-        writ_output_oid: completed.output_oid.clone(),
-        signed_metadata: envelope.metadata,
-        signature: envelope.signature,
-    };
-    let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_submission_seed_blob_bytes(plan_id);
-    let bytes = note.canonical_bytes();
-    bailiff_repo
-        .write_note(&plan_ref, &seed, &bytes)
-        .map_err(WritePlanNoteError::WritePlanNote)
-}
-
-/// Tagged failure modes of [`write_plan_note`]. The shared
-/// fetch→verify phase's failures arrive via the transparent
-/// [`FetchVerifyError`] embedded in [`Self::FetchVerify`]; only the
-/// plan-note write itself is specific to this verb.
-#[derive(Debug, Error)]
-pub enum WritePlanNoteError {
-    /// The repo-wide mutation lock could not be taken. A filesystem
-    /// problem, not contention — the lock waits.
-    #[error("locking bailiff's repo for mutation failed: {0}")]
-    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
-    /// The shared fetch→verify phase failed before any plan note was
-    /// written. See [`FetchVerifyError`] for the step-by-step matrix.
-    #[error(transparent)]
-    FetchVerify(#[from] FetchVerifyError),
-    /// Writing the bailiff-side plan note failed. Usually a
-    /// duplicate-write (a plan id reused against an existing ref) or
-    /// a filesystem problem.
-    #[error("writing the plan note to bailiff's repo failed: {0}")]
-    WritePlanNote(#[source] NotesRepoError),
-}
-
 /// Write `decision_note` as the **decision** note for its plan under
 /// [`plan_notes_ref`]`(plan_id)` in bailiff's repo. Slice D1.3 of
 /// `docs/plans/2026-05-16-slice-d1-decide.md`.
@@ -230,7 +164,7 @@ pub enum WritePlanNoteError {
 /// silently overwriting an existing verdict would destroy audit
 /// state without surfacing the conflict.
 ///
-/// Sibling to [`write_plan_note`] under the same per-plan notes
+/// Sibling to [`crate::bailiff_plan_write::write_stage_note`] under the same per-plan notes
 /// ref: the decision attaches at the seed OID derived from
 /// [`plan_decision_seed_blob_bytes`] so the submission and decision
 /// notes coexist without colliding. The submission's presence is
@@ -296,51 +230,55 @@ pub enum WriteDecisionNoteError {
     WriteDecisionNote(#[source] NotesRepoError),
 }
 
-/// Fetch writ's signed envelope for a reviewer run, verify it
-/// end-to-end, and attach a [`ReviewNote`] for `plan_id` to bailiff's
-/// per-plan notes ref. Slice D2.2 of
-/// `docs/plans/2026-05-16-slice-d2-review.md`.
+/// Fetch writ's signed envelope for `stage`'s run, verify it
+/// end-to-end, and attach the stage's note to bailiff's per-plan ref.
 ///
-/// Same fetch-verify-attach shape as [`write_plan_note`] — the
-/// envelope-vs-reply metadata/signature parity check and the
-/// `verify_run_envelope` pass are byte-for-byte identical. The
-/// load-bearing difference is the storage primitive: review notes are
-/// **idempotent by error**. A second review for the same `plan_id`
-/// returns [`WriteReviewNoteError::ReviewAlreadyRecorded`] rather than
-/// overwriting, mirroring [`write_decision_note`]'s
-/// `DecisionAlreadyRecorded` contract. D2 ships single-review-per-plan;
-/// multi-review history is the documented `v1` → `v2` ref-prefix bump
-/// (see the slice-D2 plan doc).
+/// One function for all three envelope-bearing stages. Before slice 3b
+/// this was `write_plan_note` / `write_review_note` /
+/// `write_implement_note` — three bodies that were byte-identical
+/// modulo the note type, the seed, and the noun in their error enums.
 ///
-/// The review note attaches under
-/// [`plan_notes_ref`]`(plan_id)` at the seed OID derived from
-/// [`plan_review_seed_blob_bytes`], distinct from the submission seed
-/// (bare plan id) and the decision seed (`::decision` suffix), so the
-/// three notes coexist under one per-plan ref.
-///
-/// **No precondition on submission presence.** Mirrors D1.3's decoupling
-/// of decide from submission: the only invariant the write helper
-/// enforces is "one review per plan." The submission-presence gate
-/// lives in the slice-D2.4 `submit_review` workflow, where the plan
-/// body is consumed for prompt composition.
+/// The stage varies exactly three things, and each is a projection of
+/// [`AgentStage`] rather than a parameter a caller could get wrong:
+/// which note body is built, which seed it attaches at
+/// ([`AgentStage::note_seed`]), and which noun the error names.
 ///
 /// Returns the bailiff-side target OID — the deterministic seed-blob
-/// OID [`plan_review_seed_blob_bytes`] hashes to — so a caller can
-/// hand it to [`NotesRepo::read_note`] without recomputing it.
-pub fn write_review_note(
+/// OID the stage's seed hashes to — so a caller can hand it to
+/// [`NotesRepo::read_note`] without recomputing it.
+///
+/// **Idempotent by error.** A second write for the same
+/// `(plan_id, stage)` returns
+/// [`WriteStageNoteError::AlreadyRecorded`] rather than overwriting.
+/// Before slice 3b the submission was the odd one out here: it called
+/// `write_note`, so its duplicate surfaced as a generic git failure
+/// where its siblings' surfaced as the typed conflict. Both refused;
+/// only one said why. Unreachable through the workflow either way,
+/// since slice 1 gates `Submit` to `Absent`.
+///
+/// **No precondition on any other note's presence.** The write helper
+/// enforces one invariant — one note per `(plan, stage)`. Ordering is
+/// [`crate::bailiff_plan_state::allows`]'s job, checked under the plan
+/// lock by [`crate::bailiff_stage::open_plan_stage`].
+pub fn write_stage_note(
     bailiff_repo: &NotesRepo,
-    writ_repo_path: &Path,
+    target: &StageNoteTarget,
     writ_notes_ref: &NotesRef,
-    plan_id: PlanId,
     purpose: String,
     completed: &RunAgentCompleted,
-    allowed_signers: &AllowedSigners,
-) -> Result<GitObjectId, WriteReviewNoteError> {
+) -> Result<GitObjectId, WriteStageNoteError> {
+    let StageNoteTarget {
+        stage,
+        plan_id,
+        writ_repo_path,
+        allowed_signers,
+    } = target;
+    let (stage, plan_id) = (*stage, *plan_id);
     // Repo-wide, and held across the note write as well as the fetch:
     // git refuses to make concurrent fetch+notes-add safe, and the
     // per-plan lock does not span two processes on different plans.
     // See `lock_repo_mutations`.
-    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(WriteReviewNoteError::RepoLock)?;
+    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(WriteStageNoteError::RepoLock)?;
     let envelope = fetch_and_verify(
         bailiff_repo,
         writ_repo_path,
@@ -349,189 +287,143 @@ pub fn write_review_note(
         allowed_signers,
     )?;
 
-    let note = ReviewNote {
-        plan_id,
-        purpose,
-        writ_output_oid: completed.output_oid.clone(),
-        signed_metadata: envelope.metadata,
-        signature: envelope.signature,
-    };
-    let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_review_seed_blob_bytes(plan_id);
-    let bytes = note.canonical_bytes();
+    let body = stage_note_body(stage, plan_id, purpose, completed, envelope);
     match bailiff_repo
-        .write_note_if_absent(&plan_ref, &seed, &bytes)
-        .map_err(WriteReviewNoteError::WriteReviewNote)?
+        .write_note_if_absent(&plan_notes_ref(plan_id), &stage.note_seed(plan_id), &body)
+        .map_err(|source| WriteStageNoteError::Write { stage, source })?
     {
         WriteOutcome::Written(oid) => Ok(oid),
-        WriteOutcome::AlreadyPresent(target_oid) => {
-            Err(WriteReviewNoteError::ReviewAlreadyRecorded {
-                plan_id,
-                target_oid,
-            })
-        }
+        WriteOutcome::AlreadyPresent(target_oid) => Err(WriteStageNoteError::AlreadyRecorded {
+            stage,
+            plan_id,
+            target_oid,
+        }),
     }
 }
 
-/// Tagged failure modes of [`write_review_note`]. The shared
-/// fetch→verify phase's failures arrive via the transparent
-/// [`FetchVerifyError`] in [`Self::FetchVerify`]; the two storage
-/// variants are specific to this verb's idempotent-by-error write
-/// (`ReviewAlreadyRecorded` distinct from a generic `WriteReviewNote`).
+/// Where a stage's note lands, and what its envelope is checked
+/// against.
+///
+/// Bundled rather than passed as loose arguments because the four
+/// travel together from the CLI through the runner to the write, and
+/// because [`write_stage_note`] would otherwise take eight parameters
+/// — four of which a caller could permute without the compiler
+/// noticing, since two are paths and two are ids.
+///
+/// `purpose` and the writ output ref are deliberately **not** here.
+/// They go to writ *and* onto the note, so they live in
+/// [`crate::bailiff_stage::StageRunInputs`] alone and the runner
+/// passes the same values to both; a copy here would be a second
+/// place for them to disagree.
+#[derive(Clone, Debug)]
+pub struct StageNoteTarget {
+    /// Which note to write. Also selects the seed it attaches at and
+    /// the noun its errors name.
+    pub stage: AgentStage,
+    /// Plan the note belongs to.
+    pub plan_id: PlanId,
+    /// Path to writ's bare repo, fetched from to re-read and verify
+    /// the envelope the RPC reply names.
+    pub writ_repo_path: std::path::PathBuf,
+    /// Keyring the envelope's signature must verify under.
+    pub allowed_signers: AllowedSigners,
+}
+
+/// The canonical bytes of `stage`'s note.
+///
+/// The three note types are field-identical and generated from one
+/// macro, but they stay *distinct types* so that
+/// [`crate::bailiff_plan_read::read_plan_body_bytes`] can demand the
+/// submission specifically. This match is the one place that has to
+/// name all three, and it produces bytes rather than a value, so the
+/// distinction costs nothing downstream.
+fn stage_note_body(
+    stage: AgentStage,
+    plan_id: PlanId,
+    purpose: String,
+    completed: &RunAgentCompleted,
+    envelope: SignedRunEnvelope,
+) -> Vec<u8> {
+    let writ_output_oid = completed.output_oid.clone();
+    let signed_metadata = envelope.metadata;
+    let signature = envelope.signature;
+    match stage {
+        AgentStage::Submit => PlanNote {
+            plan_id,
+            purpose,
+            writ_output_oid,
+            signed_metadata,
+            signature,
+        }
+        .canonical_bytes(),
+        AgentStage::Review => ReviewNote {
+            plan_id,
+            purpose,
+            writ_output_oid,
+            signed_metadata,
+            signature,
+        }
+        .canonical_bytes(),
+        AgentStage::Implement => ImplementNote {
+            plan_id,
+            purpose,
+            writ_output_oid,
+            signed_metadata,
+            signature,
+        }
+        .canonical_bytes(),
+    }
+}
+
+/// Tagged failure modes of [`write_stage_note`].
+///
+/// One enum where slice 3a had three, each with the same four
+/// failures under a different noun. The stage travels *in* the
+/// variants that need it, so an operator-facing message can still name
+/// the right artefact without a per-stage enum to hang it on.
 #[derive(Debug, Error)]
-pub enum WriteReviewNoteError {
+pub enum WriteStageNoteError {
     /// The repo-wide mutation lock could not be taken. A filesystem
     /// problem, not contention — the lock waits.
     #[error("locking bailiff's repo for mutation failed: {0}")]
     RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
-    /// The shared fetch→verify phase failed before any review note was
+    /// The shared fetch→verify phase failed before any note was
     /// written. See [`FetchVerifyError`] for the step-by-step matrix.
     #[error(transparent)]
     FetchVerify(#[from] FetchVerifyError),
-    /// A review note for this plan already exists under
-    /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. D2 does not
+    /// A note for this `(plan, stage)` already exists under
+    /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. Bailiff does not
     /// overwrite; the operator's recourse is to submit a fresh plan
-    /// (multi-review history is a future `v1` → `v2` migration).
-    #[error("review already recorded for plan {plan_id} at target {target_oid}")]
-    ReviewAlreadyRecorded {
+    /// (repeat attempts are the documented `v1` → `v2` migration).
+    #[error("{stage} already recorded for plan {plan_id} at target {target_oid}")]
+    AlreadyRecorded {
+        stage: AgentStage,
         plan_id: PlanId,
         target_oid: GitObjectId,
     },
-    /// Writing the review note to bailiff's repo failed for any
-    /// reason other than the idempotency conflict. Usually a
-    /// filesystem problem or a cross-process race that slipped past
-    /// the per-repo mutex (see [`NotesRepo::write_note_if_absent`]'s
-    /// docstring for the residual race surface).
-    #[error("writing the review note to bailiff's repo failed: {0}")]
-    WriteReviewNote(#[source] NotesRepoError),
-}
-
-/// Fetch writ's signed envelope for an implementer run, verify it
-/// end-to-end, and attach an [`ImplementNote`] for `plan_id` to
-/// bailiff's per-plan notes ref. Slice E2 of
-/// `docs/plans/2026-05-14-bailiff-split.md`.
-///
-/// Same fetch-verify-attach shape as [`write_plan_note`] and
-/// [`write_review_note`] — the envelope-vs-reply metadata/signature
-/// parity check and the `verify_run_envelope` pass are byte-for-byte
-/// identical. The load-bearing difference is the seed: implement
-/// notes attach under [`plan_notes_ref`]`(plan_id)` at the seed OID
-/// derived from [`plan_implement_seed_blob_bytes`], disjoint from the
-/// submission, decision, and review seeds so all four notes coexist
-/// under one per-plan ref.
-///
-/// **Idempotent by error.** A second implement-note write for the
-/// same `plan_id` returns
-/// [`WriteImplementNoteError::ImplementAlreadyRecorded`] rather than
-/// overwriting, mirroring the [`WriteReviewNoteError::ReviewAlreadyRecorded`]
-/// and [`WriteDecisionNoteError::DecisionAlreadyRecorded`] contracts.
-/// Slice E ships single-implement-per-plan; multi-attempt history is
-/// the documented `v1` → `v2` ref-prefix bump.
-///
-/// **No precondition on submission, decision, or review presence.**
-/// Mirrors the decoupling baked into [`write_review_note`] and
-/// [`write_decision_note`]: the only invariant the write helper
-/// enforces is "one implement per plan." The acceptance gate (a
-/// plan note must exist and have an `Accepted` decision note) lives
-/// in the slice-E4 `submit_implement` workflow, where the plan body
-/// is consumed for implementer prompt composition.
-///
-/// Returns the bailiff-side target OID — the deterministic seed-blob
-/// OID [`plan_implement_seed_blob_bytes`] hashes to — so a caller can
-/// hand it to [`NotesRepo::read_note`] without recomputing it.
-pub fn write_implement_note(
-    bailiff_repo: &NotesRepo,
-    writ_repo_path: &Path,
-    writ_notes_ref: &NotesRef,
-    plan_id: PlanId,
-    purpose: String,
-    completed: &RunAgentCompleted,
-    allowed_signers: &AllowedSigners,
-) -> Result<GitObjectId, WriteImplementNoteError> {
-    // Repo-wide, and held across the note write as well as the fetch:
-    // git refuses to make concurrent fetch+notes-add safe, and the
-    // per-plan lock does not span two processes on different plans.
-    // See `lock_repo_mutations`.
-    let _repo_lock =
-        lock_repo_mutations(bailiff_repo).map_err(WriteImplementNoteError::RepoLock)?;
-    let envelope = fetch_and_verify(
-        bailiff_repo,
-        writ_repo_path,
-        writ_notes_ref,
-        completed,
-        allowed_signers,
-    )?;
-
-    let note = ImplementNote {
-        plan_id,
-        purpose,
-        writ_output_oid: completed.output_oid.clone(),
-        signed_metadata: envelope.metadata,
-        signature: envelope.signature,
-    };
-    let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_implement_seed_blob_bytes(plan_id);
-    let bytes = note.canonical_bytes();
-    match bailiff_repo
-        .write_note_if_absent(&plan_ref, &seed, &bytes)
-        .map_err(WriteImplementNoteError::WriteImplementNote)?
-    {
-        WriteOutcome::Written(oid) => Ok(oid),
-        WriteOutcome::AlreadyPresent(target_oid) => {
-            Err(WriteImplementNoteError::ImplementAlreadyRecorded {
-                plan_id,
-                target_oid,
-            })
-        }
-    }
-}
-
-/// Tagged failure modes of [`write_implement_note`]. Shape parallels
-/// [`WriteReviewNoteError`]: the shared fetch→verify phase's failures
-/// arrive via the transparent [`FetchVerifyError`] in
-/// [`Self::FetchVerify`], and the idempotent-by-error storage primitive
-/// (`ImplementAlreadyRecorded` distinct from a generic
-/// `WriteImplementNote`) mirrors [`WriteReviewNoteError`] and
-/// [`WriteDecisionNoteError`].
-#[derive(Debug, Error)]
-pub enum WriteImplementNoteError {
-    /// The repo-wide mutation lock could not be taken. A filesystem
-    /// problem, not contention — the lock waits.
-    #[error("locking bailiff's repo for mutation failed: {0}")]
-    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
-    /// The shared fetch→verify phase failed before any implement note
-    /// was written. See [`FetchVerifyError`] for the step-by-step matrix.
-    #[error(transparent)]
-    FetchVerify(#[from] FetchVerifyError),
-    /// An implement note for this plan already exists under
-    /// [`plan_notes_ref`]`(plan_id)` at `target_oid`. Slice E does not
-    /// overwrite; the operator's recourse is to submit a fresh plan
-    /// (multi-attempt implement history is a future `v1` → `v2`
-    /// migration).
-    #[error("implement already recorded for plan {plan_id} at target {target_oid}")]
-    ImplementAlreadyRecorded {
-        plan_id: PlanId,
-        target_oid: GitObjectId,
+    /// Writing the note to bailiff's repo failed for any reason other
+    /// than the idempotency conflict. Usually a filesystem problem or
+    /// a cross-process race that slipped past the per-repo mutex (see
+    /// [`NotesRepo::write_note_if_absent`]'s docstring for the
+    /// residual race surface).
+    #[error("writing the {stage} note to bailiff's repo failed: {source}")]
+    Write {
+        stage: AgentStage,
+        #[source]
+        source: NotesRepoError,
     },
-    /// Writing the implement note to bailiff's repo failed for any
-    /// reason other than the idempotency conflict. Usually a
-    /// filesystem problem or a cross-process race that slipped past
-    /// the per-repo mutex (see [`NotesRepo::write_note_if_absent`]'s
-    /// docstring for the residual race surface).
-    #[error("writing the implement note to bailiff's repo failed: {0}")]
-    WriteImplementNote(#[source] NotesRepoError),
 }
 
 #[cfg(test)]
 mod decision_tests;
 #[cfg(test)]
 mod end_to_end_tests;
+// `plan_tests` / `review_tests` / `implement_tests` collapsed into
+// `stage_tests` in slice 3b, along with the three write helpers they
+// covered. Every case there runs for all three stages, so the coverage
+// is strictly larger than the three modules it replaces.
 #[cfg(test)]
-mod implement_tests;
-#[cfg(test)]
-mod plan_tests;
-#[cfg(test)]
-mod review_tests;
+mod stage_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -548,29 +440,11 @@ mod spec {
         OTHER_PUB, SIGNING_PEM, SIGNING_PUB, bailiff_repo, signed_envelope, writ_notes_ref,
     };
     use super::*;
-    use crate::bailiff_plan_note::{
-        ImplementNote, PlanId, PlanNote, ReviewNote, plan_implement_seed_blob_bytes,
-        plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
-    };
+    use crate::bailiff_plan_note::{ImplementNote, PlanId, PlanNote, ReviewNote, plan_notes_ref};
     use proptest::prelude::*;
     use tempfile::TempDir;
     use writ::core::{CapabilitySet, RepoRef, SshSignature};
     use writ::signing::{WritSigningKey, WritVerifyingKey};
-
-    /// The three verbs that share `fetch_and_verify`. Round-trip (and,
-    /// for review/implement, idempotency) differs per verb; the
-    /// fetch-verify failure matrix does not, so the rejection property
-    /// drives one representative verb.
-    #[derive(Debug, Clone, Copy)]
-    enum Verb {
-        Plan,
-        Review,
-        Implement,
-    }
-
-    fn arb_verb() -> impl Strategy<Value = Verb> {
-        prop_oneof![Just(Verb::Plan), Just(Verb::Review), Just(Verb::Implement)]
-    }
 
     fn arb_capabilities() -> impl Strategy<Value = Vec<CapabilitySet>> {
         let cap = ("[a-z0-9_-]{1,16}", "[a-z0-9_.-]{1,16}", any::<bool>()).prop_map(
@@ -658,11 +532,21 @@ mod spec {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(24))]
 
-        /// For any valid payload and any verb, a trusted-signer write
-        /// succeeds and the bailiff-side note reads back with exactly
-        /// the envelope fields writ signed.
+        /// For any valid payload and any stage, a trusted-signer
+        /// write succeeds and the bailiff-side note reads back with
+        /// exactly the envelope fields writ signed.
+        ///
+        /// Ranges over `AgentStage::ALL` rather than a local `Verb`
+        /// enum. That enum was a *fourth* encoding of the three-stage
+        /// distinction, alongside the three note types, the three
+        /// writers, and the three error enums slice 3b collapsed —
+        /// found only because deleting the writers broke it.
         #[test]
-        fn every_verb_round_trips_a_trusted_envelope(verb in arb_verb(), payload in arb_payload()) {
+        fn every_stage_round_trips_a_trusted_envelope(
+            stage_index in 0usize..AgentStage::ALL.len(),
+            payload in arb_payload(),
+        ) {
+            let stage = AgentStage::ALL[stage_index];
             let tmp = TempDir::new().unwrap();
             let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
             let envelope = envelope_for(&signing_key, &payload);
@@ -672,41 +556,34 @@ mod spec {
             let plan_id = PlanId::new();
             let purpose = "spec".to_string();
 
-            let (returned_oid, seed) = match verb {
-                Verb::Plan => (
-                    write_plan_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, purpose.clone(), &completed, &allowed)
-                        .expect("plan write must succeed"),
-                    plan_submission_seed_blob_bytes(plan_id),
-                ),
-                Verb::Review => (
-                    write_review_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, purpose.clone(), &completed, &allowed)
-                        .expect("review write must succeed"),
-                    plan_review_seed_blob_bytes(plan_id),
-                ),
-                Verb::Implement => (
-                    write_implement_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, purpose.clone(), &completed, &allowed)
-                        .expect("implement write must succeed"),
-                    plan_implement_seed_blob_bytes(plan_id),
-                ),
+            let target = StageNoteTarget {
+                stage,
+                plan_id,
+                writ_repo_path: writ_repo.path().to_path_buf(),
+                allowed_signers: allowed.clone(),
             };
+            let returned_oid = write_stage_note(
+                &bailiff, &target, &writ_notes_ref(), purpose.clone(), &completed,
+            ).expect("a trusted-signer write must succeed");
 
-            prop_assert!(!seed.is_empty());
+            prop_assert!(!stage.note_seed(plan_id).is_empty());
             let body = bailiff
                 .read_note(&plan_notes_ref(plan_id), &returned_oid)
                 .expect("bailiff-side note must be readable at the returned OID");
 
-            // Every note type carries the same envelope fields; assert
-            // the round-trip preserved them regardless of which verb wrote.
-            let (got_plan_id, got_purpose, got_oid, got_meta, got_sig) = match verb {
-                Verb::Plan => {
+            // Decoded through the stage's own type: the three are
+            // distinct on purpose, so decoding an implement note as a
+            // `PlanNote` would succeed and prove nothing.
+            let (got_plan_id, got_purpose, got_oid, got_meta, got_sig) = match stage {
+                AgentStage::Submit => {
                     let n = PlanNote::from_canonical_bytes(&body).expect("body must decode");
                     (n.plan_id, n.purpose, n.writ_output_oid, n.signed_metadata, n.signature)
                 }
-                Verb::Review => {
+                AgentStage::Review => {
                     let n = ReviewNote::from_canonical_bytes(&body).expect("body must decode");
                     (n.plan_id, n.purpose, n.writ_output_oid, n.signed_metadata, n.signature)
                 }
-                Verb::Implement => {
+                AgentStage::Implement => {
                     let n = ImplementNote::from_canonical_bytes(&body).expect("body must decode");
                     (n.plan_id, n.purpose, n.writ_output_oid, n.signed_metadata, n.signature)
                 }
@@ -721,7 +598,8 @@ mod spec {
         /// The shared fetch-verify phase rejects a tampered or
         /// untrusted envelope with the matching variant: metadata
         /// divergence, signature divergence, or an unknown signer.
-        /// Driven through `write_plan_note` as a representative verb.
+        /// Driven through the submission stage as representative;
+        /// the phase is shared, so the stage is not the variable here.
         #[test]
         fn fetch_verify_rejects_tampered_or_untrusted_envelopes(payload in arb_payload(), fault in 0u8..3) {
             let tmp = TempDir::new().unwrap();
@@ -746,12 +624,18 @@ mod spec {
                 .unwrap();
             }
 
-            let err = write_plan_note(&bailiff, writ_repo.path(), &writ_notes_ref(), PlanId::new(), "spec".into(), &completed, &allowed)
+            let target = StageNoteTarget {
+                stage: AgentStage::Submit,
+                plan_id: PlanId::new(),
+                writ_repo_path: writ_repo.path().to_path_buf(),
+                allowed_signers: allowed.clone(),
+            };
+            let err = write_stage_note(&bailiff, &target, &writ_notes_ref(), "spec".into(), &completed)
                 .unwrap_err();
             match (fault, &err) {
-                (0, WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)) => {}
-                (1, WritePlanNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)) => {}
-                (2, WritePlanNoteError::FetchVerify(FetchVerifyError::Verify(VerifyError::UnknownSigner { .. }))) => {}
+                (0, WriteStageNoteError::FetchVerify(FetchVerifyError::EnvelopeMetadataMismatch)) => {}
+                (1, WriteStageNoteError::FetchVerify(FetchVerifyError::EnvelopeSignatureMismatch)) => {}
+                (2, WriteStageNoteError::FetchVerify(FetchVerifyError::Verify(VerifyError::UnknownSigner { .. }))) => {}
                 _ => prop_assert!(false, "fault {fault} produced unexpected error: {err:?}"),
             }
         }
@@ -760,11 +644,22 @@ mod spec {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(16))]
 
-        /// Review and implement writes are idempotent by error: the
-        /// second write for a plan id is refused rather than silently
+        /// **Every** stage's write is idempotent by error: the second
+        /// write for a plan id is refused rather than silently
         /// overwriting the first.
+        ///
+        /// Was `review_and_implement_writes_are_idempotent`, over two
+        /// stages. The submission was excluded because it alone called
+        /// `write_note`, whose duplicate surfaced as a generic git
+        /// failure rather than the typed conflict. Slice 3b made all
+        /// three typed, so the property now holds for all three — and
+        /// its scope is the record of that delta.
         #[test]
-        fn review_and_implement_writes_are_idempotent(payload in arb_payload(), use_implement in any::<bool>()) {
+        fn every_stage_write_is_idempotent_by_error(
+            stage_index in 0usize..AgentStage::ALL.len(),
+            payload in arb_payload(),
+        ) {
+            let stage = AgentStage::ALL[stage_index];
             let tmp = TempDir::new().unwrap();
             let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
             let envelope = envelope_for(&signing_key, &payload);
@@ -773,24 +668,24 @@ mod spec {
             let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
             let plan_id = PlanId::new();
 
-            if use_implement {
-                write_implement_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
-                    .expect("first implement write succeeds");
-                let err = write_implement_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
-                    .unwrap_err();
-                prop_assert!(
-                    matches!(err, WriteImplementNoteError::ImplementAlreadyRecorded { .. }),
-                    "second implement must be refused, got: {err:?}",
-                );
-            } else {
-                write_review_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
-                    .expect("first review write succeeds");
-                let err = write_review_note(&bailiff, writ_repo.path(), &writ_notes_ref(), plan_id, "spec".into(), &completed, &allowed)
-                    .unwrap_err();
-                prop_assert!(
-                    matches!(err, WriteReviewNoteError::ReviewAlreadyRecorded { .. }),
-                    "second review must be refused, got: {err:?}",
-                );
+            let target = StageNoteTarget {
+                stage,
+                plan_id,
+                writ_repo_path: writ_repo.path().to_path_buf(),
+                allowed_signers: allowed.clone(),
+            };
+            let write = || write_stage_note(
+                &bailiff, &target, &writ_notes_ref(), "spec".into(), &completed,
+            );
+            let first = write().expect("first write succeeds");
+            let err = write().unwrap_err();
+            match err {
+                WriteStageNoteError::AlreadyRecorded { stage: got, plan_id: pid, target_oid } => {
+                    prop_assert_eq!(got, stage);
+                    prop_assert_eq!(pid, plan_id);
+                    prop_assert_eq!(target_oid, first);
+                }
+                other => prop_assert!(false, "{stage}: expected AlreadyRecorded, got {other:?}"),
             }
         }
     }

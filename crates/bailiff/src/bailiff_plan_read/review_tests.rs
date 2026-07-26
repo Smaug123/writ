@@ -11,7 +11,8 @@ use crate::bailiff_plan_note::{
     PlanId, ReviewNote, plan_notes_ref, plan_review_seed_blob_bytes,
     plan_submission_seed_blob_bytes,
 };
-use crate::bailiff_plan_write::write_review_note;
+use crate::bailiff_plan_write::{StageNoteTarget, write_stage_note};
+use crate::bailiff_stage::AgentStage;
 use tempfile::TempDir;
 use writ::core::{CapabilitySet, RepoRef};
 use writ::run_envelope::SignedRunEnvelope;
@@ -118,14 +119,17 @@ fn read_review_note_round_trips_through_write_review_note() {
     let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
     let plan_id = PlanId::new();
     let purpose = "plan-review".to_string();
-    write_review_note(
+    write_stage_note(
         &bailiff,
-        writ_repo.path(),
+        &StageNoteTarget {
+            stage: AgentStage::Review,
+            plan_id,
+            writ_repo_path: writ_repo.path().to_path_buf(),
+            allowed_signers: allowed.clone(),
+        },
         &writ_notes_ref(),
-        plan_id,
         purpose.clone(),
         &completed,
-        &allowed,
     )
     .expect("write_review_note must succeed");
 

@@ -381,6 +381,73 @@ the delta. Unreachable through the workflow either way, since slice 1 gates
 - `tests/stage_gate_zero_rpc.rs` passes unmodified — it plants notes at all four
   seeds, so a seed regression fails there too, independently.
 
+### Slice 3b as built
+
+Shipped. All gates pass, and **the oracle held again: `rpc_trace_baseline.rs`
+and all 24 fixtures are byte-for-byte unmodified**, as the variant-name analysis
+above predicted.
+
+Four things are worth recording.
+
+**1. The plan said "one `StageNote` body". That would have been a type-safety
+regression, so three types ship instead — generated from one macro.**
+`read_plan_body_bytes` takes `&PlanNote` specifically, because the submission's
+body is what gets spliced into the reviewer's and implementer's prompts. Under
+one shared type, handing it the *review* note would compile, and the implementer
+would receive the review as its approved plan. So the duplication is removed at
+the source (a `stage_note!` macro, following `plan_enum!`) while the distinction
+stays at the call sites. Removing triplication is not the goal; removing the
+*opportunity for the three to disagree* is, and a shared type would have traded
+one such opportunity for a worse one.
+
+A consequence worth stating: because the three bodies are byte-identical,
+`stage_note_body`'s three match arms are **unobservable on the wire** — building
+the "wrong" one writes the same bytes. The type distinction protects readers,
+not writers. `the_three_stage_notes_share_one_wire_form` records that as a
+property rather than leaving it as a gap someone later mistakes for coverage.
+
+**2. There was a *fourth* encoding, and only deleting the writers found it.** A
+`Verb { Plan, Review, Implement }` enum with its own `arb_verb` strategy lived in
+`bailiff_plan_write.rs`'s proptest module — a fourth spelling of the three-stage
+distinction alongside the three note types, three writers, and three error
+enums. Nothing pointed at it; it surfaced as a dead-code error after the writers
+it drove were gone. Two of its properties were also narrower than they needed to
+be: `every_verb_round_trips` is now `every_stage_round_trips`, and
+`review_and_implement_writes_are_idempotent` is now
+`every_stage_write_is_idempotent_by_error` — whose scope *is* the record of the
+behaviour delta, since the submission was excluded precisely because it was the
+one calling `write_note`.
+
+**3. Clippy's argument-count limit produced a better design than the plan had.**
+`write_stage_note` came out at eight parameters. The fix was not a suppression:
+four of them (two paths, two ids) travel together from CLI to runner to write and
+are permutable without the compiler noticing, so they became `StageNoteTarget` —
+which the runners were already building. `purpose` and the output ref
+deliberately stayed out of it: they go to writ *and* onto the note, so they live
+in `StageRunInputs` alone and the runner passes the same values to both. A copy
+on the target would be a second place for them to disagree.
+
+**4. A golden-bytes test, because the existing one stops short on purpose.**
+`*_canonical_bytes_pin_field_order` pins the *positions* of the five top-level
+keys and says so, "leaving inner-value canonicalisation to each field type's own
+round-trip test". That leaves a gap: a serde rename inside `SignedRunMetadata`,
+a changed number format, or a stray space keeps every key in its position and
+still rewrites the bytes on disk — which orphans every note already in an
+operator's repo. `stage_note_canonical_bytes_are_the_checked_in_wire_form`
+closes it. Written with a deliberately wrong literal first and observed to fail.
+
+Three mutations, each caught by the intended assertion:
+
+| Mutation | Fails on |
+|---|---|
+| `note_seed` swaps Review and Implement | `happy_path_round_trips_for_every_stage` (+ 4 others) |
+| revert to `write_note` (the pre-3b submission behaviour) | `a_second_write_is_refused_and_the_first_body_survives`, `every_stage_write_is_idempotent_by_error` |
+| reorder two fields in the generated body | the golden test (+ the three position tests) |
+
+Net: 1,168 lines of triplicated tests became one 450-line module whose every case
+runs for all three stages, so several properties previously pinned for one or two
+stages now hold for all three.
+
 ---
 
 ## Slice 4 — fan-out, designed and not built

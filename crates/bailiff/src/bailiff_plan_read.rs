@@ -140,7 +140,7 @@ pub enum ReadDecisionError {
 /// review seed's target OID) fold into the same `None` because both
 /// mean "writ has not produced a reviewer envelope for this plan."
 ///
-/// Sibling to [`crate::bailiff_plan_write::write_review_note`]: the
+/// Sibling to [`crate::bailiff_plan_write::write_stage_note`]: the
 /// writer hashes [`plan_review_seed_blob_bytes`] to pick the attach
 /// OID, the reader hashes the same seed bytes to recover it, and
 /// content-addressed storage makes the round-trip work without any
@@ -186,12 +186,12 @@ pub enum ReadReviewError {
     /// Indicates wire-level corruption — the canonical JSON shape is
     /// fixed and `deny_unknown_fields` plus the field-type validators
     /// make this near-impossible for any body
-    /// [`crate::bailiff_plan_write::write_review_note`] itself produced.
+    /// [`crate::bailiff_plan_write::write_stage_note`] itself produced.
     #[error("decoding the review note body failed: {0}")]
     Decode(#[source] ReviewNoteParseError),
     /// The note parsed cleanly but its embedded `plan_id` does not
     /// match the plan we were asked to read. Unreachable through
-    /// [`crate::bailiff_plan_write::write_review_note`] (which always
+    /// [`crate::bailiff_plan_write::write_stage_note`] (which always
     /// derives the attach seed from the `plan_id` argument it
     /// embeds in the note), so this surfaces only when bytes were
     /// planted via the low-level
@@ -213,8 +213,8 @@ pub enum ReadReviewError {
 /// because both mean "writ has not produced a planner envelope for
 /// this plan yet."
 ///
-/// Sibling to [`crate::bailiff_plan_write::write_plan_note`]: the
-/// writer hashes [`plan_submission_seed_blob_bytes`] to pick the
+/// Sibling to [`crate::bailiff_plan_write::write_stage_note`]: the
+/// writer hashes [`crate::bailiff_stage::AgentStage::note_seed`] to pick the
 /// attach OID, the reader hashes the same seed bytes to recover it,
 /// and content-addressed storage makes the round-trip work without
 /// any separate registry. Neither the decision nor the review note
@@ -260,12 +260,12 @@ pub enum ReadPlanError {
     /// Indicates wire-level corruption — the canonical JSON shape is
     /// fixed and `deny_unknown_fields` plus the field-type validators
     /// make this near-impossible for any body
-    /// [`crate::bailiff_plan_write::write_plan_note`] itself produced.
+    /// [`crate::bailiff_plan_write::write_stage_note`] itself produced.
     #[error("decoding the plan submission note body failed: {0}")]
     Decode(#[source] PlanNoteParseError),
     /// The note parsed cleanly but its embedded `plan_id` does not
     /// match the plan we were asked to read. Unreachable through
-    /// [`crate::bailiff_plan_write::write_plan_note`] (which always
+    /// [`crate::bailiff_plan_write::write_stage_note`] (which always
     /// derives the attach seed from the `plan_id` argument it embeds
     /// in the note), so this surfaces only when bytes were planted
     /// via the low-level [`writ::notes_repo::NotesRepo::write_note`]
@@ -287,7 +287,7 @@ pub enum ReadPlanError {
 /// both mean "writ has not produced an implementer envelope for this
 /// plan yet."
 ///
-/// Sibling to [`crate::bailiff_plan_write::write_implement_note`]: the
+/// Sibling to [`crate::bailiff_plan_write::write_stage_note`]: the
 /// writer hashes [`plan_implement_seed_blob_bytes`] to pick the attach
 /// OID, the reader hashes the same seed bytes to recover it, and
 /// content-addressed storage makes the round-trip work without any
@@ -334,13 +334,13 @@ pub enum ReadImplementError {
     /// Indicates wire-level corruption — the canonical JSON shape is
     /// fixed and `deny_unknown_fields` plus the field-type validators
     /// make this near-impossible for any body
-    /// [`crate::bailiff_plan_write::write_implement_note`] itself
+    /// [`crate::bailiff_plan_write::write_stage_note`] itself
     /// produced.
     #[error("decoding the implement note body failed: {0}")]
     Decode(#[source] ImplementNoteParseError),
     /// The note parsed cleanly but its embedded `plan_id` does not
     /// match the plan we were asked to read. Unreachable through
-    /// [`crate::bailiff_plan_write::write_implement_note`] (which
+    /// [`crate::bailiff_plan_write::write_stage_note`] (which
     /// always derives the attach seed from the `plan_id` argument it
     /// embeds in the note), so this surfaces only when bytes were
     /// planted via the low-level [`writ::notes_repo::NotesRepo::write_note`]
