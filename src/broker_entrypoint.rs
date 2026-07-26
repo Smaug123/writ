@@ -35,7 +35,6 @@ use crate::config::{
 };
 use crate::core::{AgentKind, AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
 use crate::github::GitHubMinter;
-use crate::github_git_db::GitDataHttp;
 use crate::secret::{FileSecretStore, SecretError, SecretStore};
 use crate::server::BrokerState;
 use crate::vm_git_mirror_cache::MirrorPins;
@@ -327,7 +326,7 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
         signing_key: None,
         run_agent_spawn: None,
         promote_runtime,
-        git_data_http: GitDataHttp::production(),
+        git_data_http: std::sync::OnceLock::new(),
         mirror_pins: MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     });

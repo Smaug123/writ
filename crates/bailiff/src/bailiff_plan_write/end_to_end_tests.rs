@@ -112,7 +112,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
             args: Vec::new(),
         }),
         promote_runtime: None,
-        git_data_http: writ::github_git_db::GitDataHttp::production(),
+        git_data_http: std::sync::OnceLock::new(),
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     });
@@ -257,7 +257,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
             args: Vec::new(),
         }),
         promote_runtime: None,
-        git_data_http: writ::github_git_db::GitDataHttp::production(),
+        git_data_http: std::sync::OnceLock::new(),
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     });
@@ -399,7 +399,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
             args: Vec::new(),
         }),
         promote_runtime: None,
-        git_data_http: writ::github_git_db::GitDataHttp::production(),
+        git_data_http: std::sync::OnceLock::new(),
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     });

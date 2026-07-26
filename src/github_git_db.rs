@@ -142,10 +142,32 @@ pub struct GitDataHttp {
     small_call: Duration,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Transports built on *this thread*, so a test can assert that an
+    /// operation builds none without a timing measurement.
+    ///
+    /// Thread-local rather than a process-wide atomic because the test
+    /// harness runs tests in parallel on one process: a global counter
+    /// would fold other tests' builds into the delta and make the
+    /// assertion racy. `#[cfg(test)]` — the production build carries
+    /// neither the counter nor the increment.
+    static TRANSPORTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many [`GitDataHttp`]s the calling thread has built. Only meaningful
+/// as a difference measured across the operation under test.
+#[cfg(test)]
+pub(crate) fn transports_built_on_this_thread() -> usize {
+    TRANSPORTS_BUILT.with(std::cell::Cell::get)
+}
+
 impl GitDataHttp {
     /// Build the transport. Expensive (see the type docs) — call once per
     /// broker, not once per request.
     pub fn new(timeouts: GitDataTimeouts) -> Self {
+        #[cfg(test)]
+        TRANSPORTS_BUILT.with(|built| built.set(built.get() + 1));
         debug_assert!(
             !timeouts.connect.is_zero()
                 && !timeouts.small_call.is_zero()

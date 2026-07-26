@@ -1067,7 +1067,7 @@ mod end_to_end_tests {
                 args: Vec::new(),
             }),
             promote_runtime: None,
-            git_data_http: crate::github_git_db::GitDataHttp::production(),
+            git_data_http: std::sync::OnceLock::new(),
             mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
             chatgpt_oauth_authority: Default::default(),
         });
@@ -1233,7 +1233,7 @@ mod end_to_end_tests {
                 args: Vec::new(),
             }),
             promote_runtime: None,
-            git_data_http: crate::github_git_db::GitDataHttp::production(),
+            git_data_http: std::sync::OnceLock::new(),
             mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
             chatgpt_oauth_authority: Default::default(),
         });

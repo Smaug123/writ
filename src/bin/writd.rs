@@ -421,7 +421,7 @@ async fn run_host_daemon(
         signing_key,
         run_agent_spawn,
         promote_runtime,
-        git_data_http: writ::github_git_db::GitDataHttp::production(),
+        git_data_http: std::sync::OnceLock::new(),
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     });

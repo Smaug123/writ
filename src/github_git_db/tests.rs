@@ -1628,36 +1628,25 @@ async fn update_ref_passes_slashes_in_branch_name_through_url_path() {
 /// client is `Arc`-backed). The credentials are the cheap half, and they are
 /// what varies: an approve mints a fresh installation token, so it needs a
 /// fresh *client* but the same *transport*. Splitting [`GitDataHttp`] out is
-/// what lets the broker build the transport once at boot and pay only the
-/// credential cost per approve.
+/// what lets the broker build the transport once and pay only the credential
+/// cost per approve.
 ///
-/// The assertion is self-calibrating rather than an absolute budget: it
-/// measures one steady-state transport build on the machine actually running
-/// the test and demands that 64 clients cost less than 8 of those. A
-/// regression to a transport per client would cost 64 builds — 8× over the
-/// threshold — while the passing case costs microseconds, so the margin is
-/// ~1000× in the direction that matters.
+/// Asserted by counting builds rather than by timing them: a timing
+/// assertion would be a benchmark wearing a test's clothes — slow (it has to
+/// build a transport to calibrate against) and load-dependent. The count is
+/// exact, and it states the property directly.
 #[test]
 fn a_client_borrows_its_transport_instead_of_building_one() {
-    // Warm the platform root store so the calibration below measures a
-    // steady-state build rather than this process's first-ever one.
-    let _warm = GitDataHttp::new(GitDataTimeouts::production());
-
-    let started = std::time::Instant::now();
-    let http = GitDataHttp::new(GitDataTimeouts::production());
-    let one_transport = started.elapsed();
-
-    let started = std::time::Instant::now();
+    let before = transports_built_on_this_thread();
+    let http = GitDataHttp::production();
     let clients: Vec<GitDataClient> = (0..64)
         .map(|i| GitDataClient::new(&http, "https://api.github.com", format!("ghs_token_{i}")))
         .collect();
-    let sixty_four_clients = started.elapsed();
 
     assert_eq!(clients.len(), 64);
-    assert!(
-        sixty_four_clients < one_transport * 8,
-        "64 clients took {sixty_four_clients:?}, which is not cheap next to \
-         8 transport builds ({:?}); a client is building its own transport",
-        one_transport * 8,
+    assert_eq!(
+        transports_built_on_this_thread() - before,
+        1,
+        "64 clients over one transport must build exactly the one transport",
     );
 }

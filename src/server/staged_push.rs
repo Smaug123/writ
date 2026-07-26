@@ -889,7 +889,7 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
     // here costs a retry rather than a manual reconciliation.
     let prepare_result = prepare_approve(
         promote_runtime,
-        &state.git_data_http,
+        state.git_data_http(),
         &api_base,
         &token,
         &repo,

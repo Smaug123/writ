@@ -13,7 +13,7 @@
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -103,16 +103,23 @@ pub struct BrokerState<S: SecretStore> {
     pub run_agent_spawn: Option<RunAgentSpawnConfig>,
     pub promote_runtime: Option<Arc<PromoteRuntimeConfig>>,
     /// The broker-wide transport every GitHub Git Data call runs over,
-    /// built once here and borrowed by each approve's short-lived
-    /// [`GitDataClient`](crate::github_git_db::GitDataClient).
+    /// built once and borrowed by each approve's short-lived
+    /// [`GitDataClient`](crate::github_git_db::GitDataClient). Reach it
+    /// through [`BrokerState::git_data_http`], never the field.
     ///
-    /// Unconditional (not `Option`) even though only the approve path uses
-    /// it: unlike `promote_runtime` it needs no configuration to build, so
-    /// a `None` arm would be an unreachable state that every caller would
-    /// still have to handle. Sharing is the point — a fresh transport per
-    /// approve re-parses the platform TLS root store and starts an empty
-    /// connection pool; see [`GitDataHttp`].
-    pub git_data_http: GitDataHttp,
+    /// Lazy rather than eager because most `BrokerState`s can never reach
+    /// a Git Data call: the per-session broker VM (`writd broker`) and
+    /// every test state boot with `staging_store: None`, and the approve
+    /// handler refuses on that long before it wants a transport. Building
+    /// one for them would pay the platform TLS root-store parse
+    /// ([`GitDataHttp`]) for a transport that provably cannot be used.
+    ///
+    /// A `OnceLock` rather than an `Option` because "not built yet" and
+    /// "not available" are different claims: every state *can* build one
+    /// on demand (it needs no configuration), so there is no
+    /// unconfigured arm for a caller to handle and no way to hold a state
+    /// that owes an approve a transport it cannot produce.
+    pub git_data_http: OnceLock<GitDataHttp>,
     /// Broker-wide registry pinning `(repo, rev)` mirror entries that an
     /// in-flight flake-input provision is materialising, so the clone handler's
     /// opportunistic eviction never deletes a mirror out from under a running
@@ -130,6 +137,19 @@ pub struct BrokerState<S: SecretStore> {
     /// See [`crate::openai_chatgpt_auth`] and
     /// [`crate::vm_http`]'s OpenAI proxy `build_extras`.
     pub chatgpt_oauth_authority: std::sync::Mutex<Option<Arc<ChatgptOauthAuthority>>>,
+}
+
+impl<S: SecretStore> BrokerState<S> {
+    /// The shared Git Data transport, building it on first use.
+    ///
+    /// The build is synchronous and takes ~80 ms once the process has a
+    /// warm platform root store — which a broker always does by this
+    /// point, since [`GitHubMinter::new_registry`] built a `reqwest`
+    /// client at boot. It happens at most once per broker; every approve
+    /// after the first borrows the same transport.
+    pub fn git_data_http(&self) -> &GitDataHttp {
+        self.git_data_http.get_or_init(GitDataHttp::production)
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
