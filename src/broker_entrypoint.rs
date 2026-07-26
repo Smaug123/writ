@@ -326,6 +326,7 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
         signing_key: None,
         run_agent_spawn: None,
         promote_runtime,
+        git_data_http: std::sync::OnceLock::new(),
         mirror_pins: MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     });

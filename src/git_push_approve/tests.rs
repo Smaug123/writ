@@ -33,6 +33,17 @@ fn sample_token() -> GitSecretValue {
     GitSecretValue::new("ghs_test_token_value").unwrap()
 }
 
+/// The client the approve orchestrator is handed, pointed at a test
+/// server. Each call builds its own transport, which production must not
+/// do (see [`GitDataHttp`]) but a test may: one approve per test.
+fn sample_client(api_base: impl Into<String>) -> GitDataClient {
+    GitDataClient::new(
+        &GitDataHttp::production(),
+        api_base,
+        sample_token().as_str(),
+    )
+}
+
 const PRIVATE_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
 
 fn sample_signing_key() -> WritSigningKey {
@@ -308,8 +319,7 @@ async fn prepare_and_commit(
     let prepared = prepare_approve_with_staging_repo(
         staging,
         runtime,
-        api_base,
-        &sample_token(),
+        sample_client(api_base),
         repo,
         branch,
         expected_remote_head,
@@ -719,8 +729,7 @@ async fn prepare_approve_uploads_every_object_but_never_patches() {
     let prepared = prepare_approve_with_staging_repo(
         &staging,
         &runtime,
-        &server.uri(),
-        &sample_token(),
+        sample_client(server.uri()),
         &sample_repo().as_repo_ref().clone(),
         &GitBranchName::new("main").unwrap(),
         &parent,
@@ -864,21 +873,21 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
         .mount(&server)
         .await;
 
-    // 60 s, and not tight: this guard exists to convert a hang into a
-    // failure, so its only job is to sit well clear of every legitimate
-    // cost in the call. One of those costs is large and has nothing to
-    // do with the deadline under test — `prepare_approve_with_staging_repo`
-    // constructs a `reqwest::Client`, which on macOS loads the system
-    // trust store and has been measured here at ~10 s. Sizing the guard
-    // against the 500 ms deadline instead would just re-introduce a
-    // race, with the client build as the thing that loses.
+    // This guard exists to convert a hang into a failure, so it only has
+    // to sit well clear of the legitimate costs inside the call: two real
+    // `git` execs (via the stalling wrapper) and the 500 ms deadline under
+    // test. It used to need 60 s because the call also built a
+    // `reqwest::Client` — ~7 s on macOS, which loads the system trust
+    // store — but the transport is now built by the caller: the
+    // `sample_client(…)` below is an argument expression, so it is
+    // evaluated before `timeout` arms its timer, exactly as the broker
+    // pays that cost once at boot rather than once per approve.
     let outcome = tokio::time::timeout(
-        Duration::from_secs(60),
+        Duration::from_secs(10),
         prepare_approve_with_staging_repo(
             &staging,
             &runtime,
-            &server.uri(),
-            &sample_token(),
+            sample_client(server.uri()),
             &sample_repo().as_repo_ref().clone(),
             &GitBranchName::new("main").unwrap(),
             &parent,
@@ -969,8 +978,7 @@ async fn commit_rechecks_lease_and_refuses_when_branch_moved_after_prepare() {
     let prepared = prepare_approve_with_staging_repo(
         &staging,
         &runtime,
-        &server.uri(),
-        &sample_token(),
+        sample_client(server.uri()),
         &sample_repo().as_repo_ref().clone(),
         &branch,
         &parent,
@@ -1043,8 +1051,7 @@ async fn commit_under_another_attempts_witness_panics() {
     let prepared = prepare_approve_with_staging_repo(
         &staging,
         &runtime,
-        &server.uri(),
-        &sample_token(),
+        sample_client(server.uri()),
         &sample_repo().as_repo_ref().clone(),
         &GitBranchName::new("main").unwrap(),
         &parent,

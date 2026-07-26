@@ -661,11 +661,14 @@ was deleted; its one live export, the commit-trailer vocabulary
 ### 5.8 Git storage & transport
 
 **Purpose.** Four host-side components under the pipeline:
-- **`github_git_db.rs`** (524, with the `GitDataClient` request methods in
+- **`github_git_db.rs`** (571, with the `GitDataClient` request methods in
   `github_git_db/client.rs` and tests in `github_git_db/tests.rs`) — a typed
   client for GitHub's Git Database API
   (blobs/trees/commits/refs), used to re-create bundle commits object-by-object
-  under the App identity so published commits land Verified.
+  under the App identity so published commits land Verified. Split in two by
+  lifetime: the bounded transport (`GitDataHttp`, one per broker, held on
+  `BrokerState`) and the credentials (`GitDataClient`, one per approve, since
+  the installation token is minted per approve).
 - **`notes_repo.rs`** (1022, tests in `notes_repo/tests.rs`) — a shared bare-repo wrapper (used by both writ and
   bailiff) for attaching/reading git notes that carry signed run envelopes.
 - **`vm_git_bundle.rs`** (1760) — plans/executes `git clone --mirror` + `git
@@ -673,12 +676,16 @@ was deleted; its one live export, the commit-trailer vocabulary
 - **`vm_git_mirror_cache.rs`** (951) — a `(repo, rev)`-keyed on-disk cache of
   bare mirrors so flake provisioning reuses a mirror instead of re-fetching.
 
-**Primitives.** `GitDataClient`/`CommitRequest`/`CommitIdentity`/`TreeEntry`
-(`github_git_db.rs`); `NotesRepo`/`WriteOutcome` (`notes_repo.rs:120,101`);
+**Primitives.** `GitDataHttp`/`GitDataClient`/`CommitRequest`/`CommitIdentity`/
+`TreeEntry` (`github_git_db.rs`); `NotesRepo`/`WriteOutcome` (`notes_repo.rs:120,101`);
 `GitCloneBundlePlan`/`GitCredentialBoundary` (`vm_git_bundle.rs:51,22`);
 `MirrorCache`/`MirrorCacheKey`/`MirrorCacheBounds` (`vm_git_mirror_cache.rs`).
 
-**Guarantees.** `github_git_db`: every client is time-bounded by construction;
+**Guarantees.** `github_git_db`: every client is time-bounded by construction
+(a `GitDataClient` can only be built from a `GitDataHttp`, which can only be
+built from `GitDataTimeouts`), and the approve path is handed a client rather
+than the credentials to build one, so it cannot construct a per-request
+transport;
 blobs are always base64 to avoid SHA desync; a signed `create_commit` returns a
 SHA only if GitHub reports `verified:true`; `update_ref` hard-codes
 `force:false` so non-fast-forwards surface as errors. `notes_repo`: byte-exact

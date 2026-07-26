@@ -8,6 +8,13 @@ independently reviewable and independently shippable, ordered so the cheap,
 high-leverage moves land first. No code moves in the doc PR; this file exists so
 the work is scoped and ready to pick up.
 
+**Status (2026-07-26): closed out.** Slices 0–5b are implemented, Slices 6 and 7
+were investigated and *declined* on the boundary-cost framework below (no
+`writ-git`, no `writ-vm-host` — the evidence is in their sections), and Slice 8
+is a standing opportunistic habit rather than a task list: no file in the tree
+now exceeds ~2.1k lines, and the largest, `agent_vm_lifecycle.rs`, is at its
+intrinsic domain size. Nothing in this backlog is waiting to be picked up.
+
 ## Motivation
 
 A reviewer summarised the problem as *"the repo records its history, not its
@@ -59,6 +66,8 @@ be timid about them, but keep each one in its own PR.
 
 ## Target crate graph
 
+Drafted as:
+
 ```
 bailiff ─▶ writ (shell: daemon + binaries)
                  │
@@ -71,9 +80,17 @@ bailiff ─▶ writ (shell: daemon + binaries)
             writ-vm-git ─▶ writ-core
 ```
 
+**Landed as** the same graph minus its two left-hand nodes: investigation under
+Slices 6 and 7 found that neither `writ-git` nor `writ-vm-host` is a real seam,
+and both were declined on the boundary-cost framework below (see those sections
+for the evidence). `writ-agent-run` was extracted instead (Slice 4a), so the
+shipped graph is `bailiff ─▶ writ ─▶ {writ-audit, writ-vm-client,
+writ-agent-run} ─▶ writ-vm-git ─▶ writ-core`.
+
 `writ` stays the imperative shell that wires effects to the daemon. The
-subsystem names in `architecture.md` §5 are the intended crate seams; the ones
-below are the subset worth promoting from module to crate.
+subsystem names in `architecture.md` §5 were the *candidate* crate seams; the
+sections below record, for each, whether it survived contact with the actual
+coupling graph.
 
 ---
 
@@ -256,14 +273,54 @@ a real subsystem, disambiguated by the `_from_mirror` suffix and the `vm_http::`
 path — the same rule that kept `vm_http::nix_cache` in Slice 2), not
 accretion-order artifacts.
 
-### Slice 7 — extract the VM sandbox into `writ-vm-host`
+### Slice 7 — the VM sandbox (`writ-vm-host`)
 
-`agent_vm_{lifecycle,daemon,firewall}.rs` (+ their dirs),
+The candidate set: `agent_vm_{lifecycle,daemon,firewall}.rs` (+ their dirs),
 `broker_{vm,vm_runner,entrypoint,session,log_forwarder}.rs`,
-`process_supervisor.rs`, `vm_http/`, and the Nix provisioning modules. The
-biggest and most-coupled subsystem (depends on the pipeline, minting, and
-audit), so it goes last among the crate splits. The `writ-agent-vm-runner` and
-`writ-agent-vm-pf-helper` binaries move with it.
+`process_supervisor.rs`, `vm_http/`, and the Nix provisioning modules — ~60
+files and ~43k lines with tests, plus the `writ-agent-vm-runner` and
+`writ-agent-vm-pf-helper` binaries. It was scheduled last among the crate
+splits because it is the biggest and most-coupled subsystem.
+
+**Decision: do *not* extract a `writ-vm-host` crate.** Same verdict as Slice 6
+and for a stronger reason — this boundary is not even a DAG, so it fails before
+the cost/benefit question is reached.
+
+- **It is entangled with `BrokerState`, which *is* the shell.** The set holds 23
+  `crate::server::…` references, 13 of them to `BrokerState`, spread over 15
+  files: essentially every `vm_http` handler is generic over `S: SecretStore` and
+  takes an `Arc<BrokerState<S>>`. That struct owns the minter, policy config,
+  audit handle, staging store, notes repo, signing key, and promote runtime.
+  Moving it into `writ-vm-host` moves the shell; leaving it behind means
+  inverting the dependency behind a trait the shell implements — an interface for
+  exactly one implementation, which would make every handler's control flow
+  non-local. That is the thing the rest of this repo is arranged to avoid, and
+  buying it with a crate boundary is a bad trade at any price.
+- **The dependency runs both ways.** The subsystem reaches back for
+  `crate::server::{run_with_agent_vm, capture_stream_capped,
+  MAX_RUN_AGENT_STREAM_BYTES, error_with_source_chain, CapabilityOutcome}` while
+  `server.rs`'s dispatch calls *into* the subsystem. A crate boundary must be
+  acyclic, so those five would have to be relocated first — and
+  `run_with_agent_vm` is the shell's own run-agent path, not VM-sandbox
+  internals.
+- **The ordinary shell couplings are heavy too**: `crate::secret` (22),
+  `crate::config` (16), `crate::signing` (7), `crate::git_push_{staging,promote}`
+  (8), plus `github`, `policy`, `protocol`, `run_envelope`, and `crash_point`.
+  (`core`/`agent_run`/`audit`/`vm_git`, the four heaviest by raw count, are
+  already their own crates and would be ordinary dependencies.)
+
+What the crate would buy is compile isolation, and it would not get it: a crate
+that depends on the shell's central state struct recompiles on every edit to that
+struct, which is most edits. The four clean boundaries the original review named
+(agent-run, guest-client, audit, plus the pre-existing core/vm-git) are all
+extracted; the remainder of the tree is one program, and the honest description
+of it is a functional core in five crates with an imperative shell in `writ`.
+
+The local-reasoning goal Slice 7 was reaching for is better served by Slice 8's
+in-crate module boundaries, which cost nothing and are already delivering it —
+`vm_http/`, `agent_vm_daemon/`, `agent_vm_lifecycle/`, and `broker_vm/` are all
+directories with named submodules now, which is the readability win a crate
+split was going to be a very expensive way to buy.
 
 ### Slice 8 — break up god-files within their crates (opportunistic, ongoing)
 
@@ -461,5 +518,6 @@ signal the seam is in the wrong place.
   speculative genericity. Every slice is "same code, better boundary" or "less
   code." If a slice tempts a redesign, that is a separate proposal.
 - **Ordering is a recommendation, not a lock.** Slices 1–3 are independent and
-  can land in any order; 4–7 should follow the dependency order given; 8 is
-  continuous.
+  can land in any order; 4–5 followed the dependency order given; 6 and 7 were
+  investigated and declined (their sections record why); 8 is continuous and is
+  the only slice with work left in it.
