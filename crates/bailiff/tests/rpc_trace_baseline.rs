@@ -617,7 +617,7 @@ async fn a_failed_run_still_closes_the_session() {
 
         let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap());
         let client = WritClient::new(&broker.socket_path);
-        submit_plan(
+        let err = submit_plan(
             &client,
             bailiff,
             &writ.repo_path,
@@ -626,6 +626,10 @@ async fn a_failed_run_still_closes_the_session() {
         )
         .await
         .expect_err("a broker error must surface");
+        assert!(
+            matches!(err, SubmitPlanError::RunAgent { .. }),
+            "expected RunAgent, got {err:?}",
+        );
 
         assert_trace("submit_run_agent_error", &broker.observed().await);
     }
@@ -655,7 +659,7 @@ async fn a_failed_run_still_closes_the_session() {
         );
 
         let client = WritClient::new(&broker.socket_path);
-        submit_review(
+        let err = submit_review(
             &client,
             bailiff,
             &writ.repo_path,
@@ -664,6 +668,10 @@ async fn a_failed_run_still_closes_the_session() {
         )
         .await
         .expect_err("a broker error must surface");
+        assert!(
+            matches!(err, SubmitReviewError::RunAgent { .. }),
+            "expected RunAgent, got {err:?}",
+        );
 
         assert_trace("review_run_agent_error", &broker.observed().await);
     }
@@ -706,7 +714,7 @@ async fn every_post_open_failure_branch_has_a_trace() {
                 plan_submission_seed_blob_bytes(plan_id),
                 writ.plan_note(plan_id).canonical_bytes(),
             );
-            submit_review(
+            let err_r = submit_review(
                 &client,
                 bailiff,
                 &writ.repo_path,
@@ -715,8 +723,12 @@ async fn every_post_open_failure_branch_has_a_trace() {
             )
             .await
             .expect_err("a refused OpenSession must surface");
+            assert!(
+                matches!(err_r, SubmitReviewError::OpenSession(_)),
+                "expected OpenSession, got {err_r:?}",
+            );
         } else {
-            submit_plan(
+            let err_s = submit_plan(
                 &client,
                 bailiff,
                 &writ.repo_path,
@@ -725,6 +737,10 @@ async fn every_post_open_failure_branch_has_a_trace() {
             )
             .await
             .expect_err("a refused OpenSession must surface");
+            assert!(
+                matches!(err_s, SubmitPlanError::OpenSession(_)),
+                "expected OpenSession, got {err_s:?}",
+            );
         }
         assert_trace(name, &broker.observed().await);
     }
@@ -754,7 +770,7 @@ async fn every_post_open_failure_branch_has_a_trace() {
                 plan_submission_seed_blob_bytes(plan_id),
                 writ.plan_note(plan_id).canonical_bytes(),
             );
-            submit_review(
+            let err_r = submit_review(
                 &client,
                 bailiff,
                 &writ.repo_path,
@@ -763,8 +779,17 @@ async fn every_post_open_failure_branch_has_a_trace() {
             )
             .await
             .expect_err("a session-id mismatch must surface");
+            // Named explicitly: the mutated metadata also leaves the
+            // signature stale, so a build that dropped the session-id
+            // check would fail later in note verification and emit the
+            // *same* open->run->close trace. Only the variant tells
+            // the two apart.
+            assert!(
+                matches!(err_r, SubmitReviewError::SessionIdMismatch { .. }),
+                "expected SessionIdMismatch, got {err_r:?}",
+            );
         } else {
-            submit_plan(
+            let err_s = submit_plan(
                 &client,
                 bailiff,
                 &writ.repo_path,
@@ -773,6 +798,10 @@ async fn every_post_open_failure_branch_has_a_trace() {
             )
             .await
             .expect_err("a session-id mismatch must surface");
+            assert!(
+                matches!(err_s, SubmitPlanError::SessionIdMismatch { .. }),
+                "expected SessionIdMismatch, got {err_s:?}",
+            );
         }
         assert_trace(name, &broker.observed().await);
     }
@@ -806,7 +835,7 @@ async fn every_post_open_failure_branch_has_a_trace() {
                 plan_submission_seed_blob_bytes(plan_id),
                 writ.plan_note(plan_id).canonical_bytes(),
             );
-            submit_review(
+            let err_r = submit_review(
                 &client,
                 bailiff,
                 &writ.repo_path,
@@ -815,8 +844,12 @@ async fn every_post_open_failure_branch_has_a_trace() {
             )
             .await
             .expect_err("an untrusted signer must fail the note write");
+            assert!(
+                matches!(err_r, SubmitReviewError::WriteReviewNote { .. }),
+                "expected WriteReviewNote, got {err_r:?}",
+            );
         } else {
-            submit_plan(
+            let err_s = submit_plan(
                 &client,
                 bailiff,
                 &writ.repo_path,
@@ -825,6 +858,10 @@ async fn every_post_open_failure_branch_has_a_trace() {
             )
             .await
             .expect_err("an untrusted signer must fail the note write");
+            assert!(
+                matches!(err_s, SubmitPlanError::WritePlanNote { .. }),
+                "expected WritePlanNote, got {err_s:?}",
+            );
         }
         assert_trace(name, &broker.observed().await);
     }
@@ -894,10 +931,13 @@ async fn implement_failures_still_own_no_session() {
         )
         .await
         .expect_err("this scenario must fail");
-        assert!(
-            !matches!(err, SubmitImplementError::IllegalTransition { .. }),
-            "the gate must have passed; got {err:?}",
-        );
+        let expected_variant = match name {
+            "implement_write_note_failure" => {
+                matches!(err, SubmitImplementError::WriteImplementNote { .. })
+            }
+            _ => matches!(err, SubmitImplementError::RunAgent(_)),
+        };
+        assert!(expected_variant, "unexpected variant for {name}: {err:?}");
 
         assert_trace(name, &broker.observed().await);
     }
@@ -1059,5 +1099,180 @@ async fn close_session_failures_surface_the_right_error() {
             "a cleanup close failure must not replace the original error, got {err:?}",
         );
         assert_trace("submit_cleanup_close_error", &broker.observed().await);
+    }
+}
+
+/// `implement`'s failures between the gate and its single `RunAgent`
+/// must also emit nothing.
+///
+/// It verifies the planner envelope and composes a bounded prompt
+/// before running, exactly as review does — and it is the workflow
+/// where running too early costs the most, since its capability set is
+/// `WorkspaceWrite`. A refactor that skipped verification, or ran
+/// before composing, would pass every other implement fixture.
+#[tokio::test]
+async fn implement_failures_before_run_agent_emit_nothing() {
+    // Unverifiable planner envelope.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![]).await;
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        plant(
+            &bailiff,
+            plan_id,
+            plan_submission_seed_blob_bytes(plan_id),
+            PlanNote {
+                plan_id,
+                purpose: "plan-submit".into(),
+                writ_output_oid: writ.untrusted_oid.clone(),
+                signed_metadata: writ.untrusted_metadata.clone(),
+                signature: writ.untrusted_signature.clone(),
+            }
+            .canonical_bytes(),
+        );
+        plant(
+            &bailiff,
+            plan_id,
+            plan_review_seed_blob_bytes(plan_id),
+            writ.review_note(plan_id).canonical_bytes(),
+        );
+        write_decision_note(
+            &bailiff,
+            &DecisionNote {
+                plan_id,
+                outcome: Decision::Accepted,
+                decider: Decider::try_new("cli:trace").unwrap(),
+                decided_at: UnixMillis::from_millis(1_700_000_000_000),
+            },
+        )
+        .unwrap();
+
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_implement(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            implement_inputs(plan_id),
+        )
+        .await
+        .expect_err("an unverifiable planner envelope must fail");
+        assert!(
+            matches!(err, SubmitImplementError::ReadPlanEnvelope(_)),
+            "expected ReadPlanEnvelope, got {err:?}",
+        );
+        assert_trace("implement_envelope_unverifiable", &broker.observed().await);
+    }
+
+    // Oversized composed prompt.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![]).await;
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        plant(
+            &bailiff,
+            plan_id,
+            plan_submission_seed_blob_bytes(plan_id),
+            writ.plan_note(plan_id).canonical_bytes(),
+        );
+        plant(
+            &bailiff,
+            plan_id,
+            plan_review_seed_blob_bytes(plan_id),
+            writ.review_note(plan_id).canonical_bytes(),
+        );
+        write_decision_note(
+            &bailiff,
+            &DecisionNote {
+                plan_id,
+                outcome: Decision::Accepted,
+                decider: Decider::try_new("cli:trace").unwrap(),
+                decided_at: UnixMillis::from_millis(1_700_000_000_000),
+            },
+        )
+        .unwrap();
+
+        let mut inputs = implement_inputs(plan_id);
+        inputs.feature_prompt =
+            AgentPrompt::try_new("x".repeat(writ::agent_run::MAX_AGENT_PROMPT_BYTES - 16)).unwrap();
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_implement(&client, bailiff, &writ.repo_path, allowed_signers(), inputs)
+            .await
+            .expect_err("an oversized composed prompt must fail");
+        assert!(
+            matches!(err, SubmitImplementError::ComposeImplementerPrompt(_)),
+            "expected ComposeImplementerPrompt, got {err:?}",
+        );
+        assert_trace("implement_prompt_too_large", &broker.observed().await);
+    }
+}
+
+/// The same two close-failure cases, through `review`.
+///
+/// Error mapping is per-workflow, so "submit gets it right" says
+/// nothing about review: a review-specific arm could suppress a
+/// close-only failure, or let a cleanup close replace the original run
+/// error, with an identical trace either way.
+#[tokio::test]
+async fn review_close_session_failures_surface_the_right_error() {
+    for (name, run_reply, expect_close) in [
+        ("review_close_session_error", None, true),
+        (
+            "review_cleanup_close_error",
+            Some(ServerMessage::Error {
+                message: "agent runner unavailable".into(),
+            }),
+            false,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: stub_session_id(),
+            },
+            run_reply.unwrap_or_else(|| writ.run_agent_completed()),
+            ServerMessage::Error {
+                message: "close failed".into(),
+            },
+        ])
+        .await;
+
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("b")).unwrap());
+        plant(
+            &bailiff,
+            plan_id,
+            plan_submission_seed_blob_bytes(plan_id),
+            writ.plan_note(plan_id).canonical_bytes(),
+        );
+
+        let client = WritClient::new(&broker.socket_path);
+        let err = submit_review(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            review_inputs(plan_id),
+        )
+        .await
+        .expect_err("this scenario must fail");
+
+        if expect_close {
+            assert!(
+                matches!(err, SubmitReviewError::CloseSession { .. }),
+                "a close failure on the happy path must surface as CloseSession, got {err:?}",
+            );
+        } else {
+            assert!(
+                matches!(err, SubmitReviewError::RunAgent { .. }),
+                "a cleanup close failure must not replace the original error, got {err:?}",
+            );
+        }
+        assert_trace(name, &broker.observed().await);
     }
 }
