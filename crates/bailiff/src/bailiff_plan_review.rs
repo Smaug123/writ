@@ -42,11 +42,12 @@ use tokio::task::JoinError;
 use crate::bailiff_plan_note::PlanId;
 use crate::bailiff_plan_read::{ReadPlanBodyError, ReadPlanError, SummarizePlanError};
 use crate::bailiff_plan_state::IllegalTransition;
-use crate::bailiff_plan_write::{WriteReviewNoteError, write_review_note};
+use crate::bailiff_plan_write::WriteStageNoteError;
 use crate::bailiff_repo_guard::PlanGuardError;
 use crate::bailiff_stage::{
     ComposePlanPromptError, OpenPlanStageError, OwnedSession, OwnedSessionRunError, PlanBodyStage,
-    StageRunInputs, compose_with_plan_body, open_plan_stage, run_under_owned_session,
+    StageNoteTarget, StageRunInputs, compose_with_plan_body, open_plan_stage,
+    run_under_owned_session,
 };
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
@@ -85,7 +86,7 @@ pub struct SubmitReviewInputs {
     /// to. Today this is always `refs/notes/writ/v1/agent-outputs`;
     /// surfacing it as a parameter (rather than a constant) keeps
     /// the function honest about the same ref bailiff later passes
-    /// to [`write_review_note`].
+    /// to [`crate::bailiff_plan_write::write_stage_note`].
     pub writ_output_ref: NotesRef,
     /// Optional human-readable session label. Stored on writ's audit
     /// session row; informational only.
@@ -172,9 +173,6 @@ pub async fn submit_review(
     )
     .await?;
 
-    let writ_repo_path = writ_repo_path.to_path_buf();
-    let writ_output_ref = inputs.writ_output_ref.clone();
-    let purpose = inputs.purpose.clone();
     let stage = run_under_owned_session(
         client,
         &mut guard,
@@ -183,22 +181,17 @@ pub async fn submit_review(
             agent_kind: inputs.session_agent_kind,
             agent_model: inputs.session_agent_model,
         },
+        StageNoteTarget {
+            stage: PlanBodyStage::Review.stage(),
+            plan_id,
+            writ_repo_path: writ_repo_path.to_path_buf(),
+            allowed_signers,
+        },
         StageRunInputs {
             prompt: reviewer_prompt,
             capabilities: inputs.capabilities,
             purpose: inputs.purpose,
             writ_output_ref: inputs.writ_output_ref,
-        },
-        move |repo, completed| {
-            write_review_note(
-                repo,
-                &writ_repo_path,
-                &writ_output_ref,
-                plan_id,
-                purpose,
-                completed,
-                &allowed_signers,
-            )
         },
     )
     .await?;
@@ -242,8 +235,8 @@ impl From<ComposePlanPromptError> for SubmitReviewError {
 
 /// Total map from the owned-session run phase's failures onto this
 /// workflow's.
-impl From<OwnedSessionRunError<WriteReviewNoteError>> for SubmitReviewError {
-    fn from(source: OwnedSessionRunError<WriteReviewNoteError>) -> Self {
+impl From<OwnedSessionRunError> for SubmitReviewError {
+    fn from(source: OwnedSessionRunError) -> Self {
         match source {
             OwnedSessionRunError::OpenSession(source) => Self::OpenSession(source),
             OwnedSessionRunError::RunAgent { session_id, source } => {
@@ -364,12 +357,12 @@ pub enum SubmitReviewError {
     /// so an operator can re-attempt the review-note write against
     /// the same envelope without re-running the agent. Includes the
     /// idempotency-conflict case
-    /// ([`WriteReviewNoteError::ReviewAlreadyRecorded`]).
+    /// ([`crate::bailiff_plan_write::WriteStageNoteError::AlreadyRecorded`]).
     #[error("writing the bailiff-side review note failed (session {session_id}): {source}")]
     WriteReviewNote {
         session_id: SessionId,
         #[source]
-        source: WriteReviewNoteError,
+        source: WriteStageNoteError,
     },
     /// The `spawn_blocking` task that owns the `write_review_note`
     /// call panicked or was cancelled. Surfaces separately from

@@ -167,14 +167,17 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     let bailiff_for_block = Arc::clone(&bailiff);
     let returned_oid = tokio::task::spawn_blocking(move || {
         let bailiff = bailiff_for_block.blocking_lock();
-        write_plan_note(
+        write_stage_note(
             &bailiff,
-            &writ_repo_path,
+            &StageNoteTarget {
+                stage: AgentStage::Submit,
+                plan_id,
+                writ_repo_path: writ_repo_path.clone(),
+                allowed_signers: allowed.clone(),
+            },
             &writ_notes_ref_clone,
-            plan_id,
             purpose.clone(),
             &completed_clone,
-            &allowed,
         )
     })
     .await
@@ -311,14 +314,17 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
     let bailiff_for_block = Arc::clone(&bailiff);
     let returned_oid = tokio::task::spawn_blocking(move || {
         let bailiff = bailiff_for_block.blocking_lock();
-        write_review_note(
+        write_stage_note(
             &bailiff,
-            &writ_repo_path,
+            &StageNoteTarget {
+                stage: AgentStage::Review,
+                plan_id,
+                writ_repo_path: writ_repo_path.clone(),
+                allowed_signers: allowed.clone(),
+            },
             &writ_notes_ref_clone,
-            plan_id,
             purpose.clone(),
             &completed_clone,
-            &allowed,
         )
     })
     .await
@@ -454,14 +460,17 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
     let bailiff_for_block = Arc::clone(&bailiff);
     let returned_oid = tokio::task::spawn_blocking(move || {
         let bailiff = bailiff_for_block.blocking_lock();
-        write_implement_note(
+        write_stage_note(
             &bailiff,
-            &writ_repo_path,
+            &StageNoteTarget {
+                stage: AgentStage::Implement,
+                plan_id,
+                writ_repo_path: writ_repo_path.clone(),
+                allowed_signers: allowed.clone(),
+            },
             &writ_notes_ref_clone,
-            plan_id,
             purpose.clone(),
             &completed_clone,
-            &allowed,
         )
     })
     .await

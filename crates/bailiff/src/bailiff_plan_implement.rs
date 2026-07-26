@@ -63,11 +63,11 @@ use tokio::task::JoinError;
 use crate::bailiff_plan_note::PlanId;
 use crate::bailiff_plan_read::{ReadPlanBodyError, ReadPlanError, SummarizePlanError};
 use crate::bailiff_plan_state::IllegalTransition;
-use crate::bailiff_plan_write::{WriteImplementNoteError, write_implement_note};
+use crate::bailiff_plan_write::WriteStageNoteError;
 use crate::bailiff_repo_guard::PlanGuardError;
 use crate::bailiff_stage::{
     BrokerSession, BrokerSessionRunError, ComposePlanPromptError, OpenPlanStageError,
-    PlanBodyStage, StageRunInputs, compose_with_plan_body, open_plan_stage,
+    PlanBodyStage, StageNoteTarget, StageRunInputs, compose_with_plan_body, open_plan_stage,
     run_under_broker_session,
 };
 use writ::agent_run::{AgentPrompt, AgentPromptError};
@@ -112,7 +112,7 @@ pub struct SubmitImplementInputs {
     /// to. Today this is always `refs/notes/writ/v1/agent-outputs`;
     /// surfacing it as a parameter (rather than a constant) keeps
     /// the function honest about the same ref bailiff later passes
-    /// to [`write_implement_note`].
+    /// to [`crate::bailiff_plan_write::write_stage_note`].
     pub writ_output_ref: NotesRef,
     /// Coarse agent identity. Writ uses it for GitHub-App selection
     /// on credential mints; with a `WorkspaceWrite` capability set
@@ -239,9 +239,6 @@ pub async fn submit_implement(
     // broker-managed. The session id surfaces back via the signed
     // envelope's metadata, which is where the workflow's
     // `implementer_session_id` field comes from.
-    let writ_repo_path = writ_repo_path.to_path_buf();
-    let writ_output_ref = inputs.writ_output_ref.clone();
-    let purpose = inputs.purpose.clone();
     let stage = run_under_broker_session(
         client,
         &mut guard,
@@ -250,22 +247,17 @@ pub async fn submit_implement(
             agent_kind: inputs.session_agent_kind,
             agent_model: inputs.session_agent_model,
         },
+        StageNoteTarget {
+            stage: PlanBodyStage::Implement.stage(),
+            plan_id,
+            writ_repo_path: writ_repo_path.to_path_buf(),
+            allowed_signers,
+        },
         StageRunInputs {
             prompt: implementer_prompt,
             capabilities: inputs.capabilities,
             purpose: inputs.purpose,
             writ_output_ref: inputs.writ_output_ref,
-        },
-        move |repo, completed| {
-            write_implement_note(
-                repo,
-                &writ_repo_path,
-                &writ_output_ref,
-                plan_id,
-                purpose,
-                completed,
-                &allowed_signers,
-            )
         },
     )
     .await?;
@@ -315,8 +307,8 @@ impl From<ComposePlanPromptError> for SubmitImplementError {
 /// path that would produce them does not exist on this side. A single
 /// shared run-phase error would have forced this workflow to name
 /// three failures it cannot have.
-impl From<BrokerSessionRunError<WriteImplementNoteError>> for SubmitImplementError {
-    fn from(source: BrokerSessionRunError<WriteImplementNoteError>) -> Self {
+impl From<BrokerSessionRunError> for SubmitImplementError {
+    fn from(source: BrokerSessionRunError) -> Self {
         match source {
             BrokerSessionRunError::RunAgent(source) => Self::RunAgent(source),
             BrokerSessionRunError::WriteNote { session_id, source } => {
@@ -404,12 +396,12 @@ pub enum SubmitImplementError {
     /// so an operator can re-attempt the implement-note write against
     /// the same envelope without re-running the agent. Includes the
     /// idempotency-conflict case
-    /// ([`WriteImplementNoteError::ImplementAlreadyRecorded`]).
+    /// ([`crate::bailiff_plan_write::WriteStageNoteError::AlreadyRecorded`]).
     #[error("writing the bailiff-side implement note failed (session {session_id}): {source}")]
     WriteImplementNote {
         session_id: SessionId,
         #[source]
-        source: WriteImplementNoteError,
+        source: WriteStageNoteError,
     },
     /// The `spawn_blocking` task that owns the `write_implement_note`
     /// call panicked or was cancelled. Surfaces separately from
@@ -1117,7 +1109,7 @@ mod end_to_end_tests {
     /// one call must succeed and every other must surface
     /// `IllegalTransition` — the *pre-RPC* duplicate-gate variant,
     /// never the post-RPC
-    /// [`WriteImplementNoteError::ImplementAlreadyRecorded`] that
+    /// [`crate::bailiff_plan_write::WriteStageNoteError::AlreadyRecorded`] that
     /// `write_implement_note` would surface if two callers both
     /// reached the write step.
     ///

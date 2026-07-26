@@ -966,11 +966,22 @@ for the delta table.
 
 **Guarantees & invariants.** Each stage attaches a distinct note under one
 per-plan ref `refs/notes/bailiff/v1/plans/<id>` at deterministic per-stage seed
-OIDs. Every signed stage runs fetch → verify: fetch writ's
-`refs/notes/writ/v1/*`, re-decode the envelope, check metadata+signature parity
-against the RPC reply, then `verify_run_envelope`. Append-only/idempotent via
-`NotesRepo::write_note_if_absent` (duplicate → `AlreadyRecorded`);
+OIDs, projected from `AgentStage::note_seed`. Every signed stage runs
+fetch → verify: fetch writ's `refs/notes/writ/v1/*`, re-decode the envelope,
+check metadata+signature parity against the RPC reply, then
+`verify_run_envelope`. All three envelope-bearing stages go through one
+`write_stage_note`; append-only/idempotent via `NotesRepo::write_note_if_absent`
+(duplicate → `WriteStageNoteError::AlreadyRecorded`, which names its stage);
 `deny_unknown_fields` on all notes; cross-plan `PlanIdMismatch` guards.
+
+The three note bodies are field-identical and emitted by one `stage_note!`
+macro, but stay **distinct types**: `read_plan_body_bytes` takes the submission
+specifically, because its body is what gets spliced into the reviewer's and
+implementer's prompts, and under a shared type handing it the review note would
+compile. The macro removes the duplication at the source; the type system keeps
+the distinction at the call sites. Their canonical bytes are pinned by a
+checked-in literal, since a wire-format change orphans every note already in an
+operator's repo.
 
 **Locking.** Single-writer **per plan**, via `PlanGuard` (`bailiff_repo_guard.rs`):
 one `flock` on `<bailiff_repo>/bailiff-locks/<plan-id>.lock`, taken on a blocking

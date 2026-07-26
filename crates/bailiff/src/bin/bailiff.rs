@@ -39,7 +39,7 @@ use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit
 use bailiff::bailiff_plan_state::PlanStage;
 use bailiff::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
 use bailiff::bailiff_plan_write::{
-    WriteDecisionNoteError, WriteImplementNoteError, WriteReviewNoteError, write_decision_note,
+    WriteDecisionNoteError, WriteStageNoteError, write_decision_note,
 };
 use bailiff::bailiff_stage::open_plan_stage;
 use bailiff::output::{write_bailiff_plan_list, write_bailiff_plan_show};
@@ -764,22 +764,25 @@ async fn plan_review(
             println!("{}", outcome.review_note_oid);
             Ok(())
         }
-        // `ReviewAlreadyRecorded` is the duplicate-review invariant.
-        // Surface it with the same actionable shape `plan decide`
-        // uses for `DecisionAlreadyRecorded`, so an operator who
-        // re-ran the verb sees what to do next rather than a generic
-        // formatted error chain.
+        // The duplicate-stage invariant. Surface it with the same
+        // actionable shape `plan decide` uses for
+        // `DecisionAlreadyRecorded`, so an operator who re-ran the
+        // verb sees what to do next rather than a generic formatted
+        // error chain. Since slice 3b one `AlreadyRecorded` variant
+        // covers all three stages and names its own noun, so this arm
+        // no longer has to.
         Err(SubmitReviewError::WriteReviewNote {
             session_id: _,
             source:
-                WriteReviewNoteError::ReviewAlreadyRecorded {
+                WriteStageNoteError::AlreadyRecorded {
+                    stage,
                     plan_id,
                     target_oid,
                 },
         }) => Err(format!(
-            "review already recorded for plan {plan_id} at target {target_oid}; bailiff does not \
-             overwrite reviews — submit a fresh plan if the operator wants a re-review (multi-review \
-             history is a future v1 → v2 migration)"
+            "{stage} already recorded for plan {plan_id} at target {target_oid}; bailiff does not \
+             overwrite it — submit a fresh plan if the operator wants another (repeat attempts \
+             are a future v1 → v2 migration)"
         )
         .into()),
         Err(e) => Err(format!("{e}").into()),
@@ -908,14 +911,15 @@ async fn plan_implement(
         Err(SubmitImplementError::WriteImplementNote {
             session_id: _,
             source:
-                WriteImplementNoteError::ImplementAlreadyRecorded {
+                WriteStageNoteError::AlreadyRecorded {
+                    stage,
                     plan_id,
                     target_oid,
                 },
         }) => Err(format!(
-            "implement already recorded for plan {plan_id} at target {target_oid}; bailiff does \
-             not overwrite implement notes — submit a fresh plan if a re-implement is needed \
-             (multi-attempt implement history is a future v1 → v2 migration)"
+            "{stage} already recorded for plan {plan_id} at target {target_oid}; bailiff does not \
+             overwrite it — submit a fresh plan if the operator wants another (repeat attempts \
+             are a future v1 → v2 migration)"
         )
         .into()),
         Err(e) => Err(format!("{e}").into()),
