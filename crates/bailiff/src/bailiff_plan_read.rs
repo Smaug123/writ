@@ -35,6 +35,7 @@ use crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC;
 use crate::bailiff_repo_guard::lock_repo_mutations;
 use writ::core::NotesRef;
 use writ::notes_repo::{NotesRepo, NotesRepoError};
+use writ::protocol::SignedRunMetadata;
 use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use writ::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
 use writ::vm_git::GitObjectId;
@@ -873,26 +874,12 @@ pub(crate) fn read_plan_body_bytes(
     plan_note: &PlanNote,
     allowed_signers: &AllowedSigners,
 ) -> Result<String, ReadPlanBodyError> {
-    // Repo-wide: the caller's per-plan lock does not serialise a fetch
-    // against another process's note write. See `lock_repo_mutations`.
-    let _repo_lock = lock_repo_mutations(bailiff_repo).map_err(ReadPlanBodyError::RepoLock)?;
-    bailiff_repo
-        .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
-        .map_err(ReadPlanBodyError::Fetch)?;
-    let body = bailiff_repo
-        .read_note(writ_notes_ref, &plan_note.writ_output_oid)
-        .map_err(ReadPlanBodyError::ReadEnvelope)?;
-    let envelope =
-        SignedRunEnvelope::from_bytes(&body).map_err(ReadPlanBodyError::DecodeEnvelope)?;
-    if envelope.metadata != plan_note.signed_metadata {
-        return Err(ReadPlanBodyError::EnvelopeMetadataMismatch);
-    }
-    if envelope.signature != plan_note.signature {
-        return Err(ReadPlanBodyError::EnvelopeSignatureMismatch);
-    }
-    verify_run_envelope(&envelope, allowed_signers).map_err(ReadPlanBodyError::Verify)?;
-    let output =
-        OutputEnvelope::from_bytes(&envelope.output).map_err(ReadPlanBodyError::DecodeOutput)?;
+    let _lock = fetch_writ_mirror(bailiff_repo, writ_repo_path)?;
+    let output = verify_note_output(bailiff_repo, writ_notes_ref, plan_note, allowed_signers)?;
+    // Policy, not parsing. The chain above is shared with every reader
+    // of a signed bailiff note; these three rules are specific to
+    // *this* consumer, which splices the bytes into a follow-up
+    // agent's prompt.
     if let Some(stdout_truncated_at) = output.stdout_truncated_at {
         return Err(ReadPlanBodyError::OutputTruncated {
             stdout_truncated_at,
@@ -904,6 +891,250 @@ pub(crate) fn read_plan_body_bytes(
     String::from_utf8(output.stdout).map_err(ReadPlanBodyError::OutputNotUtf8)
 }
 
+/// Fetch writ's `v1` notes namespace into bailiff's repo, once.
+///
+/// Split out of [`verify_note_output`] so a caller with *many* notes to
+/// verify pays for one fetch rather than one per note. A dossier over
+/// the 32-attempt bound was otherwise 33 identical fetches, each under
+/// the repo-wide mutation lock and each able to burn the full fetch
+/// timeout against a stalled source.
+///
+/// Returns the held lock. Keeping it for the caller's whole read is
+/// deliberate and is *stronger* than re-locking per note: every note
+/// then verifies against one snapshot, so another process's fetch
+/// cannot roll the mirror out from under a multi-note read.
+pub(crate) fn fetch_writ_mirror(
+    bailiff_repo: &NotesRepo,
+    writ_repo_path: &Path,
+) -> Result<std::fs::File, ReadVerifiedOutputError> {
+    // Repo-wide: a per-plan lock does not serialise a fetch against
+    // another process's note write. See `lock_repo_mutations`.
+    let lock = lock_repo_mutations(bailiff_repo).map_err(ReadVerifiedOutputError::RepoLock)?;
+    bailiff_repo
+        .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
+        .map_err(ReadVerifiedOutputError::Fetch)?;
+    Ok(lock)
+}
+
+/// Re-verify and decode the writ envelope a signed bailiff note points
+/// at, returning its [`OutputEnvelope`] with **no policy applied**.
+///
+/// Assumes the mirror is already fetched — the caller holds the lock
+/// [`fetch_writ_mirror`] returned.
+///
+/// The chain — read the envelope at the note's `writ_output_oid`, check
+/// the note's copied metadata and signature against the envelope's,
+/// re-run `verify_run_envelope`, decode the output — is identical for
+/// every consumer. What differs is what counts as acceptable
+/// afterwards, and that difference is real:
+/// [`read_plan_body_bytes`] rejects empty or truncated stdout because
+/// the planner's stdout *is* the plan body and a vacuous one would
+/// mislead the agent that reads it, while a dossier over implementer
+/// runs must render an empty or truncated output rather than refuse to
+/// show it. One parser, per-caller policy — and the error type follows
+/// the same split, so a failure reading an *implementer* envelope no
+/// longer reports itself as a planner failure and sends an operator to
+/// the wrong artefact.
+///
+/// Generic over [`SignedBailiffNote`] because the four fields it
+/// touches are exactly that trait, which already has three
+/// implementations for rendering — no new abstraction, just the
+/// existing one used where it fits.
+///
+/// **Re-verifying is not redundant** even though the write helper
+/// verified at attach time. Between then and now the envelope on disk
+/// could have been replaced (manual repair, a faulty mirror), and
+/// these bytes go on to be read by a human or spliced into an agent's
+/// prompt. A second verify costs microseconds and forecloses the whole
+/// "I tampered with the output after it was recorded" class.
+pub(crate) fn verify_note_output(
+    bailiff_repo: &NotesRepo,
+    writ_notes_ref: &NotesRef,
+    note: &impl SignedBailiffNote,
+    allowed_signers: &AllowedSigners,
+) -> Result<OutputEnvelope, ReadVerifiedOutputError> {
+    let body = bailiff_repo
+        .read_note(writ_notes_ref, note.writ_output_oid())
+        .map_err(ReadVerifiedOutputError::ReadEnvelope)?;
+    let envelope =
+        SignedRunEnvelope::from_bytes(&body).map_err(ReadVerifiedOutputError::DecodeEnvelope)?;
+    if &envelope.metadata != note.signed_metadata() {
+        return Err(ReadVerifiedOutputError::EnvelopeMetadataMismatch);
+    }
+    if &envelope.signature != note.signature() {
+        return Err(ReadVerifiedOutputError::EnvelopeSignatureMismatch);
+    }
+    verify_run_envelope(&envelope, allowed_signers).map_err(ReadVerifiedOutputError::Verify)?;
+    OutputEnvelope::from_bytes(&envelope.output).map_err(ReadVerifiedOutputError::DecodeOutput)
+}
+
+/// Why the shared fetch → verify → decode chain failed for **some**
+/// signed bailiff note.
+///
+/// Deliberately neutral about which note. The predecessor of this type
+/// said "planner envelope" in every message, which was accurate while
+/// the chain had one caller and became a lie the moment a dossier ran
+/// it over implementer notes: an operator chasing a "planner envelope"
+/// failure reported under attempt 3 would go looking at the wrong
+/// artefact. Planner-specific wording lives in [`ReadPlanBodyError`],
+/// which is the planner's *policy* layer.
+#[derive(Debug, Error)]
+pub enum ReadVerifiedOutputError {
+    #[error("locking bailiff's repo for mutation failed: {0}")]
+    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
+    #[error("fetching writ's notes ref failed: {0}")]
+    Fetch(#[source] NotesRepoError),
+    #[error("reading the writ envelope note failed: {0}")]
+    ReadEnvelope(#[source] NotesRepoError),
+    #[error("decoding the writ envelope failed: {0}")]
+    DecodeEnvelope(#[source] serde_json::Error),
+    #[error(
+        "the stored envelope's signed metadata differs from the metadata writ returned on the \
+         wire"
+    )]
+    EnvelopeMetadataMismatch,
+    #[error("the stored envelope's signature differs from the signature writ returned on the wire")]
+    EnvelopeSignatureMismatch,
+    #[error("re-verifying the envelope failed: {0}")]
+    Verify(#[source] VerifyError),
+    #[error("decoding the output envelope failed: {0}")]
+    DecodeOutput(#[source] serde_json::Error),
+}
+
+/// Assemble the per-plan dossier: the approved plan body once, then
+/// every implementer attempt's verified output.
+///
+/// This is the read half of the end goal — "spin up several variants,
+/// actually build them, … compose a dossier". It is deliberately a
+/// *read* and not an agent run: an agent that compares variants needs
+/// their outputs assembled first, and this is that assembly. Building
+/// the comparing agent now would mean a fifth note kind and a new
+/// stage with no consumer; if one is later wanted, its prompt is this
+/// function's output.
+///
+/// **An attempt whose envelope does not verify contributes no bytes.**
+/// Its failure is recorded instead, so a reader can see that the
+/// attempt exists and that its output could not be trusted — the one
+/// thing a dossier must never do is present unverified agent output
+/// beside verified output with nothing to tell them apart. That is why
+/// [`DossierAttempt::output`] is a `Result` rather than an
+/// `Option<Vec<u8>>`: "no bytes, and here is why" is a different
+/// statement from "no bytes".
+pub fn read_dossier(
+    bailiff_repo: &NotesRepo,
+    plan_id: PlanId,
+    writ_repo_path: &Path,
+    writ_notes_ref: &NotesRef,
+    allowed_signers: &AllowedSigners,
+) -> Result<PlanDossier, ReadDossierError> {
+    let plan_note = read_plan_note(bailiff_repo, plan_id)?;
+    let attempt_notes = read_implement_attempts(bailiff_repo, plan_id)?.notes;
+
+    // One fetch, one lock, for the whole dossier. Per-note fetching
+    // would be 33 identical fetches at the attempt bound — and worse
+    // than slow: every note would verify against a *different*
+    // snapshot, so a concurrent force-fetch could land between two
+    // attempts and make the dossier internally inconsistent. Holding
+    // one lock across the reads is what makes it a snapshot.
+    let _lock = fetch_writ_mirror(bailiff_repo, writ_repo_path)?;
+
+    let plan_body = plan_note.as_ref().map(|note| {
+        verify_note_output(bailiff_repo, writ_notes_ref, note, allowed_signers).map(|output| {
+            DossierOutput {
+                stdout: output.stdout,
+                stdout_truncated_at: output.stdout_truncated_at,
+            }
+        })
+    });
+
+    let attempts = attempt_notes
+        .into_iter()
+        .map(|(attempt, note)| {
+            let output = verify_note_output(bailiff_repo, writ_notes_ref, &note, allowed_signers)
+                .map(|output| DossierOutput {
+                    stdout: output.stdout,
+                    stdout_truncated_at: output.stdout_truncated_at,
+                });
+            DossierAttempt {
+                attempt,
+                purpose: note.purpose.clone(),
+                signed_metadata: note.signed_metadata.clone(),
+                output,
+            }
+        })
+        .collect();
+
+    Ok(PlanDossier {
+        plan_id,
+        plan_body,
+        attempts,
+    })
+}
+
+/// Everything `bailiff plan dossier` renders for one plan.
+#[derive(Debug)]
+pub struct PlanDossier {
+    pub plan_id: PlanId,
+    /// The approved plan body every attempt shared, or `None` when the
+    /// plan has no submission note (the `Corrupt` anomaly). `Err` when
+    /// the submission exists but its envelope did not verify.
+    ///
+    /// A [`DossierOutput`] and not bare bytes, so the truncation marker
+    /// travels. A truncated plan body rendered as plain `verified`
+    /// would present a captured *prefix* as the whole approved plan —
+    /// and `read_plan_body_bytes` refuses exactly that case as
+    /// misleading, so the dossier must not quietly show what the
+    /// prompt-composition path refuses to use.
+    pub plan_body: Option<Result<DossierOutput, ReadVerifiedOutputError>>,
+    /// Every implementer attempt, in order.
+    pub attempts: Vec<DossierAttempt>,
+}
+
+/// One implementer attempt's entry in the dossier.
+#[derive(Debug)]
+pub struct DossierAttempt {
+    pub attempt: ImplementAttempt,
+    pub purpose: String,
+    pub signed_metadata: SignedRunMetadata,
+    /// The verified output, or why it could not be produced. Never an
+    /// `Option`: an attempt with unverifiable output must be visibly
+    /// distinguishable from one that simply printed nothing.
+    pub output: Result<DossierOutput, ReadVerifiedOutputError>,
+}
+
+/// One attempt's agent output, verbatim.
+#[derive(Debug)]
+pub struct DossierOutput {
+    /// Raw stdout bytes. Not `String`: an implementer may legitimately
+    /// emit non-UTF-8, and a dossier renders what the run produced
+    /// rather than what would have been convenient. The renderer
+    /// length-prefixes them for exactly this reason.
+    pub stdout: Vec<u8>,
+    /// Byte offset writ truncated stdout at, if it did. Rendered as a
+    /// field rather than raised as an error — a long implementer run
+    /// hitting the cap is ordinary, unlike a truncated *plan body*,
+    /// which `read_plan_body_bytes` refuses.
+    pub stdout_truncated_at: Option<u64>,
+}
+
+/// Tagged failure modes of [`read_dossier`]. Per-attempt verification
+/// failures are *not* here: they live in
+/// [`DossierAttempt::output`], because one bad attempt must not
+/// suppress the rest of the dossier.
+#[derive(Debug, Error)]
+pub enum ReadDossierError {
+    #[error("reading plan submission note: {0}")]
+    ReadPlan(#[from] ReadPlanError),
+    #[error("reading the plan's implementer attempts: {0}")]
+    ReadAttempts(#[from] ReadImplementError),
+    /// Fetching writ's mirror failed, so no note could be verified
+    /// against a current snapshot. Whole-dossier rather than
+    /// per-attempt: without the fetch there is nothing to verify
+    /// *anything* against.
+    #[error("fetching writ's notes ref: {0}")]
+    Fetch(#[from] ReadVerifiedOutputError),
+}
+
 /// Tagged failure modes of the planner-envelope read step that
 /// `submit_review` performs before composing the reviewer prompt.
 /// Each variant pins one concrete step of the planner-envelope →
@@ -913,67 +1144,11 @@ pub(crate) fn read_plan_body_bytes(
 /// isn't text" are all distinct problems.
 #[derive(Debug, Error)]
 pub enum ReadPlanBodyError {
-    /// The repo-wide mutation lock could not be taken. A filesystem
-    /// problem, not contention — the lock waits.
-    #[error("locking bailiff's repo for mutation failed: {0}")]
-    RepoLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
-    /// `git fetch` against writ's repo failed. Usually a wrong
-    /// `writ_repo_path` or a filesystem permission problem.
-    #[error("fetching writ's notes ref failed: {0}")]
-    Fetch(#[source] NotesRepoError),
-    /// The fetch succeeded but no note exists at the plan note's
-    /// `writ_output_oid` under `writ_notes_ref`. Either the fetch
-    /// refspec didn't cover the ref writ used for the planner run,
-    /// or writ's repo was pruned since submission.
-    #[error("reading the planner envelope note failed: {0}")]
-    ReadEnvelope(#[source] NotesRepoError),
-    /// The note body exists but isn't a valid [`SignedRunEnvelope`].
-    /// Indicates wire-level corruption — `deny_unknown_fields` and
-    /// the strict newtype validators make this near-impossible for
-    /// any envelope writ itself produced.
-    #[error("decoding the planner envelope failed: {0}")]
-    DecodeEnvelope(#[source] serde_json::Error),
-    /// The envelope's `metadata` on disk differs from the
-    /// `signed_metadata` the plan note recorded at submission time.
-    /// Defence-in-depth: between submission and review, either
-    /// bailiff's plan note or writ's repo was tampered with.
-    /// Bailiff refuses to use the on-disk bytes for prompt
-    /// composition in either case.
-    #[error(
-        "planner envelope metadata on disk does not match the metadata recorded in the plan \
-         submission note"
-    )]
-    EnvelopeMetadataMismatch,
-    /// Same defence-in-depth check as [`Self::EnvelopeMetadataMismatch`]
-    /// but for the signature field. Pinned distinct from the metadata
-    /// mismatch because the two have different operator
-    /// implications: a metadata mismatch with a valid signature
-    /// suggests bailiff's note was edited; a signature mismatch
-    /// with matching metadata suggests writ's repo was replaced.
-    #[error(
-        "planner envelope signature on disk does not match the signature recorded in the plan \
-         submission note"
-    )]
-    EnvelopeSignatureMismatch,
-    /// [`verify_run_envelope`] rejected the envelope. The wrapped
-    /// [`VerifyError`] names whether the failure was an output
-    /// digest mismatch, an unknown signer, or a bad signature.
-    /// Caught here so a tampered `output` field (the bytes the
-    /// reviewer will see) never reaches the prompt composer.
-    #[error("re-verifying the planner envelope failed: {0}")]
-    Verify(#[source] VerifyError),
-    /// The envelope verified but its `output` field doesn't decode
-    /// as an [`OutputEnvelope`]. Indicates wire-level corruption
-    /// inside the signed payload — would require the signing key
-    /// to be compromised, since the digest covers these bytes.
-    #[error("decoding the planner output envelope failed: {0}")]
-    DecodeOutput(#[source] serde_json::Error),
-    /// The planner's stdout was truncated by writ at byte offset
-    /// `stdout_truncated_at`. The captured prefix is genuinely
-    /// signed, but using only a prefix as the plan body could
-    /// mislead the reviewer into approving an incomplete spec —
-    /// the operator's recourse is to re-run the planner with a
-    /// narrower scope so the body fits writ's per-stream cap.
+    /// The shared fetch → verify → decode chain failed. Transparent so
+    /// an operator sees the specific step; the planner-specific
+    /// variants below are this reader's own *policy*.
+    #[error(transparent)]
+    VerifiedOutput(#[from] ReadVerifiedOutputError),
     #[error("planner stdout was truncated at byte offset {stdout_truncated_at}")]
     OutputTruncated { stdout_truncated_at: u64 },
     /// The planner's stdout was zero bytes. The design contract
@@ -996,6 +1171,8 @@ pub enum ReadPlanBodyError {
 
 #[cfg(test)]
 mod decision_tests;
+#[cfg(test)]
+mod dossier_tests;
 #[cfg(test)]
 mod full_plan_tests;
 #[cfg(test)]

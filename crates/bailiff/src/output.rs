@@ -7,6 +7,7 @@
 use std::io::Write;
 
 use crate::bailiff_plan_note::{DecisionNote, ImplementNote};
+use crate::bailiff_plan_read::PlanDossier;
 use crate::bailiff_plan_view::{
     BailiffPlanSummary, PlanFullView, SignedBailiffNote, VerifiedSection,
 };
@@ -87,6 +88,106 @@ pub fn write_bailiff_plan_list(
         }
     }
     Ok(())
+}
+
+/// Render the `bailiff plan dossier` output: the approved plan body
+/// once, then one block per implementer attempt carrying that run's
+/// verbatim stdout.
+///
+/// # Why this format carries raw bytes
+///
+/// Every other writer here promises one line per key and escapes
+/// free-form text onto one line. Agent stdout is arbitrary multi-line
+/// bytes, possibly not UTF-8, and a dossier exists to be *read* —
+/// escaping a hundred lines of implementer output onto one is a
+/// document nobody can use. Emitting it raw would break the
+/// one-line-per-key contract every consumer of this module relies on.
+///
+/// So the bytes travel **length-prefixed**: a `stdout_bytes=<n>` line,
+/// then exactly `n` bytes verbatim, then a newline. A parser reads the
+/// count and takes that many bytes without interpreting them; a human
+/// reads the output as the agent wrote it. A length prefix rather than
+/// a delimiter specifically because the payload is *agent-controlled*:
+/// an implementer can emit a convincing delimiter on purpose, and no
+/// escaping scheme survives that as cleanly as a byte count.
+///
+/// This is the first place bailiff's output format carries
+/// agent-controlled bytes, so the choice is written down rather than
+/// defaulted into.
+///
+/// An attempt whose envelope did not verify emits `verification=` with
+/// the reason and **no `stdout_bytes` block at all**. Unverified agent
+/// output is never rendered beside verified output.
+pub fn write_bailiff_plan_dossier(
+    out: &mut dyn Write,
+    dossier: &PlanDossier,
+) -> std::io::Result<()> {
+    writeln!(out, "plan_id={}", dossier.plan_id)?;
+    writeln!(out)?;
+    writeln!(out, "-- plan --")?;
+    match &dossier.plan_body {
+        None => writeln!(out, "verification=<none>")?,
+        Some(Err(e)) => {
+            writeln!(out, "verification=failed")?;
+            write!(out, "error=")?;
+            write_inline_value(out, &e.to_string())?;
+        }
+        Some(Ok(body)) => {
+            writeln!(out, "verification=verified")?;
+            // Truncation is rendered, never elided. A captured prefix
+            // shown as the whole approved plan is the one way this
+            // section can mislead while every signature checks out.
+            match body.stdout_truncated_at {
+                Some(at) => writeln!(out, "plan_body_truncated_at={at}")?,
+                None => writeln!(out, "plan_body_truncated_at=<none>")?,
+            }
+            write_length_prefixed(out, "plan_body_bytes", &body.stdout)?;
+        }
+    }
+
+    writeln!(out)?;
+    writeln!(out, "attempts={}", dossier.attempts.len())?;
+    for entry in &dossier.attempts {
+        writeln!(out)?;
+        writeln!(out, "-- attempt {} --", entry.attempt)?;
+        write!(out, "purpose=")?;
+        write_inline_value(out, &entry.purpose)?;
+        writeln!(out, "run_id={}", entry.signed_metadata.run_id)?;
+        writeln!(out, "session_id={}", entry.signed_metadata.session_id)?;
+        writeln!(out, "exit_code={}", entry.signed_metadata.exit_code)?;
+        writeln!(
+            out,
+            "completed_at={}",
+            entry.signed_metadata.completed_at.as_millis()
+        )?;
+        match &entry.output {
+            Err(e) => {
+                writeln!(out, "verification=failed")?;
+                write!(out, "error=")?;
+                write_inline_value(out, &e.to_string())?;
+            }
+            Ok(output) => {
+                writeln!(out, "verification=verified")?;
+                match output.stdout_truncated_at {
+                    Some(at) => writeln!(out, "stdout_truncated_at={at}")?,
+                    None => writeln!(out, "stdout_truncated_at=<none>")?,
+                }
+                write_length_prefixed(out, "stdout_bytes", &output.stdout)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit `key=<len>` then exactly `len` bytes verbatim, then a newline.
+///
+/// The trailing newline is *not* counted, so a parser that reads `len`
+/// bytes and then expects `\n` is correct, and a human sees the next
+/// key on its own line even when the payload does not end in one.
+fn write_length_prefixed(out: &mut dyn Write, key: &str, bytes: &[u8]) -> std::io::Result<()> {
+    writeln!(out, "{key}={}", bytes.len())?;
+    out.write_all(bytes)?;
+    writeln!(out)
 }
 
 /// Inline writer for free-form text values that share a line with their
@@ -363,6 +464,174 @@ fn write_decision_section(
     write_inline_value(out, decision.decider.as_str())?;
     writeln!(out, "decided_at={}", decision.decided_at.as_millis())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod dossier_format_tests {
+    //! The dossier is the one place this module emits bytes it did not
+    //! choose. These tests make the "parseable *and* verbatim" claim
+    //! checkable rather than asserted in a docstring, and pin the one
+    //! thing the renderer must never do.
+
+    use super::*;
+    use crate::bailiff_plan_note::{ImplementAttempt, PlanId};
+    use crate::bailiff_plan_read::{
+        DossierAttempt, DossierOutput, PlanDossier, ReadVerifiedOutputError,
+    };
+    use proptest::prelude::*;
+    use writ::agent_run::AgentRunId;
+    use writ::core::{SessionId, Sha256Hex, SshKeyFingerprint, UnixMillis};
+
+    /// Parse `key=<n>\n<n bytes>\n` back out the way a consumer would.
+    /// A deliberate re-implementation of the reader half: if the
+    /// writer and this disagree, the format is not parseable, which is
+    /// exactly what these tests are for.
+    fn parse_length_prefixed<'a>(rendered: &'a [u8], key: &str) -> Option<&'a [u8]> {
+        let needle = format!("\n{key}=");
+        let at = rendered
+            .windows(needle.len())
+            .position(|w| w == needle.as_bytes())?;
+        let after_key = at + needle.len();
+        let nl = rendered[after_key..].iter().position(|b| *b == b'\n')? + after_key;
+        let len: usize = std::str::from_utf8(&rendered[after_key..nl])
+            .ok()?
+            .parse()
+            .ok()?;
+        let start = nl + 1;
+        Some(&rendered[start..start + len])
+    }
+
+    fn sample_metadata() -> SignedRunMetadata {
+        SignedRunMetadata {
+            run_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                .parse::<AgentRunId>()
+                .unwrap(),
+            session_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+                .parse::<SessionId>()
+                .unwrap(),
+            prompt_sha256: Sha256Hex::try_new("a".repeat(64)).unwrap(),
+            output_envelope_sha256: Sha256Hex::try_new("b".repeat(64)).unwrap(),
+            capabilities: Vec::new(),
+            exit_code: 0,
+            completed_at: UnixMillis::from_millis(1_700_000_000_000),
+            signing_key_fingerprint: SshKeyFingerprint::try_new(format!(
+                "SHA256:{}",
+                "a".repeat(43)
+            ))
+            .unwrap(),
+        }
+    }
+
+    fn render(dossier: &PlanDossier) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_bailiff_plan_dossier(&mut out, dossier).unwrap();
+        out
+    }
+
+    /// **An attempt that failed verification emits no bytes at all.**
+    ///
+    /// The renderer half of the security property; the reader half is
+    /// `an_unverifiable_attempt_contributes_no_bytes`. Both are needed:
+    /// a reader that correctly withholds bytes and a renderer that
+    /// prints them anyway would leave the promise broken, and a
+    /// mutation that made the renderer emit a `stdout_bytes` block on
+    /// the failure arm passed every other test in this crate.
+    #[test]
+    fn a_failed_attempt_emits_no_stdout_block() {
+        let dossier = PlanDossier {
+            plan_id: PlanId::new(),
+            plan_body: Some(Err(ReadVerifiedOutputError::EnvelopeSignatureMismatch)),
+            attempts: vec![DossierAttempt {
+                attempt: ImplementAttempt::FIRST,
+                purpose: "attempt-0".into(),
+                signed_metadata: sample_metadata(),
+                output: Err(ReadVerifiedOutputError::EnvelopeMetadataMismatch),
+            }],
+        };
+        let rendered = String::from_utf8(render(&dossier)).unwrap();
+        assert!(rendered.contains("verification=failed"));
+        assert!(
+            !rendered.contains("stdout_bytes"),
+            "a failed attempt must not emit an output block:\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("plan_body_bytes"),
+            "a failed plan body must not emit an output block:\n{rendered}",
+        );
+    }
+
+    /// A verified attempt's bytes come back byte-for-byte, and the
+    /// count names them.
+    #[test]
+    fn a_verified_attempt_emits_its_bytes_verbatim() {
+        let dossier = PlanDossier {
+            plan_id: PlanId::new(),
+            plan_body: Some(Ok(DossierOutput {
+                stdout: b"# Plan\n".to_vec(),
+                stdout_truncated_at: None,
+            })),
+            attempts: vec![DossierAttempt {
+                attempt: ImplementAttempt::FIRST,
+                purpose: "attempt-0".into(),
+                signed_metadata: sample_metadata(),
+                output: Ok(DossierOutput {
+                    stdout: b"line one\nline two\n".to_vec(),
+                    stdout_truncated_at: None,
+                }),
+            }],
+        };
+        let rendered = render(&dossier);
+        assert_eq!(
+            parse_length_prefixed(&rendered, "stdout_bytes").unwrap(),
+            b"line one\nline two\n",
+        );
+        assert_eq!(
+            parse_length_prefixed(&rendered, "plan_body_bytes").unwrap(),
+            b"# Plan\n",
+        );
+    }
+
+    proptest! {
+        /// For **any** payload — newlines, NULs, non-UTF-8, embedded
+        /// `stdout_bytes=` lookalikes — the declared length matches
+        /// what follows, and reading that many bytes recovers the
+        /// payload exactly.
+        ///
+        /// The adversarial cases are the point: stdout is
+        /// agent-controlled, so an implementer can emit a convincing
+        /// `\nstdout_bytes=5\n` on purpose. A length-prefixed reader is
+        /// immune; a delimiter-scanning one would not be.
+        #[test]
+        fn a_length_prefixed_payload_round_trips(
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let mut out = Vec::new();
+            // A leading line so the parser's `\n` anchor is present
+            // exactly as it is in real output.
+            writeln!(&mut out, "verification=verified").unwrap();
+            write_length_prefixed(&mut out, "stdout_bytes", &payload).unwrap();
+            let recovered =
+                parse_length_prefixed(&out, "stdout_bytes").expect("the block must parse");
+            prop_assert_eq!(recovered, payload.as_slice());
+        }
+
+        /// The byte after the payload is always a newline, and the
+        /// block's total size is exactly prefix + payload + 1 — so a
+        /// consumer that reads `n` bytes and then expects a line break
+        /// is correct even when the payload does not end in one.
+        #[test]
+        fn a_payload_is_always_followed_by_a_newline(
+            payload in prop::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let mut out = Vec::new();
+            write_length_prefixed(&mut out, "k", &payload).unwrap();
+            prop_assert_eq!(*out.last().unwrap(), b'\n');
+            prop_assert_eq!(
+                out.len(),
+                format!("k={}\n", payload.len()).len() + payload.len() + 1,
+            );
+        }
+    }
 }
 
 #[cfg(test)]

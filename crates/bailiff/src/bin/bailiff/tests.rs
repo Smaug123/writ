@@ -1147,3 +1147,46 @@ fn build_implement_workspace_bootstrap_rejects_non_utf8_destination() {
 // coverage is `bailiff_repo_guard::tests`, which asserts exclusion,
 // per-plan granularity, and release-then-reacquire against the real
 // guard.
+
+/// The dossier verb parses its flags, and `--allow-terminal` defaults
+/// off.
+///
+/// The default is the load-bearing half: the guard exists because
+/// implementer stdout is agent-controlled and a terminal interprets
+/// rather than counts, so a flag that defaulted *on* would be the
+/// guarantee silently absent.
+#[test]
+fn plan_dossier_parses_and_defaults_to_refusing_a_terminal() {
+    let args = Args::try_parse_from([
+        "bailiff",
+        "plan",
+        "dossier",
+        "--plan-id",
+        "11111111-2222-4333-8444-555555555555",
+        "--writ-allowed-signers",
+        "/tmp/signers",
+    ])
+    .expect("minimum required flags must parse");
+    match args.cmd {
+        Cmd::Plan {
+            action:
+                PlanCmd::Dossier {
+                    plan_id,
+                    bailiff_repo,
+                    writ_repo,
+                    writ_allowed_signers,
+                    allow_terminal,
+                },
+        } => {
+            assert_eq!(plan_id.to_string(), "11111111-2222-4333-8444-555555555555");
+            assert_eq!(bailiff_repo, None);
+            assert_eq!(writ_repo, None);
+            assert_eq!(writ_allowed_signers, PathBuf::from("/tmp/signers"));
+            assert!(
+                !allow_terminal,
+                "the terminal guard must be on unless the operator opts out",
+            );
+        }
+        _ => panic!("expected PlanCmd::Dossier, got a different command"),
+    }
+}

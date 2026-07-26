@@ -134,7 +134,10 @@ fn fetch_failure_when_writ_repo_path_is_not_a_repo() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ReadPlanBodyError::Fetch(_)),
+        matches!(
+            err,
+            ReadPlanBodyError::VerifiedOutput(ReadVerifiedOutputError::Fetch(_))
+        ),
         "expected Fetch, got: {err:?}",
     );
 }
@@ -170,7 +173,10 @@ fn read_envelope_failure_when_oid_is_absent() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ReadPlanBodyError::ReadEnvelope(_)),
+        matches!(
+            err,
+            ReadPlanBodyError::VerifiedOutput(ReadVerifiedOutputError::ReadEnvelope(_))
+        ),
         "expected ReadEnvelope, got: {err:?}",
     );
 }
@@ -214,7 +220,10 @@ fn decode_envelope_failure_when_body_is_not_envelope_json() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ReadPlanBodyError::DecodeEnvelope(_)),
+        matches!(
+            err,
+            ReadPlanBodyError::VerifiedOutput(ReadVerifiedOutputError::DecodeEnvelope(_))
+        ),
         "expected DecodeEnvelope, got: {err:?}",
     );
 }
@@ -252,7 +261,10 @@ fn envelope_metadata_mismatch_when_plan_note_records_other_metadata() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ReadPlanBodyError::EnvelopeMetadataMismatch),
+        matches!(
+            err,
+            ReadPlanBodyError::VerifiedOutput(ReadVerifiedOutputError::EnvelopeMetadataMismatch)
+        ),
         "expected EnvelopeMetadataMismatch, got: {err:?}",
     );
 }
@@ -299,7 +311,10 @@ fn envelope_signature_mismatch_when_plan_note_records_other_signature() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ReadPlanBodyError::EnvelopeSignatureMismatch),
+        matches!(
+            err,
+            ReadPlanBodyError::VerifiedOutput(ReadVerifiedOutputError::EnvelopeSignatureMismatch)
+        ),
         "expected EnvelopeSignatureMismatch, got: {err:?}",
     );
 }
@@ -334,7 +349,10 @@ fn verify_failure_under_untrusted_signer() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ReadPlanBodyError::Verify(_)),
+        matches!(
+            err,
+            ReadPlanBodyError::VerifiedOutput(ReadVerifiedOutputError::Verify(_))
+        ),
         "expected Verify, got: {err:?}",
     );
 }
@@ -385,7 +403,10 @@ fn decode_output_failure_when_output_is_not_output_envelope_json() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ReadPlanBodyError::DecodeOutput(_)),
+        matches!(
+            err,
+            ReadPlanBodyError::VerifiedOutput(ReadVerifiedOutputError::DecodeOutput(_))
+        ),
         "expected DecodeOutput, got: {err:?}",
     );
 }
