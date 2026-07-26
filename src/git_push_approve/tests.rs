@@ -216,19 +216,16 @@ fn maybe_git() -> Option<PathBuf> {
 /// Run `git -C <repo> <args>` under the hardened env plus pinned
 /// committer identity so commit SHAs are deterministic across runs.
 fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = apply_clean_git_config(&mut Command::new(git))
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env_clear()
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-        .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-        .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
-        .output()
-        .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
+    let output =
+        apply_clean_git_config(Command::new(git).arg("-C").arg(repo).args(args).env_clear())
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
+            .output()
+            .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
     assert!(
         output.status.success(),
         "git -C {} {args:?} failed: stdout={:?} stderr={}",
@@ -1106,13 +1103,15 @@ async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
     .expect("prepare must fetch the prereq over dumb HTTP and unbundle the tip");
 
     for (what, sha) in [("prereq", origin.prereq()), ("bundle tip", origin.tip())] {
-        let exists = apply_clean_git_config(&mut Command::new(&git))
-            .arg("-C")
-            .arg(staging.path())
-            .args(["cat-file", "-e", sha.as_str()])
-            .env_clear()
-            .status()
-            .expect("spawning git cat-file failed");
+        let exists = apply_clean_git_config(
+            Command::new(&git)
+                .arg("-C")
+                .arg(staging.path())
+                .args(["cat-file", "-e", sha.as_str()])
+                .env_clear(),
+        )
+        .status()
+        .expect("spawning git cat-file failed");
         assert!(
             exists.success(),
             "{what} {sha} must be present in the staging repo",
@@ -1175,13 +1174,15 @@ async fn unbundle_invocation_runs_against_real_git() {
     // The bundled commit must now be present in the staging repo's
     // object database (no ref is created — that's the planner's
     // job — but `cat-file -e` confirms reachability).
-    let exists = apply_clean_git_config(&mut Command::new(&git))
-        .arg("-C")
-        .arg(&staging)
-        .args(["cat-file", "-e", head.as_str()])
-        .env_clear()
-        .status()
-        .expect("spawning git cat-file failed");
+    let exists = apply_clean_git_config(
+        Command::new(&git)
+            .arg("-C")
+            .arg(&staging)
+            .args(["cat-file", "-e", head.as_str()])
+            .env_clear(),
+    )
+    .status()
+    .expect("spawning git cat-file failed");
     assert!(
         exists.success(),
         "bundled commit {head} not present in staging repo after unbundle",

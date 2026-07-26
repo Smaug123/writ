@@ -505,7 +505,15 @@ pub(crate) fn run_supervised_blocking_probed(
             // the async twin's `StdoutCapExceeded` arm.
             cleanup_guard.mark_child_exit_observed();
         }
-        cleanup_guard.kill_now()?;
+        // Hold a kill failure rather than returning on it: we still owe the child
+        // a `wait`, and `std::process::Child::drop` does not reap. Returning here
+        // would surface the right error and leak a process — the same trap as the
+        // post-spawn paths above, one arm further on.
+        if let Err(err) = cleanup_guard.kill_now() {
+            let _ = child.wait();
+            cleanup_guard.disarm();
+            return Err(err);
+        }
     }
     let status = child.wait();
     cleanup_guard.disarm();

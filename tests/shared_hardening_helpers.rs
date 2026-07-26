@@ -107,6 +107,12 @@ fn only_git_env_defines_the_hardened_git_recipe() {
             "GIT_CONFIG_SYSTEM",
             "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS",
+            // Quoted, so this matches only the standalone `GIT_CONFIG` name and
+            // not the five suffixed ones above (every one of which starts with
+            // it). The comment above used to claim this was covered when it was
+            // not — an unquoted needle would have matched everything and been
+            // silently useless.
+            "\"GIT_CONFIG\"",
         ],
         &[
             "crates/writ-core/src/git_env.rs",
@@ -171,6 +177,7 @@ fn only_process_spawn_classifies_transient_spawn_failures() {
         &[
             "libc::ETXTBSY",
             "libc::EAGAIN",
+            "libc::ENOMEM",
             "libc::EMFILE",
             "libc::ENFILE",
         ],
@@ -205,6 +212,81 @@ fn only_process_supervisor_kills_process_groups() {
         hits.is_empty(),
         "process-group signalling belongs to `process_supervisor`; use \
          `run_supervised` or `run_supervised_blocking`.\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// `env_clear` must not follow the recipe in the same statement.
+///
+/// `Command::env_clear` wipes entries already set, so
+/// `apply_clean_git_config(cmd).env_clear()` silently discards the whole recipe
+/// and leaves the child running against the host's Git configuration. The call
+/// site reads as hardened; it is not.
+///
+/// This is not hypothetical: mechanically wrapping six builder chains with the
+/// applier put `env_clear()` after it at every one of them, and no behavioural
+/// test noticed — the fixtures still passed, just unhardened. Ordering is
+/// invisible to a needle scan, so it gets its own check.
+#[test]
+fn env_clear_never_follows_the_hardening_recipe() {
+    const APPLIERS: &[&str] = &[
+        "apply_clean_git_config(",
+        "apply_clean_git_config_async(",
+        "apply_git_config_denials(",
+        "apply_git_config_denials_async(",
+    ];
+    let mut hits = Vec::new();
+    for path in workspace_rust_sources() {
+        let rel = relative(&path);
+        if rel == THIS_FILE {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for applier in APPLIERS {
+            let mut from = 0;
+            while let Some(found) = text[from..].find(applier) {
+                let at = from + found;
+                from = at + applier.len();
+                // The statement this call sits in.
+                let stmt_end = text[at..].find(';').map_or(text.len(), |e| at + e);
+                let stmt = &text[at..stmt_end];
+                // Walk to the matching close paren of the applier call; anything
+                // after it is chained onto the *result*, so an `env_clear` there
+                // erases what the applier just set. An `env_clear` *inside* the
+                // parens runs first and is correct.
+                let mut depth = 0usize;
+                let mut close = None;
+                for (offset, ch) in stmt.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(close) = close else { continue };
+                if stmt[close..].contains("env_clear") {
+                    hits.push(format!(
+                        "{rel}: `env_clear` is chained after {applier}…), which wipes the recipe"
+                    ));
+                }
+            }
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    assert!(
+        hits.is_empty(),
+        "clear the environment *first*, then apply the recipe — \
+         `apply_clean_git_config(Command::new(git).env_clear())`, not \
+         `apply_clean_git_config(&mut Command::new(git)).env_clear()`.\n  {}",
         hits.join("\n  ")
     );
 }
