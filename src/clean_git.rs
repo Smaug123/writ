@@ -360,6 +360,9 @@ mod tests {
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_GLOBAL", "/dev/null"),
                 ("GIT_CONFIG_COUNT", "0"),
+                // Not covered by `GIT_CONFIG_COUNT=0`: git parses this on an
+                // independent path, so `-c`-style injection needs its own denial.
+                ("GIT_CONFIG_PARAMETERS", ""),
                 ("HOME", "/dev/null"),
             ]
         );
@@ -396,7 +399,7 @@ mod tests {
     }
 
     /// Runtime probe: spawn a subprocess via the clean-git harness and
-    /// confirm only the four hardened env entries (plus a small allowlist
+    /// confirm only the hardened env entries (plus a small allowlist
     /// of shell-startup names) reach the child.
     ///
     /// We wrap `env` in a `sh` script rather than invoking `env` directly
@@ -411,7 +414,7 @@ mod tests {
     /// `env` basename in `argv[0]` so coreutils dispatches correctly.
     /// The cost is that `sh` adds a few startup variables (PWD, SHLVL,
     /// `_`, OLDPWD); we allowlist those and assert that anything else
-    /// observed must be one of the four hardened entries with the
+    /// observed must be one of the hardened entries with the
     /// expected value.
     #[tokio::test]
     async fn run_clean_git_subprocess_sees_only_hardened_env_vars() {
@@ -456,6 +459,7 @@ mod tests {
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_PARAMETERS", ""),
             ("HOME", "/dev/null"),
         ]
         .into_iter()

@@ -142,7 +142,7 @@ impl CatFileObjectSource {
     /// hardened clean-Git environment.
     ///
     /// The child runs from `/`, has its environment cleared down to
-    /// the four `CLEAN_GIT_CONFIG_ENV` entries, and is placed in a
+    /// the `CLEAN_GIT_CONFIG_ENV` entries, and is placed in a
     /// fresh process group so a runaway helper cannot outlive its
     /// leader. The source's [`Drop`] impl sends SIGKILL to the
     /// *process group* (`killpg`), not just the leader pid; this is

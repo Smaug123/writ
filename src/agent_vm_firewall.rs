@@ -21,7 +21,7 @@ use crate::core::{
     Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfRuleset, SessionId, render_pf,
     session_firewall_pf_ruleset,
 };
-use crate::process_spawn;
+use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome};
 
 /// The host bridge for a session's network is created a beat after `container
 /// run` returns and its members attach shortly after, so the privileged helper
@@ -320,25 +320,84 @@ impl PfctlInvocation {
     }
 }
 
-/// Run `command` to completion and collect its output, retrying a *refused*
-/// spawn via the shared [`process_spawn`] classification.
+/// Wall-clock bound on a single `pfctl`/`ifconfig` invocation. Both are small
+/// local system binaries that answer in milliseconds; the bound exists so a
+/// wedged one fails visibly instead of parking the privileged helper.
+const PF_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on captured stdout. The largest legitimate output is a full `ifconfig`
+/// listing or a session anchor's ruleset — kilobytes. 1 MiB is far beyond either
+/// and bounds a malfunctioning binary.
+const PF_COMMAND_STDOUT_CAP: usize = 1024 * 1024;
+
+/// Run `command` to completion under the shared supervisor and collect its
+/// output.
 ///
-/// Unlike `Command::output`, [`process_spawn::output`] inherits the parent's
-/// stdio unless told otherwise, so the pipes are configured explicitly here.
-/// `Stdio::null()` on stdin is deliberate: neither `ifconfig` nor `pfctl` reads
-/// stdin in these invocations, and inheriting the parent's would let a
-/// misinvocation block on the terminal.
+/// Goes through [`process_supervisor::run_supervised_blocking`] rather than
+/// `process_spawn::output` for a specific reason: `process_spawn::output` drains
+/// two piped streams by spawning a reader thread, and that `thread::Builder`
+/// spawn is *not* covered by the spawn-refusal retry. Under thread/process
+/// exhaustion it fails **after** `pfctl` has already run, so the caller would see
+/// "cannot run pfctl" for a command that may have just installed or flushed
+/// firewall rules — the worst possible misreport for this subsystem. The
+/// supervisor drains both pipes from one non-blocking `poll(2)` loop, so no
+/// thread is involved and that window does not exist.
 ///
-/// The retry never fires in production — `/sbin/ifconfig` and `/sbin/pfctl` are
-/// stable system binaries, not files writ writes — but it keeps the pfctl unit
-/// tests, which write a fake `pfctl` and immediately exec it alongside other
-/// process-spawning tests, robust under load.
+/// Supervision also gets `pfctl` a timeout and a process-group kill, which it
+/// previously had neither of. `Stdio::null()` on stdin is deliberate: neither
+/// binary reads stdin here, and inheriting the parent's would let a misinvocation
+/// block on the terminal.
+///
+/// The spawn retry inside the supervisor never fires in production —
+/// `/sbin/ifconfig` and `/sbin/pfctl` are stable system binaries, not files writ
+/// writes — but it keeps the pfctl unit tests, which write a fake `pfctl` and
+/// immediately exec it alongside other process-spawning tests, robust under load.
 fn capture_output(mut command: Command) -> std::io::Result<Output> {
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    process_spawn::output(&mut command)
+    capture_output_with_timeout(&mut command, PF_COMMAND_TIMEOUT)
+}
+
+/// [`capture_output`] with an explicit deadline. Only tests shorten it;
+/// production always uses [`PF_COMMAND_TIMEOUT`].
+fn capture_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    command.stdin(std::process::Stdio::null());
+    let outcome = process_supervisor::run_supervised_blocking(
+        command,
+        timeout,
+        None,
+        StdoutMode::Capture {
+            byte_cap: PF_COMMAND_STDOUT_CAP,
+        },
+        StderrMode::Capture,
+    )
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    match outcome {
+        SupervisedOutcome::Exited {
+            status,
+            stdout,
+            stderr,
+        } => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        // Both of these killed the process group, so the command's effect is
+        // indeterminate. Surface an error rather than a synthesised exit status:
+        // a caller must not read "did not succeed" as "did not act".
+        SupervisedOutcome::TimedOut => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "command did not finish within {timeout:?}; its process group \
+                 was killed and its effect is indeterminate"
+            ),
+        )),
+        SupervisedOutcome::StdoutCapExceeded { cap } => Err(std::io::Error::other(format!(
+            "command wrote more than the {cap}-byte stdout cap; its process \
+             group was killed and its effect is indeterminate"
+        ))),
+    }
 }
 
 pub fn pf_rules_contain_session_bootstrap(rules: &str) -> bool {
@@ -770,6 +829,42 @@ mod tests {
         assert!(!pf_anchor_has_rules("\n  \t\n"));
         assert!(pf_anchor_has_rules("block drop out all\n"));
         assert!(pf_anchor_has_rules("   pass in quick proto tcp   "));
+    }
+
+    /// A wedged `pfctl` is killed at the deadline rather than parking the
+    /// privileged helper forever.
+    ///
+    /// `pfctl` invocations previously had no timeout at all. Routing them through
+    /// the shared supervisor is what supplies one; this pins that it is actually
+    /// wired up, since a supervisor call with a generous timeout looks identical
+    /// to an unsupervised one until something hangs.
+    #[test]
+    fn a_wedged_pf_command_is_killed_at_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("hanging-pfctl");
+        // `read` from a fifo-less stdin returns immediately, so sleep instead —
+        // located absolutely because the supervisor does not clear the env here,
+        // but PATH lookups inside the script are not worth relying on.
+        std::fs::write(&tool, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tool, perms).unwrap();
+
+        let started = std::time::Instant::now();
+        let mut command = Command::new(&tool);
+        let err = capture_output_with_timeout(&mut command, Duration::from_millis(300))
+            .expect_err("a child that never exits must not be waited on forever");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "expected a timeout, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must return at the deadline, took {:?}",
+            started.elapsed()
+        );
     }
 
     /// A fake `pfctl` that prints `sr_output` and exits `sr_exit` for
