@@ -258,10 +258,8 @@ enum PlanCmd {
     /// implementer's effective prompt as
     /// `--prompt-file bytes + separator + plan body` before handing
     /// the result to writ. The implementer is granted
-    /// `WorkspaceWrite` on `--repo` so it can push; the pre-RPC
-    /// duplicate gate refuses a second `bailiff plan implement` on
-    /// the same plan to foreclose a double-push. Prints the implement
-    /// note's bailiff-side OID on success.
+    /// `WorkspaceWrite` on `--repo` so it can push. Prints the
+    /// implement note's bailiff-side OID on success.
     ///
     /// Pre-RPC gates the verb surfaces (each as a typed
     /// [`SubmitImplementError`] variant):
@@ -269,11 +267,19 @@ enum PlanCmd {
     /// - missing decision note → "run `bailiff plan decide --accept` first"
     /// - rejected decision → "submit a fresh plan"
     ///
-    /// **Repeatable.** Since slice 4 an accepted plan may take any
-    /// number of implementer runs — that is fan-out — so running this
-    /// verb again on an already-implemented plan starts a new attempt
-    /// rather than being refused. The attempt index is chosen by
-    /// bailiff under the plan lock, never named by the operator.
+    /// **Repeatable, up to 32 attempts per plan.** An accepted plan
+    /// may take several implementer runs — that is fan-out — so
+    /// running this verb again on an already-implemented plan starts a
+    /// *new attempt* rather than being refused. Each run therefore
+    /// pushes; there is no duplicate gate foreclosing a second one, so
+    /// a repeat is a deliberate act rather than something a
+    /// double-click is protected from. What is guaranteed is that an
+    /// earlier attempt's note is never rewritten: attempts occupy
+    /// distinct, append-only slots, and the plan lock serialises the
+    /// choice of index so two concurrent runs cannot claim the same
+    /// one. The index is chosen by bailiff, never named by the
+    /// operator. Past the 32nd, the verb refuses and the recourse is a
+    /// fresh plan.
     ///
     /// Mirrors [`PlanCmd::Review`] minus auto-allocation of
     /// `--plan-id` (implement needs an existing, decided plan), with

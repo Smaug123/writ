@@ -659,6 +659,28 @@ The replacement test is parameterised over gap widths that straddle the old
 check's reach (`{0,2}`, `{0,3}`, `{0,1,5}`, `{0,9}`), and an early-stopping scan
 is caught by `{0,3}` — Codex's own example.
 
+**6. Codex round 2 found two more stale surfaces, one of them a test.** The
+`plan implement` clap help still promised, a paragraph above the one slice 4
+edited, that "the pre-RPC duplicate gate refuses a second `bailiff plan
+implement` on the same plan to foreclose a double-push" — the opposite of the
+feature, and a *safety* claim rather than a description. The corrected text says
+what is actually guaranteed instead: each run pushes, so a repeat is a
+deliberate act, and what append-only slots plus the plan lock buy is that an
+earlier attempt's note is never rewritten and two concurrent runs cannot claim
+the same index.
+
+The second is more interesting. Two `#[ignore]`d end-to-end tests (awaiting slice
+VM3) still asserted the one-shot contract: one required a repeat to return
+`IllegalTransition`, the other required exactly one of three concurrent calls to
+win. Ignored tests fail no gate, so nothing in this repo would have noticed until
+VM3 un-ignored them — at which point they would have looked like a regression in
+VM3's work rather than a contract change made here. Both are rewritten to the new
+contract, and the concurrency one now witnesses something sharper than before:
+**no call may fail with `AlreadyRecorded`**, because that variant means two
+callers picked the same index, which is precisely the race the lock exists to
+prevent. Neither has been observed to hold — they cannot run yet — and both say
+so.
+
 Five mutations, each caught by the intended assertion:
 
 | Mutation | Fails on |
