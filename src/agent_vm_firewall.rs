@@ -21,6 +21,7 @@ use crate::core::{
     Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfRuleset, SessionId, render_pf,
     session_firewall_pf_ruleset,
 };
+use crate::process_spawn;
 
 /// The host bridge for a session's network is created a beat after `container
 /// run` returns and its members attach shortly after, so the privileged helper
@@ -65,36 +66,35 @@ pub fn discover_session_bridge_interfaces(
 ) -> Result<GuestBridgeDiscovery, BridgeDiscoveryError> {
     let mut last: Option<BridgeDiscoveryError> = None;
     for attempt in 0..BRIDGE_DISCOVERY_ATTEMPTS {
-        let err: BridgeDiscoveryError =
-            match run_with_etxtbsy_retry(|| Command::new(ifconfig).output()) {
-                Ok(output) if output.status.success() => {
-                    match parse_bridge_for_gateway(
-                        &String::from_utf8_lossy(&output.stdout),
-                        gateway,
-                        min_members,
-                    ) {
-                        Ok(discovery) => return Ok(discovery),
-                        Err(
-                            err @ (GuestBridgeDiscoveryError::NoBridgeForGateway(_)
-                            | GuestBridgeDiscoveryError::BridgeMembersNotReady { .. }),
-                        ) => err.into(),
-                        Err(err) => return Err(err.into()),
-                    }
+        let err: BridgeDiscoveryError = match capture_output(Command::new(ifconfig)) {
+            Ok(output) if output.status.success() => {
+                match parse_bridge_for_gateway(
+                    &String::from_utf8_lossy(&output.stdout),
+                    gateway,
+                    min_members,
+                ) {
+                    Ok(discovery) => return Ok(discovery),
+                    Err(
+                        err @ (GuestBridgeDiscoveryError::NoBridgeForGateway(_)
+                        | GuestBridgeDiscoveryError::BridgeMembersNotReady { .. }),
+                    ) => err.into(),
+                    Err(err) => return Err(err.into()),
                 }
-                Ok(output) => BridgeDiscoveryError::Failed {
-                    program: ifconfig.display().to_string(),
-                    status: output
-                        .status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "signal".into()),
-                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-                },
-                Err(source) => BridgeDiscoveryError::Run {
-                    program: ifconfig.display().to_string(),
-                    source,
-                },
-            };
+            }
+            Ok(output) => BridgeDiscoveryError::Failed {
+                program: ifconfig.display().to_string(),
+                status: output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            },
+            Err(source) => BridgeDiscoveryError::Run {
+                program: ifconfig.display().to_string(),
+                source,
+            },
+        };
         last = Some(err);
         if attempt + 1 < BRIDGE_DISCOVERY_ATTEMPTS {
             std::thread::sleep(BRIDGE_DISCOVERY_DELAY);
@@ -293,12 +293,12 @@ impl PfctlInvocation {
     /// (`-sr`) where pfctl may exit non-zero on an empty/absent anchor yet still
     /// print the (empty) ruleset to stdout.
     fn output(&self, pfctl: &Path) -> Result<Output, PfctlError> {
-        run_with_etxtbsy_retry(|| Command::new(pfctl).args(&self.args).output()).map_err(|source| {
-            PfctlError::Run {
-                program: pfctl.display().to_string(),
-                args: self.args.join(" "),
-                source,
-            }
+        let mut command = Command::new(pfctl);
+        command.args(&self.args);
+        capture_output(command).map_err(|source| PfctlError::Run {
+            program: pfctl.display().to_string(),
+            args: self.args.join(" "),
+            source,
         })
     }
 
@@ -320,43 +320,25 @@ impl PfctlInvocation {
     }
 }
 
-/// Maximum retries when a just-written program cannot yet be executed. The
-/// window that produces `ETXTBSY` clears within microseconds, so a handful of
-/// 1 ms retries is comfortably enough while still failing fast on a program
-/// that is genuinely un-runnable.
-const ETXTBSY_MAX_RETRIES: u32 = 64;
-
-/// Run `spawn`, retrying only while it fails with `ETXTBSY` ("text file busy").
+/// Run `command` to completion and collect its output, retrying a *refused*
+/// spawn via the shared [`process_spawn`] classification.
 ///
-/// Executing a program that was written moments earlier can transiently fail
-/// with `ETXTBSY`: if another thread in this process `fork`s (e.g. a concurrent
-/// `Command::spawn` in a parallel test) during the window between the program
-/// file's creation and our `execve`, the child inherits the writer's still-open
-/// fd, and Linux refuses to exec a file that any process holds open for
-/// writing. That child clears the condition within microseconds when it execs,
-/// so a bounded retry resolves it. Every other spawn error propagates
-/// immediately (a non-zero *exit* is not a spawn error and never reaches here).
+/// Unlike `Command::output`, [`process_spawn::output`] inherits the parent's
+/// stdio unless told otherwise, so the pipes are configured explicitly here.
+/// `Stdio::null()` on stdin is deliberate: neither `ifconfig` nor `pfctl` reads
+/// stdin in these invocations, and inheriting the parent's would let a
+/// misinvocation block on the terminal.
 ///
-/// This never fires in production — `/sbin/pfctl` is a stable system binary,
-/// not something writ writes — but it makes the pfctl unit tests, which write a
-/// fake `pfctl` and immediately exec it alongside other process-spawning tests,
-/// robust under load.
-fn run_with_etxtbsy_retry<T, F>(mut spawn: F) -> std::io::Result<T>
-where
-    F: FnMut() -> std::io::Result<T>,
-{
-    let mut attempts = 0;
-    loop {
-        match spawn() {
-            Err(err)
-                if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < ETXTBSY_MAX_RETRIES =>
-            {
-                attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            result => return result,
-        }
-    }
+/// The retry never fires in production — `/sbin/ifconfig` and `/sbin/pfctl` are
+/// stable system binaries, not files writ writes — but it keeps the pfctl unit
+/// tests, which write a fake `pfctl` and immediately exec it alongside other
+/// process-spawning tests, robust under load.
+fn capture_output(mut command: Command) -> std::io::Result<Output> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    process_spawn::output(&mut command)
 }
 
 pub fn pf_rules_contain_session_bootstrap(rules: &str) -> bool {
@@ -794,43 +776,6 @@ mod tests {
     /// `-a <anchor> -sr`, and exits 0 for every other invocation — so a flush
     /// can "succeed" yet leave the anchor non-empty, and a status read can exit
     /// non-zero while still reporting an empty ruleset.
-    #[test]
-    fn etxtbsy_retry_succeeds_once_the_file_is_no_longer_busy() {
-        let mut attempts = 0;
-        let result = run_with_etxtbsy_retry(|| {
-            attempts += 1;
-            if attempts < 4 {
-                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
-            } else {
-                Ok(())
-            }
-        });
-        assert!(result.is_ok());
-        assert_eq!(attempts, 4);
-    }
-
-    #[test]
-    fn etxtbsy_retry_does_not_retry_other_spawn_errors() {
-        let mut attempts = 0;
-        let result: std::io::Result<()> = run_with_etxtbsy_retry(|| {
-            attempts += 1;
-            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
-        });
-        assert_eq!(attempts, 1, "only ETXTBSY should be retried");
-        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
-    }
-
-    #[test]
-    fn etxtbsy_retry_is_bounded_and_finally_surfaces_the_busy_error() {
-        let mut attempts = 0;
-        let result: std::io::Result<()> = run_with_etxtbsy_retry(|| {
-            attempts += 1;
-            Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
-        });
-        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
-        assert_eq!(attempts, ETXTBSY_MAX_RETRIES + 1);
-    }
-
     fn write_fake_pfctl_with_sr_exit(dir: &Path, sr_output: &str, sr_exit: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-pfctl");

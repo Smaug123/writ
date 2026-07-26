@@ -485,10 +485,14 @@ fn apply_nix_env(command: &mut Command, home_dir: &Path) {
             command.env(key, value);
         }
     }
+    // A per-run `HOME` instead of `/dev/null`: nix needs a writable home, so this
+    // cannot use the full `CLEAN_GIT_CONFIG_ENV` recipe. It gets the whole config
+    // *denial* set from the shared constant, so a variable added there is not
+    // silently missing here.
     command.env("HOME", home_dir);
-    command.env("GIT_CONFIG_NOSYSTEM", "1");
-    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    command.env("GIT_CONFIG_COUNT", "0");
+    for (name, value) in writ_core::git_env::GIT_CONFIG_DENY_ENV {
+        command.env(name, value);
+    }
     command.env("GIT_TERMINAL_PROMPT", "0");
 }
 

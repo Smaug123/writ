@@ -188,9 +188,7 @@ fn required_test_tool(name: &str) -> PathBuf {
 fn run_test_git(git: &Path, args: &[&str]) {
     let output = Command::new(git)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
+        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .output()
         .unwrap();
     assert!(

@@ -55,19 +55,95 @@
 //! implicitly inside command builders. Production code uses
 //! `InheritedEnv::from_process`; tests can pass synthetic values and
 //! inspect the resulting `Command` without mutating real process env.
+//!
+//! ## Resource bounds
+//!
+//! Every child `git` runs under `crate::process_supervisor`, so each
+//! invocation carries a wall-clock deadline (`NOTES_GIT_TIMEOUT`), a
+//! stdout cap (`NOTES_GIT_STDOUT_CAP`), a tail-capped stderr, and a
+//! process-group SIGKILL on the way out.
+//!
+//! This module used to have a spawn retry and none of the above, while
+//! the broker's `clean_git` had all of the above and no spawn retry —
+//! two carefully-built disciplines with no overlap, each looking
+//! complete where it was defined. The consequence here was concrete:
+//! bailiff drives these calls as workflow steps, so a `git` that wedged
+//! (a fetch source on a stalled filesystem, a stuck `index.lock`) hung
+//! a workflow forever with no diagnosis, and a `for-each-ref` over a
+//! corrupted ref namespace could buffer without bound. The spawn retry
+//! now comes from `crate::process_spawn` and the supervision from
+//! `process_supervisor`, so neither can drift from the other callers
+//! again.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
 use crate::core::{NotesRef, NotesRefError};
+use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome, SupervisorError};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
+
+/// Wall-clock bound on any single `git` invocation this module makes.
+///
+/// Every command here is local: a `notes add`, a `hash-object`, a
+/// `for-each-ref`, or a `fetch` from a filesystem path. None has any business
+/// taking minutes, but "local" is not the same as "cannot wedge" — a fetch source
+/// on a stalled network filesystem, a `.git` holding a fifo, or a stuck lock file
+/// all hang git indefinitely. Bailiff drives these calls as workflow steps, so an
+/// unbounded wait is a workflow that stops with no diagnosis. Generous enough that
+/// a loaded host never trips it; finite so a wedged host fails visibly instead.
+const NOTES_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cap on captured stdout from a `notes_repo` git command.
+///
+/// The largest legitimate output is a `for-each-ref` listing of the notes
+/// namespace — one refname plus an object id per line, so ~100 bytes per note.
+/// 64 MiB is far more than any real namespace and still bounds a corrupted repo
+/// (or a `git` that streams garbage) to something the host can hold. Exceeding it
+/// fails the call rather than truncating: `for-each-ref` output is parsed one
+/// refname per line, and a truncated prefix would read as a complete, shorter
+/// listing — silently losing notes.
+const NOTES_GIT_STDOUT_CAP: usize = 64 * 1024 * 1024;
+
+/// Bound on retained stderr, re-exported from the supervisor so the tests assert
+/// against the same number the drain actually enforces.
+#[cfg(test)]
+use crate::process_supervisor::STDERR_CAPTURE_TAIL_CAP as NOTES_GIT_STDERR_TAIL_CAP;
+
+/// Attempts allowed for a child that died before it ran anything (see
+/// [`crate::process_supervisor::child_ran_nothing`]).
+///
+/// An attempt count is right here, where a deadline is right for a transient
+/// spawn *refusal*: a refusal clears on the host's schedule, so we wait it out;
+/// a born-dead child is a per-spawn lottery at roughly 1-in-2000, so what we
+/// want is another ticket, not a wait. Three attempts put the residual odds past
+/// 1-in-10^10.
+const BORN_DEAD_RETRY_ATTEMPTS: usize = 3;
+
+/// The bounds applied to one supervised `git` invocation.
+///
+/// A value rather than two loose constants so a caller cannot supply a timeout
+/// and forget the cap. Production always uses [`GitLimits::production`]; tests
+/// shrink both so a "child floods stdout" case is provoked in milliseconds
+/// instead of by spinning a shell against a 64 MiB bound.
+#[derive(Copy, Clone, Debug)]
+struct GitLimits {
+    timeout: Duration,
+    stdout_cap: usize,
+}
+
+impl GitLimits {
+    const fn production() -> Self {
+        Self {
+            timeout: NOTES_GIT_TIMEOUT,
+            stdout_cap: NOTES_GIT_STDOUT_CAP,
+        }
+    }
+}
 
 /// Snapshot of the parent-process environment values that flow into
 /// git child commands. Production code captures this once via
@@ -649,222 +725,6 @@ fn prepare_git_command(repo: &Path, env: &InheritedEnv) -> Command {
     command
 }
 
-/// How long to keep retrying a `git` spawn (or the stderr-drain thread spawn)
-/// that fails with a *transient* resource refusal before giving up.
-///
-/// A transient refusal (EAGAIN, &c.) means the OS momentarily had no room in
-/// the process table; it WILL clear as concurrent children exit. So the correct
-/// response is "wait for it to clear", bounded by a deadline so a genuinely
-/// wedged host still fails rather than spinning forever — not an arbitrary
-/// attempt count (which is too shallow for a sustained fork-pressure peak, the
-/// flake this replaces). The first attempt is immediate; backoff only applies
-/// between retries, so the happy path pays nothing.
-const GIT_SPAWN_RETRY_DEADLINE: Duration = Duration::from_secs(2);
-
-/// Cap on the exponential backoff between spawn retries.
-const GIT_SPAWN_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(50);
-
-/// Attempts allowed for a child that died before it ran anything (see
-/// [`child_was_born_dead`]).
-///
-/// An attempt count is right here, where a deadline is right for
-/// [`GIT_SPAWN_RETRY_DEADLINE`]: a transient spawn *refusal* clears on the
-/// host's schedule, so we wait it out; a born-dead child is a per-spawn
-/// lottery at roughly 1-in-2000, so what we want is another ticket, not a
-/// wait. Three attempts put the residual odds past 1-in-10^10.
-const BORN_DEAD_RETRY_ATTEMPTS: usize = 3;
-
-/// True if a failed `Command::spawn()` is a *transient* resource
-/// refusal that a retry can clear. The fork/`posix_spawn` was rejected,
-/// so the child never ran — re-running is correct (nothing
-/// half-happened), which is what makes the retry in [`spawn_with_retry`]
-/// safe rather than hopeful.
-///
-/// `EAGAIN` is the one observed under parallel-test fork pressure: the
-/// per-user process table (`RLIMIT_NPROC`) momentarily fills when many
-/// git children spawn at once. `ENOMEM` / `EMFILE` / `ENFILE` are the
-/// same all-or-nothing class (out of memory / fd-table full). Permanent
-/// failures — `ENOENT` (git not on `PATH`), `EACCES`, an error with no
-/// OS errno — are deliberately excluded: those must fail fast.
-fn spawn_is_retryable(err: &io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EAGAIN) | Some(libc::ENOMEM) | Some(libc::EMFILE) | Some(libc::ENFILE)
-    )
-}
-
-/// Proof-of-life probe, taken immediately after `spawn()` returns and before
-/// we touch the child: `true` when `getpgid(pid)` reports `ESRCH`.
-///
-/// This is *proof the child never ran*, not a heuristic, and the reason is the
-/// zombie rule. We have not reaped the child yet, so a process that had run
-/// and exited — however briefly, however it died — would still hold an
-/// unreaped entry in the process table, and `getpgid` on it would succeed.
-/// `ESRCH` means there is no entry at all: the pid we were handed never became
-/// a live process.
-///
-/// This is the mark left by the macOS "phantom SIGKILL" (see
-/// `docs/known-test-flakes.md`): `spawn()` succeeds and yields a pid whose
-/// process is already gone microseconds later, before it executes one
-/// instruction. Roughly 1 spawn in 2000 under the parallel test suite's load;
-/// counted per run it is 0 in every passing run and >=1 in every failing one.
-///
-/// Being a probe of a *live* condition it can only race one way: if the kernel
-/// has not yet torn the entry down we return `false` and decline to retry.
-/// That is the safe direction — a missed retry is a rare test failure, a
-/// wrongly-granted one could re-run a command that had already taken effect.
-fn child_vanished_before_running(pid: u32) -> bool {
-    // SAFETY: `getpgid` is async-signal-safe and reads no memory we own.
-    let probed = unsafe { libc::getpgid(pid as libc::pid_t) };
-    probed == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
-
-/// Whether a finished child provably ran nothing, and so may be re-run — the
-/// second way, after [`spawn_is_retryable`], that a git invocation can be
-/// retried without risking a repeated effect.
-///
-/// Both conjuncts are load-bearing:
-///
-/// * `vanished_before_running` — the [`child_vanished_before_running`] proof
-///   above. This is what makes the retry safe *irrespective of the command*:
-///   it does not assume `notes add` or `update-ref` may be repeated, it
-///   establishes that this child never ran, so there is nothing to repeat.
-/// * killed by `SIGKILL` — a guard against the one way the probe could lie.
-///   If some dependency ever set `SIGCHLD` to `SIG_IGN`, children would be
-///   auto-reaped and a *successful* fast child could also probe as `ESRCH`;
-///   but such a child cannot be reaped by us afterwards, so it surfaces as a
-///   `GitWait` error rather than reaching this predicate with a signal status.
-///
-/// Note what is deliberately *not* used: emptiness of stdout or stderr. That
-/// was the first formulation, and it is unsound — `CaptureOutput::Discard`
-/// makes stdout empty by construction, so for the mutating callers (`notes
-/// add`, `update-ref`) the test would have been vacuous, and a child killed
-/// *after* committing its ref would have been replayed.
-fn child_ran_nothing(vanished_before_running: bool, status: &ExitStatus) -> bool {
-    vanished_before_running && status.signal() == Some(libc::SIGKILL)
-}
-
-/// Spawn `command`, feed it `stdin_input`, and collect its output, re-running
-/// the whole invocation while the child provably ran nothing
-/// ([`child_ran_nothing`]).
-///
-/// Every synchronous git child in this module goes through here, so the
-/// born-dead absorption covers the config-validation children on the
-/// `NotesRepo::open` path too — the flake was first observed as
-/// `GitFailed { args: ["config"], status: unix_wait_status(9) }`.
-///
-/// `probe` exists so the retry loop itself is testable: forging a genuinely
-/// born-dead child is not something a test can do on demand, since the whole
-/// point is that the kernel discards it. Production passes
-/// [`child_vanished_before_running`]; a test can pass one that reports a
-/// vanish on a chosen attempt. It is an explicit argument rather than hidden
-/// indirection, and [`run_git_child`] is the only production caller.
-fn run_git_child_probed(
-    command: &mut Command,
-    stdin_input: Option<&[u8]>,
-    mut probe: impl FnMut(u32) -> bool,
-) -> Result<std::process::Output, NotesRepoError> {
-    for attempt in 0..BORN_DEAD_RETRY_ATTEMPTS {
-        // Retry transient spawn refusals (EAGAIN under fork pressure, &c.).
-        // A refused spawn ran nothing, so this is safe; a child that starts
-        // and exits non-zero is handled by the caller and never retried.
-        let mut child = spawn_with_retry(GIT_SPAWN_RETRY_DEADLINE, || command.spawn())
-            .map_err(|source| NotesRepoError::GitSpawn { source })?;
-
-        // Probe before touching the child: the zombie rule only holds while
-        // the child is unreaped.
-        let vanished = probe(child.id());
-
-        // A born-dead child shows up here first, as `EPIPE`: it is already
-        // gone, so nothing is reading the pipe. Hold the error rather than
-        // returning it — whether this is the flake or a real broken pipe is
-        // not yet decidable, and the wait below settles it.
-        let mut stdin_broken_pipe = None;
-        if let Some(bytes) = stdin_input {
-            let mut stdin = child
-                .stdin
-                .take()
-                .expect("stdin was configured as Stdio::piped()");
-            match stdin.write_all(bytes) {
-                Ok(()) => {}
-                Err(source) if source.kind() == io::ErrorKind::BrokenPipe => {
-                    stdin_broken_pipe = Some(source);
-                }
-                Err(source) => return Err(NotesRepoError::GitStdinWrite { source }),
-            }
-            drop(stdin);
-        }
-
-        // `wait_with_output` drains stdout AND stderr concurrently (std's internal
-        // read2: a non-blocking poll loop, not a helper thread) and waits for exit.
-        // This avoids the pipe-buffer deadlock a serial drain would hit on a child
-        // that floods stderr, WITHOUT spawning a per-call thread — that thread
-        // spawn was itself unguarded against the same EAGAIN that
-        // `spawn_with_retry` exists to absorb, so under fork pressure it would
-        // `panic` and become the next flake.
-        let output = child
-            .wait_with_output()
-            .map_err(|source| NotesRepoError::GitWait { source })?;
-
-        if child_ran_nothing(vanished, &output.status) && attempt + 1 < BORN_DEAD_RETRY_ATTEMPTS {
-            continue;
-        }
-
-        // The child's own outcome stands, including a genuine broken pipe.
-        if let Some(source) = stdin_broken_pipe {
-            return Err(NotesRepoError::GitStdinWrite { source });
-        }
-        return Ok(output);
-    }
-    unreachable!("the final attempt returns rather than continuing")
-}
-
-/// [`run_git_child_probed`] with the real proof-of-life probe.
-fn run_git_child(
-    command: &mut Command,
-    stdin_input: Option<&[u8]>,
-) -> Result<std::process::Output, NotesRepoError> {
-    run_git_child_probed(command, stdin_input, child_vanished_before_running)
-}
-
-/// Run `attempt`, retrying for up to `deadline` whenever it fails with a
-/// transient spawn refusal (see [`spawn_is_retryable`]), with exponential
-/// backoff (capped at [`GIT_SPAWN_RETRY_MAX_BACKOFF`]) so the contended
-/// resource (process table, fd table) can drain. Any non-transient error, or a
-/// transient one that outlives the deadline, is returned unchanged.
-///
-/// Bounding by elapsed TIME rather than an attempt count matches the error's
-/// nature — "resource temporarily unavailable" clears on its own schedule, not
-/// after N tries — and is what keeps a brief fork-pressure peak from surfacing
-/// as a flake while a genuinely wedged host still fails.
-///
-/// Generic over the attempt's result so the retry/backoff control flow is
-/// unit-testable with a synthetic spawner, without exhausting the real process
-/// table.
-fn spawn_with_retry<T, F>(deadline: Duration, mut attempt: F) -> io::Result<T>
-where
-    F: FnMut() -> io::Result<T>,
-{
-    let start = Instant::now();
-    let mut backoff = Duration::from_millis(1);
-    loop {
-        match attempt() {
-            Ok(value) => return Ok(value),
-            Err(err) if spawn_is_retryable(&err) && start.elapsed() < deadline => {
-                tracing::warn!(
-                    elapsed_ms = start.elapsed().as_millis(),
-                    deadline_ms = deadline.as_millis(),
-                    errno = err.raw_os_error(),
-                    "git spawn refused with a transient resource error; retrying after backoff"
-                );
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(GIT_SPAWN_RETRY_MAX_BACKOFF);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
 fn run_git<'a, I>(
     repo: &Path,
     args: I,
@@ -878,6 +738,24 @@ where
     run_git_capturing_stderr(repo, args, stdin_input, capture, env).map(|(stdout, _stderr)| stdout)
 }
 
+/// [`run_git`] under caller-chosen bounds. Only tests need anything other than
+/// [`GitLimits::production`].
+#[cfg(test)]
+fn run_git_with_limits<'a, I>(
+    repo: &Path,
+    args: I,
+    stdin_input: Option<&[u8]>,
+    capture: CaptureOutput,
+    env: &InheritedEnv,
+    limits: GitLimits,
+) -> Result<Vec<u8>, NotesRepoError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    run_git_capturing_stderr_with_limits(repo, args, stdin_input, capture, env, limits)
+        .map(|(stdout, _stderr)| stdout)
+}
+
 /// Variant of [`run_git`] that hands the caller both stdout and the
 /// captured stderr on success. Most callers never need stderr on the
 /// happy path — git prints to it only on warnings — but a few do.
@@ -889,13 +767,14 @@ where
 /// it masquerade as "no rows here", so this helper exposes the bytes
 /// and the caller decides.
 ///
-/// Stdout and stderr are drained concurrently (stderr on a background
-/// thread). A serial drain — read stdout to EOF, then read stderr —
-/// deadlocks if the child fills the stderr pipe buffer before stdout
-/// closes: `git for-each-ref` over a heavily corrupted ref namespace
-/// emits one warning per broken ref and can easily exceed the
-/// platform pipe-buffer size (64KiB on Linux). With parallel drains
-/// neither pipe can ever fill while the other is being read.
+/// Every invocation is supervised: stdin, stdout, and stderr are driven by one
+/// non-blocking event loop, the whole call is bounded by
+/// [`NOTES_GIT_TIMEOUT`], both captures are byte-capped, and the child's process
+/// group is SIGKILLed on the way out so no helper it forked can outlive it or
+/// hold a captured pipe open. Concurrent drains are what keep a child that
+/// floods one stream from deadlocking against the other: `git for-each-ref` over
+/// a heavily corrupted ref namespace emits one warning per broken ref and easily
+/// exceeds the platform pipe-buffer size (64 KiB on Linux).
 fn run_git_capturing_stderr<'a, I>(
     repo: &Path,
     args: I,
@@ -906,29 +785,142 @@ fn run_git_capturing_stderr<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
+    run_git_capturing_stderr_with_limits(
+        repo,
+        args,
+        stdin_input,
+        capture,
+        env,
+        GitLimits::production(),
+    )
+}
+
+fn run_git_capturing_stderr_with_limits<'a, I>(
+    repo: &Path,
+    args: I,
+    stdin_input: Option<&[u8]>,
+    capture: CaptureOutput,
+    env: &InheritedEnv,
+    limits: GitLimits,
+) -> Result<(Vec<u8>, Vec<u8>), NotesRepoError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let args: Vec<&str> = args.into_iter().collect();
     let mut command = prepare_git_command(repo, env);
     command.args(&args);
-    command.stdin(if stdin_input.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    command.stdout(match capture {
-        CaptureOutput::Discard => Stdio::null(),
-        CaptureOutput::Capture => Stdio::piped(),
-    });
-    command.stderr(Stdio::piped());
+    let stdout_mode = match capture {
+        CaptureOutput::Discard => StdoutMode::Discard,
+        CaptureOutput::Capture => StdoutMode::Capture {
+            byte_cap: limits.stdout_cap,
+        },
+    };
 
-    let output = run_git_child(&mut command, stdin_input)?;
-    if !output.status.success() {
+    let owned_args = || -> Vec<String> { args.iter().map(|s| (*s).to_string()).collect() };
+    let (status, stdout, stderr) =
+        supervised_git(&mut command, limits, stdin_input, stdout_mode, owned_args)?;
+    if !status.success() {
         return Err(NotesRepoError::GitFailed {
-            args: args.iter().map(|s| (*s).to_string()).collect(),
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            args: owned_args(),
+            status,
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         });
     }
-    Ok((output.stdout, output.stderr))
+    Ok((stdout, stderr))
+}
+
+/// Run one `git` child under the supervisor, re-running it while the child
+/// provably ran nothing, and map the non-exit outcomes to this module's errors.
+///
+/// Both git call sites in this module go through here — including the
+/// config-validation children on the `NotesRepo::open` path, where the born-dead
+/// flake was first seen as `GitFailed { args: ["config"], status: signal 9 }`.
+/// Returning the raw `ExitStatus` rather than judging it is what lets `git
+/// config` keep its own reading of exit 1 ("key not set") without a second copy
+/// of the retry.
+fn supervised_git(
+    command: &mut Command,
+    limits: GitLimits,
+    stdin_input: Option<&[u8]>,
+    stdout_mode: StdoutMode,
+    args: impl Fn() -> Vec<String>,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), NotesRepoError> {
+    supervised_git_probed(
+        command,
+        limits,
+        stdin_input,
+        stdout_mode,
+        args,
+        process_supervisor::child_vanished_before_running,
+    )
+}
+
+/// [`supervised_git`] with an injectable proof-of-life probe.
+///
+/// A genuinely born-dead child cannot be forged on demand — the kernel decides —
+/// so a test that wants to drive the retry supplies its own probe. Explicit
+/// argument rather than hidden indirection; [`supervised_git`] is the only
+/// production caller.
+fn supervised_git_probed(
+    command: &mut Command,
+    limits: GitLimits,
+    stdin_input: Option<&[u8]>,
+    stdout_mode: StdoutMode,
+    args: impl Fn() -> Vec<String>,
+    mut probe: impl FnMut(u32) -> bool,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), NotesRepoError> {
+    // The supervisor takes a proof-of-life probe between spawn and reap and
+    // reports it as `ran_nothing`; see `process_supervisor::child_ran_nothing`
+    // for why re-running is safe even for a *mutating* command like `notes add`
+    // (the claim is not that the command may be repeated, but that this child had
+    // no effect to repeat).
+    for attempt in 0..BORN_DEAD_RETRY_ATTEMPTS {
+        let outcome = process_supervisor::run_supervised_blocking_probed(
+            command,
+            limits.timeout,
+            stdin_input,
+            stdout_mode,
+            StderrMode::Capture,
+            |pid| probe(pid),
+        )
+        .map_err(|source| supervisor_error_to_notes_error(source, args()))?;
+
+        return match outcome {
+            SupervisedOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+                ran_nothing,
+            } => {
+                if ran_nothing && attempt + 1 < BORN_DEAD_RETRY_ATTEMPTS {
+                    continue;
+                }
+                Ok((status, stdout, stderr))
+            }
+            SupervisedOutcome::TimedOut => Err(NotesRepoError::GitTimedOut {
+                args: args(),
+                timeout: limits.timeout,
+            }),
+            SupervisedOutcome::StdoutCapExceeded { cap } => {
+                Err(NotesRepoError::GitStdoutCapExceeded { args: args(), cap })
+            }
+        };
+    }
+    unreachable!("the final attempt returns rather than continuing")
+}
+
+/// Map a supervisor failure onto this module's error type. The distinction the
+/// callers care about is spawn-vs-everything-else: a refused spawn means git
+/// never ran (so the repo is untouched), whereas the rest happened mid-flight.
+fn supervisor_error_to_notes_error(err: SupervisorError, args: Vec<String>) -> NotesRepoError {
+    match err {
+        SupervisorError::Spawn(source) => NotesRepoError::GitSpawn { source },
+        SupervisorError::Wait(source) => NotesRepoError::GitWait { source },
+        other => NotesRepoError::GitSupervision {
+            args,
+            detail: other.to_string(),
+        },
+    }
 }
 
 fn git_config_get_bool(
@@ -969,32 +961,41 @@ fn run_git_config<'a>(
     config_args: impl IntoIterator<Item = &'a str>,
     env: &InheritedEnv,
 ) -> Result<Option<String>, NotesRepoError> {
+    // Supervised like every other git call here. This is the one command whose
+    // *non-zero* exit is not necessarily an error (exit 1 means "key unset"), so
+    // it cannot share `run_git_capturing_stderr`'s success check — but it gets
+    // the identical timeout, caps, and process-group kill rather than its own
+    // weaker discipline.
     let mut command = prepare_git_command(repo, env);
     command.arg("config");
     for arg in config_args {
         command.arg(arg);
     }
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    // Through `run_git_child`, not `Command::output()`: these config children
-    // are spawned on every `NotesRepo::open`, and are as exposed to the
-    // born-dead flake as any other. It was first seen here, in fact —
-    // `GitFailed { args: ["config"], status: unix_wait_status(9) }`.
-    let output = run_git_child(&mut command, None)?;
-    if output.status.success() {
-        let s = String::from_utf8(output.stdout)
-            .map_err(|source| NotesRepoError::ConfigNonUtf8 { source })?;
+    let args = || vec!["config".to_string()];
+    let limits = GitLimits::production();
+    let (status, stdout, stderr) = supervised_git(
+        &mut command,
+        limits,
+        None,
+        StdoutMode::Capture {
+            byte_cap: limits.stdout_cap,
+        },
+        args,
+    )?;
+
+    if status.success() {
+        let s =
+            String::from_utf8(stdout).map_err(|source| NotesRepoError::ConfigNonUtf8 { source })?;
         Ok(Some(s))
-    } else if output.status.code() == Some(1) {
+    } else if status.code() == Some(1) {
         // Per `git config(1)`, exit code 1 means the key is not set.
         // Any other non-zero exit is an actual error.
         Ok(None)
     } else {
         Err(NotesRepoError::GitFailed {
-            args: vec!["config".to_string()],
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            args: args(),
+            status,
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 }
@@ -1130,6 +1131,17 @@ pub enum NotesRepoError {
         status: ExitStatus,
         stderr: String,
     },
+    #[error("git {args:?} did not finish within {timeout:?}; its process group was killed")]
+    GitTimedOut {
+        args: Vec<String>,
+        timeout: Duration,
+    },
+    #[error(
+        "git {args:?} wrote more than the {cap}-byte stdout capture cap; its process group was killed and the output discarded"
+    )]
+    GitStdoutCapExceeded { args: Vec<String>, cap: usize },
+    #[error("git {args:?} could not be supervised: {detail}")]
+    GitSupervision { args: Vec<String>, detail: String },
     #[error("git for-each-ref output is not valid UTF-8: {source}")]
     ForEachRefNonUtf8 { source: std::string::FromUtf8Error },
     #[error("git for-each-ref returned refname {raw:?} that fails validation: {source}")]

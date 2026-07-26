@@ -54,6 +54,9 @@ use crate::clean_git::{self, CLEAN_GIT_CONFIG_ENV, CLEAN_GIT_CURRENT_DIR, CleanG
 use crate::git_push_object_parse::{parse_commit_object, parse_tree_object};
 use crate::git_push_walker::{GitObjectSource, GitObjectSourceError, StagingCommit, StagingTree};
 use crate::process_spawn;
+use crate::process_supervisor::{
+    ProcessGroupCleanupGuard, kill_process_group, wait_for_pid_exit_no_reap,
+};
 use crate::vm_git::GitObjectId;
 
 pub struct CatFileObjectSource {
@@ -205,14 +208,16 @@ impl CatFileObjectSource {
     /// pid claimed by the leader (un-reaped) while we send
     /// `killpg`, which is the only way to avoid a pid-recycle race
     /// where the kernel could reuse the leader's pid for an
-    /// unrelated process group between `wait()` and `killpg`. The
-    /// same pattern is in `clean_git::execute_clean_git`.
+    /// unrelated process group between `wait()` and `killpg`. Both
+    /// steps come from `crate::process_supervisor` — this used to
+    /// be a private re-implementation of them, which is precisely
+    /// the kind of divergence that ordering subtlety cannot afford.
     ///
     /// Cancellation safety: from the moment we take ownership of
     /// the child the source's outer [`Drop`] is disarmed (`inner`
-    /// is `None`), so a local `PgidCleanupGuard` takes over and
-    /// SIGKILLs the process group if anything between here and the
-    /// final `disarm()` panics or has its await cancelled.
+    /// is `None`), so a local `ProcessGroupCleanupGuard` takes
+    /// over and SIGKILLs the process group if anything between here
+    /// and the final `disarm()` panics or has its await cancelled.
     pub async fn close(mut self) -> io::Result<()> {
         let pgid = self.pgid;
         let mutex = self
@@ -239,15 +244,17 @@ impl CatFileObjectSource {
         // the leader's pid (and therefore the pgid), and `guard`'s
         // later `killpg` could then hit an unrelated process group
         // that recycled the pid.
-        let mut guard = PgidCleanupGuard::new(pgid);
+        let mut guard = ProcessGroupCleanupGuard::new(pgid);
 
         // Observe the leader's exit without reaping. While its pid
         // remains claimed, the pgid is stable, so the subsequent
         // killpg cannot hit an unrelated recycled group.
-        let observed_exit = wait_for_pid_exit_no_reap(pgid).await?;
+        if wait_for_pid_exit_no_reap(pgid).await? {
+            guard.mark_child_exit_observed();
+        }
         // Send SIGKILL to the whole group: helpers (if any) die,
         // and the leader (already exited) is a no-op.
-        kill_process_group_best_effort(pgid, observed_exit)?;
+        guard.kill_now_io()?;
         // Now it is safe to reap the leader and free its pid.
         let status = child.wait().await?;
         guard.disarm();
@@ -271,7 +278,10 @@ impl Drop for CatFileObjectSource {
         // nothing useful to do with them from Drop, and ESRCH (the
         // group is already gone) is a normal race.
         if self.inner.is_some() {
-            unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
+            // We have not observed the leader exit, so a real EPERM would be
+            // meaningful — but there is nothing a `Drop` can do with it, and
+            // ESRCH (group already gone) is a normal race. Swallow either way.
+            let _ = kill_process_group(self.pgid, false);
         }
     }
 }
@@ -280,82 +290,6 @@ impl Drop for CatFileObjectSource {
 /// explicitly disarmed. Used inside [`CatFileObjectSource::close`]
 /// to keep the kill scheduled across `await` points so a future
 /// cancellation or panic still cleans the group up.
-struct PgidCleanupGuard {
-    pgid: libc::pid_t,
-    armed: bool,
-}
-
-impl PgidCleanupGuard {
-    fn new(pgid: libc::pid_t) -> Self {
-        Self { pgid, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PgidCleanupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
-        }
-    }
-}
-
-fn kill_process_group_best_effort(pgid: libc::pid_t, leader_exit_observed: bool) -> io::Result<()> {
-    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        // No such process group: somebody already cleaned up.
-        Some(libc::ESRCH) => Ok(()),
-        // macOS can report EPERM once the leader has exited and no
-        // signalable members remain. We only accept EPERM if we
-        // have just observed the leader exit via waitid(WNOWAIT) —
-        // otherwise EPERM means something else and we should not
-        // silently swallow it.
-        Some(libc::EPERM) if leader_exit_observed => Ok(()),
-        _ => Err(err),
-    }
-}
-
-const PID_EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Poll `waitid(WNOWAIT)` until the given pid is observed in the
-/// exited state without being reaped. Returns once exit is
-/// observed. The caller must keep the [`tokio::process::Child`]
-/// alive (un-`wait`-ed) until this returns so the pid still
-/// belongs to the leader.
-async fn wait_for_pid_exit_no_reap(pid: libc::pid_t) -> io::Result<bool> {
-    loop {
-        if pid_has_exited_without_reaping(pid)? {
-            return Ok(true);
-        }
-        tokio::time::sleep(PID_EXIT_POLL_INTERVAL).await;
-    }
-}
-
-fn pid_has_exited_without_reaping(pid: libc::pid_t) -> io::Result<bool> {
-    use std::mem::MaybeUninit;
-    let mut status = MaybeUninit::<libc::siginfo_t>::zeroed();
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            status.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let status = unsafe { status.assume_init() };
-    let observed_pid = unsafe { status.si_pid() };
-    Ok(observed_pid != 0)
-}
-
 impl CatFileObjectSource {
     fn child_mutex(&self) -> &Mutex<CatFileChild> {
         self.inner
@@ -426,7 +360,7 @@ impl CatFileObjectSource {
                 // process group so the wedged child stops holding the
                 // pipe, then surface the timeout.
                 guard.poisoned = true;
-                kill_process_group_best_effort(self.pgid, false)
+                kill_process_group(self.pgid, false)
                     .map_err(|source| GitObjectSourceError::Io { source })?;
                 Err(GitObjectSourceError::ReadTimedOut {
                     sha: sha.as_str().to_string(),
@@ -550,8 +484,7 @@ async fn read_object_body(
         // process group so the leader stops emitting bytes we
         // would never drain, and return.
         child.poisoned = true;
-        kill_process_group_best_effort(pgid, false)
-            .map_err(|source| GitObjectSourceError::Io { source })?;
+        kill_process_group(pgid, false).map_err(|source| GitObjectSourceError::Io { source })?;
         return Err(GitObjectSourceError::ObjectTooLarge {
             sha: sha.as_str().to_string(),
             size: declared_size,

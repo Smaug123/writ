@@ -123,10 +123,7 @@ pub(super) fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::O
         .arg(repo)
         .args(args)
         .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("HOME", "/dev/null")
+        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
@@ -163,10 +160,7 @@ pub(super) fn init_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
         .args(["init", "--quiet"])
         .arg(&repo)
         .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("HOME", "/dev/null")
+        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .output()
         .unwrap();
     assert!(

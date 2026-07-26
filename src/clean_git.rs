@@ -20,18 +20,10 @@ use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome,
 
 /// Environment variables prepended to every clean-Git invocation.
 ///
-/// - `GIT_CONFIG_NOSYSTEM=1` disables `/etc/gitconfig`.
-/// - `GIT_CONFIG_GLOBAL=/dev/null` disables `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config`.
-/// - `GIT_CONFIG_COUNT=0` disables any inherited `GIT_CONFIG_PARAMETERS`.
-/// - `HOME=/dev/null` defends against helpers that look up dotfiles under `$HOME`
-///   regardless of the `GIT_CONFIG_*` overrides (credential helpers, hook
-///   scripts, third-party tools invoked via `core.editor`/`pre-receive`/etc).
-pub(crate) const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 4] = [
-    ("GIT_CONFIG_NOSYSTEM", "1"),
-    ("GIT_CONFIG_GLOBAL", "/dev/null"),
-    ("GIT_CONFIG_COUNT", "0"),
-    ("HOME", "/dev/null"),
-];
+/// Re-exported from [`writ_core::git_env`], which is the single definition for
+/// the whole workspace and documents what each variable denies. Kept as a
+/// `clean_git` name because several call sites import it from here.
+pub(crate) use writ_core::git_env::CLEAN_GIT_CONFIG_ENV;
 // Git discovers repository-local config by walking up from cwd. Running from
 // root prevents a broker-local `.git/config` from rewriting a pinned HTTPS URL.
 pub(crate) const CLEAN_GIT_CURRENT_DIR: &str = "/";
@@ -288,6 +280,7 @@ async fn run_clean_git_inner(
             status,
             stdout,
             stderr,
+            ran_nothing: _,
         } => {
             if status.success() {
                 Ok(stdout)

@@ -220,10 +220,7 @@ fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
         .arg(repo)
         .args(args)
         .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("HOME", "/dev/null")
+        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
@@ -1114,9 +1111,7 @@ async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
             .arg(staging.path())
             .args(["cat-file", "-e", sha.as_str()])
             .env_clear()
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("HOME", "/dev/null")
+            .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
             .status()
             .expect("spawning git cat-file failed");
         assert!(
@@ -1186,9 +1181,7 @@ async fn unbundle_invocation_runs_against_real_git() {
         .arg(&staging)
         .args(["cat-file", "-e", head.as_str()])
         .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", "/dev/null")
+        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .status()
         .expect("spawning git cat-file failed");
     assert!(

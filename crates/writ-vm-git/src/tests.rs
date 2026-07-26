@@ -165,7 +165,7 @@ fn required_test_tool(name: &str) -> PathBuf {
 fn git_check_ref_format_branch_accepts(raw: &str) -> bool {
     Command::new(required_test_tool("git"))
         .args(["check-ref-format", "--branch", raw])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .output()
         .unwrap_or_else(|err| panic!("failed to run git check-ref-format: {err}"))
         .status
