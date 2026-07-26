@@ -108,7 +108,19 @@ pub struct PlanGuard {
     /// The `flock`ed lockfile. Released when this `File` drops, or —
     /// as a backstop against an unclean exit — when the process ends
     /// and the kernel closes the descriptor.
-    _lockfile: File,
+    ///
+    /// `Option` because [`Self::run_blocking`] *moves* it into the
+    /// blocking task and takes it back. That hand-off is what makes
+    /// the guard cancellation-safe: tokio does not cancel an
+    /// already-running `spawn_blocking`, so if the caller's future is
+    /// dropped mid-call, a lockfile owned by `PlanGuard` would close
+    /// while the blocking closure was still touching the repo — and
+    /// another workflow for the same plan could interleave with it.
+    /// Owned by the task instead, the `flock` outlives the cancelled
+    /// future and releases exactly when the closure returns.
+    ///
+    /// `None` only for the duration of that call.
+    lockfile: Option<File>,
     repo: Arc<NotesRepo>,
 }
 
@@ -125,7 +137,7 @@ impl PlanGuard {
                 .await
                 .map_err(|source| PlanGuardError::LockTaskFailed { plan_id, source })??;
         Ok(Self {
-            _lockfile: lockfile,
+            lockfile: Some(lockfile),
             repo,
         })
     }
@@ -133,16 +145,36 @@ impl PlanGuard {
     /// Run `work` against the repo in a `spawn_blocking` task under
     /// the held lock.
     ///
+    /// The lockfile is moved into the task and moved back out, so the
+    /// `flock` is held for exactly as long as the closure runs even if
+    /// the caller's future is cancelled in the meantime — tokio does
+    /// not cancel an already-running `spawn_blocking`, so a lockfile
+    /// the guard kept would close while the closure was still using
+    /// the repo.
+    ///
     /// Surfaces a [`JoinError`] iff the task panicked or was
     /// cancelled — the same condition each workflow maps to its own
-    /// `ReadTaskFailed` / `WriteTaskFailed` variant.
+    /// `ReadTaskFailed` / `WriteTaskFailed` variant. In that case the
+    /// lockfile died with the task, which closes its descriptor and
+    /// releases the lock; the guard is left unusable and any further
+    /// `run_blocking` panics rather than silently running unlocked.
     pub async fn run_blocking<F, R>(&mut self, work: F) -> Result<R, JoinError>
     where
         F: FnOnce(&NotesRepo) -> R + Send + 'static,
         R: Send + 'static,
     {
+        let lockfile = self
+            .lockfile
+            .take()
+            .expect("PlanGuard invariant: the lockfile is Some outside run_blocking");
         let repo = Arc::clone(&self.repo);
-        tokio::task::spawn_blocking(move || work(&repo)).await
+        let (lockfile, result) = tokio::task::spawn_blocking(move || {
+            let r = work(&repo);
+            (lockfile, r)
+        })
+        .await?;
+        self.lockfile = Some(lockfile);
+        Ok(result)
     }
 }
 
@@ -168,11 +200,14 @@ fn acquire_plan_lockfile(repo_path: &Path, plan_id: PlanId) -> Result<File, Plan
             source,
         })?;
     // Report contention once before settling in to wait, so an
-    // operator staring at an idle CLI knows why.
+    // operator staring at an idle CLI knows why. `warn`, not `info`:
+    // the `bailiff` binary initialises telemetry at `warn`
+    // (`bin/bailiff.rs`), so an `info` event here is filtered out and
+    // the command just looks hung for the length of an LLM run.
     match file.try_lock() {
         Ok(()) => return Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => {
-            tracing::info!(
+            tracing::warn!(
                 %plan_id,
                 lockfile = %path.display(),
                 "waiting for another bailiff workflow to release this plan",
@@ -182,6 +217,52 @@ fn acquire_plan_lockfile(repo_path: &Path, plan_id: PlanId) -> Result<File, Plan
             return Err(PlanGuardError::OpenLockfile { path, source });
         }
     }
+    file.lock()
+        .map_err(|source| PlanGuardError::OpenLockfile { path, source })?;
+    Ok(file)
+}
+
+/// Lockfile name for the shared writ-notes mirror. Cannot collide
+/// with a plan lockfile: those are named by UUID.
+const MIRROR_LOCK: &str = "_writ-mirror.lock";
+
+/// Take the repo-wide lock guarding bailiff's mirror of writ's notes,
+/// waiting for it. Blocking; call from inside a [`PlanGuard::run_blocking`]
+/// section, which is already on a blocking thread.
+///
+/// Per-plan locks are the right granularity for *plan* state, because
+/// each plan owns its ref. They are the wrong granularity for the
+/// writ mirror, which every workflow fetches into the same
+/// destination (`refs/notes/writ/v1/*`, force-fetched). Two workflows
+/// for different plans do not contend on their plan locks, so without
+/// this a fetch from one can roll the shared mirror back between
+/// another's fetch and its read — and on the implement path that can
+/// happen *after* the agent has already pushed, leaving the run
+/// without its `ImplementNote`.
+///
+/// `NotesRepo`'s own mutex does not cover this: it serialises each git
+/// invocation, not the fetch-then-read pair, and it is process-wide
+/// where this hazard is not.
+///
+/// **Lock ordering: plan lock first, then this one.** Every caller
+/// takes it inside a held [`PlanGuard`] and releases it before the
+/// guard drops, so the order is total and cannot deadlock.
+pub(crate) fn lock_writ_mirror(repo: &NotesRepo) -> Result<File, PlanGuardError> {
+    let dir = repo.path().join(LOCK_DIR);
+    std::fs::create_dir_all(&dir).map_err(|source| PlanGuardError::OpenLockfile {
+        path: dir.clone(),
+        source,
+    })?;
+    let path = dir.join(MIRROR_LOCK);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| PlanGuardError::OpenLockfile {
+            path: path.clone(),
+            source,
+        })?;
     file.lock()
         .map_err(|source| PlanGuardError::OpenLockfile { path, source })?;
     Ok(file)

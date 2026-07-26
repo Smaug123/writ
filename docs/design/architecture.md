@@ -845,9 +845,18 @@ atomic. `acquire` waits rather than failing — the holder is typically
 mid-LLM-run. All four mutating verbs take it, including `decide`, which before
 2026-07-26 took no lock at all.
 
-One mechanism, not two: an `flock` binds to an *open file description*, so two
-`open` calls contend even inside one process, and the kernel supplies the
-in-process queueing that an earlier draft built a mutex registry to provide.
+A **second, repo-wide** lock (`lock_writ_mirror`, `<repo>/bailiff-locks/_writ-mirror.lock`)
+guards the one thing that is *not* per-plan: every workflow force-fetches
+`refs/notes/writ/v1/*` into the same destination, so per-plan locks would let a
+fetch for one plan roll the shared mirror back between another plan's fetch and
+its read. It is held only across each fetch→read pair, inside the plan lock —
+the ordering is total (plan, then mirror), so the pair cannot deadlock.
+
+One mechanism per scope, not two per scope: an `flock` binds to an *open file
+description*, so two `open` calls contend even inside one process, and the kernel
+supplies the in-process queueing that an earlier draft built a mutex registry to
+provide. `PlanGuard::run_blocking` hands its lockfile *to* the blocking task, so
+a cancelled workflow keeps the lock until its closure actually returns.
 Per-plan granularity is safe because each plan owns its ref and git updates refs
 through their own lockfiles (measured: 32 concurrent cross-process `git notes
 add` calls on distinct refs, all successful); concurrent *git invocations*

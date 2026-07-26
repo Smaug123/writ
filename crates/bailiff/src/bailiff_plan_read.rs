@@ -32,6 +32,7 @@ use crate::bailiff_plan_note::{
     plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_write::WRIT_V1_NOTES_REFSPEC;
+use crate::bailiff_repo_guard::lock_writ_mirror;
 use writ::core::NotesRef;
 use writ::notes_repo::{NotesRepo, NotesRepoError};
 use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
@@ -752,6 +753,9 @@ pub(crate) fn read_plan_body_bytes(
     plan_note: &PlanNote,
     allowed_signers: &AllowedSigners,
 ) -> Result<String, ReadPlanBodyError> {
+    // Shared across every plan, so the caller's per-plan lock does not
+    // cover it; held only across fetch→read. See `lock_writ_mirror`.
+    let _mirror = lock_writ_mirror(bailiff_repo).map_err(ReadPlanBodyError::MirrorLock)?;
     bailiff_repo
         .fetch_from_remote(writ_repo_path, &[WRIT_V1_NOTES_REFSPEC])
         .map_err(ReadPlanBodyError::Fetch)?;
@@ -789,6 +793,10 @@ pub(crate) fn read_plan_body_bytes(
 /// isn't text" are all distinct problems.
 #[derive(Debug, Error)]
 pub enum ReadPlanBodyError {
+    /// The shared writ-mirror lock could not be taken. A filesystem
+    /// problem, not contention — the lock waits.
+    #[error("locking the writ notes mirror failed: {0}")]
+    MirrorLock(#[source] crate::bailiff_repo_guard::PlanGuardError),
     /// `git fetch` against writ's repo failed. Usually a wrong
     /// `writ_repo_path` or a filesystem permission problem.
     #[error("fetching writ's notes ref failed: {0}")]

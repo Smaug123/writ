@@ -386,6 +386,40 @@ listed "swapping `try_lock` for `lock`" as a regression it would catch — which
 is precisely the deliberate change. A comment at its former site records that,
 and points at the guard-module tests that replace it.
 
+**5. Codex review found three more, all valid.** Recorded because two of them are
+the *same shape* as the bugs above — a lock whose scope did not match the scope
+of the thing it protected.
+
+- **The shared writ mirror was left per-plan.** Every workflow force-fetches
+  `refs/notes/writ/v1/*` into one destination, so per-plan locks do not
+  serialise it; a fetch for one plan can roll the mirror back between another
+  plan's fetch and its read, and on the implement path that can strike *after*
+  the agent has pushed. `NotesRepo`'s mutex does not cover it — it serialises
+  each git invocation, not the fetch→read pair, and it is process-wide where the
+  hazard is not. Fixed with `lock_writ_mirror`, a repo-wide flock held only
+  across that pair, taken inside the plan lock (total order, no deadlock).
+  Slice 2 had *widened* this hazard in-process: the old repo-wide guard
+  accidentally covered it.
+- **`run_blocking` was cancellation-unsafe.** Tokio does not cancel a running
+  `spawn_blocking`, so a dropped workflow future closed the lockfile while the
+  closure still held the repo. The two-layer draft had this right by accident —
+  it passed the mutex guard *into* the closure — and collapsing to one mechanism
+  lost the property. Fixed by handing the lockfile to the task and taking it
+  back.
+- **The contention notice was invisible.** `tracing::info!` sits below the
+  `warn` filter `bin/bailiff.rs` installs, so a waiting CLI looked hung. Now
+  `warn!`. (Codex's stated reason — that the binary installs no subscriber — was
+  wrong; it calls `telemetry::init("warn")`. The conclusion held.)
+
+**6. The cancellation test took three attempts to become evidence.**
+`!contender.is_finished()` passed with the bug reintroduced; so did a
+sequence-number ordering assertion. Both confused "the contender was correctly
+blocked" with "the contender had not been scheduled yet". Only a *synchronous*
+`try_lock` probe from the test thread — which depends on no scheduling at all —
+actually failed against the bug. Two spawned-contender assertions that looked
+rigorous were worth nothing, which is the sharpest instance yet of the rule that
+a property test never watched to fail is a claim.
+
 ## Slice 3 has not started
 
 The next action is **capturing the recorded RPC traces on the pre-refactor

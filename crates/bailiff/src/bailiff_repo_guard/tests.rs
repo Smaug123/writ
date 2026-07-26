@@ -243,3 +243,129 @@ async fn a_guarded_read_then_write_is_atomic_for_one_plan() {
         "exactly one guarded writer must have created the note",
     );
 }
+
+/// Cancelling a workflow mid-`run_blocking` must not release the
+/// plan's lock while the blocking closure is still running.
+///
+/// Tokio does not cancel an already-running `spawn_blocking` task, so
+/// a guard that owned the lockfile itself would close it on drop while
+/// the closure kept touching the repo — and another workflow for the
+/// same plan could interleave with the first one's gate or write. The
+/// fix is that `run_blocking` hands the lockfile *to* the task.
+///
+/// The check is a **synchronous probe**, deliberately. Two earlier
+/// drafts asserted against a spawned contender — first
+/// `!contender.is_finished()`, then a sequence-number ordering — and
+/// *both passed with the bug reintroduced*, because neither could tell
+/// "the contender was correctly blocked" from "the contender had not
+/// been scheduled yet". Probing the lockfile from this thread depends
+/// on no scheduling whatsoever: either the flock is held at the moment
+/// we look, or it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_run_blocking_holds_the_lock_until_the_closure_returns() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo(&tmp);
+    let plan_id = PlanId::new();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    let mut guard = PlanGuard::acquire(Arc::clone(&repo), plan_id)
+        .await
+        .unwrap();
+
+    // Start the blocking work, then cancel the future without awaiting
+    // it to completion.
+    {
+        let fut = guard.run_blocking(move |_repo| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let mut fut = std::pin::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("the blocking closure cannot finish before it is released"),
+            _ = tokio::task::yield_now() => {}
+        }
+    } // <- cancellation
+
+    // The blocking closure is definitely running now (it said so), and
+    // the guard is gone.
+    started_rx.recv().unwrap();
+    drop(guard);
+
+    let lock_path = repo
+        .path()
+        .join("bailiff-locks")
+        .join(format!("{plan_id}.lock"));
+    let probe = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    assert!(
+        matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "the plan lock was released while the cancelled workflow's blocking closure was \
+         still running",
+    );
+    drop(probe);
+
+    // Releasing the closure lets it return, which drops the lockfile
+    // it owns — after which the plan is acquirable again.
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        PlanGuard::acquire(Arc::clone(&repo), plan_id),
+    )
+    .await
+    .expect("the plan must be acquirable once the blocking closure returns")
+    .expect("re-acquiring a released plan must succeed");
+}
+
+/// The writ-mirror lock is repo-wide, unlike the plan locks.
+///
+/// Every workflow force-fetches `refs/notes/writ/v1/*` into the *same*
+/// destination, so per-plan locks — correct for plan state, which is
+/// per-ref — do not serialise it. Without a repo-wide lock around the
+/// fetch→read pair, a fetch for one plan can roll the shared mirror
+/// back between another plan's fetch and its read; on the implement
+/// path that can strike after the agent has already pushed.
+///
+/// Probed synchronously, for the reason given on
+/// `cancelling_run_blocking_holds_the_lock_until_the_closure_returns`.
+#[test]
+fn the_writ_mirror_lock_is_repo_wide_while_plan_locks_are_not() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("bare")).unwrap();
+
+    let open = |name: String| {
+        let path = repo.path().join("bailiff-locks").join(name);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap()
+    };
+
+    let held = lock_writ_mirror(&repo).expect("first mirror lock must succeed");
+
+    // A second holder — of any plan, in any process — must wait.
+    let probe = open("_writ-mirror.lock".to_string());
+    assert!(
+        matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "the mirror lock must exclude every other holder repo-wide",
+    );
+    drop(probe);
+
+    // ... but it must not serialise unrelated plan work, which is the
+    // whole point of keeping it separate from the plan locks.
+    let plan_probe = open(format!("{}.lock", PlanId::new()));
+    assert!(
+        plan_probe.try_lock().is_ok(),
+        "the mirror lock must not contend with per-plan locks",
+    );
+
+    drop(held);
+    lock_writ_mirror(&repo).expect("the mirror lock must be reacquirable once released");
+}
