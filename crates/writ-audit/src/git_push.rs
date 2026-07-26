@@ -19,7 +19,8 @@ mod dao;
 
 pub use approve_attempt::{
     ApproveAttempt, ApproveAttemptOutcomeName, ApproveAttemptStateName, ApproveAttemptTransition,
-    IllegalApproveTransition, apply as apply_approve_transition,
+    AttemptPosition, IllegalApproveTransition, RejectBlockerKind,
+    apply as apply_approve_transition, position_predicate_sql,
 };
 
 /// The base `(request, outcome)` [`EffectAuditTable`](crate::EffectAuditTable)
@@ -433,10 +434,11 @@ fn load_reconciliation_predecessor(
             AuditError::Invariant("approve attempt row: outcome value is invalid"),
         )?),
     };
-    let is_uncertain = state == ApproveAttemptStateName::Uncertain;
-    let is_post_patch_failure = state == ApproveAttemptStateName::Resolved
-        && outcome_name == Some(ApproveAttemptOutcomeName::PostPatchFailure);
-    if !is_uncertain && !is_post_patch_failure {
+    let position = AttemptPosition {
+        state,
+        outcome: outcome_name,
+    };
+    if !position.is_reconcilable() {
         return Err(AuditError::Invariant(
             "reconciliation predecessor is not in an eligible state",
         ));
@@ -462,7 +464,7 @@ fn load_reconciliation_predecessor(
     // reconcile writes, before admitting an Uncertain predecessor.
     // Resolved(PostPatchFailure) rows are terminal: once TX3 commits the
     // live broker never touches them again, so no gate is needed.
-    if is_uncertain {
+    if position.state == ApproveAttemptStateName::Uncertain {
         let observed: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM git_push_approve_attempt_boot_observed

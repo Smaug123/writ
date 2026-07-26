@@ -10,6 +10,36 @@
 use super::*;
 use rusqlite::Connection;
 
+/// The `(state, outcome)` clause matching attempts that stand in the way
+/// of a resolution, generated from
+/// [`AttemptPosition::blocks_resolution`] so the query cannot drift from
+/// the predicate the rest of the crate uses.
+fn blocking_positions_sql(
+    state_col: &str,
+    outcome_col: &str,
+    first_param: usize,
+) -> (String, Vec<&'static str>) {
+    let positions: Vec<_> = AttemptPosition::all()
+        .into_iter()
+        .filter(|p| p.blocks_resolution())
+        .collect();
+    position_predicate_sql(&positions, state_col, outcome_col, first_param)
+}
+
+/// The same, for the attempts boot reconcile must look at
+/// ([`AttemptPosition::is_in_flight`]).
+fn in_flight_positions_sql(
+    state_col: &str,
+    outcome_col: &str,
+    first_param: usize,
+) -> (String, Vec<&'static str>) {
+    let positions: Vec<_> = AttemptPosition::all()
+        .into_iter()
+        .filter(|p| p.is_in_flight())
+        .collect();
+    position_predicate_sql(&positions, state_col, outcome_col, first_param)
+}
+
 /// Read one attempt back as the machine sees it — the parsed row state
 /// *and* the v7 ledger mint — inside a transaction.
 ///
@@ -495,24 +525,24 @@ impl AuditLog {
             // `PostPatchFailure` to "did not apply" could never retry
             // the push — the predecessor would forever block fresh
             // starts.
+            let (blocking_clause, blocking_params) =
+                blocking_positions_sql("a.state", "a.outcome", 2);
             let blocker: Option<i64> = tx
                 .query_row(
-                    "SELECT 1 FROM git_push_approve_attempt a
-                      WHERE a.push_request_id = ?1
-                        AND (a.state IN (?2, ?3)
-                          OR (a.state = ?4 AND a.outcome = ?5))
-                        AND NOT EXISTS (
-                            SELECT 1 FROM git_push_approve_attempt b
-                            WHERE b.supersedes_attempt_id = a.attempt_id
-                        )
-                      LIMIT 1",
-                    params![
-                        push_request_id.as_uuid().to_string(),
-                        ApproveAttemptStateName::Started.as_wire(),
-                        ApproveAttemptStateName::Uncertain.as_wire(),
-                        ApproveAttemptStateName::Resolved.as_wire(),
-                        ApproveAttemptOutcomeName::PostPatchFailure.as_wire(),
-                    ],
+                    &format!(
+                        "SELECT 1 FROM git_push_approve_attempt a
+                          WHERE a.push_request_id = ?1
+                            AND {blocking_clause}
+                            AND NOT EXISTS (
+                                SELECT 1 FROM git_push_approve_attempt b
+                                WHERE b.supersedes_attempt_id = a.attempt_id
+                            )
+                          LIMIT 1"
+                    ),
+                    rusqlite::params_from_iter(
+                        std::iter::once(push_request_id.as_uuid().to_string())
+                            .chain(blocking_params.into_iter().map(str::to_string)),
+                    ),
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -1087,27 +1117,22 @@ impl AuditLog {
             if superseded_ids.contains(&attempt.attempt_id) {
                 return None;
             }
-            match attempt.state {
-                GitPushApproveAttemptState::Started
-                | GitPushApproveAttemptState::Uncertain { .. } => {
-                    Some(RejectBlocker::AttemptInFlight {
-                        attempt_id: attempt.attempt_id,
-                    })
-                }
-                GitPushApproveAttemptState::Resolved { outcome, .. } => match outcome {
-                    GitPushApproveAttemptOutcome::Succeeded { .. } => {
-                        Some(RejectBlocker::AlreadyApproved {
-                            attempt_id: attempt.attempt_id,
-                        })
+            let attempt_id = attempt.attempt_id;
+            attempt
+                .state
+                .position()
+                .reject_blocker()
+                .map(|kind| match kind {
+                    RejectBlockerKind::AttemptInFlight => {
+                        RejectBlocker::AttemptInFlight { attempt_id }
                     }
-                    GitPushApproveAttemptOutcome::PostPatchFailure { .. } => {
-                        Some(RejectBlocker::PostPatchUncertain {
-                            attempt_id: attempt.attempt_id,
-                        })
+                    RejectBlockerKind::AlreadyApproved => {
+                        RejectBlocker::AlreadyApproved { attempt_id }
                     }
-                    GitPushApproveAttemptOutcome::PrePatchFailure { .. } => None,
-                },
-            }
+                    RejectBlockerKind::PostPatchUncertain => {
+                        RejectBlocker::PostPatchUncertain { attempt_id }
+                    }
+                })
         }))
     }
 
@@ -1174,28 +1199,19 @@ impl AuditLog {
             if superseded.contains(&attempt.attempt_id) {
                 continue;
             }
-            match &attempt.state {
-                GitPushApproveAttemptState::Started => {
-                    in_flight = true;
+            let position = attempt.state.position();
+            // An `Uncertain` predecessor is only reconcilable once boot
+            // reconcile has marked it — proof the worker that wrote it is
+            // gone. That is a fact about the *row*, not about its
+            // position, so it stays here rather than in the predicate.
+            let awaiting_boot_marker = position.state == ApproveAttemptStateName::Uncertain
+                && !boot_observed.contains(&attempt.attempt_id);
+            if position.is_reconcilable() && !awaiting_boot_marker {
+                if eligible.is_none() {
+                    eligible = Some(attempt.attempt_id);
                 }
-                GitPushApproveAttemptState::Uncertain { .. } => {
-                    if boot_observed.contains(&attempt.attempt_id) {
-                        if eligible.is_none() {
-                            eligible = Some(attempt.attempt_id);
-                        }
-                    } else {
-                        in_flight = true;
-                    }
-                }
-                GitPushApproveAttemptState::Resolved { outcome, .. } => match outcome {
-                    GitPushApproveAttemptOutcome::PostPatchFailure { .. } => {
-                        if eligible.is_none() {
-                            eligible = Some(attempt.attempt_id);
-                        }
-                    }
-                    GitPushApproveAttemptOutcome::Succeeded { .. }
-                    | GitPushApproveAttemptOutcome::PrePatchFailure { .. } => {}
-                },
+            } else if position.is_in_flight() {
+                in_flight = true;
             }
         }
 
@@ -1259,26 +1275,25 @@ impl AuditLog {
     pub fn list_blocking_approve_attempts(
         &self,
     ) -> Result<Vec<GitPushApproveAttemptEntry>, AuditError> {
+        let (in_flight_clause, in_flight_params) =
+            in_flight_positions_sql("a.state", "a.outcome", 1);
         self.with_conn(|c| {
-            let mut stmt = c.prepare(
+            let mut stmt = c.prepare(&format!(
                 "SELECT a.attempt_id, a.push_request_id, a.operator, a.started_at,
                         a.state, a.outcome, a.completed_at,
                         a.new_app_tip, a.failure_detail,
                         a.mint_jti, a.mint_github_app_id, a.mint_issued_at, a.mint_expires_at
                    FROM git_push_approve_attempt a
-                  WHERE a.state IN (?1, ?2)
+                  WHERE {in_flight_clause}
                     AND NOT EXISTS (
                         SELECT 1 FROM git_push_approve_attempt b
                         WHERE b.supersedes_attempt_id = a.attempt_id
                     )
-                  ORDER BY a.started_at ASC, a.attempt_id ASC",
-            )?;
+                  ORDER BY a.started_at ASC, a.attempt_id ASC"
+            ))?;
             let rows = stmt
                 .query_map(
-                    params![
-                        ApproveAttemptStateName::Started.as_wire(),
-                        ApproveAttemptStateName::Uncertain.as_wire(),
-                    ],
+                    rusqlite::params_from_iter(in_flight_params.iter()),
                     git_push_approve_attempt_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
