@@ -61,7 +61,7 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::{
-    PlanId, plan_implement_seed_blob_bytes, plan_review_seed_blob_bytes,
+    ImplementAttempt, PlanId, plan_implement_seed_blob_bytes, plan_review_seed_blob_bytes,
     plan_submission_seed_blob_bytes,
 };
 use crate::bailiff_plan_read::{
@@ -123,20 +123,18 @@ impl AgentStage {
         }
     }
 
-    /// The deterministic seed blob this stage's note attaches at,
-    /// under [`crate::bailiff_plan_note::plan_notes_ref`]`(plan_id)`.
+    /// The slot this stage writes to on a plan with no prior notes.
     ///
-    /// The four seed families are disjoint by construction, which is
-    /// what lets all of a plan's notes coexist under one ref. Routing
-    /// the three envelope-bearing ones through this projection is what
-    /// lets `write_stage_note` be one function: before slice 3b each
-    /// write helper named its own seed, so the seed and the note body
-    /// were chosen in two places that could disagree.
-    pub fn note_seed(self, plan_id: PlanId) -> Vec<u8> {
+    /// Total, unlike the general stage⇒slot direction: `Implement`
+    /// owns a family of slots, and this names its first. Callers that
+    /// may be extending an existing plan must ask
+    /// [`crate::bailiff_plan_read::read_implement_attempts`] instead —
+    /// this is for the first run and for tests that sweep the stages.
+    pub const fn first_slot(self) -> StageNoteSlot {
         match self {
-            AgentStage::Submit => plan_submission_seed_blob_bytes(plan_id),
-            AgentStage::Review => plan_review_seed_blob_bytes(plan_id),
-            AgentStage::Implement => plan_implement_seed_blob_bytes(plan_id),
+            AgentStage::Submit => StageNoteSlot::Submission,
+            AgentStage::Review => StageNoteSlot::Review,
+            AgentStage::Implement => StageNoteSlot::Implement(ImplementAttempt::FIRST),
         }
     }
 
@@ -178,6 +176,55 @@ pub enum PlanBodyStage {
     /// The implementer. It acts on a plan that carries an accepted
     /// verdict.
     Implement,
+}
+
+/// Which note slot a run writes to.
+///
+/// A refinement of [`AgentStage`], not a duplicate of it: submit and
+/// review each own exactly one slot on a plan, while implement owns
+/// one *per attempt* since slice 4 made fan-out N implementer runs
+/// under one plan. Carrying the attempt here rather than on
+/// [`AgentStage`] is what keeps "the third submission" unrepresentable
+/// — `AgentStage` still answers the gate and the prompt, which have no
+/// attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StageNoteSlot {
+    /// The plan's one submission note.
+    Submission,
+    /// The plan's one review note.
+    Review,
+    /// One implementer attempt's note.
+    Implement(ImplementAttempt),
+}
+
+impl StageNoteSlot {
+    /// Which agent produced the run this slot records. The projection
+    /// back to [`AgentStage`]; the inverse is not a function, because
+    /// `Implement` maps to a family.
+    pub const fn stage(self) -> AgentStage {
+        match self {
+            StageNoteSlot::Submission => AgentStage::Submit,
+            StageNoteSlot::Review => AgentStage::Review,
+            StageNoteSlot::Implement(_) => AgentStage::Implement,
+        }
+    }
+
+    /// The deterministic seed blob this slot's note attaches at, under
+    /// [`crate::bailiff_plan_note::plan_notes_ref`]`(plan_id)`.
+    ///
+    /// The seed families are disjoint by construction, which is what
+    /// lets all of a plan's notes coexist under one ref. Routing every
+    /// slot through this projection is what lets `write_stage_note` be
+    /// one function: before slice 3b each write helper named its own
+    /// seed, so the seed and the note body were chosen in two places
+    /// that could disagree.
+    pub fn seed(self, plan_id: PlanId) -> Vec<u8> {
+        match self {
+            StageNoteSlot::Submission => plan_submission_seed_blob_bytes(plan_id),
+            StageNoteSlot::Review => plan_review_seed_blob_bytes(plan_id),
+            StageNoteSlot::Implement(attempt) => plan_implement_seed_blob_bytes(plan_id, attempt),
+        }
+    }
 }
 
 /// Names the stage in operator-facing text — the noun

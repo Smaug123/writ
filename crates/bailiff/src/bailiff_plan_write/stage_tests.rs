@@ -15,7 +15,8 @@
 use super::test_support::*;
 use super::*;
 use crate::bailiff_plan_note::{
-    ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes, plan_notes_ref,
+    ImplementAttempt, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
+    plan_notes_ref,
 };
 use tempfile::TempDir;
 use writ::core::{SshSignature, UnixMillis};
@@ -32,7 +33,7 @@ fn target(
     allowed: &AllowedSigners,
 ) -> StageNoteTarget {
     StageNoteTarget {
-        stage,
+        slot: stage.first_slot(),
         plan_id,
         writ_repo_path: writ_repo_path.to_path_buf(),
         allowed_signers: allowed.clone(),
@@ -128,7 +129,7 @@ fn happy_path_round_trips_for_every_stage() {
         // hash-object`; pin them so a writer-side change cannot
         // silently move where a stage's note lives.
         assert_eq!(
-            std::str::from_utf8(&stage.note_seed(plan_id)).unwrap(),
+            std::str::from_utf8(&stage.first_slot().seed(plan_id)).unwrap(),
             expected_seed_text(stage, plan_id),
             "{stage} seed",
         );
@@ -464,5 +465,139 @@ fn any_stage_writes_with_no_other_note_present() {
             &completed,
         )
         .unwrap_or_else(|e| panic!("{stage} must write with no other note present: {e}"));
+    }
+}
+
+/// N implementer attempts on one plan: each lands at its own target,
+/// each reads back with its own body, and none disturbs an earlier
+/// one.
+///
+/// This is fan-out's core claim. The pre-slice-4 code refused the
+/// second attempt outright, so this test failing open would mean the
+/// feature does not exist; it failing *closed* on a later attempt
+/// would mean a seed collision silently overwrote a completed run's
+/// audit record.
+#[test]
+fn several_implementer_attempts_coexist_on_one_plan() {
+    const ATTEMPTS: u32 = 5;
+    let tmp = TempDir::new().unwrap();
+    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+    let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+    let bailiff = bailiff_repo(&tmp);
+    let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+    let plan_id = PlanId::new();
+
+    let written: Vec<(ImplementAttempt, GitObjectId)> = ImplementAttempt::first_n(ATTEMPTS)
+        .map(|attempt| {
+            let oid = write_stage_note(
+                &bailiff,
+                &StageNoteTarget {
+                    slot: StageNoteSlot::Implement(attempt),
+                    plan_id,
+                    writ_repo_path: writ_repo.path().to_path_buf(),
+                    allowed_signers: allowed.clone(),
+                },
+                &writ_notes_ref(),
+                format!("attempt-{attempt}"),
+                &completed,
+            )
+            .unwrap_or_else(|e| panic!("attempt {attempt} must write: {e}"));
+            (attempt, oid)
+        })
+        .collect();
+
+    let mut distinct: Vec<String> = written.iter().map(|(_, o)| o.to_string()).collect();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        ATTEMPTS as usize,
+        "each attempt must attach at its own target",
+    );
+
+    // Every attempt still says what it said when it was written — the
+    // check that distinguishes "all five wrote" from "all five wrote
+    // and the last four overwrote the first".
+    for (attempt, oid) in &written {
+        let body = bailiff
+            .read_note(&plan_notes_ref(plan_id), oid)
+            .unwrap_or_else(|e| panic!("attempt {attempt} must still be readable: {e}"));
+        assert_eq!(
+            decode(AgentStage::Implement, &body).purpose,
+            format!("attempt-{attempt}"),
+            "attempt {attempt}",
+        );
+    }
+
+    // And the reader agrees: the attempts come back in order, and the
+    // next free index is exactly past the end.
+    let found = crate::bailiff_plan_read::read_implement_attempts(&bailiff, plan_id)
+        .expect("the attempt scan must succeed");
+    assert_eq!(
+        found.notes.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+        ImplementAttempt::first_n(ATTEMPTS).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        found.next_free.map(|a| a.index()),
+        Some(ATTEMPTS),
+        "the next free attempt must be one past the last written",
+    );
+}
+
+/// A gap in the attempt sequence is refused, not silently truncated —
+/// **at every width**, and however far past the hole the next note is.
+///
+/// Parameterised over the gap width because the first version of the
+/// scanner probed exactly one slot past the miss, which catches width
+/// one and nothing else: `{0, 3}` looked identical to `{0}`, so
+/// attempt 3 was invisible to every reader while the next run refilled
+/// slot 1. Codex review caught that; a width-1-only test could not
+/// have. The widths here straddle the old check's reach on both sides.
+#[test]
+fn a_gap_in_the_attempt_sequence_is_refused_at_any_width() {
+    for present in [vec![0u32, 2], vec![0, 3], vec![0, 1, 5], vec![0, 9]] {
+        let tmp = TempDir::new().unwrap();
+        let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let (writ_repo, completed, _envelope) = writ_repo_with_envelope(&tmp, &signing_key);
+        let bailiff = bailiff_repo(&tmp);
+        let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
+        let plan_id = PlanId::new();
+
+        for index in &present {
+            let attempt = ImplementAttempt::first_n(index + 1).last().unwrap();
+            write_stage_note(
+                &bailiff,
+                &StageNoteTarget {
+                    slot: StageNoteSlot::Implement(attempt),
+                    plan_id,
+                    writ_repo_path: writ_repo.path().to_path_buf(),
+                    allowed_signers: allowed.clone(),
+                },
+                &writ_notes_ref(),
+                format!("attempt-{index}"),
+                &completed,
+            )
+            .unwrap_or_else(|e| panic!("planting attempt {index}: {e}"));
+        }
+
+        let expected_missing = (0u32..)
+            .find(|i| !present.contains(i))
+            .expect("a gap exists by construction");
+        let err = crate::bailiff_plan_read::read_implement_attempts(&bailiff, plan_id)
+            .expect_err(&format!("{present:?} must be refused"));
+        match err {
+            crate::bailiff_plan_read::ReadImplementError::NonDenseAttempts {
+                plan_id: p,
+                missing,
+            } => {
+                assert_eq!(p, plan_id);
+                assert_eq!(
+                    missing.index(),
+                    expected_missing,
+                    "{present:?} must name the first hole",
+                );
+            }
+            other => panic!("expected NonDenseAttempts for {present:?}, got {other:?}"),
+        }
     }
 }

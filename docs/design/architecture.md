@@ -939,7 +939,18 @@ from an existing-but-empty ref, which is an anomaly rather than a fresh plan),
 `derive_state` parses it into a `PlanState` (Absent/Submitted/Accepted/Rejected/
 Reviewed/Implemented/Corrupt), and `allows(state, stage)` is the gate every
 mutating verb calls — submit from `Absent`, review from `Submitted`, decide from
-`Reviewed`, implement from `Accepted`. Review precedes the decision because
+`Reviewed`, implement from `Accepted` **or `Implemented`**.
+
+`implement` is the one repeatable stage: fan-out is N implementer runs on one
+accepted plan, so a plan that is already `Implemented` may take another attempt.
+Each attempt owns a seed (`<plan-id>::implement`, then `::implement::<n>`;
+attempt zero keeps the pre-fan-out bytes so existing notes are not orphaned) and
+attempts are **dense from zero**, which is what lets the gate ask about attempt
+zero alone rather than scanning. A gap is refused, not truncated. The attempt
+index is chosen by the workflow under the plan lock, never named by an operator,
+and it rides on `StageNoteSlot` rather than on `AgentStage` so that "the third
+submission" stays unrepresentable. Attempts on one plan share that lock, so they
+serialise; parallel variants would need the write keyed by `(plan, attempt)`. Review precedes the decision because
 reviewer feedback is an input to it (`2026-05-11-agent-plans.md`: "the review →
 decide → execute cycle"; "reviewer feedback is for the decision, not for
 execution"). The four ad-hoc idempotency gates are

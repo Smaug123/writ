@@ -20,9 +20,9 @@ use super::test_support::*;
 use super::*;
 use crate::bailiff_decision::{Decider, Decision};
 use crate::bailiff_plan_note::{
-    DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
-    plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
-    plan_submission_seed_blob_bytes,
+    DecisionNote, ImplementAttempt, ImplementNote, PlanId, PlanNote, ReviewNote,
+    plan_decision_seed_blob_bytes, plan_implement_seed_blob_bytes, plan_notes_ref,
+    plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use tempfile::TempDir;
 use writ::agent_run::{AgentRunId, sha256_hex};
@@ -158,7 +158,7 @@ fn plant_implement_note_for(bailiff: &NotesRepo, plan_id: PlanId, run: &PlantedR
     bailiff
         .write_note(
             &plan_notes_ref(plan_id),
-            &plan_implement_seed_blob_bytes(plan_id),
+            &plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST),
             &note.canonical_bytes(),
         )
         .unwrap();
@@ -269,11 +269,12 @@ fn read_full_plan_returns_verified_view_when_all_four_sections_present() {
         }
         other => panic!("expected Verified review section, got {other:?}"),
     }
-    match view
+    let (attempt, implement_section) = view
         .implement
-        .as_ref()
-        .expect("implement section must be present")
-    {
+        .first()
+        .expect("implement section must be present");
+    assert_eq!(*attempt, ImplementAttempt::FIRST);
+    match implement_section {
         VerifiedSection::Verified { note, envelope } => {
             assert_eq!(note.plan_id, plan_id);
             assert_eq!(envelope.metadata, implement_run.metadata);
@@ -298,7 +299,7 @@ fn read_full_plan_returns_only_plan_section_when_other_notes_missing() {
     assert!(matches!(view.plan, Some(VerifiedSection::Verified { .. })));
     assert!(view.decision.is_none());
     assert!(view.review.is_none());
-    assert!(view.implement.is_none());
+    assert!(view.implement.is_empty());
 }
 
 /// Corrupt anomaly: downstream notes (decision + review) present
@@ -322,7 +323,7 @@ fn read_full_plan_returns_none_plan_when_only_downstream_notes_present() {
         view.review,
         Some(VerifiedSection::Verified { .. })
     ));
-    assert!(view.implement.is_none());
+    assert!(view.implement.is_empty());
 }
 
 /// Writ envelope missing: a plan note references a synthetic OID

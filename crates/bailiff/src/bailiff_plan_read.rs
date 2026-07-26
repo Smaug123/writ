@@ -26,8 +26,8 @@ use std::string::FromUtf8Error;
 use thiserror::Error;
 
 use crate::bailiff_plan_note::{
-    BAILIFF_PLAN_NOTES_REF_PREFIX, DecisionNote, DecisionNoteParseError, ImplementNote,
-    ImplementNoteParseError, PlanId, PlanNote, PlanNoteParseError, ReviewNote,
+    BAILIFF_PLAN_NOTES_REF_PREFIX, DecisionNote, DecisionNoteParseError, ImplementAttempt,
+    ImplementNote, ImplementNoteParseError, PlanId, PlanNote, PlanNoteParseError, ReviewNote,
     ReviewNoteParseError, plan_decision_seed_blob_bytes, plan_implement_seed_blob_bytes,
     plan_notes_ref, plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
@@ -214,7 +214,7 @@ pub enum ReadReviewError {
 /// this plan yet."
 ///
 /// Sibling to [`crate::bailiff_plan_write::write_stage_note`]: the
-/// writer hashes [`crate::bailiff_stage::AgentStage::note_seed`] to pick the
+/// writer hashes [`crate::bailiff_stage::StageNoteSlot::seed`] to pick the
 /// attach OID, the reader hashes the same seed bytes to recover it,
 /// and content-addressed storage makes the round-trip work without
 /// any separate registry. Neither the decision nor the review note
@@ -298,9 +298,10 @@ pub enum ReadPlanError {
 pub fn read_implement_note(
     bailiff_repo: &NotesRepo,
     plan_id: PlanId,
+    attempt: ImplementAttempt,
 ) -> Result<Option<ImplementNote>, ReadImplementError> {
     let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_implement_seed_blob_bytes(plan_id);
+    let seed = plan_implement_seed_blob_bytes(plan_id, attempt);
     let Some(body) = bailiff_repo
         .read_note_at_seed(&plan_ref, &seed)
         .map_err(ReadImplementError::ReadNote)?
@@ -317,6 +318,79 @@ pub fn read_implement_note(
     Ok(Some(note))
 }
 
+/// Every implementer attempt on `plan_id`, in order, and the first
+/// free attempt after them.
+///
+/// **Scans the whole bounded range** rather than stopping at the first
+/// miss. Stopping early is what a dense sequence would allow, but it
+/// cannot *establish* density: attempts `{0, 3}` look identical to
+/// `{0}` to a scan that halts at the first hole, so every attempt past
+/// the hole would be invisible to `plan show` while the next run
+/// happily refilled the hole — leaving two live notes nobody had
+/// reconciled. That is the "silently truncated" failure this function
+/// exists to avoid, so it does not sample; it looks everywhere it
+/// could be wrong. (A first version probed one slot past the miss,
+/// which catches a gap of width one and no more. Codex review caught
+/// it, correctly.)
+///
+/// A gap can only come from manual repo surgery — bailiff only ever
+/// writes at the first free index — and is refused rather than
+/// absorbed, the same treatment
+/// [`crate::bailiff_plan_state::PlanState::Corrupt`] gets for the same
+/// reason.
+///
+/// # Cost
+///
+/// [`ImplementAttempt::MAX`] probes, each two git invocations
+/// (`hash-object` for the seed, then the note read). That is why this
+/// is **not** on the gate's path: `summarize_plan` reads attempt zero
+/// alone, which is equivalent to "any attempt exists" exactly while
+/// density holds, and density is what this function is here to check.
+/// Its two callers — the implementer workflow, which is about to run
+/// an agent for minutes, and `bailiff plan show` — can both afford it.
+pub fn read_implement_attempts(
+    bailiff_repo: &NotesRepo,
+    plan_id: PlanId,
+) -> Result<ImplementAttempts, ReadImplementError> {
+    let mut notes = Vec::new();
+    let mut first_free: Option<ImplementAttempt> = None;
+    for attempt in ImplementAttempt::first_n(ImplementAttempt::MAX) {
+        match read_implement_note(bailiff_repo, plan_id, attempt)? {
+            Some(note) => {
+                // A note *after* a hole: the sequence is not a prefix,
+                // so no count over it is trustworthy.
+                if let Some(missing) = first_free {
+                    return Err(ReadImplementError::NonDenseAttempts { plan_id, missing });
+                }
+                notes.push((attempt, note));
+            }
+            None => {
+                if first_free.is_none() {
+                    first_free = Some(attempt);
+                }
+            }
+        }
+    }
+    Ok(ImplementAttempts {
+        notes,
+        next_free: first_free,
+    })
+}
+
+/// What [`read_implement_attempts`] found: the attempts that exist,
+/// and where the next one would go.
+///
+/// `next_free` is `None` only at [`ImplementAttempt::MAX`], which is
+/// the bound that keeps the probe loop finite; a caller that finds it
+/// `None` must refuse rather than overwrite.
+#[derive(Debug)]
+pub struct ImplementAttempts {
+    /// Every attempt present, in ascending order.
+    pub notes: Vec<(ImplementAttempt, ImplementNote)>,
+    /// The first attempt with no note, or `None` if the plan is full.
+    pub next_free: Option<ImplementAttempt>,
+}
+
 /// Tagged failure modes of [`read_implement_note`]. Same three-variant
 /// shape as [`ReadDecisionError`] / [`ReadReviewError`] /
 /// [`ReadPlanError`]: filesystem/git read failure vs.
@@ -330,6 +404,18 @@ pub enum ReadImplementError {
     /// surfaces here.
     #[error("reading the implement note from bailiff's repo failed: {0}")]
     ReadNote(#[source] NotesRepoError),
+    /// Attempt `missing` has no note but a later one does, so the
+    /// plan's attempts are not dense from zero and no count over them
+    /// is trustworthy. Manual repo surgery; reported rather than
+    /// absorbed.
+    #[error(
+        "plan {plan_id} has no implement attempt {missing} but has a later one; \
+         the attempt sequence is not dense and cannot be extended safely"
+    )]
+    NonDenseAttempts {
+        plan_id: PlanId,
+        missing: ImplementAttempt,
+    },
     /// The note body existed but did not parse as an [`ImplementNote`].
     /// Indicates wire-level corruption — the canonical JSON shape is
     /// fixed and `deny_unknown_fields` plus the field-type validators
@@ -479,8 +565,12 @@ pub fn summarize_plan(
     });
     let reviewed_at =
         read_review_note(bailiff_repo, plan_id)?.map(|note| note.signed_metadata.completed_at);
-    let implemented_at =
-        read_implement_note(bailiff_repo, plan_id)?.map(|note| note.signed_metadata.completed_at);
+    // Attempt zero only. Attempts are dense, so its presence is
+    // exactly "any attempt exists", which is all the relation needs —
+    // and this read is on the gate's hot path, so a scan here would
+    // make every gate cost O(attempts).
+    let implemented_at = read_implement_note(bailiff_repo, plan_id, ImplementAttempt::FIRST)?
+        .map(|note| note.signed_metadata.completed_at);
     Ok(BailiffPlanSummary {
         plan_id,
         ref_exists,
@@ -697,11 +787,14 @@ pub fn read_full_plan(
         read_review_note(bailiff_repo, plan_id)?,
         allowed_signers,
     )?;
-    let implement = read_and_project_section(
-        bailiff_repo,
-        read_implement_note(bailiff_repo, plan_id)?,
-        allowed_signers,
-    )?;
+    // `plan show` is the read path where fan-out becomes visible, so
+    // it scans rather than reading attempt zero alone.
+    let mut implement = Vec::new();
+    for (attempt, note) in read_implement_attempts(bailiff_repo, plan_id)?.notes {
+        let section = read_and_project_section(bailiff_repo, Some(note), allowed_signers)?
+            .expect("read_and_project_section returns Some for a Some note");
+        implement.push((attempt, section));
+    }
     Ok(PlanFullView {
         plan_id,
         plan,

@@ -580,6 +580,120 @@ than discover it. If parallel variants are wanted, that is a follow-on that
 needs the lock keyed by `(plan, attempt)` for the write and by `plan` for the
 gate, and it should be measured before being assumed necessary.
 
+### Slice 4 as built
+
+Shipped. All gates pass; **the 24 RPC fixtures are byte-for-byte unmodified**,
+as predicted — a first attempt puts exactly what it always did on the wire.
+
+**1. `NotePresence.implement` stayed a `bool`.** The plan said "becomes a count".
+Writing it out, the count is not what the relation needs: `derive_state` asks
+only "is this plan implemented at all", and a count would have widened slice 1's
+48-element enumeration — the domain every property there quantifies over — to
+carry a number none of them read. Parse-don't-validate cuts the other way here:
+the observation the relation takes should be exactly what the relation uses.
+The count lives where it is *used* instead, in the workflow choosing its next
+attempt and in `plan show`.
+
+That has a load-bearing consequence, so it is stated rather than assumed:
+**attempts are dense from zero**, which is what makes "attempt zero exists"
+equivalent to "any attempt exists". Density is why the gate still costs one note
+read rather than a scan, and `read_implement_attempts` refuses a gap
+(`NonDenseAttempts`) rather than truncating at it — a gap would otherwise hide
+every attempt past it from every reader while the next write happily filled the
+hole, leaving two live notes nobody had reconciled.
+
+**2. The attempt lives on a new `StageNoteSlot`, not on `AgentStage`.** Putting
+it on `AgentStage` would have made "the third submission" representable. The slot
+is a refinement — `Submission | Review | Implement(ImplementAttempt)` — with
+`stage()` projecting back; the inverse is not a function, which is exactly the
+fan-out shape. `AgentStage` keeps answering the gate and the prompt, neither of
+which has an attempt.
+
+**3. Five slice-1 properties failed, and only two were the planned deltas.** The
+plan named `legal_stages_never_repeat_from_the_state_they_produce`. The other
+three were found by running:
+
+| Property | What it turned out to say |
+|---|---|
+| `implement_now_requires_an_accepted_verdict` | asserted `Implement` is illegal from `Implemented` — the old duplicate gate, now the feature |
+| `next_stage_follows_the_chain_and_stops_at_terminals` | `Implemented` was a terminal; it no longer is |
+| `rank_is_defined_for_every_state_on_the_progression` | **every legal move strictly increases rank** |
+
+The third is the interesting one. Rank monotonicity is what makes
+`already_passed_from` — defined as "beyond every legal predecessor" — mean
+"already passed", and a repeatable stage is a self-loop, so monotonicity cannot
+hold universally any more. Rather than dropping the property, it now names the
+**exact pair** that is exempt (`Implement` from `Implemented`, landing on
+`Implemented`), so any *other* move that stops advancing rank still fails. Same
+treatment for the one-shot property: scoped to the other three stages, with
+`implement_is_the_one_repeatable_stage` pinning that the exemption set has
+exactly one member — computed from the relation, not written down beside it.
+
+`already_passed_from` needed no edit at all: it derives from
+`legal_predecessors`, so adding `Implemented` to that list flipped it for free.
+That is slice 1's design paying off, and it is the reason this slice is one
+entry in a table rather than a new shape.
+
+**4. Two stale operator surfaces.** `plan implement`'s clap help still listed
+"already-implemented → submit a fresh plan if a re-implement is needed", and the
+`AlreadyRecorded` message still called repeat attempts "a future v1 → v2
+migration". Both were true when written and are now the opposite of the feature.
+Same class as the `decide` clap help found in slice 1's fourth review round —
+help text does not fail a build.
+
+**5. Codex found the gap check only catching gaps of width one.** The first
+version probed a single slot past the first miss. That is enough for `{0, 2}`
+and useless for `{0, 3}`: the scan returned `next_free = 1` and attempt 3 stayed
+invisible to every reader while the next run refilled slot 1. The test I had
+written used width one, so it passed.
+
+The rule the fix follows: **a check that samples cannot establish an invariant
+that quantifies.** Density is a claim about *every* slot, so the scan now reads
+every slot in the bounded range and refuses on the first note that follows a
+hole. That costs `MAX` probes at two git invocations each, which is why `MAX`
+came down from 256 to 32 — it is a *cost* bound, not a product opinion about
+fan-out width, and the docstring now says so. Neither caller is on the gate's
+path: one is about to run an agent for minutes, the other is `plan show`.
+
+The replacement test is parameterised over gap widths that straddle the old
+check's reach (`{0,2}`, `{0,3}`, `{0,1,5}`, `{0,9}`), and an early-stopping scan
+is caught by `{0,3}` — Codex's own example.
+
+**6. Codex round 2 found two more stale surfaces, one of them a test.** The
+`plan implement` clap help still promised, a paragraph above the one slice 4
+edited, that "the pre-RPC duplicate gate refuses a second `bailiff plan
+implement` on the same plan to foreclose a double-push" — the opposite of the
+feature, and a *safety* claim rather than a description. The corrected text says
+what is actually guaranteed instead: each run pushes, so a repeat is a
+deliberate act, and what append-only slots plus the plan lock buy is that an
+earlier attempt's note is never rewritten and two concurrent runs cannot claim
+the same index.
+
+The second is more interesting. Two `#[ignore]`d end-to-end tests (awaiting slice
+VM3) still asserted the one-shot contract: one required a repeat to return
+`IllegalTransition`, the other required exactly one of three concurrent calls to
+win. Ignored tests fail no gate, so nothing in this repo would have noticed until
+VM3 un-ignored them — at which point they would have looked like a regression in
+VM3's work rather than a contract change made here. Both are rewritten to the new
+contract, and the concurrency one now witnesses something sharper than before:
+**no call may fail with `AlreadyRecorded`**, because that variant means two
+callers picked the same index, which is precisely the race the lock exists to
+prevent. Neither has been observed to hold — they cannot run yet — and both say
+so.
+
+Five mutations, each caught by the intended assertion:
+
+| Mutation | Fails on |
+|---|---|
+| attempt zero gets an indexed suffix | `attempt_zero_keeps_the_pre_slice_4_seed` (+2) |
+| the scan stops after two consecutive misses | `a_gap_in_the_attempt_sequence_is_refused_at_any_width`, on `{0,3}` |
+| the gap check is dropped entirely | the same test, on `{0,2}` |
+| `Implement` stops being repeatable | 3 state properties **and** the grid-count assertion in `stage_gate_zero_rpc` |
+
+The grid test derives both halves from `allows`, so a widened relation would
+have silently moved cases across it. It now asserts the split as a number: four
+permitted pairs, one of which — `Implement` from `Implemented` — is this slice.
+
 ---
 
 ## Outcome so far

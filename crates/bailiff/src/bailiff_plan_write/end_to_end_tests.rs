@@ -18,7 +18,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use wiremock::MockServer;
 
 use super::*;
-use crate::bailiff_plan_note::{ImplementNote, PlanId, PlanNote, ReviewNote, plan_notes_ref};
+use crate::bailiff_plan_note::{
+    ImplementAttempt, ImplementNote, PlanId, PlanNote, ReviewNote, plan_notes_ref,
+};
 use writ::agent_run::AgentPrompt;
 use writ::audit::AuditLog;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
@@ -170,7 +172,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
         write_stage_note(
             &bailiff,
             &StageNoteTarget {
-                stage: AgentStage::Submit,
+                slot: StageNoteSlot::Submission,
                 plan_id,
                 writ_repo_path: writ_repo_path.clone(),
                 allowed_signers: allowed.clone(),
@@ -317,7 +319,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
         write_stage_note(
             &bailiff,
             &StageNoteTarget {
-                stage: AgentStage::Review,
+                slot: StageNoteSlot::Review,
                 plan_id,
                 writ_repo_path: writ_repo_path.clone(),
                 allowed_signers: allowed.clone(),
@@ -463,7 +465,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
         write_stage_note(
             &bailiff,
             &StageNoteTarget {
-                stage: AgentStage::Implement,
+                slot: StageNoteSlot::Implement(ImplementAttempt::FIRST),
                 plan_id,
                 writ_repo_path: writ_repo_path.clone(),
                 allowed_signers: allowed.clone(),

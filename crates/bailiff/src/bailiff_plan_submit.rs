@@ -48,8 +48,8 @@ use crate::bailiff_plan_state::IllegalTransition;
 use crate::bailiff_plan_write::WriteStageNoteError;
 use crate::bailiff_repo_guard::PlanGuardError;
 use crate::bailiff_stage::{
-    AgentStage, OpenPlanStageError, OwnedSession, OwnedSessionRunError, StageNoteTarget,
-    StageRunInputs, open_plan_stage, run_under_owned_session,
+    AgentStage, OpenPlanStageError, OwnedSession, OwnedSessionRunError, StageNoteSlot,
+    StageNoteTarget, StageRunInputs, open_plan_stage, run_under_owned_session,
 };
 use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
@@ -168,7 +168,7 @@ pub async fn submit_plan(
             agent_model: inputs.session_agent_model,
         },
         StageNoteTarget {
-            stage: AgentStage::Submit,
+            slot: StageNoteSlot::Submission,
             plan_id,
             writ_repo_path: writ_repo_path.to_path_buf(),
             allowed_signers,

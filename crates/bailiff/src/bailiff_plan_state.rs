@@ -262,17 +262,25 @@ impl PlanState {
 impl PlanStage {
     /// Every state from which this stage may run.
     ///
-    /// The relation is currently a chain — each stage has exactly one
-    /// legal predecessor — but it is expressed as a set because a
-    /// transition relation is a relation, and slice 4's fan-out and
-    /// collect stages are not obviously single-predecessor. Costs a
-    /// `contains` over a one-element slice.
+    /// Every stage but one has a single legal predecessor. `Implement`
+    /// has two, because slice 4 made it **repeatable**: fan-out is N
+    /// implementer runs on one accepted plan, so a plan that is already
+    /// `Implemented` may take another attempt. Slice 1 expressed this
+    /// as a set rather than a single state precisely so that change
+    /// would be one entry rather than a new shape.
+    ///
+    /// That repeatability is the one place the workflow is not a chain,
+    /// and it is why
+    /// `legal_stages_except_implement_never_repeat_from_the_state_they_produce`
+    /// is scoped to the other three — see
+    /// `implement_is_the_one_repeatable_stage`, which pins that
+    /// `Implement` is the only exemption.
     pub const fn legal_predecessors(self) -> &'static [PlanState] {
         match self {
             PlanStage::Submit => &[PlanState::Absent],
             PlanStage::Review => &[PlanState::Submitted],
             PlanStage::Decide => &[PlanState::Reviewed],
-            PlanStage::Implement => &[PlanState::Accepted],
+            PlanStage::Implement => &[PlanState::Accepted, PlanState::Implemented],
         }
     }
 }

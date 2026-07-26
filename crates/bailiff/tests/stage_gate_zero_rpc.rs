@@ -52,9 +52,9 @@ use bailiff::bailiff_plan_implement::{
     SubmitImplementError, SubmitImplementInputs, submit_implement,
 };
 use bailiff::bailiff_plan_note::{
-    DecisionNote, ImplementNote, PlanId, PlanNote, ReviewNote, plan_decision_seed_blob_bytes,
-    plan_implement_seed_blob_bytes, plan_notes_ref, plan_review_seed_blob_bytes,
-    plan_submission_seed_blob_bytes,
+    DecisionNote, ImplementAttempt, ImplementNote, PlanId, PlanNote, ReviewNote,
+    plan_decision_seed_blob_bytes, plan_implement_seed_blob_bytes, plan_notes_ref,
+    plan_review_seed_blob_bytes, plan_submission_seed_blob_bytes,
 };
 use bailiff::bailiff_plan_read::summarize_plan;
 use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
@@ -278,7 +278,7 @@ fn plant(repo: &NotesRepo, writ: &WritSide, plan_id: PlanId, state: PlanState) {
         };
         repo.write_note(
             &plan_ref,
-            &plan_implement_seed_blob_bytes(plan_id),
+            &plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST),
             &note.canonical_bytes(),
         )
         .unwrap();
@@ -436,15 +436,23 @@ async fn a_forbidden_stage_emits_no_rpcs_and_an_allowed_one_emits_some() {
         }
     }
 
-    // The grid was actually swept, and both halves are non-empty —
-    // a relation that forbade or permitted everything would otherwise
-    // make one half of this test vacuous without failing it.
+    // The grid was actually swept, and the split is exactly what the
+    // relation says it should be. Counts rather than `> 0`: a relation
+    // that forbade or permitted everything would pass a non-emptiness
+    // check while making one half of this test vacuous.
     assert_eq!(
         forbidden + permitted,
         PlanState::ALL.len() * AgentStage::ALL.len()
     );
-    assert!(
-        forbidden > 0 && permitted > 0,
-        "{forbidden} forbidden, {permitted} permitted"
-    );
+    // Four legal (stage, state) pairs: submit from `absent`, review
+    // from `submitted`, implement from `accepted` — and, since slice 4,
+    // **implement from `implemented`**, because fan-out is N
+    // implementer runs on one accepted plan. That fourth pair crossing
+    // from the forbidden half to the permitted half is slice 4's
+    // behaviour delta, written here as a number so it cannot be
+    // absorbed silently: this file derives both halves from `allows`,
+    // so without the count a widened relation would just quietly move
+    // cases across.
+    assert_eq!(permitted, 4, "the permitted half of the grid changed");
+    assert_eq!(forbidden, PlanState::ALL.len() * AgentStage::ALL.len() - 4);
 }

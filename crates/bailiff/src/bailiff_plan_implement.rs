@@ -61,14 +61,17 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::PlanId;
-use crate::bailiff_plan_read::{ReadPlanBodyError, ReadPlanError, SummarizePlanError};
+use crate::bailiff_plan_read::{
+    ReadImplementError, ReadPlanBodyError, ReadPlanError, SummarizePlanError,
+    read_implement_attempts,
+};
 use crate::bailiff_plan_state::IllegalTransition;
 use crate::bailiff_plan_write::WriteStageNoteError;
 use crate::bailiff_repo_guard::PlanGuardError;
 use crate::bailiff_stage::{
     BrokerSession, BrokerSessionRunError, ComposePlanPromptError, OpenPlanStageError,
-    PlanBodyStage, StageNoteTarget, StageRunInputs, compose_with_plan_body, open_plan_stage,
-    run_under_broker_session,
+    PlanBodyStage, StageNoteSlot, StageNoteTarget, StageRunInputs, compose_with_plan_body,
+    open_plan_stage, run_under_broker_session,
 };
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
@@ -231,6 +234,21 @@ pub async fn submit_implement(
     )
     .await?;
 
+    // Which attempt this run is. Chosen here, under the same guard the
+    // gate ran under, so "read the attempts, then write the next one"
+    // is atomic against another process — the same reason the gate and
+    // the note write share a lock. An operator never names an index:
+    // tracking them by hand is exactly the bookkeeping the plan lock
+    // already does correctly.
+    let attempts = guard
+        .run_blocking(move |repo| read_implement_attempts(repo, plan_id))
+        .await
+        .map_err(SubmitImplementError::ReadTaskFailed)?
+        .map_err(SubmitImplementError::ReadImplementAttempts)?;
+    let attempt = attempts
+        .next_free
+        .ok_or(SubmitImplementError::AttemptsExhausted { plan_id })?;
+
     // VM mode mints its own audit session (the broker rejects a
     // caller-supplied `session_id` alongside a workspace bootstrap),
     // and `agent_vm.stop_session` closes that session on the broker
@@ -248,7 +266,7 @@ pub async fn submit_implement(
             agent_model: inputs.session_agent_model,
         },
         StageNoteTarget {
-            stage: PlanBodyStage::Implement.stage(),
+            slot: StageNoteSlot::Implement(attempt),
             plan_id,
             writ_repo_path: writ_repo_path.to_path_buf(),
             allowed_signers,
@@ -373,6 +391,18 @@ pub enum SubmitImplementError {
         #[source]
         source: IllegalTransition,
     },
+    /// Scanning the plan's existing implementer attempts failed, so
+    /// which attempt this run would be is unknown. Includes the
+    /// not-dense anomaly, where a gap in the sequence makes the count
+    /// untrustworthy. Pre-RPC.
+    #[error("reading the plan's implementer attempts failed: {0}")]
+    ReadImplementAttempts(#[source] ReadImplementError),
+    /// The plan already carries [`crate::bailiff_plan_note::ImplementAttempt::MAX`]
+    /// attempts. The bound exists so the upward probe for a free
+    /// attempt is finite; hitting it means fan-out on this plan is
+    /// over, and the recourse is a fresh plan. Pre-RPC.
+    #[error("plan {plan_id} has no free implementer attempt left")]
+    AttemptsExhausted { plan_id: PlanId },
     /// The fetch / verify / decode chain that extracts the plan
     /// body from the planner envelope failed. The wrapped
     /// [`ReadPlanBodyError`] names the specific step. Pre-RPC.
@@ -445,6 +475,7 @@ mod end_to_end_tests {
 
     use super::*;
     use crate::bailiff_decision::{Decider, Decision};
+    use crate::bailiff_plan_note::ImplementAttempt;
     use crate::bailiff_plan_note::{DecisionNote, ImplementNote, plan_notes_ref};
     use crate::bailiff_plan_note::{ReviewNote, plan_review_seed_blob_bytes};
     use crate::bailiff_plan_read::read_plan_note;
@@ -985,7 +1016,7 @@ mod end_to_end_tests {
         let bailiff_for_read = Arc::clone(&bailiff);
         let implement_note = tokio::task::spawn_blocking(move || {
             let repo = &*bailiff_for_read;
-            crate::bailiff_plan_read::read_implement_note(repo, plan_id)
+            crate::bailiff_plan_read::read_implement_note(repo, plan_id, ImplementAttempt::FIRST)
         })
         .await
         .unwrap()
@@ -996,15 +1027,27 @@ mod end_to_end_tests {
         let _ = broker_task.await;
     }
 
-    /// `WorkspaceWrite`, so an accidental double-click on
-    /// `bailiff plan implement` must not let it push twice. The
-    /// bailiff-side implement note's OID is unchanged across the
-    /// repeat — proof the duplicate path did not even reach
-    /// `write_implement_note`, which would mint a fresh signature
-    /// stamp.
+    /// A repeat call starts a **new attempt** rather than being
+    /// refused.
+    ///
+    /// Was `submit_implement_returns_already_implemented_on_repeat_call`,
+    /// which asserted the opposite: the pre-slice-4 duplicate gate
+    /// existed so an accidental double-click could not push twice.
+    /// Slice 4 made repeating this stage the point — fan-out is N
+    /// implementer runs on one accepted plan — so the guarantee moves
+    /// rather than disappearing: the *earlier attempt's note is
+    /// untouched*, which is what stops a repeat from rewriting a
+    /// completed run's audit record.
+    ///
+    /// Still `#[ignore]`d pending slice VM3, so this encodes the
+    /// intended contract without having been observed to hold. The
+    /// runnable half of the same claim is
+    /// `several_implementer_attempts_coexist_on_one_plan` in
+    /// `bailiff_plan_write::stage_tests`, which drives the note writes
+    /// directly.
     #[tokio::test]
     #[ignore = "re-enabled by slice VM3 once bailiff passes workspace: Some(...) for WorkspaceWrite runs"]
-    async fn submit_implement_returns_already_implemented_on_repeat_call() {
+    async fn submit_implement_repeat_call_starts_a_new_attempt() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
@@ -1023,7 +1066,6 @@ mod end_to_end_tests {
         record_review(&bailiff, plan_id).await;
         record_decision(&bailiff, plan_id, Decision::Accepted).await;
 
-        // First call must succeed and stamp an implement note.
         let first = tokio::time::timeout(
             Duration::from_secs(15),
             submit_implement(
@@ -1040,7 +1082,7 @@ mod end_to_end_tests {
         let first_session = first.implementer_session_id;
         let first_run_output_oid = first.run.output_oid.clone();
 
-        let err = tokio::time::timeout(
+        let second = tokio::time::timeout(
             Duration::from_secs(15),
             submit_implement(
                 &client,
@@ -1051,28 +1093,15 @@ mod end_to_end_tests {
             ),
         )
         .await
-        .expect("duplicate submit_implement must return within 15s")
-        .expect_err("duplicate implement must surface as IllegalTransition");
+        .expect("second submit_implement must return within 15s")
+        .expect("a repeat implement must start a new attempt, not be refused");
 
-        match err {
-            // The duplicate-implement gate is no longer a bespoke
-            // check: `Implement` is simply illegal from `Implemented`.
-            SubmitImplementError::IllegalTransition {
-                plan_id: found,
-                source,
-            } => {
-                assert_eq!(found, plan_id);
-                assert_eq!(source.state, PlanState::Implemented);
-                assert_eq!(source.stage, PlanStage::Implement);
-            }
-            other => panic!("expected IllegalTransition, got: {other:?}"),
-        }
+        assert_ne!(
+            second.implement_note_oid, first.implement_note_oid,
+            "the second attempt must attach at its own target",
+        );
 
         // Witness 1: the first session is still closed and untouched.
-        // If the duplicate path had opened a new session bound to the
-        // same id (impossible — session ids are fresh per
-        // `open_session`) or run any cleanup against `first_session`
-        // it would show here.
         let audit_for_get = Arc::clone(&state.audit);
         let row = tokio::task::spawn_blocking(move || audit_for_get.get_session(first_session))
             .await
@@ -1084,10 +1113,11 @@ mod end_to_end_tests {
             "first implementer session must remain closed",
         );
 
-        // Witness 2: the bailiff-side implement note's signed envelope
-        // is exactly the first run's envelope. The duplicate path did
-        // not reach `write_implement_note`, so the recorded run is
-        // unchanged.
+        // Witness 2: attempt zero's note still records the *first*
+        // run's envelope. This is the guarantee the old duplicate gate
+        // provided and the one that must survive repeatability — a
+        // second attempt may not rewrite a completed run's audit
+        // record.
         let bailiff_for_read = Arc::clone(&bailiff);
         let plan_ref = plan_notes_ref(plan_id);
         let oid = first.implement_note_oid.clone();
@@ -1101,32 +1131,57 @@ mod end_to_end_tests {
         let note = ImplementNote::from_canonical_bytes(&body).unwrap();
         assert_eq!(note.writ_output_oid, first_run_output_oid);
 
+        // Witness 3: the reader sees exactly two dense attempts.
+        let bailiff_for_scan = Arc::clone(&bailiff);
+        let attempts = tokio::task::spawn_blocking(move || {
+            crate::bailiff_plan_read::read_implement_attempts(&bailiff_for_scan, plan_id)
+        })
+        .await
+        .unwrap()
+        .expect("the attempt scan must succeed");
+        assert_eq!(
+            attempts
+                .notes
+                .iter()
+                .map(|(a, _)| a.index())
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+        );
+        assert_eq!(attempts.next_free.map(|a| a.index()), Some(2));
+
         broker_task.abort();
         let _ = broker_task.await;
     }
 
-    /// Concurrent `submit_implement` against the same plan: exactly
-    /// one call must succeed and every other must surface
-    /// `IllegalTransition` — the *pre-RPC* duplicate-gate variant,
-    /// never the post-RPC
-    /// [`crate::bailiff_plan_write::WriteStageNoteError::AlreadyRecorded`] that
-    /// `write_implement_note` would surface if two callers both
-    /// reached the write step.
+    /// Concurrent `submit_implement` against the same plan:
+    /// **every** call succeeds, and they land on distinct, dense
+    /// attempts.
     ///
-    /// Witnesses the in-process atomicity invariant
-    /// [`PlanGuard`] is the primitive of: the
-    /// `read_implement_note` gate and the `write_implement_note` call
-    /// happen under one held lock, so a second caller blocks on
-    /// `acquire` until the first has either landed the implement note
-    /// (so the gate fires) or failed and released (so the next caller
-    /// is free to proceed). Without the workflow-spanning guard a
-    /// concurrent duplicate could pass the gate, open a
-    /// `WorkspaceWrite` session, run the agent, and only fail at the
-    /// terminal `write_implement_note` step — by which time the
-    /// implementer's side effects are already loose.
+    /// Was `concurrent_submit_implement_serialises_on_the_duplicate_gate`,
+    /// which required one success and two `IllegalTransition`s. Slice
+    /// 4 made the stage repeatable, so the thing being witnessed
+    /// changes but does not weaken: the guard still serialises the
+    /// callers, and what serialisation buys is now *distinct attempt
+    /// indices* rather than *one winner*.
+    ///
+    /// That is still the in-process atomicity invariant [`PlanGuard`]
+    /// is the primitive of. Each caller reads the attempt set and
+    /// writes its note under one held lock, so a second caller blocks
+    /// until the first has either landed its note (making the next
+    /// index free) or failed and released. Without the
+    /// workflow-spanning guard two callers could read the same
+    /// `next_free`, both open `WorkspaceWrite` sessions, both run
+    /// agents, and only one survive the write — by which time the
+    /// loser's side effects are already loose. So the load-bearing
+    /// assertion is that **no call fails with `AlreadyRecorded`**:
+    /// that variant means two callers picked the same index, which is
+    /// exactly the race the lock exists to prevent.
+    ///
+    /// Still `#[ignore]`d pending slice VM3, so this encodes the
+    /// intended contract without having been observed to hold.
     #[tokio::test]
     #[ignore = "re-enabled by slice VM3 once bailiff passes workspace: Some(...) for WorkspaceWrite runs"]
-    async fn concurrent_submit_implement_serialises_on_the_duplicate_gate() {
+    async fn concurrent_submit_implement_serialises_into_distinct_attempts() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
@@ -1176,33 +1231,48 @@ mod end_to_end_tests {
 
         let successes: Vec<_> = outcomes.iter().filter_map(|r| r.as_ref().ok()).collect();
         let failures: Vec<_> = outcomes.iter().filter_map(|r| r.as_ref().err()).collect();
+        // Any failure is a bug now, but `AlreadyRecorded` is the
+        // specific one that means the lock did not hold: two callers
+        // read the same `next_free` and raced for the same seed.
+        for err in &failures {
+            assert!(
+                !matches!(err, SubmitImplementError::WriteImplementNote { .. }),
+                "two callers picked the same attempt index, so the plan lock did not \
+                 serialise them; got: {err:?}",
+            );
+        }
         assert_eq!(
             successes.len(),
-            1,
-            "exactly one concurrent submit_implement must succeed; outcomes = {outcomes:?}",
+            3,
+            "every concurrent submit_implement must land its own attempt; outcomes = \
+             {outcomes:?}",
         );
+
+        // Three distinct notes, and the attempt sequence is dense —
+        // serialisation is what makes both true at once.
+        let mut oids: Vec<String> = successes
+            .iter()
+            .map(|o| o.implement_note_oid.to_string())
+            .collect();
+        oids.sort();
+        oids.dedup();
+        assert_eq!(oids.len(), 3, "each attempt must attach at its own target");
+
+        let bailiff_for_scan = Arc::clone(&bailiff);
+        let attempts = tokio::task::spawn_blocking(move || {
+            crate::bailiff_plan_read::read_implement_attempts(&bailiff_for_scan, plan_id)
+        })
+        .await
+        .unwrap()
+        .expect("the attempt scan must succeed; a gap would mean a lost write");
         assert_eq!(
-            failures.len(),
-            2,
-            "the other two concurrent calls must fail; outcomes = {outcomes:?}",
+            attempts
+                .notes
+                .iter()
+                .map(|(a, _)| a.index())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
         );
-        for err in &failures {
-            match err {
-                SubmitImplementError::IllegalTransition {
-                    plan_id: found,
-                    source,
-                } => {
-                    assert_eq!(*found, plan_id);
-                    assert_eq!(source.state, PlanState::Implemented);
-                    assert_eq!(source.stage, PlanStage::Implement);
-                }
-                SubmitImplementError::WriteImplementNote { .. } => panic!(
-                    "duplicate must trip the pre-RPC gate, not the write-side idempotency \
-                     check; got: {err:?}",
-                ),
-                other => panic!("expected IllegalTransition, got: {other:?}"),
-            }
-        }
 
         // All three sessions writ recorded must be closed — both the
         // succeeding caller and the two callers that surfaced

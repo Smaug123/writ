@@ -306,13 +306,19 @@ fn allows_is_total_and_agrees_with_legal_predecessors() {
 /// (which is what makes the machine subsume the old `AlreadyRecorded`
 /// pre-RPC gates rather than merely coexist with them).
 #[test]
-fn legal_stages_never_repeat_from_the_state_they_produce() {
+fn legal_stages_except_implement_never_repeat_from_the_state_they_produce() {
     for &state in PlanState::ALL {
         let Some(presence) = state.presence() else {
             continue;
         };
         for &stage in PlanStage::ALL {
             if !stage.legal_predecessors().contains(&state) {
+                continue;
+            }
+            // `Implement` is deliberately exempt since slice 4 — see
+            // `implement_is_the_one_repeatable_stage`, which pins that
+            // it is the *only* exemption.
+            if stage == PlanStage::Implement {
                 continue;
             }
             for outcome in [Decision::Accepted, Decision::Rejected] {
@@ -363,12 +369,43 @@ fn implement_now_requires_an_accepted_verdict() {
     assert!(allows(PlanState::Reviewed, PlanStage::Implement).is_err());
     assert!(allows(PlanState::Rejected, PlanStage::Implement).is_err());
     assert!(allows(PlanState::Accepted, PlanStage::Implement).is_ok());
-    // The old duplicate gate, now a consequence of the relation.
-    assert!(allows(PlanState::Implemented, PlanStage::Implement).is_err());
+    // Slice 4: legal from `Implemented` too. The old duplicate gate
+    // was a consequence of the relation until fan-out made repeating
+    // this stage the point — see `implement_is_the_one_repeatable_stage`.
+    assert!(allows(PlanState::Implemented, PlanStage::Implement).is_ok());
 }
 
-/// `next_stage` is the remedy hint's source; pin the chain and the two
-/// terminals so an error message cannot start recommending nonsense.
+/// `Implement` is the one stage that may run again from the state it
+/// produces, because fan-out is N implementer runs on one accepted
+/// plan. Every other stage stays one-shot.
+///
+/// Stated as an exact set rather than "implement is special", so a
+/// future stage that accidentally becomes repeatable fails here rather
+/// than quietly joining it.
+#[test]
+fn implement_is_the_one_repeatable_stage() {
+    let repeatable: Vec<PlanStage> = PlanStage::ALL
+        .iter()
+        .copied()
+        .filter(|stage| {
+            stage
+                .legal_predecessors()
+                .iter()
+                .any(|state| match state.presence() {
+                    Some(presence) => {
+                        derive_state(&write_note(presence, *stage, Decision::Accepted)) == *state
+                    }
+                    None => false,
+                })
+        })
+        .collect();
+    assert_eq!(repeatable, vec![PlanStage::Implement]);
+    assert!(allows(PlanState::Implemented, PlanStage::Implement).is_ok());
+    assert!(!PlanStage::Implement.already_passed_from(PlanState::Implemented));
+}
+
+/// `next_stage` is the remedy hint's source; pin the chain and the
+/// one terminal so an error message cannot start recommending nonsense.
 #[test]
 fn next_stage_follows_the_chain_and_stops_at_terminals() {
     assert_eq!(PlanState::Absent.next_stage(), Some(PlanStage::Submit));
@@ -376,7 +413,16 @@ fn next_stage_follows_the_chain_and_stops_at_terminals() {
     assert_eq!(PlanState::Reviewed.next_stage(), Some(PlanStage::Decide));
     assert_eq!(PlanState::Accepted.next_stage(), Some(PlanStage::Implement));
     assert_eq!(PlanState::Rejected.next_stage(), None);
-    assert_eq!(PlanState::Implemented.next_stage(), None);
+    // `Implemented` stopped being terminal in slice 4: another
+    // implementer attempt may always run, which is what fan-out is.
+    // This is not "the plan is unfinished" — it is "more variants are
+    // available", and no error message consults it, because every
+    // stage illegal from `Implemented` is one the plan has already
+    // passed and so renders the fresh-plan remedy instead.
+    assert_eq!(
+        PlanState::Implemented.next_stage(),
+        Some(PlanStage::Implement),
+    );
 }
 
 /// Pins the lowercase spellings the CLI renders. `bailiff plan list`
@@ -437,7 +483,7 @@ fn repeating_a_passed_stage_recommends_a_fresh_plan_not_a_later_stage() {
         (PlanState::Rejected, PlanStage::Decide),
         (PlanState::Reviewed, PlanStage::Review),
         (PlanState::Accepted, PlanStage::Review),
-        (PlanState::Implemented, PlanStage::Implement),
+        (PlanState::Implemented, PlanStage::Review),
     ] {
         assert!(
             stage.already_passed_from(state),
@@ -517,6 +563,20 @@ fn rank_is_defined_for_every_state_on_the_progression() {
             };
             for outcome in [Decision::Accepted, Decision::Rejected] {
                 let next = derive_state(&write_note(presence, stage, outcome));
+                // Slice 4 introduced exactly one self-loop: a repeated
+                // implementer attempt stays `Implemented`. Named as a
+                // pair rather than waved through as "implement is
+                // special", so any *other* move that stops advancing
+                // rank still fails here — which matters because
+                // `already_passed_from` is defined in terms of rank,
+                // and it is only meaningful while advancement holds
+                // everywhere else.
+                let is_the_one_self_loop = stage == PlanStage::Implement
+                    && state == PlanState::Implemented
+                    && next == PlanState::Implemented;
+                if is_the_one_self_loop {
+                    continue;
+                }
                 assert!(
                     next.rank() > state.rank(),
                     "{stage} from {state} lands on {next}, which does not advance rank",
