@@ -24,12 +24,10 @@
 //! `$XDG_DATA_HOME/writ/repo` for the writ-owned repo bailiff
 //! fetches from. `--bailiff-repo` and `--writ-repo` override either.
 
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{ArgGroup, Parser, Subcommand};
-use tokio::sync::Mutex as AsyncMutex;
 
 use bailiff::bailiff_decision::{Decider, Decision};
 use bailiff::bailiff_plan_implement::{
@@ -43,6 +41,7 @@ use bailiff::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
 use bailiff::bailiff_plan_write::{
     WriteDecisionNoteError, WriteImplementNoteError, WriteReviewNoteError, write_decision_note,
 };
+use bailiff::bailiff_repo_guard::PlanGuard;
 use bailiff::output::{write_bailiff_plan_list, write_bailiff_plan_show};
 use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
@@ -659,7 +658,7 @@ async fn plan_submit(
                     bailiff_repo_path.display()
                 )
             })?;
-    let bailiff = Arc::new(AsyncMutex::new(bailiff));
+    let bailiff = Arc::new(bailiff);
 
     let plan_id = plan_id.unwrap_or_else(PlanId::new);
     let writ_output_ref =
@@ -742,7 +741,7 @@ async fn plan_review(
                     bailiff_repo_path.display()
                 )
             })?;
-    let bailiff = Arc::new(AsyncMutex::new(bailiff));
+    let bailiff = Arc::new(bailiff);
 
     let writ_output_ref =
         NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
@@ -783,53 +782,6 @@ async fn plan_review(
         )
         .into()),
         Err(e) => Err(format!("{e}").into()),
-    }
-}
-
-/// Repo-scoped exclusive lockfile guard for cross-process serialisation
-/// of `bailiff plan implement` runs.
-///
-/// The library workflow ([`submit_implement`]) takes an
-/// `Arc<AsyncMutex<NotesRepo>>` for the in-process single-writer
-/// invariant via [`bailiff::bailiff_repo_guard::BailiffRepoGuard`], but
-/// the CLI constructs a fresh `Arc` per invocation, so two CLI
-/// processes against the same `--bailiff-repo` can each pass the
-/// in-process pre-RPC state gate, both kick off
-/// `WorkspaceWrite`-capable agent runs (with `git push` side effects
-/// minted by writ), and only the second's notes-add loses the
-/// duplicate-implement race. The `BailiffRepoGuard` module docstring
-/// names git's notes-add idempotency at the seed OID as the
-/// cross-process fallback — that fallback fires *after* the agent has
-/// already executed, which is acceptable for `WorkspaceRead` verbs
-/// (no externally-observable side effects) but is load-bearing for
-/// `WorkspaceWrite`.
-///
-/// The lockfile lives at `<bailiff_repo>/bailiff-implement.lock` and
-/// is held by an OS-level advisory `flock` (`std::fs::File::try_lock`).
-/// Distinct `--bailiff-repo` paths do not contend. The lock is
-/// released when the returned `File` is dropped, or — as a backstop
-/// against unclean exits — when the process terminates and the kernel
-/// closes the descriptor.
-fn acquire_implement_lock(bailiff_repo_path: &Path) -> Result<File, String> {
-    let lock_path = bailiff_repo_path.join("bailiff-implement.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("opening implement lockfile {}: {e}", lock_path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
-            "another `bailiff plan implement` is in progress against {}; retry once it finishes \
-             (lockfile at {})",
-            bailiff_repo_path.display(),
-            lock_path.display(),
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(format!(
-            "acquiring implement lockfile at {}: {e}",
-            lock_path.display()
-        )),
     }
 }
 
@@ -908,16 +860,7 @@ async fn plan_implement(
                     bailiff_repo_path.display()
                 )
             })?;
-    let bailiff = Arc::new(AsyncMutex::new(bailiff));
-
-    // Cross-process flock: distinct from the in-process `Arc<AsyncMutex>`
-    // above, which only serialises callers sharing this CLI process.
-    // Two concurrent `bailiff plan implement` processes would both pass
-    // `submit_implement`'s pre-RPC state gate and both
-    // launch `WorkspaceWrite` agent runs before either reached the final
-    // notes-add. Held to scope end (Drop releases) so the lock spans the
-    // entire workflow.
-    let _implement_lock = acquire_implement_lock(&bailiff_repo_path)?;
+    let bailiff = Arc::new(bailiff);
 
     let writ_output_ref =
         NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
@@ -1017,40 +960,51 @@ async fn plan_decide(
         decided_at: UnixMillis::now(),
     };
 
-    // Both `init_or_open` and `write_decision_note` shell out to git;
-    // run them on a blocking thread so the runtime stays responsive.
+    // `init_or_open` shells out to git; do it on a blocking thread so
+    // the runtime stays responsive.
     let bailiff_repo_path_for_init = bailiff_repo_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let repo = NotesRepo::init_or_open(bailiff_repo_path_for_init)?;
-        // Slice 1's gate. `decide` previously read no precondition at
-        // all, which is why it could write a verdict for a plan that
-        // was never submitted: `write_decision_note` creates the
-        // per-plan ref, `list_plan_ids` enumerates by ref existence,
-        // and the resulting row rendered as `corrupt` — the anomaly
-        // the display layer exists to *report*, manufactured by this
-        // verb in one command.
-        //
-        // The gate and the write share this one blocking section, but
-        // `decide` still takes no lock, so the pair is not yet atomic
-        // against a concurrent process. Slice 2 fixes that; until
-        // then `write_decision_note`'s `DecisionAlreadyRecorded` is
-        // the backstop, as it always was.
-        let state = summarize_plan(&repo, plan_id)
-            .map_err(DecideError::ReadPlanState)?
-            .state();
-        allows(state, PlanStage::Decide).map_err(DecideError::IllegalTransition)?;
-        write_decision_note(&repo, &note).map_err(DecideError::Write)
-    })
-    .await
-    .map_err(|e| format!("decide task failed: {e}"))?;
+    let repo =
+        tokio::task::spawn_blocking(move || NotesRepo::init_or_open(bailiff_repo_path_for_init))
+            .await
+            .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "opening bailiff repo at {}: {e}",
+                    bailiff_repo_path.display()
+                )
+            })?;
+
+    // Slice 2: `decide` takes the plan's lock like every other
+    // mutating verb. Before, it was the one mutator outside the
+    // single-writer invariant entirely — it opened its own repo handle
+    // inside `spawn_blocking` and never touched a guard — so its
+    // slice-1 gate and its write were not atomic against a concurrent
+    // process. `write_decision_note`'s `DecisionAlreadyRecorded`
+    // remains the backstop beneath both.
+    let mut guard = PlanGuard::acquire(Arc::new(repo), plan_id)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let result = guard
+        .run_blocking(move |repo| {
+            // Slice 1's gate. `decide` previously read no precondition
+            // at all, which is why it could write a verdict for a plan
+            // that was never submitted: `write_decision_note` creates
+            // the per-plan ref, `list_plan_ids` enumerates by ref
+            // existence, and the resulting row rendered as `corrupt` —
+            // the anomaly the display layer exists to *report*,
+            // manufactured by this verb in one command.
+            let state = summarize_plan(repo, plan_id)
+                .map_err(DecideError::ReadPlanState)?
+                .state();
+            allows(state, PlanStage::Decide).map_err(DecideError::IllegalTransition)?;
+            write_decision_note(repo, &note).map_err(DecideError::Write)
+        })
+        .await
+        .map_err(|e| format!("decide task failed: {e}"))?;
 
     match result {
         Ok(_target_oid) => Ok(()),
-        Err(DecideError::OpenRepo(e)) => Err(format!(
-            "opening bailiff repo at {}: {e}",
-            bailiff_repo_path.display()
-        )
-        .into()),
         Err(DecideError::ReadPlanState(e)) => {
             Err(format!("reading the state of plan {plan_id}: {e}").into())
         }
@@ -1198,16 +1152,9 @@ impl From<writ::notes_repo::NotesRepoError> for ShowError {
 /// "the duplicate-decide invariant fired" so the caller-facing stderr
 /// is specific. Local to this binary; not part of any wire contract.
 enum DecideError {
-    OpenRepo(writ::notes_repo::NotesRepoError),
     ReadPlanState(bailiff::bailiff_plan_read::SummarizePlanError),
     IllegalTransition(bailiff::bailiff_plan_state::IllegalTransition),
     Write(WriteDecisionNoteError),
-}
-
-impl From<writ::notes_repo::NotesRepoError> for DecideError {
-    fn from(e: writ::notes_repo::NotesRepoError) -> Self {
-        DecideError::OpenRepo(e)
-    }
 }
 
 /// Map the parsed `--accept` / `--reject` flags to a [`Decision`].

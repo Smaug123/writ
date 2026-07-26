@@ -101,6 +101,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "uuid",
  "wiremock",
  "writ",

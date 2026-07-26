@@ -836,9 +836,23 @@ OIDs. Every signed stage runs fetch → verify: fetch writ's
 `refs/notes/writ/v1/*`, re-decode the envelope, check metadata+signature parity
 against the RPC reply, then `verify_run_envelope`. Append-only/idempotent via
 `NotesRepo::write_note_if_absent` (duplicate → `AlreadyRecorded`);
-`deny_unknown_fields` on all notes; cross-plan `PlanIdMismatch` guards;
-single-writer via an in-process `BailiffRepoGuard` plus a cross-process flock
-for `implement` (load-bearing because implement grants `WorkspaceWrite`).
+`deny_unknown_fields` on all notes; cross-plan `PlanIdMismatch` guards.
+
+**Locking.** Single-writer **per plan**, via `PlanGuard` (`bailiff_repo_guard.rs`):
+one `flock` on `<bailiff_repo>/bailiff-locks/<plan-id>.lock`, taken on a blocking
+thread and held for the whole workflow, so every gate-then-write sequence is
+atomic. `acquire` waits rather than failing — the holder is typically
+mid-LLM-run. All four mutating verbs take it, including `decide`, which before
+2026-07-26 took no lock at all.
+
+One mechanism, not two: an `flock` binds to an *open file description*, so two
+`open` calls contend even inside one process, and the kernel supplies the
+in-process queueing that an earlier draft built a mutex registry to provide.
+Per-plan granularity is safe because each plan owns its ref and git updates refs
+through their own lockfiles (measured: 32 concurrent cross-process `git notes
+add` calls on distinct refs, all successful); concurrent *git invocations*
+against one repo are serialised a layer down by `NotesRepo`'s own per-path
+mutex.
 
 **Current-state note.** The bailiff *split* is **complete in code**: the writ
 root crate has no `agent_plan` module and no plan/decide CLI verb (top-level

@@ -54,7 +54,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::{PlanId, PlanNote};
@@ -64,7 +63,7 @@ use crate::bailiff_plan_read::{
 };
 use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
 use crate::bailiff_plan_write::{WriteImplementNoteError, write_implement_note};
-use crate::bailiff_repo_guard::BailiffRepoGuard;
+use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
@@ -169,19 +168,13 @@ pub struct SubmitImplementOutcome {
 
 /// Drive the full plan-implement workflow against a live writ broker.
 ///
-/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so the
-/// single-writer invariant on bailiff's bare repo can be enforced for
-/// the whole workflow: [`submit_implement`] acquires the lock via
-/// [`BailiffRepoGuard`] before reading the decision and duplicate
-/// gates and releases it only on return. Holding the guard across the
-/// gate-then-write sequence is what makes the duplicate gate
-/// load-bearing for in-process callers — without it two concurrent
-/// `submit_implement` calls could both pass `read_implement_note` and
-/// then both open `WorkspaceWrite` sessions whose side effects no
-/// later `write_implement_note` rejection can undo.
+/// `bailiff_repo` is an `Arc<NotesRepo>`; the workflow takes
+/// this plan's lock via [`PlanGuard`] before its first read and holds
+/// it until return, so the gate and the eventual note write cannot be
+/// interleaved by another workflow — in this process or another.
 pub async fn submit_implement(
     client: &WritClient,
-    bailiff_repo: Arc<AsyncMutex<NotesRepo>>,
+    bailiff_repo: Arc<NotesRepo>,
     writ_repo_path: &Path,
     allowed_signers: AllowedSigners,
     inputs: SubmitImplementInputs,
@@ -190,7 +183,10 @@ pub async fn submit_implement(
     // gates, opens, run, write, close — so concurrent submit_*/bailiff
     // workflows serialise instead of racing the gate-then-write
     // sequence. Released on function return.
-    let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+    let plan_id = inputs.plan_id;
+    let mut bailiff = PlanGuard::acquire(bailiff_repo, plan_id)
+        .await
+        .map_err(SubmitImplementError::PlanLock)?;
 
     // Pre-RPC: read the submission note, read the decision note (and
     // gate on it being an `accepted` verdict), gate on the absence of
@@ -361,6 +357,11 @@ fn compose_implementer_prompt_bytes(
 /// the time any post-RPC variant returns.
 #[derive(Debug, Error)]
 pub enum SubmitImplementError {
+    /// This plan's lock could not be taken — another bailiff process
+    /// is working on it, or the lockfile is unusable. Pre-RPC: no
+    /// session was opened and no note was read.
+    #[error("locking plan: {0}")]
+    PlanLock(#[source] PlanGuardError),
     /// The `spawn_blocking` task that owns the pre-RPC read chain
     /// panicked or was cancelled. Surfaces separately from
     /// `ReadPlanNote` / `ReadDecisionNote` / `ReadPlanEnvelope`
@@ -710,7 +711,7 @@ mod end_to_end_tests {
     /// recorded in bailiff's repo. Returns the plan id so the caller
     /// can plant a decision and drive `submit_implement`.
     async fn record_submission(
-        bailiff: &Arc<AsyncMutex<NotesRepo>>,
+        bailiff: &Arc<NotesRepo>,
         client: &WritClient,
         writ_repo_path: &Path,
         allowed: &AllowedSigners,
@@ -744,11 +745,7 @@ mod end_to_end_tests {
     /// Plant a decision note on `plan_id` with the supplied outcome,
     /// using `write_decision_note` so the on-disk shape matches what
     /// the production `bailiff plan decide` verb produces.
-    async fn record_decision(
-        bailiff: &Arc<AsyncMutex<NotesRepo>>,
-        plan_id: PlanId,
-        outcome: Decision,
-    ) {
+    async fn record_decision(bailiff: &Arc<NotesRepo>, plan_id: PlanId, outcome: Decision) {
         let bailiff = Arc::clone(bailiff);
         let note = DecisionNote {
             plan_id,
@@ -757,7 +754,6 @@ mod end_to_end_tests {
             decided_at: UnixMillis::from_millis(1_700_000_000_000),
         };
         tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff.blocking_lock();
             write_decision_note(&bailiff, &note)
                 .expect("write_decision_note must succeed for the fixture");
         })
@@ -776,10 +772,9 @@ mod end_to_end_tests {
     /// coverage. The signed metadata and signature are copied off the
     /// plan note so the planted note is still structurally
     /// well-formed.
-    async fn record_review(bailiff: &Arc<AsyncMutex<NotesRepo>>, plan_id: PlanId) {
+    async fn record_review(bailiff: &Arc<NotesRepo>, plan_id: PlanId) {
         let bailiff = Arc::clone(bailiff);
         tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff.blocking_lock();
             let plan_note = read_plan_note(&bailiff, plan_id)
                 .expect("reading the plan note must succeed for the fixture")
                 .expect("record_review requires a submission note");
@@ -834,7 +829,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -876,7 +871,7 @@ mod end_to_end_tests {
         let plan_ref = plan_notes_ref(plan_id);
         let oid = outcome.implement_note_oid.clone();
         let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
+            let bailiff = &*bailiff_for_read;
             bailiff.read_note(&plan_ref, &oid)
         })
         .await
@@ -919,7 +914,7 @@ mod end_to_end_tests {
         let (_state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = tmp.path().join("writ-bare");
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -969,7 +964,7 @@ mod end_to_end_tests {
         let (_state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = tmp.path().join("writ-bare");
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -1020,7 +1015,7 @@ mod end_to_end_tests {
         let (_state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = tmp.path().join("writ-bare");
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -1084,7 +1079,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -1131,8 +1126,8 @@ mod end_to_end_tests {
         // implementable once it has actually been reviewed.
         let bailiff_for_read = Arc::clone(&bailiff);
         let implement_note = tokio::task::spawn_blocking(move || {
-            let repo = bailiff_for_read.blocking_lock();
-            crate::bailiff_plan_read::read_implement_note(&repo, plan_id)
+            let repo = &*bailiff_for_read;
+            crate::bailiff_plan_read::read_implement_note(repo, plan_id)
         })
         .await
         .unwrap()
@@ -1157,7 +1152,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -1238,7 +1233,7 @@ mod end_to_end_tests {
         let plan_ref = plan_notes_ref(plan_id);
         let oid = first.implement_note_oid.clone();
         let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
+            let bailiff = &*bailiff_for_read;
             bailiff.read_note(&plan_ref, &oid)
         })
         .await
@@ -1260,7 +1255,7 @@ mod end_to_end_tests {
     /// reached the write step.
     ///
     /// Witnesses the in-process atomicity invariant
-    /// [`BailiffRepoGuard`] is the primitive of: the
+    /// [`PlanGuard`] is the primitive of: the
     /// `read_implement_note` gate and the `write_implement_note` call
     /// happen under one held lock, so a second caller blocks on
     /// `acquire` until the first has either landed the implement note
@@ -1278,7 +1273,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);

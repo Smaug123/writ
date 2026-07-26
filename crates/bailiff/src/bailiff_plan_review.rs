@@ -36,7 +36,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinError;
 
 use crate::bailiff_plan_note::{PlanId, PlanNote};
@@ -46,7 +45,7 @@ use crate::bailiff_plan_read::{
 };
 use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
 use crate::bailiff_plan_write::{WriteReviewNoteError, write_review_note};
-use crate::bailiff_repo_guard::BailiffRepoGuard;
+use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
@@ -131,16 +130,13 @@ pub struct SubmitReviewOutcome {
 
 /// Drive the full plan-review workflow against a live writ broker.
 ///
-/// `bailiff_repo` is taken as an [`Arc`]`<`[`AsyncMutex`]`<_>>` so the
-/// single-writer invariant on bailiff's bare repo can be enforced for
-/// the whole workflow: [`submit_review`] acquires the lock via
-/// [`BailiffRepoGuard`] before reading the submission note and
-/// releases it only on return, so a concurrent bailiff workflow
-/// cannot interleave between the pre-RPC read gate and the eventual
-/// review-note write.
+/// `bailiff_repo` is an `Arc<NotesRepo>`; the workflow takes
+/// this plan's lock via [`PlanGuard`] before its first read and holds
+/// it until return, so the gate and the eventual note write cannot be
+/// interleaved by another workflow — in this process or another.
 pub async fn submit_review(
     client: &WritClient,
-    bailiff_repo: Arc<AsyncMutex<NotesRepo>>,
+    bailiff_repo: Arc<NotesRepo>,
     writ_repo_path: &Path,
     allowed_signers: AllowedSigners,
     inputs: SubmitReviewInputs,
@@ -149,13 +145,15 @@ pub async fn submit_review(
     // read, opens, run, write, close — so concurrent submit_*/bailiff
     // workflows serialise instead of racing the gate-then-write
     // sequence. Released on function return.
-    let mut bailiff = BailiffRepoGuard::acquire(bailiff_repo).await;
+    let plan_id = inputs.plan_id;
+    let mut bailiff = PlanGuard::acquire(bailiff_repo, plan_id)
+        .await
+        .map_err(SubmitReviewError::PlanLock)?;
 
     // Pre-RPC: read the submission note, fetch+verify+decode the
     // planner envelope, extract the plan body. Done before opening
     // a session so a missing or unverifiable submission never burns
     // a writ audit row.
-    let plan_id = inputs.plan_id;
     let writ_repo_path_owned = writ_repo_path.to_path_buf();
     let writ_output_ref_for_read = inputs.writ_output_ref.clone();
     let allowed_for_read = allowed_signers.clone();
@@ -318,6 +316,11 @@ fn compose_reviewer_prompt_bytes(
 /// the close itself failed — the session may still be open.
 #[derive(Debug, Error)]
 pub enum SubmitReviewError {
+    /// This plan's lock could not be taken — another bailiff process
+    /// is working on it, or the lockfile is unusable. Pre-RPC: no
+    /// session was opened and no note was read.
+    #[error("locking plan: {0}")]
+    PlanLock(#[source] PlanGuardError),
     /// The `spawn_blocking` task that owns the pre-RPC read chain
     /// panicked or was cancelled. Surfaces separately from
     /// `ReadPlanNote` / `ReadPlanEnvelope` because the cause is a
@@ -591,7 +594,7 @@ mod end_to_end_tests {
     /// `PlanState::Accepted`, the only state `review` is legal from.
     /// Written through `write_decision_note` so the on-disk shape
     /// matches what `bailiff plan decide` produces.
-    async fn record_acceptance(bailiff: &Arc<AsyncMutex<NotesRepo>>, plan_id: PlanId) {
+    async fn record_acceptance(bailiff: &Arc<NotesRepo>, plan_id: PlanId) {
         let bailiff = Arc::clone(bailiff);
         let note = DecisionNote {
             plan_id,
@@ -600,7 +603,6 @@ mod end_to_end_tests {
             decided_at: UnixMillis::from_millis(1_700_000_000_000),
         };
         tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff.blocking_lock();
             write_decision_note(&bailiff, &note)
                 .expect("write_decision_note must succeed for the fixture");
         })
@@ -609,7 +611,7 @@ mod end_to_end_tests {
     }
 
     async fn record_submission(
-        bailiff: &Arc<AsyncMutex<NotesRepo>>,
+        bailiff: &Arc<NotesRepo>,
         client: &WritClient,
         writ_repo_path: &Path,
         allowed: &AllowedSigners,
@@ -654,7 +656,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -710,7 +712,7 @@ mod end_to_end_tests {
         let plan_ref = plan_notes_ref(plan_id);
         let oid = outcome.review_note_oid.clone();
         let body = tokio::task::spawn_blocking(move || {
-            let bailiff = bailiff_for_read.blocking_lock();
+            let bailiff = &*bailiff_for_read;
             bailiff.read_note(&plan_ref, &oid)
         })
         .await
@@ -755,7 +757,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -771,8 +773,8 @@ mod end_to_end_tests {
         };
         let bailiff_for_write = Arc::clone(&bailiff);
         tokio::task::spawn_blocking(move || {
-            let repo = bailiff_for_write.blocking_lock();
-            write_decision_note(&repo, &rejection).expect("write_decision_note must succeed");
+            let repo = &*bailiff_for_write;
+            write_decision_note(repo, &rejection).expect("write_decision_note must succeed");
         })
         .await
         .unwrap();
@@ -835,7 +837,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -902,7 +904,7 @@ mod end_to_end_tests {
     ///
     /// `SubmitReviewError::WriteReviewNote { source:
     /// ReviewAlreadyRecorded }` is consequently no longer reachable
-    /// in-process: the workflow-held `BailiffRepoGuard` means nothing
+    /// in-process: the workflow-held [`PlanGuard`] means nothing
     /// can attach a review note between this gate and the write. It
     /// remains reachable across processes, which is exactly the hole
     /// slice 2's per-plan flock closes; the write-side check stays as
@@ -914,7 +916,7 @@ mod end_to_end_tests {
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
 
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
-        let bailiff = Arc::new(AsyncMutex::new(bailiff_repo));
+        let bailiff = Arc::new(bailiff_repo);
         let writ_repo_path = state.notes_repo.as_ref().unwrap().path().to_path_buf();
         let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
         let client = WritClient::new(&socket_path);
@@ -1001,8 +1003,8 @@ mod end_to_end_tests {
         // duplicate rather than overwriting.
         let bailiff_for_read = Arc::clone(&bailiff);
         let note_after = tokio::task::spawn_blocking(move || {
-            let repo = bailiff_for_read.blocking_lock();
-            crate::bailiff_plan_read::read_review_note(&repo, plan_id)
+            let repo = &*bailiff_for_read;
+            crate::bailiff_plan_read::read_review_note(repo, plan_id)
         })
         .await
         .unwrap()
