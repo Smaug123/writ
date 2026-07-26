@@ -1039,21 +1039,98 @@ fn list_refs_under_prefix_surfaces_corruption_as_error() {
     }
 }
 
-/// A child that dies before executing anything is retried, not reported.
+/// The born-dead predicate is a proof, not a heuristic: it fires only when the
+/// proof-of-life probe found no process at all AND the child died by SIGKILL.
 ///
-/// This is the "phantom SIGKILL" that made the parallel test suite flaky on
-/// macOS: `spawn()` returns a pid whose process is already gone (`getpgid`
-/// reports `ESRCH` microseconds later), so the child produces no output and
-/// never reads stdin. Measured at ~1 spawn in 2000 under the suite's load, it
-/// correlated 1:1 with the failures — zero occurrences in passing runs.
-///
-/// The signature is forged deterministically rather than raced for: the fake
-/// `git` SIGKILLs *itself*, producing no output, on its first invocation only
-/// (recorded with a marker file), then succeeds. Without the retry this fails
-/// with exactly the reported shape, `GitFailed { status: unix_wait_status(9),
-/// stderr: "" }`.
+/// The negative cases are the important ones. A child that ran and was killed
+/// (probe found it alive) must never be retried, and neither must a clean
+/// exit. The earlier formulation of this predicate keyed on empty
+/// stdout/stderr instead, which is unsound: `CaptureOutput::Discard` makes
+/// stdout empty by construction, so a `notes add` killed *after* committing
+/// its ref would have been replayed.
 #[test]
-fn a_child_that_died_before_running_is_retried_not_reported() {
+fn only_a_child_that_never_existed_counts_as_having_run_nothing() {
+    let sigkilled = ExitStatus::from_raw(9);
+    let clean_exit = ExitStatus::from_raw(0);
+
+    assert!(
+        child_ran_nothing(true, &sigkilled),
+        "vanished before running and SIGKILLed: the flake, safe to re-run"
+    );
+    assert!(
+        !child_ran_nothing(false, &sigkilled),
+        "a child the probe found ALIVE ran, and must not be re-run even though \
+         it died by the same signal"
+    );
+    assert!(
+        !child_ran_nothing(true, &clean_exit),
+        "a clean exit is not the flake, whatever the probe saw"
+    );
+    assert!(
+        !child_ran_nothing(false, &clean_exit),
+        "an ordinary successful child is never retried"
+    );
+}
+
+/// A child that really ran is not retried, even when it dies by SIGKILL having
+/// written nothing to the captured streams — the case that makes replaying a
+/// mutating `git notes add` dangerous.
+///
+/// This exercises the *real* probe, so it pins the production behaviour rather
+/// than the loop mechanics: the fake git records an attempt (a stand-in for
+/// committing a ref), then SIGKILLs itself.
+#[test]
+fn a_child_that_ran_is_not_retried_even_when_sigkilled() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let attempts = dir.path().join("attempts");
+    let fake_git = dir.path().join("git");
+    std::fs::write(
+        &fake_git,
+        format!(
+            "#!/bin/sh\nprintf x >> {a}\nkill -9 $$\n",
+            a = attempts.display()
+        ),
+    )
+    .expect("write fake git");
+    let mut perms = std::fs::metadata(&fake_git).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_git, perms).expect("chmod");
+
+    let env = synthetic_env(dir.path().to_str().expect("utf8 tempdir"));
+    let err = run_git_capturing_stderr(
+        dir.path(),
+        ["rev-parse"],
+        None,
+        CaptureOutput::Discard,
+        &env,
+    )
+    .expect_err("a child that ran and then died must be surfaced, not retried");
+
+    assert!(
+        matches!(err, NotesRepoError::GitFailed { .. }),
+        "expected GitFailed, got {err:?}"
+    );
+    let ran = std::fs::read(&attempts).expect("attempts marker");
+    assert_eq!(
+        ran.len(),
+        1,
+        "a child that took effect must run exactly once; retrying it could \
+         double a `notes add`"
+    );
+}
+
+/// The retry loop re-runs the invocation when the probe proves the child never
+/// existed, and returns the successful attempt's output.
+///
+/// A genuinely born-dead child cannot be forged on demand — the kernel decides
+/// — so the probe is supplied here, which is what `run_git_child_probed` takes
+/// it as an argument for. The child still has to die by SIGKILL for the
+/// predicate to fire, so this drives both halves of the conjunction.
+#[test]
+fn a_child_proven_never_to_have_existed_is_retried() {
+    use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1071,67 +1148,25 @@ fn a_child_that_died_before_running_is_retried_not_reported() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&fake_git, perms).expect("chmod");
 
-    let env = synthetic_env(dir.path().to_str().expect("utf8 tempdir"));
-    let (stdout, _stderr) = run_git_capturing_stderr(
-        dir.path(),
-        ["rev-parse"],
-        None,
-        CaptureOutput::Capture,
-        &env,
-    )
-    .expect("a born-dead child must be retried, not surfaced as GitFailed");
+    let mut command = Command::new(&fake_git);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
 
+    // Report "vanished" on the first attempt only, mimicking the kernel having
+    // discarded that child.
+    let probes = Cell::new(0usize);
+    let output = run_git_child_probed(&mut command, None, |_pid| {
+        probes.set(probes.get() + 1);
+        probes.get() == 1
+    })
+    .expect("a child proven never to have run is retried");
+
+    assert!(output.status.success(), "the retry must reach a live child");
     assert_eq!(
-        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&output.stdout),
         "survived",
         "the retry must return the successful attempt's output"
     );
-    assert!(marker.exists(), "the first attempt really did die");
-}
-
-/// The retry is bounded to children that ran *nothing*. A child that produced
-/// output before dying by the same signal is a real failure and is reported —
-/// otherwise the retry would silently re-run commands that had already taken
-/// effect, which is exactly what makes retrying safe here and not elsewhere.
-#[test]
-fn a_child_that_died_after_writing_output_is_reported_not_retried() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let attempts = dir.path().join("attempts");
-    let fake_git = dir.path().join("git");
-    // Always writes to stderr, then SIGKILLs itself: same signal, but it
-    // demonstrably ran, so it must NOT be retried.
-    std::fs::write(
-        &fake_git,
-        format!(
-            "#!/bin/sh\nprintf x >> {a}\nprintf 'did work' 1>&2\nkill -9 $$\n",
-            a = attempts.display()
-        ),
-    )
-    .expect("write fake git");
-    let mut perms = std::fs::metadata(&fake_git).expect("meta").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fake_git, perms).expect("chmod");
-
-    let env = synthetic_env(dir.path().to_str().expect("utf8 tempdir"));
-    let err = run_git_capturing_stderr(
-        dir.path(),
-        ["rev-parse"],
-        None,
-        CaptureOutput::Capture,
-        &env,
-    )
-    .expect_err("a child that ran and then died must be surfaced");
-
-    assert!(
-        matches!(err, NotesRepoError::GitFailed { .. }),
-        "expected GitFailed, got {err:?}"
-    );
-    let ran = std::fs::read(&attempts).expect("attempts marker");
-    assert_eq!(
-        ran.len(),
-        1,
-        "a child that produced output must be run exactly once, not retried"
-    );
+    assert_eq!(probes.get(), 2, "exactly one retry was needed");
 }

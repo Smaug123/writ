@@ -177,11 +177,28 @@ innocence was sound; it had merely never been demonstrated.
 since a retry is safe only where the operation is idempotent, and `update-ref`
 is not. The born-dead mark dissolves that objection, because it does not ask
 whether the *command* may be repeated; it establishes that the *child never ran*,
-and so there is nothing to repeat. `NotesRepo` now retries on the conjunction of
-three things: killed by `SIGKILL`, and empty stdout, and empty stderr. A child
-that ran, did work, and was then killed will almost always have written
-something, is not retried, and is reported exactly as before. Two tests pin both
-sides of that boundary.
+and so there is nothing to repeat. Every synchronous git child now passes through
+one helper, which re-runs the invocation when the proof-of-life probe reported
+`ESRCH` *and* the child died by `SIGKILL`. A child that ran and was then killed
+is reported exactly as before.
+
+**A false start, recorded because it is the instructive part.** The first
+version of this remedy asked instead for `SIGKILL`, and empty stdout, and empty
+stderr — reasoning that a child which had done work would have said something.
+That is unsound, and on precisely the paths where it would have hurt most: the
+mutating callers pass `CaptureOutput::Discard`, which makes stdout empty *by
+construction*, so the test collapsed to "killed, and quiet". A `git notes add`
+struck down after it had written its ref would have satisfied it, been run a
+second time, and failed with "note already exists" — reporting a failure for
+work that had in fact been committed. The lesson is that absence of output is
+not evidence of absence of effect; only the process-table entry is. Caught in
+review, before it shipped.
+
+**And a gap of scope.** The config children spawned on every `NotesRepo::open`
+called `Command::output()` directly and so were covered by none of this — which
+mattered more than it sounds, the very first sighting in this inquiry having
+been `GitFailed { args: ["config"], status: unix_wait_status(9) }`. They now go
+through the same helper.
 
 **What remains unknown.** Which hand inside the kernel discards the process, and
 why. System Integrity Protection still forbids `dtrace`'s `proc:::signal-send`,

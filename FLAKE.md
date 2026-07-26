@@ -129,12 +129,35 @@ timeout-`killpg` (zero `killpg` calls in the victim's process), and macOS killin
 concurrent execs of the same binary (2400 concurrent `git --version` from the same
 store path, zero kills — consistent with established fact 2's 144k-operation result).
 
-**The fix** (`NotesRepo::run_git_capturing_stderr`) retries on the conjunction
-`SIGKILL && stdout.is_empty() && stderr.is_empty()`. This sidesteps the idempotency
-objection that made "retry on signal" unsafe: it does not assume the *command* may be
-repeated, it establishes that the *child never ran*. A child that ran, produced
-output and was then killed is reported unchanged. Both sides of that boundary are
-pinned by tests in `src/notes_repo/tests.rs`.
+**The fix.** Every synchronous git child in `NotesRepo` now goes through
+`run_git_child`, which re-runs the invocation while `child_ran_nothing` holds:
+
+```
+getpgid(pid) == ESRCH immediately after spawn   AND   killed by SIGKILL
+```
+
+The first conjunct is the proof, and it rests on the zombie rule: we have not reaped
+the child, so one that had run and exited — however briefly — would still hold an
+unreaped process-table entry and `getpgid` would succeed. `ESRCH` means the pid never
+became a live process. The second guards the one way the probe could lie (if anything
+ever set `SIGCHLD` to `SIG_IGN`, children would be auto-reaped; such a child cannot
+then be waited for, so it surfaces as a `GitWait` error instead).
+
+This sidesteps the idempotency objection that made "retry on signal" unsafe: it does
+not assume the *command* may be repeated, it establishes that the *child never ran*,
+so there is nothing to repeat. A child that ran and was then killed is reported
+unchanged.
+
+Note what is **not** used: emptiness of stdout/stderr. That was the first
+formulation and it is unsound — `CaptureOutput::Discard` makes stdout empty by
+construction, so for the mutating callers (`notes add`, `update-ref`) the test would
+have been vacuous, and a child killed *after* committing its ref would have been
+replayed into a spurious "note already exists" failure. Caught in review.
+
+The config-validation children on the `NotesRepo::open` path go through the same
+helper. They previously called `Command::output()` directly and so were not covered
+at all — which mattered, because the flake was first observed there:
+`GitFailed { args: ["config"], status: unix_wait_status(9) }`.
 
 **Still unknown, and deliberately not depended upon:** which kernel path discards the
 process. SIP blocks `proc:::signal-send` and the unified log needs privileges. The fix
