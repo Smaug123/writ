@@ -92,8 +92,9 @@ fn writ_output_ref() -> NotesRef {
 /// One message per connection matches `WritClient`'s round-trip shape:
 /// it dials per RPC. Replies are consumed in order, so a scenario
 /// scripts exactly as many as its workflow should send — a workflow
-/// that sends more gets a closed socket and fails loudly rather than
-/// silently reusing a reply.
+/// that sends more is still *recorded*, then hung up on, so the extra
+/// RPC shows up as a fixture diff rather than only as a transport
+/// error the caller might swallow.
 struct StubBroker {
     socket_path: PathBuf,
     requests: Arc<AsyncMutex<Vec<ClientMessage>>>,
@@ -113,16 +114,25 @@ impl StubBroker {
         let mut replies = replies.into_iter();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let Some(reply) = replies.next() else {
-                    return;
-                };
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
+                // Record *before* looking for a reply. Draining the
+                // request first is what makes the zero-RPC fixtures
+                // mean anything: with no scripted reply the earlier
+                // version returned without reading, so a workflow that
+                // sent an RPC before its gate got an EOF, surfaced a
+                // transport error that `expect_err` happily accepted,
+                // and left `observed()` empty — the fixture passed on
+                // exactly the regression it exists to catch.
                 if let Ok(Some(line)) = lines.next_line().await
                     && let Ok(msg) = serde_json::from_str::<ClientMessage>(&line)
                 {
                     req_clone.lock().await.push(msg);
                 }
+                let Some(reply) = replies.next() else {
+                    // Unscripted request: recorded, then hung up on.
+                    continue;
+                };
                 let mut json = serde_json::to_string(&reply).unwrap();
                 json.push('\n');
                 let _ = writer.write_all(json.as_bytes()).await;
