@@ -1063,6 +1063,87 @@ where `AgentStage::precondition`'s test
 (`each_agent_stage_gates_on_its_namesake_plan_stage`) is written to force a
 deliberate change rather than silently generalise.
 
+## Slice 5 — the dossier is a read
+
+**Dependencies**: slice 4.
+
+**Implements**: the end goal's last clause — "spin up several variants, actually
+build them, … compose a dossier". Slice 4 made variants exist; nothing showed
+what they *did*.
+
+`plan show` renders each attempt's metadata and verification status, not its
+output, so N variants were countable but not comparable. `bailiff plan dossier`
+assembles the approved plan body once — the context every attempt shared — then
+every attempt's verified stdout.
+
+**Deliberately a read, not an agent run.** Fable's step list has
+`collect-evidence` as a workflow step, and a comparing agent is the obvious
+reading of "compose a dossier". But such an agent needs the variants' outputs
+assembled before it can compare them, and this *is* that assembly. Building the
+agent now would mean a fifth note kind and a new stage with no consumer —
+speculative generality. If one is later wanted, its prompt is this verb's
+output, and it composes as one more `AgentStage` over the existing phases.
+
+**One parser, per-caller policy.** `read_plan_body_bytes` was the fetch →
+re-verify → decode chain hard-wired to `&PlanNote` *and* to the planner's
+acceptance rules (non-empty, non-truncated, UTF-8). The dossier needs the chain
+for `&ImplementNote` and needs the opposite rules: an implementer that pushes
+and says nothing is ordinary, a long run hitting the output cap is ordinary, and
+its stdout need not be text. So the chain is now `read_verified_output`, generic
+over the existing `SignedBailiffNote` trait and returning the decoded
+`OutputEnvelope` with **no policy applied**; `read_plan_body_bytes` is a thin
+wrapper applying the planner's three rules. Parse once, judge per caller.
+
+**The format carries agent-controlled bytes, which is new here.** Every other
+writer in `output.rs` promises one line per key and escapes free-form text onto
+one line; a hundred lines of implementer output escaped onto one is unreadable,
+and raw bytes would break the contract every consumer relies on. So output
+travels length-prefixed — `stdout_bytes=<n>`, then exactly `n` bytes, then a
+newline. A length prefix rather than a delimiter *specifically because* the
+payload is agent-controlled: an implementer can emit a convincing delimiter on
+purpose, and no escaping scheme survives that as cleanly as a byte count.
+
+**Correctness oracle**:
+- The 24 RPC fixtures unmodified — splitting `read_plan_body_bytes` must not
+  change what review or implement do.
+- Named test: an attempt whose envelope does not verify contributes **no bytes**,
+  and the failure is per-attempt rather than failing the whole dossier. This is
+  the verb's load-bearing security property: unverified agent output rendered
+  beside verified output with nothing to tell them apart is the worst thing a
+  dossier could do.
+- Property: for any payload — newlines, NULs, non-UTF-8, embedded
+  `stdout_bytes=` lookalikes — the declared length matches what follows and the
+  payload round-trips through a re-implemented reader.
+- Named tests for the policy split: an empty output and a non-UTF-8 output are
+  rendered, not refused, where `read_plan_body_bytes` refuses both.
+
+### Slice 5 as built
+
+Shipped, and one finding is worth more than the feature.
+
+**Mutation testing found a property with no test.** Making `read_verified_output`
+skip `verify_run_envelope` was caught. Making the *renderer* emit a
+`stdout_bytes` block on the failure arm was **caught by nothing** — every test in
+the crate passed while the renderer printed unverified agent bytes labelled
+`verification=failed` right next to them.
+
+The reader-side test (`an_unverifiable_attempt_contributes_no_bytes`) proves the
+reader withholds the bytes; it says nothing about what the renderer does with a
+failure it is handed. Two halves of one promise, and only one was covered.
+`a_failed_attempt_emits_no_stdout_block` is the other half. The general shape,
+which has now recurred at every layer of this plan: **a promise that spans two
+components needs a test at each, because a test of one half passes while the
+other half breaks it.**
+
+**Two `git checkout -- <file>` mistakes.** Reverting a mutation that way
+discarded uncommitted work twice — once the slice-4 relation edit, once this
+slice's entire renderer. Both were caught immediately (the tests started failing
+for the wrong reason), but the habit is wrong: scratchpad copies for mutations,
+and commit before mutating. Recorded because the second one happened after
+noticing the first.
+
+---
+
 ## Non-goals
 
 - **No new note schema in slices 1–3.** The four seeds and their notes are

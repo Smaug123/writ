@@ -34,7 +34,7 @@ use bailiff::bailiff_plan_implement::{
     SubmitImplementError, SubmitImplementInputs, submit_implement,
 };
 use bailiff::bailiff_plan_note::{DecisionNote, PlanId};
-use bailiff::bailiff_plan_read::{list_plan_ids, read_full_plan, summarize_plan};
+use bailiff::bailiff_plan_read::{list_plan_ids, read_dossier, read_full_plan, summarize_plan};
 use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit_review};
 use bailiff::bailiff_plan_state::PlanStage;
 use bailiff::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
@@ -42,7 +42,9 @@ use bailiff::bailiff_plan_write::{
     WriteDecisionNoteError, WriteStageNoteError, write_decision_note,
 };
 use bailiff::bailiff_stage::open_plan_stage;
-use bailiff::output::{write_bailiff_plan_list, write_bailiff_plan_show};
+use bailiff::output::{
+    write_bailiff_plan_dossier, write_bailiff_plan_list, write_bailiff_plan_show,
+};
 use writ::agent_run::AgentPrompt;
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
@@ -404,6 +406,43 @@ enum PlanCmd {
     /// sections render with an explicit `<none>` and a
     /// missing-because-not-fetched section renders with the failure
     /// noted explicitly (see `VerifiedSection`).
+    /// Assemble the per-plan dossier: the approved plan body once,
+    /// then every implementer attempt's verified output verbatim.
+    ///
+    /// The comparison surface for fan-out. `plan show` renders each
+    /// attempt's *metadata* and verification status; this renders what
+    /// each run actually produced, which is what makes N variants
+    /// comparable.
+    ///
+    /// Unlike `plan show`, this **fetches** writ's notes namespace, so
+    /// it needs `--writ-repo`: the outputs are re-verified against
+    /// writ's current copy rather than trusted from the note. An
+    /// attempt whose envelope fails to verify contributes its failure
+    /// and none of its bytes.
+    ///
+    /// Output carries agent-controlled bytes, so they are
+    /// length-prefixed: a `stdout_bytes=<n>` line, then exactly `n`
+    /// bytes, then a newline. Everything else is one line per key as
+    /// usual.
+    Dossier {
+        /// Plan to assemble. Must parse as the canonical UUID form
+        /// `PlanId` prints.
+        #[arg(long)]
+        plan_id: PlanId,
+        /// Path to bailiff's bare git repo. Defaults to
+        /// `$XDG_DATA_HOME/bailiff/repo`.
+        #[arg(long)]
+        bailiff_repo: Option<PathBuf>,
+        /// Path to writ's bare git repo, fetched from to re-verify
+        /// each attempt's envelope. Defaults to
+        /// `$XDG_DATA_HOME/writ/repo`.
+        #[arg(long)]
+        writ_repo: Option<PathBuf>,
+        /// OpenSSH `allowed_signers` file enumerating which writ
+        /// signing keys bailiff will accept envelopes from.
+        #[arg(long)]
+        writ_allowed_signers: PathBuf,
+    },
     Show {
         /// Plan to render. Must parse as the canonical UUID form
         /// `PlanId` prints. Matches `decide` and `review`'s flag
@@ -602,6 +641,12 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 writ_allowed_signers,
                 bailiff_repo,
             } => plan_show(plan_id, writ_allowed_signers, bailiff_repo).await,
+            PlanCmd::Dossier {
+                plan_id,
+                bailiff_repo,
+                writ_repo,
+                writ_allowed_signers,
+            } => plan_dossier(plan_id, bailiff_repo, writ_repo, writ_allowed_signers).await,
         },
     }
 }
@@ -1149,6 +1194,65 @@ async fn plan_show(
     Ok(())
 }
 
+/// Drive `read_dossier` from the CLI. Mirrors `plan_show`'s shape —
+/// parse the allowed-signers file before touching git, do the git work
+/// on a blocking thread, render the pure-data result on the runtime
+/// thread — and adds `--writ-repo`, because a dossier re-verifies
+/// against writ's current copy rather than trusting what the notes
+/// recorded.
+async fn plan_dossier(
+    plan_id: PlanId,
+    bailiff_repo: Option<PathBuf>,
+    writ_repo: Option<PathBuf>,
+    writ_allowed_signers: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
+        format!(
+            "reading writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
+        format!(
+            "parsing writ allowed-signers file {}: {e}",
+            writ_allowed_signers.display()
+        )
+    })?;
+
+    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+    let writ_repo_path = writ_repo.unwrap_or_else(default_writ_repo_path);
+    let writ_output_ref =
+        NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
+
+    let bailiff_repo_path_for_task = bailiff_repo_path.clone();
+    let result: Result<_, DossierError> = tokio::task::spawn_blocking(move || {
+        let repo = NotesRepo::init_or_open(bailiff_repo_path_for_task)?;
+        read_dossier(&repo, plan_id, &writ_repo_path, &writ_output_ref, &allowed)
+            .map_err(DossierError::ReadDossier)
+    })
+    .await
+    .map_err(|e| format!("dossier task failed: {e}"))?;
+
+    let dossier = match result {
+        Ok(d) => d,
+        Err(DossierError::OpenRepo(e)) => {
+            return Err(format!(
+                "opening bailiff repo at {}: {e}",
+                bailiff_repo_path.display()
+            )
+            .into());
+        }
+        Err(DossierError::ReadDossier(e)) => {
+            return Err(format!("assembling the dossier: {e}").into());
+        }
+    };
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_bailiff_plan_dossier(&mut handle, &dossier)?;
+    Ok(())
+}
+
 /// Tagged failure modes for the `spawn_blocking` show closure. Mirrors
 /// `ListError`'s pattern: tag enough to give the
 /// post-await arm a specific error message rather than collapsing
@@ -1157,6 +1261,26 @@ async fn plan_show(
 enum ShowError {
     OpenRepo(writ::notes_repo::NotesRepoError),
     ReadFullPlan(bailiff::bailiff_plan_read::ReadFullPlanError),
+}
+
+/// Tagged failure modes for the `spawn_blocking` dossier closure.
+///
+/// Separate from [`ShowError`] rather than a shared enum with both
+/// read variants. A shared one would give each function an arm it
+/// cannot produce, and the only way to discharge that is an
+/// `unreachable!` — a representable illegal state, which is the
+/// defect the stage phases in `bailiff_stage` were shaped to avoid.
+/// Two three-line enums cost less than one union plus a panic that
+/// claims to be impossible.
+enum DossierError {
+    OpenRepo(writ::notes_repo::NotesRepoError),
+    ReadDossier(bailiff::bailiff_plan_read::ReadDossierError),
+}
+
+impl From<writ::notes_repo::NotesRepoError> for DossierError {
+    fn from(e: writ::notes_repo::NotesRepoError) -> Self {
+        DossierError::OpenRepo(e)
+    }
 }
 
 impl From<writ::notes_repo::NotesRepoError> for ShowError {
