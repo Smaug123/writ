@@ -343,7 +343,11 @@ fn mark_attempt_uncertain_rejects_already_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant("approve attempt is not in 'started' state")
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Uncertain,
+                transition: "mark-uncertain",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -424,7 +428,11 @@ fn complete_attempt_succeeded_rejects_when_not_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant("approve attempt is not in 'uncertain' state")
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Started,
+                transition: "resolve-succeeded",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -588,9 +596,11 @@ fn complete_attempt_pre_patch_failure_capturing_mint_refuses_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant(
-                "approve attempt: capturing-mint pre_patch_failure requires 'started' state"
-            )
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Uncertain,
+                transition: "capture-pre-patch-failure",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -620,9 +630,11 @@ fn complete_attempt_post_patch_failure_only_from_uncertain() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant(
-                "approve attempt is not in a state that admits this failure outcome"
-            )
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Started,
+                transition: "resolve-post-patch-failure",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -1081,7 +1093,11 @@ fn record_attempt_mint_refused_once_past_started() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant("approve attempt mint ledger requires 'started' state")
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Uncertain,
+                transition: "record-mint",
+                ..
+            })
         ),
         "got: {err:?}"
     );
@@ -1118,7 +1134,11 @@ fn record_attempt_mint_refused_twice() {
     assert!(
         matches!(
             err,
-            AuditError::Invariant("approve attempt already has a mint ledger row")
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Started,
+                transition: "record-mint",
+                because: "the attempt has already recorded a mint",
+            })
         ),
         "got: {err:?}"
     );
@@ -1151,9 +1171,18 @@ fn mark_attempt_uncertain_refused_when_mint_disagrees_with_ledger() {
     let err = log
         .mark_attempt_uncertain(attempt_id, sample_promote_mint_audit())
         .unwrap_err();
+    // The machine refuses this before any write is attempted; the
+    // `mint_matches_ledger` trigger remains the backstop underneath.
     assert!(
-        err.to_string().contains("must match the mint ledger row"),
-        "unexpected error: {err}"
+        matches!(
+            err,
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Started,
+                transition: "mark-uncertain",
+                because: "the mint ledger already records a different credential",
+            })
+        ),
+        "unexpected error: {err:?}"
     );
 }
 
@@ -1187,8 +1216,15 @@ fn capturing_pre_patch_failure_refused_when_mint_disagrees_with_ledger() {
         )
         .unwrap_err();
     assert!(
-        err.to_string().contains("must match the mint ledger row"),
-        "unexpected error: {err}"
+        matches!(
+            err,
+            AuditError::IllegalApproveTransition(IllegalApproveTransition {
+                from: ApproveAttemptStateName::Started,
+                transition: "capture-pre-patch-failure",
+                because: "the mint ledger already records a different credential",
+            })
+        ),
+        "unexpected error: {err:?}"
     );
 
     // And with the *recorded* mint the resolve goes through.

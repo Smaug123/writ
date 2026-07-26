@@ -120,16 +120,29 @@ the set is rejected. That pins the Rust enum to the SQL enum.
 
 ### Slice 2 — the transition relation as a pure total function
 
-`ApproveAttemptTransition` (the events: `MarkUncertain`, `ResolveSucceeded`,
-`ResolvePrePatchFailure`, `ResolvePostPatchFailure`) and
-`fn apply(&State, &Transition) -> Result<State, IllegalTransition>` — one place
-enumerating what is legal. The DAO's ad-hoc preflights are replaced by a parse of
-the current row plus a call to `apply`; `allowed_states: &[&'static str]`
-disappears.
+`ApproveAttemptTransition` (the events: `RecordMint`, `MarkUncertain`,
+`ResolveSucceeded`, `ResolvePrePatchFailure`, `CapturePrePatchFailure`,
+`ResolvePostPatchFailure`) and
+`fn apply(&ApproveAttempt, &Transition) -> Result<ApproveAttempt, IllegalApproveTransition>`
+— one place enumerating what is legal. The DAO's ad-hoc preflights are replaced
+by a parse of the current row plus a call to `apply`;
+`allowed_states: &[&'static str]` disappears.
 
-Test: the **Rust ≡ SQLite oracle**. For every (state, transition) pair, build a
-row in that state in a real in-memory DB, drive the DAO, and assert the write
-succeeds iff `apply` returned `Ok`.
+The machine's state is `ApproveAttempt`: the row's position **plus the v7 mint
+ledger**. The ledger looks like a side table, but migration 0007 says it exists
+only because SQLite could not widen the `state` CHECK to add a `minted` state —
+"the ledger records the same fact with a plain CREATE TABLE" — and two triggers
+(`mint_matches_ledger`, `resolve_carries_ledger_mint`) judge writes against it.
+A machine that could not see it would permit moves the database refuses, which
+is exactly what the first draft did: `apply(&Started, MarkUncertain { mint: B })`
+returned `Ok` for an attempt whose ledger already recorded A. Modelling the
+ledger also lets the machine *derive* the mint a resolve records, so no call site
+has to remember to carry it.
+
+Test: the **Rust ≡ SQLite oracle**. For every (position, transition) pair —
+positions being row states crossed with ledger presence — build the row by a
+legal path in a real in-memory DB, then compare `apply` against a naive writer
+that never consults it, asserting both accept the same moves.
 
 ### Slice 3 — the derived predicates, in one place
 
