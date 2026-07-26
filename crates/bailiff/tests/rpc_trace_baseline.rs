@@ -308,7 +308,11 @@ fn assert_trace(name: &str, observed: &[ClientMessage]) {
         .join(format!("{name}.json"));
     let rendered = format!("{}\n", serde_json::to_string_pretty(observed).unwrap());
 
-    if std::env::var("UPDATE_RPC_TRACES").is_ok() {
+    // Exactly "1", not merely "set". A runner exporting
+    // `UPDATE_RPC_TRACES=0` to mean *disabled* would otherwise rewrite
+    // every fixture and return without comparing anything, turning the
+    // baseline off precisely where it is relied on.
+    if std::env::var("UPDATE_RPC_TRACES").as_deref() == Ok("1") {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(rendered.as_bytes()).unwrap();
@@ -515,5 +519,90 @@ async fn refused_gates_emit_no_rpcs() {
         .await
         .expect_err("implement must refuse an unreviewed plan");
         assert_trace("implement_refused", &broker.observed().await);
+    }
+}
+
+/// After a session is open, a failing `RunAgent` must still be
+/// followed by `CloseSession`.
+///
+/// This is the contract both `submit_plan` and `submit_review`
+/// document at length ("from here on, every early return must close
+/// the session"), and it is the sad path most easily lost in slice 3:
+/// an interpreter that propagates the run error with `?` before its
+/// cleanup arm leaks the session, and no happy-path or pre-RPC fixture
+/// would notice. The plan asks for "happy *and each sad path*"; this
+/// is the half that was missing from the first capture.
+///
+/// The leak would be invisible in writ's audit log too — the session
+/// row simply never closes — so the trace is the cheapest place to
+/// pin it.
+#[tokio::test]
+async fn a_failed_run_still_closes_the_session() {
+    // submit
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: stub_session_id(),
+            },
+            ServerMessage::Error {
+                message: "agent runner unavailable".into(),
+            },
+            ServerMessage::SessionClosed,
+        ])
+        .await;
+
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap());
+        let client = WritClient::new(&broker.socket_path);
+        submit_plan(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            submit_inputs(fixed_plan_id()),
+        )
+        .await
+        .expect_err("a broker error must surface");
+
+        assert_trace("submit_run_agent_error", &broker.observed().await);
+    }
+
+    // review
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let writ = build_writ_side(tmp.path());
+        let broker = StubBroker::start(vec![
+            ServerMessage::SessionOpened {
+                session_id: stub_session_id(),
+            },
+            ServerMessage::Error {
+                message: "agent runner unavailable".into(),
+            },
+            ServerMessage::SessionClosed,
+        ])
+        .await;
+
+        let plan_id = fixed_plan_id();
+        let bailiff = Arc::new(NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap());
+        plant(
+            &bailiff,
+            plan_id,
+            plan_submission_seed_blob_bytes(plan_id),
+            writ.plan_note(plan_id).canonical_bytes(),
+        );
+
+        let client = WritClient::new(&broker.socket_path);
+        submit_review(
+            &client,
+            bailiff,
+            &writ.repo_path,
+            allowed_signers(),
+            review_inputs(plan_id),
+        )
+        .await
+        .expect_err("a broker error must surface");
+
+        assert_trace("review_run_agent_error", &broker.observed().await);
     }
 }
