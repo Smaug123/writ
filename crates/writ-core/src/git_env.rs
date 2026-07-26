@@ -9,10 +9,22 @@
 //! This module exists because that is exactly what happened, in two distinct
 //! ways. First, the recipe was written out longhand at eight call sites and they
 //! drifted: one used `GIT_CONFIG_SYSTEM=/dev/null` where the others used
-//! `GIT_CONFIG_NOSYSTEM=1`, and three omitted `GIT_CONFIG_COUNT=0`. Second — and
-//! worse, because it affected every site equally — the recipe was *documented* as
-//! covering `GIT_CONFIG_PARAMETERS` via `GIT_CONFIG_COUNT=0`, and it did not; see
-//! that entry below. Nothing about either mistake read as wrong.
+//! `GIT_CONFIG_NOSYSTEM=1`, and three omitted `GIT_CONFIG_COUNT=0`. Second, the
+//! recipe was *documented* as covering `GIT_CONFIG_PARAMETERS` via
+//! `GIT_CONFIG_COUNT=0`, and it did not; see that entry below. Nothing about
+//! either mistake read as wrong.
+//!
+//! Scope of that second mistake, precisely: every *production* caller
+//! (`clean_git`, `notes_repo`, `git_push_objects_cat_file`, `flake_provision`)
+//! also calls `env_clear`, which removes `GIT_CONFIG_PARAMETERS` whether or not
+//! the recipe names it, so none of them was ever exposed. What was exposed was
+//! the test helpers, which layer the recipe over an inherited environment — so a
+//! developer or CI machine with `GIT_CONFIG_PARAMETERS` set could have had it
+//! reach the test gits. Naming the variable here therefore fixes real test
+//! hermeticity and is defence in depth for production, rather than closing a live
+//! hole in the broker. The recipe should be sufficient on its own regardless:
+//! "it happens to be safe because every current caller also does something else"
+//! is not a property worth relying on.
 //!
 //! It lives in `writ-core` rather than beside its main consumer so that the host
 //! daemon, the guest client, and every crate's test helpers can all derive from
@@ -39,6 +51,22 @@
 //!   an assumption. Empty parses as "no parameters"; unsetting would also work,
 //!   but an explicit empty value survives being merged into an env a caller
 //!   builds up in any order.
+//!
+//! And one variable that must be *removed* rather than set
+//! ([`GIT_CONFIG_REMOVE_ENV`]):
+//!
+//! * `GIT_CONFIG` — `git config` treats this as `--file`, so it overrides the
+//!   whole recipe for exactly the command writ uses to *validate* a repo
+//!   (`core.bare`, `extensions.objectformat`). None of the settings above
+//!   neutralises it. It cannot be handled by setting a value: `GIT_CONFIG=/dev/null`
+//!   makes `git config <name> <value>` fail to lock and silently lose the write,
+//!   which is worse than the disease. It also cannot be expressed as a
+//!   `(name, value)` pair at all — which is why [`apply_clean_git_config`] and its
+//!   siblings, not the constants, are the sanctioned way to apply the recipe.
+//!   (Scope, measured on git 2.54: `GIT_CONFIG` affects `git config` only — a
+//!   non-config command ignores it — and with an explicit selector like `--local`
+//!   git errors rather than silently reading the wrong file.)
+//!
 //! * `HOME=/dev/null` — dotfiles that helpers read regardless of the
 //!   `GIT_CONFIG_*` overrides: credential helpers, hook scripts, and anything
 //!   invoked via `core.editor` / `pre-receive`. Only in
@@ -56,6 +84,13 @@ pub const GIT_CONFIG_DENY_ENV: [(&str, &str); 4] = [
     ("GIT_CONFIG_PARAMETERS", ""),
 ];
 
+/// Variables the recipe must *remove* rather than set. See the module docs for
+/// why `GIT_CONFIG` cannot be neutralised with a value.
+///
+/// Because this exists, the constants alone are never the whole recipe. Prefer
+/// [`apply_clean_git_config`] / [`apply_git_config_denials`].
+pub const GIT_CONFIG_REMOVE_ENV: [&str; 1] = ["GIT_CONFIG"];
+
 /// [`GIT_CONFIG_DENY_ENV`] plus `HOME=/dev/null`: the full recipe for a caller
 /// with no legitimate use for a home directory.
 pub const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 5] = [
@@ -66,25 +101,73 @@ pub const CLEAN_GIT_CONFIG_ENV: [(&str, &str); 5] = [
     ("HOME", "/dev/null"),
 ];
 
-/// Apply [`CLEAN_GIT_CONFIG_ENV`] to `command`.
+/// Apply the full hardened recipe to `command`: set [`CLEAN_GIT_CONFIG_ENV`] and
+/// remove [`GIT_CONFIG_REMOVE_ENV`].
+///
+/// **Use this rather than `.envs(CLEAN_GIT_CONFIG_ENV)`.** The recipe is not just
+/// a set of values — `GIT_CONFIG` has to be *removed* — so applying the constant
+/// alone leaves a hole that looks nothing like a hole at the call site.
+/// `tests/shared_hardening_helpers.rs` enforces this: using the constants outside
+/// this module fails that guard.
+///
+/// Returns `command` so it drops into a builder chain:
+/// `apply_clean_git_config(&mut Command::new(git)).args(args).output()`.
 ///
 /// Note this *adds* the overrides; it does not clear the inherited environment.
 /// A caller that must also strip inherited `GIT_DIR` / `GIT_WORK_TREE` /
 /// `GIT_OBJECT_DIRECTORY` has to call `env_clear` itself and re-add whatever it
 /// genuinely needs (typically just `PATH`) — the two concerns are separate, and
 /// conflating them here would silently break callers that rely on inheritance.
-pub fn apply_clean_git_config(command: &mut std::process::Command) {
+/// A caller that does `env_clear` gets the removal for free but should still call
+/// this, so the recipe stays correct if the `env_clear` is ever dropped.
+pub fn apply_clean_git_config(command: &mut std::process::Command) -> &mut std::process::Command {
     for (name, value) in CLEAN_GIT_CONFIG_ENV {
         command.env(name, value);
     }
+    for name in GIT_CONFIG_REMOVE_ENV {
+        command.env_remove(name);
+    }
+    command
 }
 
 /// [`apply_clean_git_config`] for a tokio command.
 #[cfg(feature = "host")]
-pub fn apply_clean_git_config_async(command: &mut tokio::process::Command) {
+pub fn apply_clean_git_config_async(
+    command: &mut tokio::process::Command,
+) -> &mut tokio::process::Command {
     for (name, value) in CLEAN_GIT_CONFIG_ENV {
         command.env(name, value);
     }
+    for name in GIT_CONFIG_REMOVE_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// The config *denials* only, for a caller that supplies its own `HOME` (nix
+/// fetching a flake input needs a writable one). Still removes `GIT_CONFIG`.
+pub fn apply_git_config_denials(command: &mut std::process::Command) -> &mut std::process::Command {
+    for (name, value) in GIT_CONFIG_DENY_ENV {
+        command.env(name, value);
+    }
+    for name in GIT_CONFIG_REMOVE_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// [`apply_git_config_denials`] for a tokio command.
+#[cfg(feature = "host")]
+pub fn apply_git_config_denials_async(
+    command: &mut tokio::process::Command,
+) -> &mut tokio::process::Command {
+    for (name, value) in GIT_CONFIG_DENY_ENV {
+        command.env(name, value);
+    }
+    for name in GIT_CONFIG_REMOVE_ENV {
+        command.env_remove(name);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -134,18 +217,28 @@ mod tests {
         // Inject through both env channels a caller could inherit, then confirm
         // neither reaches git once the recipe is layered on top — which is the
         // order a caller adding the recipe to an inherited environment produces.
+        // A config file the recipe must not let git reach via `GIT_CONFIG`
+        // (which `git config` honours as `--file`).
+        let dir =
+            std::env::temp_dir().join(format!("writ-git-env-injection-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let evil = dir.join("evil.cfg");
+        std::fs::write(&evil, "[core]\n\tpager = INJECTED\n").expect("write evil config");
+
         let mut command = std::process::Command::new(&git);
         command
             .args(["config", "--get", "core.pager"])
             .env("GIT_CONFIG_PARAMETERS", "'core.pager=INJECTED'")
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "core.pager")
-            .env("GIT_CONFIG_VALUE_0", "INJECTED");
+            .env("GIT_CONFIG_VALUE_0", "INJECTED")
+            .env("GIT_CONFIG", &evil);
         apply_clean_git_config(&mut command);
 
         let output = command
             .output()
             .expect("git config must be runnable once located on PATH");
+        let _ = std::fs::remove_dir_all(&dir);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             !stdout.contains("INJECTED"),
@@ -185,24 +278,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_sets_every_entry_on_the_command() {
+    fn apply_sets_every_entry_and_removes_git_config() {
         let mut command = std::process::Command::new("/bin/true");
         apply_clean_git_config(&mut command);
-        let seen: Vec<(String, String)> = command
+        let seen: Vec<(String, Option<String>)> = command
             .get_envs()
             .map(|(k, v)| {
                 (
                     k.to_string_lossy().into_owned(),
-                    v.expect("recipe entries always set a value")
-                        .to_string_lossy()
-                        .into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
                 )
             })
             .collect();
         for (name, value) in CLEAN_GIT_CONFIG_ENV {
             assert!(
-                seen.iter().any(|(k, v)| k == name && v == value),
-                "{name}={value} must reach the command; saw {seen:?}"
+                seen.iter()
+                    .any(|(k, v)| k == name && v.as_deref() == Some(value)),
+                "{name}={value:?} must reach the command; saw {seen:?}"
+            );
+        }
+        // A removal shows up as an explicit `None`, which is what distinguishes
+        // "unset it" from "never mentioned it" when the parent env is inherited.
+        for name in GIT_CONFIG_REMOVE_ENV {
+            assert!(
+                seen.iter().any(|(k, v)| k == name && v.is_none()),
+                "{name} must be removed, not merely absent; saw {seen:?}"
             );
         }
     }

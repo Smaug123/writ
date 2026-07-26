@@ -10,6 +10,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use crate::github_git_db::GitDataHttp;
+use writ_core::git_env::apply_clean_git_config;
 
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
@@ -118,12 +119,11 @@ pub(super) fn required_git() -> PathBuf {
 /// runs and machines. Asserts success; returns the full output
 /// for callers that need stdout (e.g. `rev-parse`).
 pub(super) fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = Command::new(git)
+    let output = apply_clean_git_config(&mut Command::new(git))
         .arg("-C")
         .arg(repo)
         .args(args)
         .env_clear()
-        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
@@ -156,11 +156,10 @@ pub(super) fn init_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().to_path_buf();
     let git = required_git();
-    let init = Command::new(&git)
+    let init = apply_clean_git_config(&mut Command::new(&git))
         .args(["init", "--quiet"])
         .arg(&repo)
         .env_clear()
-        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .output()
         .unwrap();
     assert!(

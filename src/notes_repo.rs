@@ -40,12 +40,12 @@
 //! property load-bearing instead of relying on operator discipline.
 //!
 //! Host-config isolation: every child `git` runs under `env_clear`
-//! plus the `clean_git` config recipe (`HOME=/dev/null`,
-//! `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
-//! `GIT_CONFIG_COUNT=0`), so neither an inherited `GIT_DIR` /
-//! `GIT_DEFAULT_HASH` nor a host-wide `safe.bareRepository` /
-//! `init.defaultObjectFormat` setting can subvert the owning
-//! daemon's repo.
+//! plus the shared hardened recipe (`writ_core::git_env`, applied via
+//! `apply_clean_git_config` — see there for what each variable denies
+//! and why the list is not repeated here). So neither an inherited
+//! `GIT_DIR` / `GIT_DEFAULT_HASH` nor a host-wide
+//! `safe.bareRepository` / `init.defaultObjectFormat` setting can
+//! subvert the owning daemon's repo.
 //! We then point git at the repo via `--git-dir=<canonical_path>`
 //! instead of bare-repo discovery, which a hardened host can
 //! disable. See the `prepare_git_command` helper.
@@ -82,7 +82,6 @@ use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use crate::clean_git::CLEAN_GIT_CONFIG_ENV;
 use crate::core::{NotesRef, NotesRefError};
 use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome, SupervisorError};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
@@ -330,12 +329,10 @@ impl NotesRepo {
             HashWrite::Persist,
         )?;
         // `notes add` creates a commit on the notes ref, so it
-        // needs an author identity. The `clean_git` env recipe
-        // we run under (HOME=/dev/null, GIT_CONFIG_GLOBAL=/dev/null,
-        // GIT_CONFIG_NOSYSTEM=1) deliberately denies git access to
-        // every config source except the repo's local file, so we
-        // inject the identity via `-c` flags rather than rely on
-        // operator gitconfig. The values are placeholders — the
+        // needs an author identity. The shared hardened env recipe we
+        // run under deliberately denies git every config source except
+        // the repo's local file, so we inject the identity via `-c`
+        // flags rather than rely on operator gitconfig. The values are placeholders — the
         // commit author is not part of the audit trail; the signed
         // envelope inside the note body is.
         run_git(
@@ -696,13 +693,11 @@ enum CaptureOutput {
 /// configuration neutralised.
 ///
 /// `env_clear` strips every inherited env var — `GIT_DIR`,
-/// `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`, `GIT_DEFAULT_HASH`,
-/// `GIT_CONFIG_GLOBAL`, etc. — so a hostile or just unusual parent
-/// can never redirect or reconfigure the child. We then re-add the
-/// `clean_git` hardening recipe (`HOME=/dev/null`,
-/// `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
-/// `GIT_CONFIG_COUNT=0`) plus `PATH` so the git binary itself
-/// remains discoverable.
+/// `GIT_WORK_TREE`, `GIT_OBJECT_DIRECTORY`, `GIT_DEFAULT_HASH`, and
+/// the config-source overrides — so a hostile or just unusual parent
+/// can never redirect or reconfigure the child. We then re-apply the
+/// shared hardened recipe (`writ_core::git_env`) plus `PATH` so the
+/// git binary itself remains discoverable.
 ///
 /// `--git-dir=<repo>` is load-bearing alongside the env scrub:
 /// implicit `-C <bare-repo>` discovery fails on hosts hardened
@@ -716,9 +711,12 @@ fn prepare_git_command(repo: &Path, env: &InheritedEnv) -> Command {
     if let Some(path) = env.path.as_ref() {
         command.env("PATH", path);
     }
-    for (key, value) in CLEAN_GIT_CONFIG_ENV {
-        command.env(key, value);
-    }
+    // Via the shared applier, not the constant: the recipe includes a *removal*
+    // (`GIT_CONFIG`, which `git config` honours as `--file`) that a name/value
+    // loop cannot express. `env_clear` above already covers it, but this module
+    // runs `git config --local --get` to validate the repo, so the belt and
+    // braces are cheap and the applier keeps the recipe whole in one place.
+    writ_core::git_env::apply_clean_git_config(&mut command);
     let mut git_dir_arg = OsString::from("--git-dir=");
     git_dir_arg.push(repo);
     command.arg(git_dir_arg);
@@ -881,7 +879,7 @@ fn supervised_git_probed(
             stdin_input,
             stdout_mode,
             StderrMode::Capture,
-            |pid| probe(pid),
+            &mut probe,
         )
         .map_err(|source| supervisor_error_to_notes_error(source, args()))?;
 

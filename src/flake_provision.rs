@@ -490,9 +490,7 @@ fn apply_nix_env(command: &mut Command, home_dir: &Path) {
     // *denial* set from the shared constant, so a variable added there is not
     // silently missing here.
     command.env("HOME", home_dir);
-    for (name, value) in writ_core::git_env::GIT_CONFIG_DENY_ENV {
-        command.env(name, value);
-    }
+    writ_core::git_env::apply_git_config_denials_async(command);
     command.env("GIT_TERMINAL_PROMPT", "0");
 }
 

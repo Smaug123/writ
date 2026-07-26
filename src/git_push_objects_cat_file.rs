@@ -50,7 +50,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use crate::clean_git::{self, CLEAN_GIT_CONFIG_ENV, CLEAN_GIT_CURRENT_DIR, CleanGitError};
+use crate::clean_git::{self, CLEAN_GIT_CURRENT_DIR, CleanGitError};
 use crate::git_push_object_parse::{parse_commit_object, parse_tree_object};
 use crate::git_push_walker::{GitObjectSource, GitObjectSourceError, StagingCommit, StagingTree};
 use crate::process_spawn;
@@ -159,9 +159,7 @@ impl CatFileObjectSource {
         let program = clean_git::resolve_program_for_clean_env(git_program).await?;
         let mut command = Command::new(&program);
         command.env_clear();
-        for (name, value) in CLEAN_GIT_CONFIG_ENV {
-            command.env(name, value);
-        }
+        writ_core::git_env::apply_clean_git_config_async(&mut command);
         command.args([
             OsString::from("-C"),
             staging_repo.as_os_str().to_os_string(),

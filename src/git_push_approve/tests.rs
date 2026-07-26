@@ -18,6 +18,7 @@ use crate::git_push_promote::UpdateRefError;
 use crate::github_git_db::{CommitIdentity, GitDataError};
 use crate::vm_git::GitBranchName;
 use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
+use writ_core::git_env::apply_clean_git_config;
 
 // ---------- shared fixtures ----------
 
@@ -215,12 +216,11 @@ fn maybe_git() -> Option<PathBuf> {
 /// Run `git -C <repo> <args>` under the hardened env plus pinned
 /// committer identity so commit SHAs are deterministic across runs.
 fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = Command::new(git)
+    let output = apply_clean_git_config(&mut Command::new(git))
         .arg("-C")
         .arg(repo)
         .args(args)
         .env_clear()
-        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
@@ -1106,12 +1106,11 @@ async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
     .expect("prepare must fetch the prereq over dumb HTTP and unbundle the tip");
 
     for (what, sha) in [("prereq", origin.prereq()), ("bundle tip", origin.tip())] {
-        let exists = Command::new(&git)
+        let exists = apply_clean_git_config(&mut Command::new(&git))
             .arg("-C")
             .arg(staging.path())
             .args(["cat-file", "-e", sha.as_str()])
             .env_clear()
-            .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
             .status()
             .expect("spawning git cat-file failed");
         assert!(
@@ -1176,12 +1175,11 @@ async fn unbundle_invocation_runs_against_real_git() {
     // The bundled commit must now be present in the staging repo's
     // object database (no ref is created — that's the planner's
     // job — but `cat-file -e` confirms reachability).
-    let exists = Command::new(&git)
+    let exists = apply_clean_git_config(&mut Command::new(&git))
         .arg("-C")
         .arg(&staging)
         .args(["cat-file", "-e", head.as_str()])
         .env_clear()
-        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .status()
         .expect("spawning git cat-file failed");
     assert!(

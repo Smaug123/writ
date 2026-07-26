@@ -251,6 +251,13 @@ async fn run_clean_git_inner(
     let program = resolve_program_for_clean_env(invocation.program()).await?;
     let mut command = Command::new(program);
     command.env_clear();
+    // `env_clear` already removes `GIT_CONFIG`, but state it through the shared
+    // helper so the recipe stays whole if the clear is ever relaxed. (The
+    // `CleanGitEnv` vec carries the *settable* half; a removal cannot be a
+    // name/value pair, which is why both are applied.)
+    for name in writ_core::git_env::GIT_CONFIG_REMOVE_ENV {
+        command.env_remove(name);
+    }
     command.args(invocation.args());
     command.stdin(Stdio::null());
     command.current_dir(CLEAN_GIT_CURRENT_DIR);

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::vm_git_mirror_cache::GitCommitSha;
+use writ_core::git_env::apply_clean_git_config;
 
 /// A `flake.lock` declaring no inputs — the only network-free provisionable
 /// fixture, since the classifier (correctly) refuses local `path`/`file://`
@@ -48,10 +49,9 @@ pub(crate) fn tool_on_path(name: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn git(program: &Path, args: &[&str], cwd: &Path) {
-    let status = std::process::Command::new(program)
+    let status = apply_clean_git_config(&mut std::process::Command::new(program))
         .args(args)
         .current_dir(cwd)
-        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@e")
         .env("GIT_COMMITTER_NAME", "t")

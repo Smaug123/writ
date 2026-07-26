@@ -130,12 +130,15 @@ These hold across subsystems and are the reason to trust the whole:
   a wrong answer, it only becomes a bug later when one is updated and the other
   is not. This was not hypothetical: five partial copies of the process
   discipline had accumulated, and the `GIT_CONFIG_*` recipe had been re-typed at
-  eight sites, three of which silently omitted `GIT_CONFIG_COUNT=0`. Worse, the
-  recipe was *documented* as neutralising `GIT_CONFIG_PARAMETERS` via
+  eight sites, three of which silently omitted `GIT_CONFIG_COUNT=0`. Separately,
+  the recipe was *documented* as neutralising `GIT_CONFIG_PARAMETERS` via
   `GIT_CONFIG_COUNT=0` and did not — git parses that variable on an independent
-  path, so `-c`-style config injection passed through every site equally until
-  the recipe was given its own entry for it (`git_env.rs`, with a test that asks
-  real `git` rather than trusting the reasoning).
+  path. Every production caller also calls `env_clear`, which strips it anyway,
+  so no live hole existed there; the exposure was in test helpers, which layer the
+  recipe over an inherited environment. `git_env` now names the variable
+  explicitly, with a test that asks real `git` rather than trusting the
+  reasoning — because a recipe that is only safe when callers happen to do
+  something else as well is not a recipe you can reason about locally.
 
 ---
 

@@ -457,8 +457,98 @@ pub(crate) fn run_supervised_blocking_probed(
     // while the child is unreaped, so it has to happen here and nowhere later.
     let vanished_before_running = probe(child.id());
 
-    let pgid = process_group_id(child.id())?;
+    // Everything after the spawn runs inside `supervise_blocking_child` so that
+    // *no* error path can return while the child is still un-reaped. `?` on a
+    // post-spawn failure (an `fcntl`, a `poll`, a `waitid`) would otherwise skip
+    // the `child.wait()` below, and `std::process::Child::drop` deliberately does
+    // not reap — so each such failure would leave a zombie until the daemon
+    // exits. The failures are individually near-impossible; the leak is
+    // unbounded, which is the asymmetry that matters.
+    let pgid = match process_group_id(child.id()) {
+        Ok(pgid) => pgid,
+        Err(err) => {
+            // No pgid means no group to signal; still reap the child we made.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
     let mut cleanup_guard = ProcessGroupCleanupGuard::new(pgid);
+    let outcome = supervise_blocking_child(
+        &mut child,
+        &mut cleanup_guard,
+        timeout,
+        stdin_input,
+        stdout_byte_cap,
+    );
+    let (observation, stdout_buf, stderr_buf, child_exited) = match outcome {
+        Ok(state) => state,
+        Err(err) => {
+            // Kill the group and reap before surfacing, so a supervision failure
+            // costs us an error and not a process-table entry.
+            let _ = cleanup_guard.kill_now_io();
+            let _ = child.wait();
+            cleanup_guard.disarm();
+            return Err(err);
+        }
+    };
+
+    if !child_exited {
+        if matches!(observation, ChildExitObservation::StdoutCapExceeded) {
+            // The over-cap rejection closed the read end of stdout, so a child
+            // mid-write takes SIGPIPE and can already be dead — in which case
+            // `killpg` finds no signalable member and reports a benign EPERM on
+            // macOS. Mark the exit as observed so that EPERM is tolerated: we own
+            // this group (we created it with `process_group(0)`) and can always
+            // signal a live member, so EPERM here can only mean the group is
+            // already empty, never a real permission failure. Same reasoning as
+            // the async twin's `StdoutCapExceeded` arm.
+            cleanup_guard.mark_child_exit_observed();
+        }
+        cleanup_guard.kill_now()?;
+    }
+    let status = child.wait();
+    cleanup_guard.disarm();
+
+    match observation {
+        ChildExitObservation::Exited => {
+            let status = status.map_err(SupervisorError::Wait)?;
+            // Settled-flag backstop, mirroring the async twin: the drain may have
+            // crossed the cap in the same iteration the child exited.
+            if stdout_buf.overran() {
+                return Ok(SupervisedOutcome::StdoutCapExceeded {
+                    cap: stdout_byte_cap.expect("cap only set under Capture"),
+                });
+            }
+            Ok(SupervisedOutcome::Exited {
+                ran_nothing: child_ran_nothing(vanished_before_running, &status),
+                status,
+                stdout: stdout_buf.finish(),
+                stderr: stderr_buf.finish(),
+            })
+        }
+        ChildExitObservation::StdoutCapExceeded => Ok(SupervisedOutcome::StdoutCapExceeded {
+            cap: stdout_byte_cap.expect("cap only set under Capture"),
+        }),
+        ChildExitObservation::TimedOut => Ok(SupervisedOutcome::TimedOut),
+    }
+}
+
+/// The event loop of [`run_supervised_blocking`], factored out so its caller can
+/// guarantee the child is reaped on every error path.
+///
+/// Returns how the child left the loop plus the two capture buffers. Does not
+/// reap, kill on the way out, or interpret the exit status: those belong to the
+/// caller, which is the only place that can sequence them correctly against the
+/// cleanup guard.
+fn supervise_blocking_child(
+    child: &mut std::process::Child,
+    cleanup_guard: &mut ProcessGroupCleanupGuard,
+    timeout: Duration,
+    stdin_input: Option<&[u8]>,
+    stdout_byte_cap: Option<usize>,
+) -> Result<(ChildExitObservation, CaptureBuffer, CaptureBuffer, bool), SupervisorError> {
+    let pgid = process_group_id(child.id())?;
 
     // `Option` is the "still live" marker for each stream: taking a handle out
     // closes that fd, which is exactly how we signal EOF to the child (stdin) or
@@ -579,45 +669,7 @@ pub(crate) fn run_supervised_blocking_probed(
         }
     }
 
-    if !child_exited {
-        if matches!(observation, ChildExitObservation::StdoutCapExceeded) {
-            // The over-cap rejection closed the read end of stdout, so a child
-            // mid-write takes SIGPIPE and can already be dead — in which case
-            // `killpg` finds no signalable member and reports a benign EPERM on
-            // macOS. Mark the exit as observed so that EPERM is tolerated: we own
-            // this group (we created it with `process_group(0)`) and can always
-            // signal a live member, so EPERM here can only mean the group is
-            // already empty, never a real permission failure. Same reasoning as
-            // the async twin's `StdoutCapExceeded` arm.
-            cleanup_guard.mark_child_exit_observed();
-        }
-        cleanup_guard.kill_now()?;
-    }
-    let status = child.wait();
-    cleanup_guard.disarm();
-
-    match observation {
-        ChildExitObservation::Exited => {
-            let status = status.map_err(SupervisorError::Wait)?;
-            // Settled-flag backstop, mirroring the async twin: the drain may have
-            // crossed the cap in the same iteration the child exited.
-            if stdout_buf.overran() {
-                return Ok(SupervisedOutcome::StdoutCapExceeded {
-                    cap: stdout_byte_cap.expect("cap only set under Capture"),
-                });
-            }
-            Ok(SupervisedOutcome::Exited {
-                ran_nothing: child_ran_nothing(vanished_before_running, &status),
-                status,
-                stdout: stdout_buf.finish(),
-                stderr: stderr_buf.finish(),
-            })
-        }
-        ChildExitObservation::StdoutCapExceeded => Ok(SupervisedOutcome::StdoutCapExceeded {
-            cap: stdout_byte_cap.expect("cap only set under Capture"),
-        }),
-        ChildExitObservation::TimedOut => Ok(SupervisedOutcome::TimedOut),
-    }
+    Ok((observation, stdout_buf, stderr_buf, child_exited))
 }
 
 fn as_raw<T: std::os::fd::AsRawFd>(handle: &T) -> libc::c_int {

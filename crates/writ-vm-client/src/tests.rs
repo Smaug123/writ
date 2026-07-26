@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use writ_core::git_env::apply_clean_git_config;
 use writ_vm_git::{
     GUEST_IMAGE_REBUILD_COMMAND, VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION,
     WRIT_VM_ORIGINATED_TARGETS,
@@ -186,9 +187,8 @@ fn required_test_tool(name: &str) -> PathBuf {
 }
 
 fn run_test_git(git: &Path, args: &[&str]) {
-    let output = Command::new(git)
+    let output = apply_clean_git_config(&mut Command::new(git))
         .args(args)
-        .envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)
         .output()
         .unwrap();
     assert!(

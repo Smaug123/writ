@@ -82,34 +82,78 @@ fn offenders(needles: &[&str], allowed: &[&str]) -> Vec<String> {
     hits
 }
 
-/// The hardened Git environment must be *applied* from
-/// `writ_core::git_env`, never re-typed.
+/// The hardened Git environment must be *applied* from `writ_core::git_env`,
+/// never re-typed.
 ///
-/// The needles match the act of setting one of the variables on a `Command`
-/// (`.env("GIT_CONFIG_…"`), not merely mentioning its name — so doc comments and
-/// tests that *assert* a child saw the recipe are unaffected. That distinction is
-/// what keeps the guard specific enough to stay useful.
+/// The needles are the bare variable names, deliberately **not** tied to a
+/// particular setter spelling. An earlier version of this guard matched only
+/// `.env("GIT_CONFIG_…"`, which missed `.envs([("GIT_CONFIG_NOSYSTEM", "1"), …])`
+/// — i.e. exactly the style the migrated call sites were rewritten into. A guard
+/// blind to the codebase's own idiom is worse than none, because it reads as
+/// coverage.
+///
+/// The cost of matching bare names is that files legitimately *asserting* a child
+/// saw the recipe also match, so they are allowlisted individually below. That is
+/// the intended trade: adding a name to this list is a deliberate, reviewable act,
+/// whereas a new file quietly constructing the recipe is not.
 #[test]
 fn only_git_env_defines_the_hardened_git_recipe() {
     let hits = offenders(
+        // Every entry of the recipe, plus `GIT_CONFIG_SYSTEM` (the divergent
+        // spelling that started this) and `GIT_CONFIG` (the `--file` override).
         &[
-            r#".env("GIT_CONFIG_NOSYSTEM""#,
-            r#".env("GIT_CONFIG_GLOBAL""#,
-            r#".env("GIT_CONFIG_SYSTEM""#,
-            r#".env("GIT_CONFIG_COUNT""#,
-            r#"env("GIT_CONFIG_NOSYSTEM""#,
-            r#"env("GIT_CONFIG_GLOBAL""#,
-            r#"env("GIT_CONFIG_SYSTEM""#,
-            r#"env("GIT_CONFIG_COUNT""#,
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+        ],
+        &[
+            "crates/writ-core/src/git_env.rs",
+            // Assert on the recipe rather than defining it: they check that a
+            // spawned child actually saw the hardened values.
+            "src/clean_git.rs",
+            "src/notes_repo/tests.rs",
+            "src/git_push_approve/tests.rs",
+            "src/git_push_walker/branch_creation_plan_tests.rs",
+            "src/vm_git_bundle.rs",
+        ],
+    );
+    assert!(
+        hits.is_empty(),
+        "the hardened Git environment must come from `writ_core::git_env` — call \
+         `apply_clean_git_config` (or `apply_git_config_denials`), not the raw \
+         constants and not a hand-written copy. Note the recipe includes a \
+         *removal* (`GIT_CONFIG`) that a name/value list cannot express, so \
+         `.envs(CLEAN_GIT_CONFIG_ENV)` is itself incomplete.\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// The recipe constants must not be applied directly outside `git_env`.
+///
+/// Separate from the test above because it catches a *correct-looking* misuse
+/// rather than a re-typing: `.envs(CLEAN_GIT_CONFIG_ENV)` sets every value in the
+/// recipe and still leaves `GIT_CONFIG` inherited, because a removal cannot be a
+/// `(name, value)` pair. The constants remain public for assertions and for
+/// callers composing their own env; applying them is what must go through the
+/// helper.
+#[test]
+fn the_recipe_constants_are_not_applied_outside_git_env() {
+    let hits = offenders(
+        &[
+            ".envs(writ_core::git_env::CLEAN_GIT_CONFIG_ENV)",
+            ".envs(CLEAN_GIT_CONFIG_ENV)",
+            ".envs(writ_core::git_env::GIT_CONFIG_DENY_ENV)",
+            ".envs(GIT_CONFIG_DENY_ENV)",
         ],
         &["crates/writ-core/src/git_env.rs"],
     );
     assert!(
         hits.is_empty(),
-        "the hardened Git environment must come from `writ_core::git_env` \
-         (`CLEAN_GIT_CONFIG_ENV`, `GIT_CONFIG_DENY_ENV`, or \
-         `apply_clean_git_config`), not be written out again. A partial copy is \
-         how `GIT_CONFIG_COUNT=0` went missing at three call sites.\n  {}",
+        "apply the recipe with `apply_clean_git_config` / \
+         `apply_git_config_denials`; `.envs(...)` alone silently omits the \
+         `GIT_CONFIG` removal.\n  {}",
         hits.join("\n  ")
     );
 }
