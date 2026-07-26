@@ -8,12 +8,13 @@ independently reviewable and independently shippable, ordered so the cheap,
 high-leverage moves land first. No code moves in the doc PR; this file exists so
 the work is scoped and ready to pick up.
 
-**Status (2026-07-26): closed out.** Slices 0–5b are implemented, Slices 6 and 7
-were investigated and *declined* on the boundary-cost framework below (no
-`writ-git`, no `writ-vm-host` — the evidence is in their sections), and Slice 8
-is a standing opportunistic habit rather than a task list: no file in the tree
+**Status (2026-07-26): closed out.** Slices 0–5b are implemented. Slices 6 and 7
+each proposed one more crate and *declined* it on the boundary-cost framework
+below — no `writ-git`, no `writ-vm-host`, evidence in their sections — though
+Slice 6's in-crate hygiene (the trailer extraction and the module renames) did
+land. Slice 8 is a standing habit rather than a task list: no file in the tree
 now exceeds ~2.1k lines, and the largest, `agent_vm_lifecycle.rs`, is at its
-intrinsic domain size. Nothing in this backlog is waiting to be picked up.
+intrinsic domain size. Nothing here is waiting to be picked up.
 
 ## Motivation
 
@@ -103,28 +104,25 @@ coupling graph.
 
 ### Slice 1 — sever the `host` → `vm-client` feature entanglement (implemented)
 
-**Highest leverage-to-cost in the list.** Today host code uses exactly two
-things that live behind `vm-client`: the env-var-name constants
-`VM_BROKER_URL_ENV`/`VM_BROKER_TOKEN_ENV` (re-exported at
-`agent_vm_daemon.rs:52`), and the `pub use writ_vm_git as vm_git` re-export
-gated on `vm-client` at `lib.rs:101` (host uses `crate::vm_git` in ~20 modules).
-For those two, `host` pulls in the whole 3.3k-line `vm_client.rs` guest client
-and `reqwest`-for-guest that it never runs.
+**Highest leverage-to-cost in the list.** Host code used exactly two things
+that lived behind `vm-client`: the env-var-name constants
+`VM_BROKER_URL_ENV`/`VM_BROKER_TOKEN_ENV`, and the `pub use writ_vm_git as
+vm_git` re-export (host uses `crate::vm_git` in ~20 modules). For those two,
+`host` pulled in the whole 3.3k-line `vm_client.rs` guest client and
+`reqwest`-for-guest that it never runs.
 
-Steps:
-- Move the two env-var-name constants to `writ-vm-git` (they are a shared
-  host↔guest contract, not guest-client internals).
-- Add a `#[cfg(feature = "host")] pub use writ_vm_git as vm_git;` so host gets
-  the wire types without `vm-client`.
-- Add `dep:reqwest` directly to the `host` feature (host needs it for the GitHub
-  minter and the VM proxies — today it only gets it transitively via
-  `vm-client`).
-- Remove `"vm-client"` from the `host` feature list (`Cargo.toml:16`).
+All four steps landed as planned: the two constants moved to `writ-vm-git`
+(they are a shared host↔guest contract, not guest-client internals, and
+`agent_vm_daemon` now re-exports them from there under its own names); the
+`vm_git` re-export is gated `#[cfg(any(feature = "host", feature =
+"vm-client"))]` rather than the sketch's host-only, since both surfaces need
+the wire types; `dep:reqwest` and `dep:writ-vm-git` are direct `host` deps; and
+`"vm-client"` is gone from the `host` feature list, with the reason recorded in
+a `Cargo.toml` comment so it does not get re-added by reflex.
 
-**Done when** a `--no-default-features --features host` build does not compile
-`vm_client.rs`, `--all-features --all-targets` clippy/test/doc all pass, and the
-`writ-vm` (`--no-default-features --features vm-client`) build is unchanged.
-Mechanical; no behaviour change.
+`--no-default-features --features host` therefore no longer compiles
+`vm_client.rs`, and the `writ-vm` (`--no-default-features --features
+vm-client`) build is unchanged. Mechanical; no behaviour change.
 
 ### Slice 2 — disambiguate the two `nix_cache` modules (implemented)
 
@@ -140,9 +138,11 @@ Renamed by layer (they are domain-lib vs HTTP-shell, see `architecture.md` §5.6
 
 Pure `git mv` + word-boundary-guarded rewrite of `crate::nix_cache` paths, fully
 compiler-checked. The `flake_provision.rs` / `flake_provision_from_mirror.rs` /
-`vm_http/flake_provision.rs` trio is **deferred**: those names do not actually
-*collide* (only the two `nix_cache` did), so renaming them is lower-value churn
-better folded into the god-file/naming pass (Slice 8).
+`vm_http/flake_provision.rs` trio was **deferred** here — those names do not
+actually *collide* (only the two `nix_cache` did), so renaming them is
+lower-value churn — and then **declined** under Slice 6's naming pass: the
+shared prefix marks a real subsystem rather than accretion order. No rename is
+outstanding.
 
 ### Slice 3 — correct stale in-code claims (implemented); vestigial-replay delete re-scoped
 
@@ -352,7 +352,7 @@ single file exceeds what one reading can hold.
     `dispatch_message`, so no test edits were needed.
 
   `server.rs` is now pure transport, dispatch, and connection handling.
-- **`agent_vm_lifecycle.rs` (3215 → 2405, started):** the largest root-crate
+- **`agent_vm_lifecycle.rs` (3215 → 2405, first pass):** the largest root-crate
   god-file. Two inherent `impl` blocks lifted into submodules — inherent-impl
   moves need no call-site changes (method resolution is by type), so only the
   handful of private methods invoked from *outside* their impl needed
@@ -366,8 +366,9 @@ single file exceeds what one reading can hold.
     function) needed `pub(super)`; the twelve other private builders stayed
     private.
 
-  Remaining clean seam: the session-teardown/`run_*_cleanup_until_absent`
-  machinery (~394 lines, with a dedicated `cleanup_tests.rs`).
+  The clean seam this pass left — the session-teardown/
+  `run_*_cleanup_until_absent` machinery (~394 lines, with a dedicated
+  `cleanup_tests.rs`) — was taken later; see the last bullet in this list.
 - **`protocol.rs` (2296 → `protocol/mod.rs` 2072 + `views.rs` 246):** the
   payload types the wire messages *carry* — the staged-push views, the
   `SignedRunMetadata` envelope, `ReconcileOutcome`, and the `RejectionReason`
@@ -382,8 +383,8 @@ single file exceeds what one reading can hold.
   by-type inherent-impl move needed zero `pub(super)` bumps and zero call-site
   changes; the struct, its timeout/error types, the domain types it returns, and
   the wire DTOs stay in the parent, reached via `super`. (~1.6k of the original
-  lines are the inline test module — a candidate future test-file split, as done
-  for `nix_binary_cache.rs` below and still pending for `git_push_approve.rs`.)
+  lines were the inline test module, flagged here as a candidate test-file
+  split; that split landed in the batch below, as did `git_push_approve.rs`'s.)
 - **`broker_vm.rs` (2636 → 2422):** the `BrokerVmPlan` launch/teardown builders
   (network-create/run/inspect/logs/stop invocations — a 214-line inherent
   `impl`) moved to `broker_vm/plan.rs`. Ten of eleven methods are `pub` and the
@@ -410,7 +411,7 @@ single file exceeds what one reading can hold.
   bulk was a ~1.7k-line inline test module. Relocated to
   `crates/writ-vm-client/src/tests.rs`; the 41 tests run unchanged. (No
   `include_*!` paths this time, so no fixup.)
-- **`bailiff` binary (`src/bin/bailiff.rs`, 2428 → 1255):** the CLI command
+- **`bailiff` binary (`crates/bailiff/src/bin/bailiff.rs`, 2428 → 1255):** the CLI command
   surface plus a ~1.2k-line inline test module of clap-parsing/dispatch tests.
   Relocated to `src/bin/bailiff/tests.rs`. A binary's entry file is a *crate
   root*, so a bare `mod tests;` resolves to a sibling `src/bin/tests.rs` — which
