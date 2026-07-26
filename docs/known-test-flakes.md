@@ -59,7 +59,7 @@ waited out.
 > seen, it need not: the kernel's reckoning of pids passes over the dead, and so
 > answers `ESRCH` for a child that ran, did its work, and expired. A test now
 > stands as witness, touching a file before it dies by the knife
-> (`getpgid_reports_esrch_for_a_child_that_did_run`). The mark is therefore a
+> (`getpgid_does_not_portably_prove_a_child_never_ran`). The mark is therefore a
 > *likelihood* and not a proof, and the licence to re-run must be sought from
 > the command rather than from the corpse. It is so sought now: each invocation
 > declares for itself, at the place it is written, whether repetition can harm

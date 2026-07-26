@@ -145,7 +145,7 @@ the pid never became a live process.
 > is the only platform the flake was ever observed on. The zombie rule holds on
 > Linux; XNU's pid lookup **excludes zombies**, so `getpgid` answers `ESRCH` for a
 > child that ran, took effect, and exited without being reaped. Demonstrated by
-> `process_supervisor::blocking_tests::getpgid_reports_esrch_for_a_child_that_did_run`,
+> `process_supervisor::blocking_tests::getpgid_does_not_portably_prove_a_child_never_ran`,
 > which touches a file and then `kill -9`s itself: the marker exists, the status is
 > `SIGKILL`, and the probe still reports absent. Both conjuncts of the "proof" are
 > therefore satisfiable *after an observable side effect*.

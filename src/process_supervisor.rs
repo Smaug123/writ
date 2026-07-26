@@ -246,17 +246,27 @@ pub(crate) async fn run_supervised(
             // Both joins are bounded by the same deadline that bounded the
             // child: the contract is a wall-clock bound on the whole call, and
             // the child exiting is not the last thing that can block it.
+            // Both early returns below abort the *stderr* drain on the way out.
+            // Dropping its `JoinHandle` would only detach it, leaving a task
+            // holding a pipe fd for as long as whatever is keeping the write end
+            // open lives — which, in the escaped-descendant case, is unbounded.
             let stdout = match join_capture(stdout_drain, deadline).await {
                 CaptureJoin::NotCaptured => Vec::new(),
                 CaptureJoin::Finished(DrainOutput {
                     read_error: Some(error),
                     ..
-                }) => return Err(SupervisorError::CaptureRead(error)),
+                }) => {
+                    abort_captures(None, stderr_drain);
+                    return Err(SupervisorError::CaptureRead(error));
+                }
                 CaptureJoin::Finished(DrainOutput { bytes, .. }) => bytes,
                 // The capture never reached EOF, so we cannot certify it is
                 // complete. Report the deadline rather than a short stdout that
                 // a caller would parse as the child's whole answer.
-                CaptureJoin::DeadlineExpired => return Ok(SupervisedOutcome::TimedOut),
+                CaptureJoin::DeadlineExpired => {
+                    abort_captures(None, stderr_drain);
+                    return Ok(SupervisedOutcome::TimedOut);
+                }
             };
             // Stderr is diagnostics under a tail cap, so an incomplete capture
             // is already an accepted outcome here: keep whatever arrived and let
@@ -418,16 +428,20 @@ enum CaptureJoin {
 /// outlives the supervisor's advertised wall-clock bound *indefinitely* — the
 /// one failure mode a timeout exists to prevent.
 ///
-/// On expiry the task is aborted, which drops the read end and releases the fd
-/// rather than leaking a drain that can never finish.
+/// On expiry the task is **aborted**, releasing the read end. Note the
+/// `&mut handle`: `timeout_at` would otherwise consume the `JoinHandle`, and
+/// dropping a `JoinHandle` *detaches* the task rather than cancelling it — so the
+/// drain would keep running, holding the fd, in exactly the scenario this
+/// function exists to bound. Every supervised run against such a child would leak
+/// one task and one descriptor.
 async fn join_capture(
     handle: Option<tokio::task::JoinHandle<DrainOutput>>,
     deadline: tokio::time::Instant,
 ) -> CaptureJoin {
-    let Some(handle) = handle else {
+    let Some(mut handle) = handle else {
         return CaptureJoin::NotCaptured;
     };
-    match tokio::time::timeout_at(deadline, handle).await {
+    match tokio::time::timeout_at(deadline, &mut handle).await {
         Ok(Ok(output)) => CaptureJoin::Finished(output),
         // The drain task panicked or was cancelled. It holds the only copy of
         // the captured bytes, so there is nothing to return and no basis for
@@ -438,7 +452,10 @@ async fn join_capture(
                 "capture drain task did not finish: {join_error}"
             ))),
         }),
-        Err(_elapsed) => CaptureJoin::DeadlineExpired,
+        Err(_elapsed) => {
+            handle.abort();
+            CaptureJoin::DeadlineExpired
+        }
     }
 }
 
@@ -459,7 +476,7 @@ async fn join_capture(
 /// could only mean the pid never became a live process. That rule holds on Linux
 /// and **not on this platform**: XNU's pid lookup excludes zombies, so `getpgid`
 /// answers `ESRCH` for a child that ran, took effect, and exited. See
-/// `getpgid_reports_esrch_for_a_child_that_did_run`, which demonstrates it
+/// `getpgid_does_not_portably_prove_a_child_never_ran`, which demonstrates it
 /// against a child that writes a file before dying.
 ///
 /// So the observation is a *signature*, not a proof, and the caller — not this
@@ -1529,7 +1546,9 @@ mod tests {
     /// already empty) and the read end never sees EOF.
     ///
     /// This is the one failure mode a timeout exists to prevent, so the assertion
-    /// is on the wall clock as much as on the outcome.
+    /// is on the wall clock as much as on the outcome. That the abandoned drain is
+    /// also *cancelled* rather than left running is the subject of
+    /// [`an_abandoned_capture_drain_is_cancelled_not_detached`].
     #[tokio::test]
     async fn an_escaped_descendant_cannot_hold_the_supervisor_past_the_deadline() {
         // `setsid(2)` has no shell builtin and macOS ships no `setsid(1)`, so the
@@ -1544,55 +1563,109 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().expect("tempdir");
-        let escaped = dir.path().join("escaped");
-        // The helper must confirm the escape *before* the leader exits: otherwise
-        // the supervisor's killpg races it and kills it while still in the group,
-        // which would make this test pass for the wrong reason.
-        let script = format!(
-            "{perl} -e 'use POSIX; POSIX::setsid() or exit 3; \
-             open(F, \">\", \"{escaped}\") or exit 4; print F \"escaped\\n\"; close F; \
-             sleep 120' & \
-             i=0; while [ ! -f {escaped} ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; \
-             exit 0",
-            perl = perl.display(),
-            escaped = escaped.display(),
-        );
-        let mut command = Command::new(locate_on_path("sh"));
-        command.arg("-c").arg(script);
+        let timeout = Duration::from_secs(1);
+        {
+            let escaped = dir.path().join("escaped");
+            // The helper must confirm the escape *before* the leader exits:
+            // otherwise the supervisor's killpg races it and kills it while still
+            // in the group, which would make this test pass for the wrong reason.
+            // It outlives the deadline severalfold but not by so much that a
+            // failing run leaves long-lived strays behind.
+            let script = format!(
+                "{perl} -e 'use POSIX; POSIX::setsid() or exit 3; \
+                 open(F, \">\", \"{escaped}\") or exit 4; print F \"escaped\\n\"; close F; \
+                 sleep 8' & \
+                 i=0; while [ ! -f {escaped} ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; \
+                 exit 0",
+                perl = perl.display(),
+                escaped = escaped.display(),
+            );
+            let mut command = Command::new(locate_on_path("sh"));
+            command.arg("-c").arg(script);
 
-        let timeout = Duration::from_secs(2);
-        let started = std::time::Instant::now();
-        let outcome = run_supervised(
-            &mut command,
-            timeout,
-            StdoutMode::Capture {
-                byte_cap: 64 * 1024,
-            },
-            StderrMode::Capture,
-        )
-        .await
-        .expect("supervised sh run");
-        let elapsed = started.elapsed();
+            let started = std::time::Instant::now();
+            let outcome = run_supervised(
+                &mut command,
+                timeout,
+                StdoutMode::Capture {
+                    byte_cap: 64 * 1024,
+                },
+                StderrMode::Capture,
+            )
+            .await
+            .expect("supervised sh run");
+            let elapsed = started.elapsed();
 
-        if !escaped.exists() {
-            eprintln!("skipping: the helper never confirmed its setsid escape");
-            return;
+            if !escaped.exists() {
+                eprintln!("skipping: the helper never confirmed its setsid escape");
+                return;
+            }
+            assert!(
+                elapsed < Duration::from_secs(30),
+                "the call must return on the supervisor's schedule, not the escaped \
+                 helper's: took {elapsed:?} against a {timeout:?} timeout"
+            );
+            // The leader exits cleanly, so the exit poll observes `Exited`; the
+            // capture then cannot reach EOF, and an incomplete capture must be
+            // reported as the deadline rather than as a short but complete stdout.
+            match outcome {
+                SupervisedOutcome::TimedOut => {}
+                other => panic!(
+                    "expected TimedOut once the capture could not complete, got {}",
+                    outcome_name(&other)
+                ),
+            }
         }
+    }
+
+    /// A drain abandoned at the deadline must be **cancelled**, not merely dropped.
+    ///
+    /// `tokio::time::timeout_at` consumes the `JoinHandle` it is given, and dropping
+    /// a `JoinHandle` *detaches* the task — it keeps running, holding the pipe
+    /// descriptor it was reading. Against a child whose capture can never reach EOF
+    /// that is one task and one descriptor retained per supervised run, unbounded
+    /// over the daemon's lifetime.
+    ///
+    /// The property is observed from inside the task: a guard whose `Drop` fires
+    /// only when the task's future is dropped, which cancellation does and
+    /// detaching does not. Measuring the process's open descriptors instead was the
+    /// first attempt and is unsound here — the test binary is one process with many
+    /// threads, so `/dev/fd` is shared with every concurrently running test.
+    #[tokio::test]
+    async fn an_abandoned_capture_drain_is_cancelled_not_detached() {
+        struct CancelFlag(Arc<AtomicBool>);
+        impl Drop for CancelFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let handle: tokio::task::JoinHandle<DrainOutput> = tokio::spawn(async move {
+            let _guard = CancelFlag(flag);
+            // Stands in for a drain whose pipe never reaches EOF.
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // A deadline already in the past, so the abandon path is taken at once.
+        let joined = join_capture(Some(handle), tokio::time::Instant::now()).await;
         assert!(
-            elapsed < Duration::from_secs(30),
-            "the call must return on the supervisor's schedule, not the escaped \
-             helper's: took {elapsed:?} against a {timeout:?} timeout"
+            matches!(joined, CaptureJoin::DeadlineExpired),
+            "an already-expired deadline must abandon the drain"
         );
-        // The leader exits cleanly, so the exit poll observes `Exited`; the
-        // capture then cannot reach EOF, and an incomplete capture must be
-        // reported as the deadline rather than as a short but complete stdout.
-        match outcome {
-            SupervisedOutcome::TimedOut => {}
-            other => panic!(
-                "expected TimedOut once the capture could not complete, got {}",
-                outcome_name(&other)
-            ),
+
+        for _ in 0..200 {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        panic!(
+            "the abandoned drain was still running two seconds later: it was \
+             detached rather than aborted, so it keeps its pipe descriptor"
+        );
     }
 
     fn outcome_name(outcome: &SupervisedOutcome) -> &'static str {
@@ -1855,7 +1928,7 @@ mod blocking_tests {
     ///
     /// From #354 (`f36b4c0`); the predicate moved here when the supervisor took
     /// ownership of the spawn. What it does *not* establish is the subject of
-    /// [`getpgid_reports_esrch_for_a_child_that_did_run`].
+    /// [`getpgid_does_not_portably_prove_a_child_never_ran`].
     #[test]
     fn the_born_dead_signature_needs_both_an_absent_pid_and_a_sigkill() {
         use std::os::unix::process::ExitStatusExt;
@@ -1897,8 +1970,20 @@ mod blocking_tests {
     /// after an observable effect, the signature cannot authorise replaying a
     /// command that must not be applied twice — which is why the retry decision
     /// lives with the caller, per invocation.
+    ///
+    /// Asserted on macOS only, because macOS is where it was measured. The zombie
+    /// rule is expected to hold on Linux, making the probe answer `false` there
+    /// and these assertions fail — but "expected" is not "verified", and the point
+    /// of this test is to record a measurement rather than to encode a belief
+    /// about a platform this developer cannot run. Either way the conclusion is
+    /// unchanged: a proof that holds on only some of the platforms the daemon runs
+    /// on is not a proof the shared supervisor can offer its callers.
     #[test]
-    fn getpgid_reports_esrch_for_a_child_that_did_run() {
+    fn getpgid_does_not_portably_prove_a_child_never_ran() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: documents an XNU-specific behaviour, measured there only");
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("the-child-ran");
         // Touch the marker, then die by SIGKILL — the child's own doing, so no
