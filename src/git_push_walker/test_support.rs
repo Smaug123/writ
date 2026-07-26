@@ -10,6 +10,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use crate::github_git_db::GitDataHttp;
+use writ_core::git_env::apply_clean_git_config;
 
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
@@ -118,23 +119,16 @@ pub(super) fn required_git() -> PathBuf {
 /// runs and machines. Asserts success; returns the full output
 /// for callers that need stdout (e.g. `rev-parse`).
 pub(super) fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = Command::new(git)
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("HOME", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-        .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-        .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
-        .output()
-        .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
+    let output =
+        apply_clean_git_config(Command::new(git).arg("-C").arg(repo).args(args).env_clear())
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
+            .output()
+            .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
     assert!(
         output.status.success(),
         "git -C {} {args:?} failed with {}: stdout={:?} stderr={}",
@@ -159,16 +153,14 @@ pub(super) fn init_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().to_path_buf();
     let git = required_git();
-    let init = Command::new(&git)
-        .args(["init", "--quiet"])
-        .arg(&repo)
-        .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("HOME", "/dev/null")
-        .output()
-        .unwrap();
+    let init = apply_clean_git_config(
+        Command::new(&git)
+            .args(["init", "--quiet"])
+            .arg(&repo)
+            .env_clear(),
+    )
+    .output()
+    .unwrap();
     assert!(
         init.status.success(),
         "git init failed: {}",

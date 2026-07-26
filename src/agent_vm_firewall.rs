@@ -21,6 +21,7 @@ use crate::core::{
     Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfRuleset, SessionId, render_pf,
     session_firewall_pf_ruleset,
 };
+use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome};
 
 /// The host bridge for a session's network is created a beat after `container
 /// run` returns and its members attach shortly after, so the privileged helper
@@ -65,36 +66,35 @@ pub fn discover_session_bridge_interfaces(
 ) -> Result<GuestBridgeDiscovery, BridgeDiscoveryError> {
     let mut last: Option<BridgeDiscoveryError> = None;
     for attempt in 0..BRIDGE_DISCOVERY_ATTEMPTS {
-        let err: BridgeDiscoveryError =
-            match run_with_etxtbsy_retry(|| Command::new(ifconfig).output()) {
-                Ok(output) if output.status.success() => {
-                    match parse_bridge_for_gateway(
-                        &String::from_utf8_lossy(&output.stdout),
-                        gateway,
-                        min_members,
-                    ) {
-                        Ok(discovery) => return Ok(discovery),
-                        Err(
-                            err @ (GuestBridgeDiscoveryError::NoBridgeForGateway(_)
-                            | GuestBridgeDiscoveryError::BridgeMembersNotReady { .. }),
-                        ) => err.into(),
-                        Err(err) => return Err(err.into()),
-                    }
+        let err: BridgeDiscoveryError = match capture_output(Command::new(ifconfig)) {
+            Ok(output) if output.status.success() => {
+                match parse_bridge_for_gateway(
+                    &String::from_utf8_lossy(&output.stdout),
+                    gateway,
+                    min_members,
+                ) {
+                    Ok(discovery) => return Ok(discovery),
+                    Err(
+                        err @ (GuestBridgeDiscoveryError::NoBridgeForGateway(_)
+                        | GuestBridgeDiscoveryError::BridgeMembersNotReady { .. }),
+                    ) => err.into(),
+                    Err(err) => return Err(err.into()),
                 }
-                Ok(output) => BridgeDiscoveryError::Failed {
-                    program: ifconfig.display().to_string(),
-                    status: output
-                        .status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "signal".into()),
-                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-                },
-                Err(source) => BridgeDiscoveryError::Run {
-                    program: ifconfig.display().to_string(),
-                    source,
-                },
-            };
+            }
+            Ok(output) => BridgeDiscoveryError::Failed {
+                program: ifconfig.display().to_string(),
+                status: output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            },
+            Err(source) => BridgeDiscoveryError::Run {
+                program: ifconfig.display().to_string(),
+                source,
+            },
+        };
         last = Some(err);
         if attempt + 1 < BRIDGE_DISCOVERY_ATTEMPTS {
             std::thread::sleep(BRIDGE_DISCOVERY_DELAY);
@@ -293,12 +293,12 @@ impl PfctlInvocation {
     /// (`-sr`) where pfctl may exit non-zero on an empty/absent anchor yet still
     /// print the (empty) ruleset to stdout.
     fn output(&self, pfctl: &Path) -> Result<Output, PfctlError> {
-        run_with_etxtbsy_retry(|| Command::new(pfctl).args(&self.args).output()).map_err(|source| {
-            PfctlError::Run {
-                program: pfctl.display().to_string(),
-                args: self.args.join(" "),
-                source,
-            }
+        let mut command = Command::new(pfctl);
+        command.args(&self.args);
+        capture_output(command).map_err(|source| PfctlError::Run {
+            program: pfctl.display().to_string(),
+            args: self.args.join(" "),
+            source,
         })
     }
 
@@ -320,42 +320,87 @@ impl PfctlInvocation {
     }
 }
 
-/// Maximum retries when a just-written program cannot yet be executed. The
-/// window that produces `ETXTBSY` clears within microseconds, so a handful of
-/// 1 ms retries is comfortably enough while still failing fast on a program
-/// that is genuinely un-runnable.
-const ETXTBSY_MAX_RETRIES: u32 = 64;
+/// Wall-clock bound on a single `pfctl`/`ifconfig` invocation. Both are small
+/// local system binaries that answer in milliseconds; the bound exists so a
+/// wedged one fails visibly instead of parking the privileged helper.
+const PF_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Run `spawn`, retrying only while it fails with `ETXTBSY` ("text file busy").
+/// Cap on captured stdout. The largest legitimate output is a full `ifconfig`
+/// listing or a session anchor's ruleset — kilobytes. 1 MiB is far beyond either
+/// and bounds a malfunctioning binary.
+const PF_COMMAND_STDOUT_CAP: usize = 1024 * 1024;
+
+/// Run `command` to completion under the shared supervisor and collect its
+/// output.
 ///
-/// Executing a program that was written moments earlier can transiently fail
-/// with `ETXTBSY`: if another thread in this process `fork`s (e.g. a concurrent
-/// `Command::spawn` in a parallel test) during the window between the program
-/// file's creation and our `execve`, the child inherits the writer's still-open
-/// fd, and Linux refuses to exec a file that any process holds open for
-/// writing. That child clears the condition within microseconds when it execs,
-/// so a bounded retry resolves it. Every other spawn error propagates
-/// immediately (a non-zero *exit* is not a spawn error and never reaches here).
+/// Goes through [`process_supervisor::run_supervised_blocking`] rather than
+/// `process_spawn::output` for a specific reason: `process_spawn::output` drains
+/// two piped streams by spawning a reader thread, and that `thread::Builder`
+/// spawn is *not* covered by the spawn-refusal retry. Under thread/process
+/// exhaustion it fails **after** `pfctl` has already run, so the caller would see
+/// "cannot run pfctl" for a command that may have just installed or flushed
+/// firewall rules — the worst possible misreport for this subsystem. The
+/// supervisor drains both pipes from one non-blocking `poll(2)` loop, so no
+/// thread is involved and that window does not exist.
 ///
-/// This never fires in production — `/sbin/pfctl` is a stable system binary,
-/// not something writ writes — but it makes the pfctl unit tests, which write a
-/// fake `pfctl` and immediately exec it alongside other process-spawning tests,
-/// robust under load.
-fn run_with_etxtbsy_retry<T, F>(mut spawn: F) -> std::io::Result<T>
-where
-    F: FnMut() -> std::io::Result<T>,
-{
-    let mut attempts = 0;
-    loop {
-        match spawn() {
-            Err(err)
-                if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < ETXTBSY_MAX_RETRIES =>
-            {
-                attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            result => return result,
-        }
+/// Supervision also gets `pfctl` a timeout and a process-group kill, which it
+/// previously had neither of. `Stdio::null()` on stdin is deliberate: neither
+/// binary reads stdin here, and inheriting the parent's would let a misinvocation
+/// block on the terminal.
+///
+/// The spawn retry inside the supervisor never fires in production —
+/// `/sbin/ifconfig` and `/sbin/pfctl` are stable system binaries, not files writ
+/// writes — but it keeps the pfctl unit tests, which write a fake `pfctl` and
+/// immediately exec it alongside other process-spawning tests, robust under load.
+fn capture_output(mut command: Command) -> std::io::Result<Output> {
+    capture_output_with_timeout(&mut command, PF_COMMAND_TIMEOUT)
+}
+
+/// [`capture_output`] with an explicit deadline. Only tests shorten it;
+/// production always uses [`PF_COMMAND_TIMEOUT`].
+fn capture_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    command.stdin(std::process::Stdio::null());
+    let outcome = process_supervisor::run_supervised_blocking(
+        command,
+        timeout,
+        None,
+        StdoutMode::Capture {
+            byte_cap: PF_COMMAND_STDOUT_CAP,
+        },
+        StderrMode::Capture,
+    )
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    match outcome {
+        SupervisedOutcome::Exited {
+            status,
+            stdout,
+            stderr,
+            // pfctl/ifconfig are idempotent status queries and rule loads; a
+            // born-dead retry belongs with the caller that needs it (notes_repo),
+            // not here.
+            born_dead_signature: _,
+        } => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        // Both of these killed the process group, so the command's effect is
+        // indeterminate. Surface an error rather than a synthesised exit status:
+        // a caller must not read "did not succeed" as "did not act".
+        SupervisedOutcome::TimedOut => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "command did not finish within {timeout:?}; its process group \
+                 was killed and its effect is indeterminate"
+            ),
+        )),
+        SupervisedOutcome::StdoutCapExceeded { cap } => Err(std::io::Error::other(format!(
+            "command wrote more than the {cap}-byte stdout cap; its process \
+             group was killed and its effect is indeterminate"
+        ))),
     }
 }
 
@@ -790,47 +835,46 @@ mod tests {
         assert!(pf_anchor_has_rules("   pass in quick proto tcp   "));
     }
 
+    /// A wedged `pfctl` is killed at the deadline rather than parking the
+    /// privileged helper forever.
+    ///
+    /// `pfctl` invocations previously had no timeout at all. Routing them through
+    /// the shared supervisor is what supplies one; this pins that it is actually
+    /// wired up, since a supervisor call with a generous timeout looks identical
+    /// to an unsupervised one until something hangs.
+    #[test]
+    fn a_wedged_pf_command_is_killed_at_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("hanging-pfctl");
+        // `read` from a fifo-less stdin returns immediately, so sleep instead —
+        // located absolutely because the supervisor does not clear the env here,
+        // but PATH lookups inside the script are not worth relying on.
+        std::fs::write(&tool, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tool, perms).unwrap();
+
+        let started = std::time::Instant::now();
+        let mut command = Command::new(&tool);
+        let err = capture_output_with_timeout(&mut command, Duration::from_millis(300))
+            .expect_err("a child that never exits must not be waited on forever");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "expected a timeout, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must return at the deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A fake `pfctl` that prints `sr_output` and exits `sr_exit` for
     /// `-a <anchor> -sr`, and exits 0 for every other invocation — so a flush
     /// can "succeed" yet leave the anchor non-empty, and a status read can exit
     /// non-zero while still reporting an empty ruleset.
-    #[test]
-    fn etxtbsy_retry_succeeds_once_the_file_is_no_longer_busy() {
-        let mut attempts = 0;
-        let result = run_with_etxtbsy_retry(|| {
-            attempts += 1;
-            if attempts < 4 {
-                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
-            } else {
-                Ok(())
-            }
-        });
-        assert!(result.is_ok());
-        assert_eq!(attempts, 4);
-    }
-
-    #[test]
-    fn etxtbsy_retry_does_not_retry_other_spawn_errors() {
-        let mut attempts = 0;
-        let result: std::io::Result<()> = run_with_etxtbsy_retry(|| {
-            attempts += 1;
-            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
-        });
-        assert_eq!(attempts, 1, "only ETXTBSY should be retried");
-        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOENT));
-    }
-
-    #[test]
-    fn etxtbsy_retry_is_bounded_and_finally_surfaces_the_busy_error() {
-        let mut attempts = 0;
-        let result: std::io::Result<()> = run_with_etxtbsy_retry(|| {
-            attempts += 1;
-            Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
-        });
-        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ETXTBSY));
-        assert_eq!(attempts, ETXTBSY_MAX_RETRIES + 1);
-    }
-
     fn write_fake_pfctl_with_sr_exit(dir: &Path, sr_output: &str, sr_exit: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-pfctl");

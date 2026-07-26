@@ -50,7 +50,7 @@ Everything below is a consequence of holding those two invariants at once.
 
 | Crate | Role | Depends on |
 |---|---|---|
-| **`writ-core`** (`crates/writ-core/`) | Pure data core: request/decision/grant types, ids, capability sets, the PF/network model, SSHSIG signing types. No dependency on the rest of writ. | — |
+| **`writ-core`** (`crates/writ-core/`) | Pure data core: request/decision/grant types, ids, capability sets, the PF/network model, SSHSIG signing types. Also the home for helpers that must have exactly one workspace-wide definition (`git_env`, `process_spawn`), since every other crate can reach here. No dependency on the rest of writ. | — |
 | **`writ-vm-git`** (`crates/writ-vm-git/`) | Host↔guest wire types for VM-mediated git (clone/push request shapes, object-id/branch parsing). | `writ-core` |
 | **`writ-agent-run`** (`crates/writ-agent-run/`) | The managed-agent run contract (prompt/output/correlation-id types) plus the agent process-runner. Shared by host, guest, and bailiff; re-exported as `writ::agent_run`. | `writ-core` |
 | **`writ-vm-client`** (`crates/writ-vm-client/`) | The guest-side `writ-vm` command surface that runs inside the agent VM. Links no host-only dependency — enforced by the crate graph. Re-exported as `writ::vm_client` under the `vm-client` feature. | `writ-core`, `writ-vm-git`, `writ-agent-run` |
@@ -119,6 +119,40 @@ These hold across subsystems and are the reason to trust the whole:
   the broker re-derives object graphs from bundle bytes, re-checks branch tips
   before and after replay, re-authorises repos against the session's grants,
   and reads guest-writable files with `O_NOFOLLOW` + fstat + byte caps.
+- **One definition per safety-critical discipline.** Subprocess supervision and
+  the hardened Git environment each have exactly one home, and
+  `tests/shared_hardening_helpers.rs` scans the workspace to keep it that way.
+  Spawning a child goes through `writ_core::process_spawn` (one
+  transient-refusal classifier); bounding one goes through `process_supervisor`
+  (timeout, byte caps, process-group SIGKILL); running `git` goes through
+  `writ_core::git_env`'s recipe. The guard exists because duplication here is a
+  *structural* defect no behavioural test can catch — two implementations is not
+  a wrong answer, it only becomes a bug later when one is updated and the other
+  is not. This was not hypothetical: five partial copies of the process
+  discipline had accumulated, and the `GIT_CONFIG_*` recipe had been re-typed at
+  eight sites, three of which silently omitted `GIT_CONFIG_COUNT=0`. Separately,
+  the recipe was *documented* as neutralising `GIT_CONFIG_PARAMETERS` via
+  `GIT_CONFIG_COUNT=0` and did not — git parses that variable on an independent
+  path. Every production caller also calls `env_clear`, which strips it anyway,
+  so no live hole existed there; the exposure was in test helpers, which layer the
+  recipe over an inherited environment. `git_env` now names the variable
+  explicitly, with a test that asks real `git` rather than trusting the
+  reasoning — because a recipe that is only safe when callers happen to do
+  something else as well is not a recipe you can reason about locally.
+
+  **What these guards do and do not establish.** They ask "is this discipline
+  defined twice?", which is not the same question as "is it applied everywhere?".
+  A helper that simply never mentions the recipe passes all of them, and several
+  did — including `writ-vm-client`'s four guest-side git runners, which
+  `git_env`'s own module doc named as consumers while they ran git with no
+  hardening at all. A sixth guard now flags any `git`-named helper that builds and
+  runs a process `Command` without applying the recipe. That is still a
+  name-keyed heuristic; the durable form of the invariant is a **construction
+  boundary** — a type from which the only obtainable runnable git `Command` is a
+  hardened one, so the recipe is enforced by construction rather than by the
+  author remembering. `clean_git`'s `CleanGitInvocation` is the closest existing
+  thing (it carries the recipe as validated `CleanGitEnv` values and is the
+  guard's one recorded exemption); generalising it is not yet done.
 
 ---
 
@@ -135,9 +169,16 @@ types, so editing the application layers doesn't recompile the core.
 ("Dependency-free" means no dependency on the rest of writ, not zero external
 crates.)
 
-**Lives in.** `crates/writ-core/src/core/` (nine submodules) plus three
-low-level host helpers (`bearer`, `process_spawn`, `telemetry`). Re-exported
-from the root crate as `writ::core` (`lib.rs:37`).
+**Lives in.** `crates/writ-core/src/core/` (nine submodules) plus four
+low-level shared helpers (`bearer`, `git_env`, `process_spawn`, `telemetry`).
+Re-exported from the root crate as `writ::core` (`lib.rs:37`).
+
+Being the crate everything else depends on makes this the right home for
+anything that must have exactly one definition workspace-wide, which is why
+`git_env` (the hardened `GIT_CONFIG_*`/`HOME` recipe) and `process_spawn` (the
+transient-spawn-refusal classifier) live here rather than beside their main
+consumers: a copy in a crate the guest-side crates cannot reach is a copy those
+crates will re-type.
 
 **Primitives.** UUID newtypes via the `uuid_id!` macro — `SessionId`,
 `RequestId`, `Jti`, `ApproveAttemptId` (`core/mod.rs:37`); `UnixMillis`
@@ -151,9 +192,21 @@ from the root crate as `writ::core` (`lib.rs:37`).
 (`AgentNetwork`, `Ipv4Cidr`, `PfRuleset`, `render_pf`) in `core/agent_vm.rs`;
 and the `NetworkHealth` reachability enum (`core/network_health.rs`).
 
-**Guarantees.** `core` is pure — no IO. The only host-only surface is
-`process_spawn::spawn_async`, gated behind the crate's own `host` feature (which
-alone pulls in tokio).
+**Guarantees.** `core` is pure — no IO. The only host-only surfaces are
+`process_spawn::spawn_async` and `git_env::apply_clean_git_config_async`, both
+gated behind the crate's own `host` feature (which alone pulls in tokio); the
+blocking twins of each are available everywhere, including `vm-client` builds.
+`git_env` also guarantees the recipe is applied whole: `GIT_CONFIG_DENY_ENV` is
+the complete config-source denial set (`GIT_CONFIG_NOSYSTEM=1`,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_COUNT=0`, **and**
+`GIT_CONFIG_PARAMETERS=` — the last is a separate channel git parses
+independently of the count, so it needs its own entry), `CLEAN_GIT_CONFIG_ENV` is
+that plus `HOME=/dev/null`, and a test asserts the second is exactly the first
+plus `HOME` so the two cannot drift apart. A caller needing a real `HOME` (nix
+fetching a flake input) takes the denial set and supplies its own — never a
+subset. One test runs real `git` under the recipe with injections on every
+channel and asserts none lands, because the shape of the constant cannot tell you
+whether git honours it.
 
 **Invariants.** Make-illegal-states-unrepresentable: `Metadata` requests carry a
 one-variant `MetadataAccess::Read`; private constructors (`AgentNetwork::new`,
@@ -407,8 +460,44 @@ lifecycle runner (`writ-agent-vm-runner`, owns Apple-`container` ordering), and
 a root PF helper (`writ-agent-vm-pf-helper`, pins `/sbin/pfctl` +
 `/sbin/ifconfig`, trusts no caller-supplied path). *Guest:* the agent VM, and —
 under `BrokerPlacement::Vm` — a dedicated broker VM running `writd broker` on a
-shared `--internal` network. `process_supervisor.rs` is the shared subprocess
-core (timeout + process-group SIGKILL).
+shared `--internal` network.
+
+`process_supervisor.rs` (2069, byte-cap policy in
+`process_supervisor/capture.rs`) is filed under this subsystem for historical
+reasons but is **workspace-wide**: it supervises every bounded child (agent-VM
+and broker lifecycle, `clean_git`'s git replay, `flake_provision`'s nix,
+`notes_repo`'s git). Two arms over one contract — `run_supervised` (async) and
+`run_supervised_blocking` (for callers not on a runtime, notably `notes_repo`,
+which holds a `std::sync::Mutex` across the whole invocation and so cannot
+await). Both give a wall-clock timeout, a stdout byte cap, a line-aligned
+tail-capped stderr, and a process-group SIGKILL, and both share the byte-cap
+policy, the `waitid(WNOWAIT)`-then-`killpg`-then-reap ordering, and the cleanup
+guard, so the pair cannot drift. The blocking arm additionally owns **stdin**,
+because a single-threaded caller that writes stdin to completion before draining
+stdout deadlocks against a child that fills its stdout pipe; it drives all three
+streams from one non-blocking `poll(2)` loop. `git_push_objects_cat_file`'s
+long-lived `cat-file --batch` session is not spawn-and-wait, so it uses neither
+arm, but it shares the group-kill primitives rather than re-deriving them.
+
+Two properties are stated jointly for both arms because having them in only one
+was a live defect in each case. **The timeout bounds the whole call, not just the
+child**: a capture drain reaches EOF only when every fd on the pipe's write end
+closes, and a descendant that called `setsid` has left the process group, survives
+the SIGKILL, and holds it open indefinitely — so the drain joins are bounded by the
+same deadline, and a capture that cannot complete is reported as `TimedOut` rather
+than as a short but plausible-looking stdout. **A failed capture is never a
+capture**: a read error, or a drain task that dies, surfaces as
+`SupervisorError::CaptureRead` instead of being folded into EOF, because callers
+parse stdout as data (one object id per `rev-list` line) where a truncated prefix
+reads as a complete, shorter answer.
+
+**What the supervisor does not decide.** It reports a `born_dead_signature` — pid
+absent when probed, and killed by `SIGKILL` (§`docs/known-test-flakes.md`) — as
+*evidence*, not as permission to re-run. The probe cannot prove non-execution:
+`getpgid` answers `ESRCH` for an exited-but-unreaped child on macOS, so a child
+that ran, took effect, and was then killed matches the same signature. Replay
+safety is therefore a fact about the command, decided at the call site
+(`notes_repo::OnBornDead`), not a boolean the supervisor hands out.
 
 **Primitives.** `AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`
@@ -635,7 +724,10 @@ test suite in `git_push_approve/tests.rs`),
 vocabulary), `git_push_object_parse.rs` (827, tests in
 `git_push_object_parse/tests.rs`),
 `git_push_objects_cat_file.rs`, `git_push_walker.rs` (1485) +
-`git_push_walker/`, `clean_git.rs` (hardened git subprocess helpers).
+`git_push_walker/`, `clean_git.rs` (661 — the git-flavoured wrapper: it owns
+program resolution, stderr secret-redaction, and the success/exit-status policy,
+delegating the supervision loop to `process_supervisor` (§5.5) and the env recipe
+to `writ_core::git_env` (§5.1)).
 
 **Stage flow.**
 1. **Stage** (`git_push_staging.rs:151`): the guest POST persists `bundle` +
@@ -694,7 +786,7 @@ was deleted; its one live export, the commit-trailer vocabulary
   lifetime: the bounded transport (`GitDataHttp`, one per broker, held on
   `BrokerState`) and the credentials (`GitDataClient`, one per approve, since
   the installation token is minted per approve).
-- **`notes_repo.rs`** (1022, tests in `notes_repo/tests.rs`) — a shared bare-repo wrapper (used by both writ and
+- **`notes_repo.rs`** (1154, tests in `notes_repo/tests.rs`) — a shared bare-repo wrapper (used by both writ and
   bailiff) for attaching/reading git notes that carry signed run envelopes.
 - **`vm_git_bundle.rs`** (1760) — plans/executes `git clone --mirror` + `git
   bundle create` for a guest clone request.
@@ -716,12 +808,20 @@ SHA only if GitHub reports `verified:true`; `update_ref` hard-codes
 `force:false` so non-fast-forwards surface as errors. `notes_repo`: byte-exact
 round-trip (bypassing `stripspace`), append-only notes in a validated bare repo,
 serialised by a per-repo process-wide mutex; the note **body is an opaque signed
-envelope — verification lives in callers** (`run_verify.rs`), not here.
-`vm_git_bundle`: size cap + path-containment re-checked post-run.
-`vm_git_mirror_cache`: atomic-rename publish, pin-protected + bounded eviction.
+envelope — verification lives in callers** (`run_verify.rs`), not here. Every
+`notes_repo` git child is supervised (§5.5), so each invocation is bounded by a
+wall-clock deadline, a stdout cap, and a process-group kill — these calls are
+bailiff workflow steps, so an unbounded wait is a workflow that stops with no
+diagnosis, and a `for-each-ref` over a corrupted ref namespace must not be able
+to buffer without bound. `vm_git_bundle`: size cap + path-containment re-checked
+post-run. `vm_git_mirror_cache`: atomic-rename publish, pin-protected + bounded
+eviction.
 
-**Invariants.** Commit-signature check (`github_git_db/client.rs:228`); bundle byte cap
-+ path containment enforced at plan time and re-canonicalised at runtime;
+**Invariants.** Commit-signature check (`github_git_db/client.rs:228`); bundle
+byte cap + path containment enforced at plan time (lexically — the bundle does
+not exist yet) and re-checked at runtime by a single `validate_bundle_location`
+that canonicalises once and asserts both "under the work dir" and "not under the
+mirror", so the two halves of the boundary cannot be updated out of step;
 `GitCommitSha::parse`/`MirrorCacheKey` sha256 slug are parse-don't-validate;
 cache eviction honours `max_entries` + `max_bytes` oldest-first and skips
 pinned slugs.

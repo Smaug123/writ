@@ -136,17 +136,33 @@ store path, zero kills — consistent with established fact 2's 144k-operation r
 getpgid(pid) == ESRCH immediately after spawn   AND   killed by SIGKILL
 ```
 
-The first conjunct is the proof, and it rests on the zombie rule: we have not reaped
-the child, so one that had run and exited — however briefly — would still hold an
-unreaped process-table entry and `getpgid` would succeed. `ESRCH` means the pid never
-became a live process. The second guards the one way the probe could lie (if anything
-ever set `SIGCHLD` to `SIG_IGN`, children would be auto-reaped; such a child cannot
-then be waited for, so it surfaces as a `GitWait` error instead).
+The first conjunct was presented as a *proof*, resting on the zombie rule: we have
+not reaped the child, so one that had run and exited — however briefly — would still
+hold an unreaped process-table entry and `getpgid` would succeed, making `ESRCH` mean
+the pid never became a live process.
 
-This sidesteps the idempotency objection that made "retry on signal" unsafe: it does
-not assume the *command* may be repeated, it establishes that the *child never ran*,
-so there is nothing to repeat. A child that ran and was then killed is reported
-unchanged.
+> **Correction (later, and load-bearing).** That reasoning is wrong on macOS, which
+> is the only platform the flake was ever observed on. The zombie rule holds on
+> Linux; XNU's pid lookup **excludes zombies**, so `getpgid` answers `ESRCH` for a
+> child that ran, took effect, and exited without being reaped. Demonstrated by
+> `process_supervisor::blocking_tests::getpgid_does_not_portably_prove_a_child_never_ran`,
+> which touches a file and then `kill -9`s itself: the marker exists, the status is
+> `SIGKILL`, and the probe still reports absent. Both conjuncts of the "proof" are
+> therefore satisfiable *after an observable side effect*.
+>
+> So the mark is **evidence, not proof**, and it cannot by itself license replaying a
+> non-idempotent command. The retry survives, because every invocation in
+> `notes_repo` is independently replay-safe — `hash-object -w` is content-addressed,
+> `fetch` and `init` converge, `notes add` without `-f` *refuses* on a second run so
+> it cannot double-apply — but that is now stated per invocation at the call site, as
+> `OnBornDead::Retry` with its justification, rather than derived from a property of
+> the probe. The supervisor no longer offers a generic "safe to re-run" boolean,
+> because the next caller would have believed it.
+
+The second conjunct guards one way the probe could lie (if anything ever set
+`SIGCHLD` to `SIG_IGN`, children would be auto-reaped; such a child cannot then be
+waited for, so it surfaces as a `GitWait` error instead). It does not bound *when*
+the kill landed, which is the gap the correction above describes.
 
 Note what is **not** used: emptiness of stdout/stderr. That was the first
 formulation and it is unsound — `CaptureOutput::Discard` makes stdout empty by

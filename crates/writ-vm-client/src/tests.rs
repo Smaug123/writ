@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use writ_core::git_env::apply_clean_git_config;
 use writ_vm_git::{
     GUEST_IMAGE_REBUILD_COMMAND, VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION,
     WRIT_VM_ORIGINATED_TARGETS,
@@ -185,12 +186,28 @@ fn required_test_tool(name: &str) -> PathBuf {
     panic!("{name} not found on PATH for vm_client tests");
 }
 
-fn run_test_git(git: &Path, args: &[&str]) {
-    let output = Command::new(git)
+/// `run_test_git` for the callers that need stdout back.
+///
+/// Exists so that wanting the output is not a reason to drop the hardened
+/// environment: every raw `Command::new(git)` in this file was one of these, and
+/// each was hardened-adjacent enough to read as fine.
+fn run_test_git_stdout(git: &Path, args: &[&str]) -> String {
+    let output = apply_clean_git_config(&mut Command::new(git))
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_COUNT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn run_test_git(git: &Path, args: &[&str]) {
+    let output = apply_clean_git_config(&mut Command::new(git))
+        .args(args)
         .output()
         .unwrap();
     assert!(
@@ -551,18 +568,17 @@ fn clone_bundle_with_real_git_supports_full_head_refs_from_bundles() {
         fs::read_to_string(checkout.join("file.txt")).unwrap(),
         "hello\n"
     );
-    let head = Command::new(&git)
-        .args([
+    let head = run_test_git_stdout(
+        &git,
+        &[
             "-C",
             checkout.to_str().unwrap(),
             "rev-parse",
             "--abbrev-ref",
             "HEAD",
-        ])
-        .output()
-        .unwrap();
-    assert!(head.status.success());
-    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "HEAD");
+        ],
+    );
+    assert_eq!(head, "HEAD");
 }
 
 fn commit_one_file(git: &Path, repo_dir: &Path) -> String {
@@ -574,12 +590,7 @@ fn commit_one_file(git: &Path, repo_dir: &Path) -> String {
     fs::write(repo_dir.join("flake.nix"), "{}\n").unwrap();
     run_test_git(git, &["-C", arg, "add", "."]);
     run_test_git(git, &["-C", arg, "commit", "-m", "init"]);
-    let head = Command::new(git)
-        .args(["-C", arg, "rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    assert!(head.status.success());
-    String::from_utf8_lossy(&head.stdout).trim().to_string()
+    run_test_git_stdout(git, &["-C", arg, "rev-parse", "HEAD"])
 }
 
 fn provision_request() -> VmFlakeProvisionRequest {
@@ -781,40 +792,26 @@ fn workspace_init_creates_clean_main_branch_tracking_origin_from_bundle() {
         fs::read_to_string(checkout.join("file.txt")).unwrap(),
         "hello\n"
     );
-    let branch = Command::new(&git)
-        .args([
+    let checkout_arg = checkout.to_str().unwrap();
+    let branch = run_test_git_stdout(
+        &git,
+        &["-C", checkout_arg, "rev-parse", "--abbrev-ref", "HEAD"],
+    );
+    assert_eq!(branch, "main");
+    let upstream = run_test_git_stdout(
+        &git,
+        &[
             "-C",
-            checkout.to_str().unwrap(),
-            "rev-parse",
-            "--abbrev-ref",
-            "HEAD",
-        ])
-        .output()
-        .unwrap();
-    assert!(branch.status.success());
-    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
-    let upstream = Command::new(&git)
-        .args([
-            "-C",
-            checkout.to_str().unwrap(),
+            checkout_arg,
             "rev-parse",
             "--abbrev-ref",
             "--symbolic-full-name",
             "@{u}",
-        ])
-        .output()
-        .unwrap();
-    assert!(upstream.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&upstream.stdout).trim(),
-        "origin/main"
+        ],
     );
-    let status = Command::new(&git)
-        .args(["-C", checkout.to_str().unwrap(), "status", "--porcelain=v1"])
-        .output()
-        .unwrap();
-    assert!(status.status.success());
-    assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
+    assert_eq!(upstream, "origin/main");
+    let status = run_test_git_stdout(&git, &["-C", checkout_arg, "status", "--porcelain=v1"]);
+    assert_eq!(status, "");
 }
 
 #[tokio::test]

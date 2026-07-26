@@ -13,6 +13,9 @@ serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 thiserror = "2"
+# `process_spawn` classifies spawn refusals by raw errno; `io::ErrorKind` has no
+# stable variant for EMFILE/ENFILE, so the constants come from libc.
+libc = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
 tokio = { version = "1", features = ["process", "time"], optional = true }
 

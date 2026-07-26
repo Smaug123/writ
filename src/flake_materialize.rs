@@ -160,6 +160,7 @@ mod tests {
     use std::process::Stdio;
 
     use super::*;
+    use writ_core::git_env::apply_clean_git_config;
 
     fn git_on_path() -> PathBuf {
         let path = std::env::var_os("PATH").expect("PATH must be set for git tests");
@@ -173,11 +174,9 @@ mod tests {
     }
 
     fn git(program: &Path, args: &[&str], cwd: &Path) {
-        let status = std::process::Command::new(program)
+        let status = apply_clean_git_config(&mut std::process::Command::new(program))
             .args(args)
             .current_dir(cwd)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e")
             .env("GIT_COMMITTER_NAME", "t")
@@ -191,7 +190,7 @@ mod tests {
     }
 
     fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
-        let out = std::process::Command::new(program)
+        let out = apply_clean_git_config(&mut std::process::Command::new(program))
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())

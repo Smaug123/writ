@@ -51,6 +51,20 @@ waited out.
 > [The apparition named, and laid](#the-apparition-named-and-laid) at the foot
 > of this section; the suite no longer fails on it.
 
+> **Later still, and in retraction.** The clause "known with certainty" was
+> vanity. The mark by which the born-dead child was to be recognised —
+> `getpgid` answering `ESRCH` — was thought to admit of no other reading,
+> because a child that had lived and died unreaped must still keep its place in
+> the table. On Linux it must. On macOS, where alone this apparition was ever
+> seen, it need not: the kernel's reckoning of pids passes over the dead, and so
+> answers `ESRCH` for a child that ran, did its work, and expired. A test now
+> stands as witness, touching a file before it dies by the knife
+> (`getpgid_does_not_portably_prove_a_child_never_ran`). The mark is therefore a
+> *likelihood* and not a proof, and the licence to re-run must be sought from
+> the command rather than from the corpse. It is so sought now: each invocation
+> declares for itself, at the place it is written, whether repetition can harm
+> it.
+
 ### The measures taken to summon it
 
 I record the experiments in the order they were made, the false road included,
@@ -175,12 +189,23 @@ innocence was sound; it had merely never been demonstrated.
 **The remedy, and why it is safe.** The first of the two remedies proposed above
 — to retry a child that dies by a signal — was rightly held to be dangerous,
 since a retry is safe only where the operation is idempotent, and `update-ref`
-is not. The born-dead mark dissolves that objection, because it does not ask
-whether the *command* may be repeated; it establishes that the *child never ran*,
-and so there is nothing to repeat. Every synchronous git child now passes through
-one helper, which re-runs the invocation when the proof-of-life probe reported
-`ESRCH` *and* the child died by `SIGKILL`. A child that ran and was then killed
-is reported exactly as before.
+is not. The born-dead mark was held to dissolve that objection, because it did not
+ask whether the *command* may be repeated; it claimed to establish that the *child
+never ran*, and so that there was nothing to repeat. Every synchronous git child
+passes through one helper, which re-runs the invocation when the probe reported
+`ESRCH` *and* the child died by `SIGKILL`. A child the probe found alive is
+reported exactly as before.
+
+**Wherein that reasoning fails, and what now carries the weight.** The objection
+was not dissolved, only moved. `ESRCH` does not distinguish a pid that never lived
+from one that lived, laboured, and died unreaped — not on macOS, which is the only
+host where the apparition walks (see the retraction near the head of this section).
+The retry stands, but it now rests on the plainer ground it should have rested on
+from the first: every one of these invocations may be run twice without harm, and
+each says so where it is written. `hash-object -w` is content-addressed; `fetch`
+and `init` converge on the same end; `notes add`, lacking `-f`, *refuses* the
+second attempt outright and so cannot apply itself twice. The supervisor, which
+knows nothing of any command, no longer hands out a general licence to repeat one.
 
 **A false start, recorded because it is the instructive part.** The first
 version of this remedy asked instead for `SIGKILL`, and empty stdout, and empty
