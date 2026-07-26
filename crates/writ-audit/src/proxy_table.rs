@@ -266,14 +266,19 @@ impl_effect_table_for_proxy!(crate::openai_proxy::OpenAiProxyAuditTable);
 impl_effect_table_for_proxy!(crate::nix_cache::NixCacheAuditTable);
 
 impl AuditLog {
-    /// Persist a proxy-request audit row before the upstream call is
-    /// attempted. The matching outcome row is appended via
-    /// [`AuditLog::record_proxy_outcome`].
+    /// Persist a proxy-request audit row on its own, without the guard that
+    /// would force its outcome to follow.
     ///
-    /// This two-phase form is what makes the request durable *before* the
-    /// action — required for any write that records granted authority. The
-    /// authority-free proxy/cache read paths can instead coalesce both rows in
-    /// one commit via [`AuditLog::record_effect_coalesced`].
+    /// **Test-only.** Production writes go through the guard: `begin_effect` +
+    /// [`complete`](crate::RecordedRequest::complete) makes the request durable
+    /// before the upstream call, and
+    /// [`record_effect_coalesced`](AuditLog::record_effect_coalesced) writes
+    /// both rows in one commit for the authority-free paths. Two things still
+    /// want the unguarded halves: seeding an unpaired row to prove the boot
+    /// sweep and the audit-pair oracle catch one, and the equivalence proptest
+    /// that pins the coalesced writer's rows to be byte-for-byte what this
+    /// two-phase pair produces.
+    #[cfg(test)]
     pub(super) fn record_proxy_request<T: ProxyAuditTable>(
         &self,
         r: &ProxyRequestRecord<'_, T::Route>,
@@ -288,8 +293,10 @@ impl AuditLog {
         })
     }
 
-    /// Append an outcome row to a previously-recorded proxy-request
-    /// audit row.
+    /// Append an outcome row to a previously-recorded proxy-request audit row.
+    /// Test-only, for the same reason as
+    /// [`AuditLog::record_proxy_request`].
+    #[cfg(test)]
     pub(super) fn record_proxy_outcome<T: ProxyAuditTable>(
         &self,
         r: &ProxyOutcomeRecord<'_>,

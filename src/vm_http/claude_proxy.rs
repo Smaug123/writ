@@ -7,16 +7,13 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::audit::{
-    AuditError, AuditLog, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
-};
+use crate::audit::ClaudeProxyAuditRoute;
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
 
 use super::proxy_common::{
-    ClaudeBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader,
-    ProxyOutcomeFields, ProxyRequestFields, ProxyStream, UpstreamAuth, VmHttpProxyService,
-    is_proxy_id_byte, proxy_target_path,
+    ClaudeBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader, ProxyStream,
+    UpstreamAuth, VmHttpProxyService, is_proxy_id_byte, proxy_target_path,
 };
 use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
 
@@ -252,6 +249,7 @@ impl ProxyBackend for ClaudeBackend {
     const REQUEST_AUDIT_KIND: &'static str = "claude_proxy_request";
     const OUTCOME_AUDIT_KIND: &'static str = "claude_proxy_outcome";
     const STREAMING_OUTCOME_AUDIT_KIND: &'static str = "claude_proxy_streaming_outcome";
+    const LOCAL_RESPONSE_AUDIT_KIND: &'static str = "claude_proxy_request_and_outcome";
 
     fn classify_proxy_target(target: &str) -> Option<ClaudeProxyAuditRoute> {
         // Match on the path only. Anthropic's clients pass through query
@@ -351,36 +349,6 @@ impl ProxyBackend for ClaudeBackend {
             }
         };
         claude_proxy_upstream_auth(secret, config.auth_kind())
-    }
-
-    fn record_request_audit(
-        audit_log: &AuditLog,
-        fields: ProxyRequestFields<'_, ClaudeProxyAuditRoute>,
-    ) -> Result<(), AuditError> {
-        audit_log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
-            request_id: fields.request_id,
-            session_id: fields.session_id,
-            received_at: fields.received_at,
-            method: fields.method,
-            target: fields.target,
-            route: fields.route,
-            decision: fields.decision,
-        })
-    }
-
-    fn record_outcome_audit(
-        audit_log: &AuditLog,
-        fields: ProxyOutcomeFields<'_>,
-    ) -> Result<(), AuditError> {
-        audit_log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
-            request_id: fields.request_id,
-            completed_at: fields.completed_at,
-            http_status: fields.http_status,
-            upstream_url: fields.upstream_url,
-            upstream_status: fields.upstream_status,
-            response_bytes: fields.response_bytes,
-            error: fields.error,
-        })
     }
 
     fn into_vm_http_dispatch(stream: ProxyStream<Self>) -> VmHttpDispatch {
@@ -1563,5 +1531,76 @@ mod tests {
             }
         );
         assert_eq!(entries[0].2, Some(401));
+    }
+
+    /// **A locally-generated proxy response records its audit pair atomically.**
+    ///
+    /// This path (auth denial, unsupported route, method-not-allowed) performs no
+    /// IO, so the request row need not be durable before anything happens: both
+    /// rows go in one commit through the coalesced guard writer. The test forces
+    /// the *outcome* half to be refused — an empty `error` string, which the
+    /// DAO's field validation rejects — and asserts that **neither** row lands.
+    ///
+    /// The two-commit form this replaced would leave the request row behind, and
+    /// `reconcile_unpaired_effect_rows` then reports it at boot as a request that
+    /// may have performed an effect. For a path that performs none, that is a
+    /// false positive the coalesced writer makes unrepresentable.
+    #[tokio::test]
+    async fn a_refused_local_response_outcome_records_neither_row() {
+        let github = MockServer::start().await;
+        let secret_key = SecretKey::new("anthropic-api-key").unwrap();
+        let state = make_broker_state_with_extra_secret(
+            &github,
+            Some((secret_key.clone(), "host-anthropic-key")),
+        );
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        let service = VmHttpClaudeProxyService::new(
+            Arc::clone(&state),
+            VmHttpClaudeProxyConfig::new(
+                "http://127.0.0.1:9/",
+                secret_key,
+                VmHttpClaudeProxyAuthKind::XApiKey,
+                std::time::Duration::from_millis(10),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = VmHttpRequest::new(
+            "POST",
+            VM_CLAUDE_MESSAGES_PATH,
+            Some(bearer(token().as_str())),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+        );
+
+        let response = super::super::proxy_common::record_proxy_local_response::<ClaudeBackend, _>(
+            &service,
+            &session,
+            &request,
+            ClaudeProxyAuditRoute::Messages,
+            ClaudeProxyAuditDecision::Deny {
+                reason: "missing credentials".into(),
+            },
+            VmHttpResponse::text(VmHttpStatus::Unauthorized, "denied"),
+            // Refused by `validate_proxy_outcome`: an `error` that is present
+            // must not be empty. The request row is perfectly valid, so this
+            // fails the outcome write *after* a request write would have
+            // committed under the two-commit form.
+            Some(""),
+        );
+
+        assert_eq!(response.status, VmHttpStatus::InternalServerError);
+        assert_eq!(
+            (
+                state.audit.table_row_count_for_test("claude_proxy_request"),
+                state.audit.table_row_count_for_test("claude_proxy_outcome"),
+            ),
+            (0, 0),
+            "a refused outcome must roll the request row back with it: this path \
+             performs no effect, so a surviving request row is a dangling row the \
+             boot sweep would report as a possible mid-effect stop",
+        );
     }
 }
