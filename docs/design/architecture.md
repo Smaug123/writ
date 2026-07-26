@@ -282,8 +282,9 @@ stays in `writ` — it *drives* the audit DAOs but also needs the git pipeline
 (`writ-audit/src/lib.rs`); refuse-to-open errors
 `SchemaTooNew`/`SchemaHistoryMismatch` (same); `Migration { version, name, sql }`
 + `MIGRATIONS` (`writ-audit/src/schema.rs:38,57`); generic proxy row types
-(`proxy_table.rs`); git-push state enums (`writ-audit/src/git_push.rs`);
-`ReconcileReport`
+(`proxy_table.rs`); git-push state enums (`writ-audit/src/git_push.rs`); the
+approve-attempt state machine (`writ-audit/src/git_push/approve_attempt.rs`, see
+below); `ReconcileReport`
 (`boot_reconcile.rs:55`). The generic two-phase audit-pair guard
 (`effect_table.rs`) is the emerging spine of the "complete by construction"
 work: `EffectAuditTable` describes any `(request, outcome)` table pair, and the
@@ -294,6 +295,38 @@ whose key disagrees); `record_effect_coalesced` writes both in one commit for th
 authority-free Nix-cache serve. The shared open-session check lives once in
 `validation::check_session_open`. The guard is crate-internal until the VM-HTTP
 driver (§5.6) adopts it; the proxy tables already implement `EffectAuditTable`.
+
+**The approve-attempt state machine.** `approve_attempt.rs` owns the vocabulary
+and the transition relation of the operator-approve lifecycle, which the DAO
+merely persists. Three layers:
+
+- **Vocabulary.** `ApproveAttemptStateName` / `ApproveAttemptOutcomeName` — the
+  flat discriminants the `state` / `outcome` columns hold, generated with
+  `as_wire`/`parse_wire`/`ALL` from one variant⇒literal table, so no hand-kept
+  list can fall out of step. Every DAO read *and* write goes through them; the
+  names appear nowhere else as literals.
+- **Position.** `ApproveAttempt { state, ledger_mint }`. The v7 mint ledger
+  (`git_push_approve_attempt_mint`) is part of the attempt's durable position,
+  not a side table: migration 0007 adopted it only because SQLite cannot widen a
+  CHECK to add a `minted` state, and two triggers judge writes against it. A
+  machine blind to it would permit moves the schema refuses.
+- **Relation.** `apply(&ApproveAttempt, &ApproveAttemptTransition) ->
+  Result<ApproveAttempt, IllegalApproveTransition>` — one wildcard-free match,
+  each refusal naming the invariant it protects. The DAO reads the row, asks
+  `apply`, and writes every mutable column from the position it returns, so a
+  write cannot disagree with the decision.
+
+**Guarantee (schema-backed).** The triggers below remain the authority — the
+database refuses a contradiction even when every Rust caller is wrong — and the
+Rust machine is held to them mechanically:
+`approve_attempt::tests::transition_agrees_with_the_schema` drives every
+(position, transition) pair against a real database, comparing `apply` against a
+naive writer that never consults it, and
+`rust_and_schema_admit_the_same_{state,outcome}_names` compares `ALL` against the
+CHECK literals read back from `sqlite_master`. Divergence in *either* direction
+fails the build. The one place the machine is deliberately stricter than the
+schema (a mint-capturing resolve from `Uncertain`) is enumerated in the test, not
+implicit.
 
 **Schema.** ~24 live tables across **7 migrations** (`audit/schema.rs`), versus
 the 4 tables `broker.md` documents. Version is tracked in a `schema_version`

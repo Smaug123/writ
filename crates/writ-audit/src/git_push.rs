@@ -17,7 +17,10 @@ mod approve_attempt;
 /// out to keep `git_push.rs` readable.
 mod dao;
 
-pub use approve_attempt::{ApproveAttemptOutcomeName, ApproveAttemptStateName};
+pub use approve_attempt::{
+    ApproveAttempt, ApproveAttemptOutcomeName, ApproveAttemptStateName, ApproveAttemptTransition,
+    IllegalApproveTransition, apply as apply_approve_transition,
+};
 
 /// The base `(request, outcome)` [`EffectAuditTable`](crate::EffectAuditTable)
 /// marker, re-exported so the VM-HTTP `broker_effect` driver can name it.
@@ -329,19 +332,6 @@ const GIT_PUSH_AUDIT_ENTRY_BY_SESSION_SQL: &str = "
     WHERE r.session_id = ?1
     ORDER BY r.received_at ASC, r.rowid ASC
 ";
-
-/// Internal projection of the columns `complete_attempt_succeeded`
-/// needs to copy from the attempt row into the resolution row. Held
-/// only inside the joint transaction, so it does not appear in the
-/// public types.
-struct ApproveAttemptMintRow {
-    state: String,
-    push_request_id: String,
-    mint_jti: Option<String>,
-    mint_app: Option<i64>,
-    mint_iat: Option<i64>,
-    mint_exp: Option<i64>,
-}
 
 /// Metadata about a quarantined predecessor attempt that a
 /// reconciliation row is about to supersede. Built inside the

@@ -69,11 +69,12 @@ pub use flake_provision::{
     FlakeProvisionOutcomeRecord, FlakeProvisionRequestRecord, FlakeProvisionResult,
 };
 pub use git_push::{
-    ApproveAttemptOutcomeName, ApproveAttemptStateName, GitPushApproveAttemptEntry,
-    GitPushApproveAttemptOutcome, GitPushApproveAttemptState, GitPushAuditEntry, GitPushAuditTable,
-    GitPushOutcomeRecord, GitPushOutcomeResult, GitPushRequestRecord, GitPushResolution,
-    GitPushResolutionEntry, GitPushResolutionRecord, PromoteMintAudit, ReconciliationTarget,
-    RejectBlocker, UncertainAttempt,
+    ApproveAttempt, ApproveAttemptOutcomeName, ApproveAttemptStateName, ApproveAttemptTransition,
+    GitPushApproveAttemptEntry, GitPushApproveAttemptOutcome, GitPushApproveAttemptState,
+    GitPushAuditEntry, GitPushAuditTable, GitPushOutcomeRecord, GitPushOutcomeResult,
+    GitPushRequestRecord, GitPushResolution, GitPushResolutionEntry, GitPushResolutionRecord,
+    IllegalApproveTransition, PromoteMintAudit, ReconciliationTarget, RejectBlocker,
+    UncertainAttempt, apply_approve_transition,
 };
 pub use grant::{MintFailureRecord, PreMintRecord};
 pub use nix_cache::{
@@ -119,6 +120,13 @@ pub enum AuditError {
     /// failed relationship directly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+
+    /// The approve-attempt state machine refused a transition. Carries
+    /// the state the attempt was in and the move that was asked for, so
+    /// the operator-facing message can say which, rather than a bare
+    /// "wrong state" string per call site.
+    #[error("{0}")]
+    IllegalApproveTransition(#[from] git_push::IllegalApproveTransition),
 
     /// Field validation invariant where callers need the column or stream
     /// label alongside the reusable validation failure.
