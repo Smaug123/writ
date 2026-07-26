@@ -907,8 +907,30 @@ bailiff-owned note in bailiff's own bare git repo, keeping product-level
 workflow out of the security-critical broker.
 
 **Lives in.** `crates/bailiff/` (`bailiff_plan_{submit,review,implement,write,
-read,view,note,state}.rs`, `bailiff_decision.rs`, `bailiff_repo_guard.rs`,
-`bin/`).
+read,view,note,state}.rs`, `bailiff_stage.rs`, `bailiff_decision.rs`,
+`bailiff_repo_guard.rs`, `bin/`).
+
+**Stage phases.** The three agent-run workflows are compositions of a shared
+phase vocabulary in `bailiff_stage.rs`, not three hand-written bodies:
+`open_plan_stage` (take the plan lock, then gate), `compose_with_plan_body`
+(read the submission note, verify the planner envelope, splice the body under
+the stage's framing), and one of two run phases. `AgentStage` is `PlanStage`
+minus `Decide` — the stage with no agent run — and `PlanBodyStage` refines it
+further to the two stages that *consume* a plan body, so "compose a prompt for
+decide" and "splice a plan body into the planner's own prompt" are both
+unrepresentable. Each phase's error type is total for its callers, so every
+workflow's map into its own error enum is an exhaustive match with no
+unreachable arm.
+
+**Session ownership is a type-level distinction.** `run_under_owned_session`
+(submit, review) opens the session, binds `RunAgent` to it, cross-checks the id
+the broker stamped into the signed metadata, and closes it on every exit path
+after the open. `run_under_broker_session` (implement) does none of that: writd's
+VM dispatch arm mints its own audit session and closes it before `RunAgent`
+returns. Two functions rather than one function over a flag, so the close-session
+path is not *reachable* from the VM-dispatched stage. Callers are routed by the
+data they hold — only implement has an `AgentVmWorkspaceBootstrap`, which is the
+same field writd's dispatch keys on.
 
 **Workflow.** One transition relation, in `bailiff_plan_state.rs`. `NotePresence`
 is the observation (whether the plan's ref exists, which of the four notes exist,

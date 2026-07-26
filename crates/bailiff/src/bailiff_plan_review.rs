@@ -16,10 +16,11 @@
 //!
 //! # Composition
 //!
-//! The reviewer prompt is `reviewer_instructions` + the
-//! `REVIEWER_PROMPT_SEPARATOR` string + the plan body bytes, joined
-//! inline (rather than re-wrapping the bytes in a structured
-//! plan-body type first) to avoid unwrapping them again for signing.
+//! The reviewer prompt is `reviewer_instructions` + the separator
+//! [`crate::bailiff_stage::PlanBodyStage::Review`] names
+//! (`# Proposed plan`) + the plan body bytes, joined inline (rather
+//! than re-wrapping the bytes in a structured plan-body type first) to
+//! avoid unwrapping them again for signing.
 //!
 //! # Error handling
 //!
@@ -38,20 +39,21 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::JoinError;
 
-use crate::bailiff_plan_note::{PlanId, PlanNote};
-use crate::bailiff_plan_read::{
-    ReadPlanBodyError, ReadPlanError, SummarizePlanError, read_plan_body_bytes, read_plan_note,
-    summarize_plan,
-};
-use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
+use crate::bailiff_plan_note::PlanId;
+use crate::bailiff_plan_read::{ReadPlanBodyError, ReadPlanError, SummarizePlanError};
+use crate::bailiff_plan_state::IllegalTransition;
 use crate::bailiff_plan_write::{WriteReviewNoteError, write_review_note};
-use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
+use crate::bailiff_repo_guard::PlanGuardError;
+use crate::bailiff_stage::{
+    ComposePlanPromptError, OpenPlanStageError, OwnedSession, OwnedSessionRunError, PlanBodyStage,
+    StageRunInputs, compose_with_plan_body, open_plan_stage, run_under_owned_session,
+};
 use writ::agent_run::{AgentPrompt, AgentPromptError};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
 use writ::vm_git::GitObjectId;
-use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClientError};
+use writ::writ_client::{RunAgentCompleted, WritClient, WritClientError};
 
 /// Inputs to [`submit_review`]. Mirror of [`crate::bailiff_plan_submit::SubmitPlanInputs`]
 /// with `plan_id` non-optional (the plan must already exist) and
@@ -130,9 +132,11 @@ pub struct SubmitReviewOutcome {
 
 /// Drive the full plan-review workflow against a live writ broker.
 ///
-/// `bailiff_repo` is an `Arc<NotesRepo>`; the workflow takes
-/// this plan's lock via [`PlanGuard`] before its first read and holds
-/// it until return, so the gate and the eventual note write cannot be
+/// Three phases from [`crate::bailiff_stage`], composed: gate, compose
+/// the prompt from the verified plan body, then run under a session
+/// bailiff owns. The plan lock
+/// [`crate::bailiff_stage::open_plan_stage`] returns is held until this
+/// function returns, so the gate and the eventual note write cannot be
 /// interleaved by another workflow — in this process or another.
 pub async fn submit_review(
     client: &WritClient,
@@ -141,171 +145,128 @@ pub async fn submit_review(
     allowed_signers: AllowedSigners,
     inputs: SubmitReviewInputs,
 ) -> Result<SubmitReviewOutcome, SubmitReviewError> {
-    // Hold the bailiff-repo lock across the entire workflow — pre-RPC
-    // read, opens, run, write, close — so concurrent submit_*/bailiff
-    // workflows serialise instead of racing the gate-then-write
-    // sequence. Released on function return.
+    // Before slice 1 this workflow gated on the submission note by
+    // hand; it now asks the shared relation. `Review` is legal from
+    // `Submitted` only — reviewer feedback is an input to the verdict,
+    // so a plan that already has one is past this stage.
     let plan_id = inputs.plan_id;
-    let mut bailiff = PlanGuard::acquire(bailiff_repo, plan_id)
-        .await
-        .map_err(SubmitReviewError::PlanLock)?;
+    let mut guard = open_plan_stage(
+        bailiff_repo,
+        plan_id,
+        PlanBodyStage::Review.stage().precondition(),
+    )
+    .await?;
 
     // Pre-RPC: read the submission note, fetch+verify+decode the
-    // planner envelope, extract the plan body. Done before opening
-    // a session so a missing or unverifiable submission never burns
-    // a writ audit row.
-    let writ_repo_path_owned = writ_repo_path.to_path_buf();
-    let writ_output_ref_for_read = inputs.writ_output_ref.clone();
-    let allowed_for_read = allowed_signers.clone();
-    let read_outcome = bailiff
-        .run_blocking(
-            move |repo| -> Result<(PlanNote, String), SubmitReviewError> {
-                // Before slice 1 this workflow gated on the
-                // submission note by hand; it now asks the shared
-                // relation. `Review` is legal from `Submitted` only —
-                // reviewer feedback is an input to the verdict, so a
-                // plan that already has one is past this stage.
-                let state = summarize_plan(repo, plan_id)
-                    .map_err(SubmitReviewError::ReadPlanState)?
-                    .state();
-                allows(state, PlanStage::Review)
-                    .map_err(|source| SubmitReviewError::IllegalTransition { plan_id, source })?;
+    // planner envelope, splice the plan body under `# Proposed plan`.
+    // Done before opening a session so a missing or unverifiable
+    // submission never burns a writ audit row.
+    let reviewer_prompt = compose_with_plan_body(
+        &mut guard,
+        writ_repo_path,
+        &inputs.writ_output_ref,
+        &allowed_signers,
+        plan_id,
+        inputs.reviewer_instructions,
+        PlanBodyStage::Review,
+    )
+    .await?;
 
-                let plan_note = read_plan_note(repo, plan_id)
-                    .map_err(SubmitReviewError::ReadPlanNote)?
-                    .expect("gate passed, so a submission note exists");
-                let body = read_plan_body_bytes(
-                    repo,
-                    &writ_repo_path_owned,
-                    &writ_output_ref_for_read,
-                    &plan_note,
-                    &allowed_for_read,
-                )
-                .map_err(SubmitReviewError::ReadPlanEnvelope)?;
-                Ok((plan_note, body))
-            },
-        )
-        .await
-        .map_err(SubmitReviewError::ReadTaskFailed)?;
-    let (_plan_note, plan_body) = read_outcome?;
-
-    let reviewer_prompt =
-        compose_reviewer_prompt_bytes(inputs.reviewer_instructions.as_str(), plan_body.as_str())
-            .map_err(SubmitReviewError::ComposeReviewerPrompt)?;
-
-    let session_id = client
-        .open_session(
-            inputs.session_label.clone(),
-            inputs.session_agent_kind,
-            inputs.session_agent_model.clone(),
-        )
-        .await
-        .map_err(SubmitReviewError::OpenSession)?;
-
-    // From here on, every early return must close the session.
-    let run_result = client
-        .run_agent(RunAgentRequest {
+    let writ_repo_path = writ_repo_path.to_path_buf();
+    let writ_output_ref = inputs.writ_output_ref.clone();
+    let purpose = inputs.purpose.clone();
+    let stage = run_under_owned_session(
+        client,
+        &mut guard,
+        OwnedSession {
+            label: inputs.session_label,
+            agent_kind: inputs.session_agent_kind,
+            agent_model: inputs.session_agent_model,
+        },
+        StageRunInputs {
             prompt: reviewer_prompt,
             capabilities: inputs.capabilities,
-            purpose: inputs.purpose.clone(),
-            output_ref: inputs.writ_output_ref.clone(),
-            session_id: Some(session_id),
-            workspace: None,
-            agent_kind: None,
-            agent_model: None,
-        })
-        .await;
-    let completed = match run_result {
-        Ok(c) => c,
-        Err(source) => {
-            let _ = client.close_session(session_id).await;
-            return Err(SubmitReviewError::RunAgent { session_id, source });
-        }
-    };
-
-    // Cross-check the broker honoured the session binding we asked
-    // for: the signed metadata must stamp the same session id we
-    // opened. A mismatch means the broker minted its own id and the
-    // envelope can't be correlated with our audit row — refuse to
-    // persist the review note.
-    if completed.signed_metadata.session_id != session_id {
-        let returned_session_id = completed.signed_metadata.session_id;
-        let _ = client.close_session(session_id).await;
-        return Err(SubmitReviewError::SessionIdMismatch {
-            session_id,
-            returned_session_id,
-        });
-    }
-
-    // `write_review_note` is blocking (shells out to git). Run under
-    // the workflow-held guard so the lock spans this section and the
-    // surrounding awaits without being re-acquired here.
-    let writ_repo_path_owned = writ_repo_path.to_path_buf();
-    let writ_output_ref_clone = inputs.writ_output_ref.clone();
-    let purpose_clone = inputs.purpose.clone();
-    let completed_clone = completed.clone();
-    let write_outcome = bailiff
-        .run_blocking(move |repo| {
+            purpose: inputs.purpose,
+            writ_output_ref: inputs.writ_output_ref,
+        },
+        move |repo, completed| {
             write_review_note(
                 repo,
-                &writ_repo_path_owned,
-                &writ_output_ref_clone,
+                &writ_repo_path,
+                &writ_output_ref,
                 plan_id,
-                purpose_clone,
-                &completed_clone,
+                purpose,
+                completed,
                 &allowed_signers,
             )
-        })
-        .await;
-    let review_note_oid = match write_outcome {
-        Ok(Ok(oid)) => oid,
-        Ok(Err(source)) => {
-            let _ = client.close_session(session_id).await;
-            return Err(SubmitReviewError::WriteReviewNote { session_id, source });
-        }
-        Err(source) => {
-            let _ = client.close_session(session_id).await;
-            return Err(SubmitReviewError::WriteTaskFailed { session_id, source });
-        }
-    };
-
-    if let Err(source) = client.close_session(session_id).await {
-        return Err(SubmitReviewError::CloseSession { session_id, source });
-    }
+        },
+    )
+    .await?;
 
     Ok(SubmitReviewOutcome {
         plan_id,
-        review_note_oid,
-        reviewer_session_id: session_id,
-        run: completed,
+        review_note_oid: stage.note_oid,
+        reviewer_session_id: stage.session_id,
+        run: stage.run,
     })
 }
 
-/// Separator the reviewer's effective prompt uses between the
-/// reviewer instructions and the plan body under evaluation. Distinct
-/// from the implementer-side `# Approved plan` heading
-/// (`bailiff_plan_implement.rs::PLAN_PROMPT_SEPARATOR`) because the
-/// plan has not been accepted at the point the reviewer reads it:
-/// `# Proposed plan` makes that frame explicit so an LLM cannot
-/// mistake the artefact's status.
-const REVIEWER_PROMPT_SEPARATOR: &str = "\n\n---\n\n# Proposed plan\n\n";
+/// Total map from the gate phase's failures onto this workflow's. All
+/// four variants are produced by [`open_plan_stage`] for every caller,
+/// so the match is exhaustive with no unreachable arm.
+impl From<OpenPlanStageError> for SubmitReviewError {
+    fn from(source: OpenPlanStageError) -> Self {
+        match source {
+            OpenPlanStageError::PlanLock(source) => Self::PlanLock(source),
+            OpenPlanStageError::ReadTaskFailed(source) => Self::ReadTaskFailed(source),
+            OpenPlanStageError::ReadPlanState(source) => Self::ReadPlanState(source),
+            OpenPlanStageError::IllegalTransition { plan_id, source } => {
+                Self::IllegalTransition { plan_id, source }
+            }
+        }
+    }
+}
 
-/// Compose the reviewer's effective prompt from operator instructions
-/// and the planner's plan body. Takes raw `&str` rather than a
-/// structured plan-body type because the plan body has already been
-/// extracted from the signed planner envelope as bytes — re-wrapping
-/// it just to unwrap it again for signing would be churn.
-fn compose_reviewer_prompt_bytes(
-    reviewer_instructions: &str,
-    plan_body: &str,
-) -> Result<AgentPrompt, AgentPromptError> {
-    let mut combined = String::with_capacity(
-        reviewer_instructions.len() + REVIEWER_PROMPT_SEPARATOR.len() + plan_body.len(),
-    );
-    combined.push_str(reviewer_instructions);
-    combined.push_str(REVIEWER_PROMPT_SEPARATOR);
-    combined.push_str(plan_body);
-    AgentPrompt::try_new(combined)
+/// Total map from the prompt-composition phase's failures onto this
+/// workflow's.
+impl From<ComposePlanPromptError> for SubmitReviewError {
+    fn from(source: ComposePlanPromptError) -> Self {
+        match source {
+            ComposePlanPromptError::ReadTaskFailed(source) => Self::ReadTaskFailed(source),
+            ComposePlanPromptError::ReadPlanNote(source) => Self::ReadPlanNote(source),
+            ComposePlanPromptError::ReadPlanEnvelope(source) => Self::ReadPlanEnvelope(source),
+            ComposePlanPromptError::ComposePrompt(source) => Self::ComposeReviewerPrompt(source),
+        }
+    }
+}
+
+/// Total map from the owned-session run phase's failures onto this
+/// workflow's.
+impl From<OwnedSessionRunError<WriteReviewNoteError>> for SubmitReviewError {
+    fn from(source: OwnedSessionRunError<WriteReviewNoteError>) -> Self {
+        match source {
+            OwnedSessionRunError::OpenSession(source) => Self::OpenSession(source),
+            OwnedSessionRunError::RunAgent { session_id, source } => {
+                Self::RunAgent { session_id, source }
+            }
+            OwnedSessionRunError::SessionIdMismatch {
+                session_id,
+                returned_session_id,
+            } => Self::SessionIdMismatch {
+                session_id,
+                returned_session_id,
+            },
+            OwnedSessionRunError::WriteNote { session_id, source } => {
+                Self::WriteReviewNote { session_id, source }
+            }
+            OwnedSessionRunError::WriteTaskFailed { session_id, source } => {
+                Self::WriteTaskFailed { session_id, source }
+            }
+            OwnedSessionRunError::CloseSession { session_id, source } => {
+                Self::CloseSession { session_id, source }
+            }
+        }
+    }
 }
 
 /// Tagged failure modes of [`submit_review`]. Pre-RPC variants
@@ -328,7 +289,8 @@ pub enum SubmitReviewError {
     /// violation. Pre-RPC: no session was opened.
     #[error("plan-body read task failed: {0}")]
     ReadTaskFailed(#[source] JoinError),
-    /// [`read_plan_note`] returned an error. The gate has already
+    /// [`crate::bailiff_plan_read::read_plan_note`] returned an error.
+    /// The gate has already
     /// passed by the time this read runs, so this is "bailiff's repo
     /// broke between two reads", not "the plan is in the wrong
     /// state" — that is [`Self::IllegalTransition`]. Pre-RPC.
@@ -432,32 +394,10 @@ pub enum SubmitReviewError {
     },
 }
 
-#[cfg(test)]
-mod compose_tests {
-    //! Tests for [`compose_reviewer_prompt_bytes`]. The composer
-    //! is intentionally tiny; the two tests pin the load-bearing
-    //! properties: the separator appears verbatim, and the byte cap
-    //! fires on the combined length.
-    use super::*;
-
-    #[test]
-    fn separator_appears_verbatim_between_instructions_and_body() {
-        let composed =
-            compose_reviewer_prompt_bytes("Evaluate the plan.", "# Plan\n\nDo a thing.\n").unwrap();
-        let expected =
-            format!("Evaluate the plan.{REVIEWER_PROMPT_SEPARATOR}# Plan\n\nDo a thing.\n");
-        assert_eq!(composed.as_str(), expected);
-    }
-
-    #[test]
-    fn errors_when_combined_exceeds_agent_prompt_limit() {
-        // Instructions at the cap, non-empty plan body, plus the
-        // separator must overflow `AgentPrompt::try_new`.
-        let instructions = "x".repeat(writ::agent_run::MAX_AGENT_PROMPT_BYTES);
-        let err = compose_reviewer_prompt_bytes(&instructions, "p").unwrap_err();
-        assert!(err.to_string().contains("exceeding"), "{err}");
-    }
-}
+// `compose_tests` moved to `crate::bailiff_stage::tests` in slice 3,
+// along with the composer it covered. The reviewer's framing is now
+// `PlanBodyStage::Review`, and its exact-concatenation and byte-cap
+// tests live beside the single definition.
 
 #[cfg(test)]
 mod end_to_end_tests {
@@ -477,7 +417,7 @@ mod end_to_end_tests {
     use super::*;
     use crate::bailiff_decision::{Decider, Decision};
     use crate::bailiff_plan_note::{DecisionNote, ReviewNote, plan_notes_ref};
-    use crate::bailiff_plan_state::PlanState;
+    use crate::bailiff_plan_state::{PlanStage, PlanState};
     use crate::bailiff_plan_submit::{SubmitPlanInputs, submit_plan};
     use crate::bailiff_plan_write::write_decision_note;
     use writ::audit::AuditLog;
