@@ -76,7 +76,7 @@ the gates above is what catches feature-combination mistakes.
   `writ-agent-vm-pf-helper`.
 - **`crates/writ-vm-git`** — wire types shared between host and guest for
   VM-mediated git (branch/object-id parsing, clone/push request shapes).
-- **`crates/bailiff`** — a plan-workflow product (submit → decide → review →
+- **`crates/bailiff`** — a plan-workflow product (submit → review → decide →
   implement) built *on top of* writ. Records each step as a signed git note in
   its own bare repo and verifies agent-run envelopes minted by the broker.
   `bailiff` depends on `writ`; `writ` never depends on `bailiff`.

@@ -160,11 +160,11 @@ pub async fn submit_review(
     let read_outcome = bailiff
         .run_blocking(
             move |repo| -> Result<(PlanNote, String), SubmitReviewError> {
-                // Before slice 1 this workflow gated on the submission
-                // note alone and never read the decision, so a
-                // *rejected* plan reviewed happily. The gate is now
-                // the shared relation: `Review` is legal only from
-                // `Accepted`.
+                // Before slice 1 this workflow gated on the
+                // submission note by hand; it now asks the shared
+                // relation. `Review` is legal from `Submitted` only —
+                // reviewer feedback is an input to the verdict, so a
+                // plan that already has one is past this stage.
                 let state = summarize_plan(repo, plan_id)
                     .map_err(SubmitReviewError::ReadPlanState)?
                     .state();
@@ -667,8 +667,6 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nReplace bar with baz.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
-        // Slice 1: `review` is legal only from `accepted`.
-        record_acceptance(&bailiff, plan_id).await;
 
         let inputs = SubmitReviewInputs {
             plan_id,
@@ -742,16 +740,18 @@ mod end_to_end_tests {
         let _ = broker_task.await;
     }
 
-    /// Behaviour delta (slice 1): reviewing a **rejected** plan is
-    /// refused, pre-RPC.
+    /// Behaviour delta (slice 1): a plan that already carries a
+    /// verdict is past `review`, and the refusal says so rather than
+    /// pointing at a later stage.
     ///
-    /// This is the gap the pre-slice gate missed outright:
-    /// `submit_review` read the submission note and nothing else, so
-    /// a plan the operator had explicitly killed would still burn a
-    /// reviewer agent run. There was no test asserting either
-    /// behaviour, because there was no gate to test.
+    /// This replaces a test asserting that reviewing a *rejected* plan
+    /// is refused. Under the shipped order (`review` → `decide`) that
+    /// scenario cannot be built: reaching `rejected` requires a review
+    /// note, so the second call is a repeat rather than a first
+    /// review. The property worth keeping is that the repeat is
+    /// refused pre-RPC with actionable guidance.
     #[tokio::test]
-    async fn submit_review_refuses_a_rejected_plan_before_opening_a_session() {
+    async fn submit_review_refuses_a_decided_plan_before_opening_a_session() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
@@ -765,19 +765,38 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nReplace bar with baz.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
-        let rejection = DecisionNote {
+
+        let inputs = || SubmitReviewInputs {
             plan_id,
-            outcome: Decision::Rejected,
-            decider: Decider::try_new("cli:test").unwrap(),
-            decided_at: UnixMillis::from_millis(1_700_000_000_000),
+            reviewer_instructions: AgentPrompt::try_new("Evaluate.").unwrap(),
+            capabilities: vec![CapabilitySet::WorkspaceRead {
+                repo: RepoRef {
+                    owner: "smaug123".into(),
+                    name: "writ".into(),
+                },
+            }],
+            purpose: "plan-review".into(),
+            writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_label: None,
+            session_agent_kind: Some(AgentKind::Claude),
+            session_agent_model: None,
         };
-        let bailiff_for_write = Arc::clone(&bailiff);
-        tokio::task::spawn_blocking(move || {
-            let repo = &*bailiff_for_write;
-            write_decision_note(repo, &rejection).expect("write_decision_note must succeed");
-        })
+
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            submit_review(
+                &client,
+                Arc::clone(&bailiff),
+                &writ_repo_path,
+                allowed.clone(),
+                inputs(),
+            ),
+        )
         .await
-        .unwrap();
+        .expect("the first review must return within 15s")
+        .expect("the first review must succeed");
+
+        record_acceptance(&bailiff, plan_id).await;
 
         let err = tokio::time::timeout(
             Duration::from_secs(15),
@@ -786,26 +805,12 @@ mod end_to_end_tests {
                 Arc::clone(&bailiff),
                 &writ_repo_path,
                 allowed,
-                SubmitReviewInputs {
-                    plan_id,
-                    reviewer_instructions: AgentPrompt::try_new("Evaluate.").unwrap(),
-                    capabilities: vec![CapabilitySet::WorkspaceRead {
-                        repo: RepoRef {
-                            owner: "smaug123".into(),
-                            name: "writ".into(),
-                        },
-                    }],
-                    purpose: "plan-review".into(),
-                    writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
-                    session_label: None,
-                    session_agent_kind: Some(AgentKind::Claude),
-                    session_agent_model: None,
-                },
+                inputs(),
             ),
         )
         .await
         .expect("submit_review must return within 15s")
-        .expect_err("a rejected plan must not be reviewable");
+        .expect_err("a decided plan must not be reviewable again");
 
         match &err {
             SubmitReviewError::IllegalTransition {
@@ -813,11 +818,13 @@ mod end_to_end_tests {
                 source,
             } => {
                 assert_eq!(*found, plan_id);
-                assert_eq!(source.state, PlanState::Rejected);
+                assert_eq!(source.state, PlanState::Accepted);
                 assert_eq!(source.stage, PlanStage::Review);
-                // The remedy must not tell the operator to re-run a
-                // stage: `rejected` is terminal.
-                assert!(source.to_string().contains("terminal"), "{source}");
+                // Must not recommend a later stage; the remedy is a
+                // fresh plan.
+                let msg = source.to_string();
+                assert!(msg.contains("already past"), "{msg}");
+                assert!(!msg.contains("first"), "{msg}");
             }
             other => panic!("expected IllegalTransition, got: {other:?}"),
         }
@@ -924,8 +931,6 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nReplace bar with baz.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
-        // Slice 1: `review` is legal only from `accepted`.
-        record_acceptance(&bailiff, plan_id).await;
 
         let inputs = || SubmitReviewInputs {
             plan_id,

@@ -953,13 +953,6 @@ async fn plan_decide(
     let decider = resolve_decider(decider, user_env)?;
     let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
 
-    let note = DecisionNote {
-        plan_id,
-        outcome,
-        decider,
-        decided_at: UnixMillis::now(),
-    };
-
     // `init_or_open` shells out to git; do it on a blocking thread so
     // the runtime stays responsive.
     let bailiff_repo_path_for_init = bailiff_repo_path.clone();
@@ -998,6 +991,18 @@ async fn plan_decide(
                 .map_err(DecideError::ReadPlanState)?
                 .state();
             allows(state, PlanStage::Decide).map_err(DecideError::IllegalTransition)?;
+            // Stamped here, not before `acquire`. The lock waits, and
+            // it can wait for the length of another workflow's agent
+            // run, so a timestamp taken at command start could claim
+            // the verdict predates the submission it rules on. The
+            // note is the audit record; its clock must be the moment
+            // it was actually decidable.
+            let note = DecisionNote {
+                plan_id,
+                outcome,
+                decider,
+                decided_at: UnixMillis::now(),
+            };
             write_decision_note(repo, &note).map_err(DecideError::Write)
         })
         .await

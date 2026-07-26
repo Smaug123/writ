@@ -315,16 +315,23 @@ fn summarize_plan_returns_submission_only_when_just_submitted() {
     assert_eq!(summary.state(), PlanState::Submitted);
 }
 
-/// Submission + accept decision → state=accepted, decision fields
-/// projected from the note. A regression that swapped accept and
-/// reject would be catastrophically wrong but invisible to the
+/// Submission + review + accept decision → state=accepted, decision
+/// fields projected from the note. A regression that swapped accept
+/// and reject would be catastrophically wrong but invisible to the
 /// `submitted` test above.
+///
+/// The review note is part of the fixture because a verdict is only
+/// reachable through `review`; a decision without one is a note set no
+/// legal sequence produces, which is what
+/// `summarize_plan_reports_corrupt_for_a_verdict_without_a_review`
+/// covers.
 #[test]
 fn summarize_plan_projects_accepted_decision() {
     let tmp = TempDir::new().unwrap();
     let bailiff = bailiff_repo(&tmp);
     let plan_id = PlanId::new();
     plant_plan_note(&bailiff, plan_id, "p", 1);
+    plant_review_note(&bailiff, plan_id, 2);
     plant_decision_note(&bailiff, plan_id, Decision::Accepted, "cli:alice", 2);
     let summary = summarize_plan(&bailiff, plan_id).unwrap();
     let decision = summary.decision.as_ref().expect("decision must be Some");
@@ -334,13 +341,34 @@ fn summarize_plan_projects_accepted_decision() {
     assert_eq!(summary.state(), PlanState::Accepted);
 }
 
-/// Submission + reject decision → state=rejected.
+/// A verdict recorded without a review is a note set no legal
+/// sequence of stages produces, so it derives to `Corrupt` rather than
+/// being rendered as a verdict the operator can act on. Before the
+/// transition relation existed, `bailiff plan decide` produced exactly
+/// this shape on demand.
+#[test]
+fn summarize_plan_reports_corrupt_for_a_verdict_without_a_review() {
+    let tmp = TempDir::new().unwrap();
+    let bailiff = bailiff_repo(&tmp);
+    let plan_id = PlanId::new();
+    plant_plan_note(&bailiff, plan_id, "p", 1);
+    plant_decision_note(&bailiff, plan_id, Decision::Accepted, "cli:alice", 2);
+    let summary = summarize_plan(&bailiff, plan_id).unwrap();
+    // The projections still render — the operator needs to see what is
+    // there in order to repair it.
+    assert!(summary.submission.is_some());
+    assert!(summary.decision.is_some());
+    assert_eq!(summary.state(), PlanState::Corrupt);
+}
+
+/// Submission + review + reject decision → state=rejected.
 #[test]
 fn summarize_plan_projects_rejected_decision() {
     let tmp = TempDir::new().unwrap();
     let bailiff = bailiff_repo(&tmp);
     let plan_id = PlanId::new();
     plant_plan_note(&bailiff, plan_id, "p", 1);
+    plant_review_note(&bailiff, plan_id, 2);
     plant_decision_note(&bailiff, plan_id, Decision::Rejected, "cli:bob", 2);
     let summary = summarize_plan(&bailiff, plan_id).unwrap();
     assert_eq!(
@@ -350,15 +378,14 @@ fn summarize_plan_projects_rejected_decision() {
     assert_eq!(summary.state(), PlanState::Rejected);
 }
 
-/// Submission + accept + review → state=reviewed; `reviewed_at`
-/// lifted from the review note's signed metadata.
+/// Submission + review, no verdict yet → state=reviewed;
+/// `reviewed_at` lifted from the review note's signed metadata.
 #[test]
 fn summarize_plan_projects_reviewed_at_when_reviewed() {
     let tmp = TempDir::new().unwrap();
     let bailiff = bailiff_repo(&tmp);
     let plan_id = PlanId::new();
     plant_plan_note(&bailiff, plan_id, "p", 1);
-    plant_decision_note(&bailiff, plan_id, Decision::Accepted, "cli:alice", 2);
     plant_review_note(&bailiff, plan_id, 1_700_000_001_000);
     let summary = summarize_plan(&bailiff, plan_id).unwrap();
     assert_eq!(
@@ -370,8 +397,9 @@ fn summarize_plan_projects_reviewed_at_when_reviewed() {
 }
 
 /// All four notes present → state=implemented; every projection
-/// populated. The "highest stage" rule means `Implemented` wins
-/// over `Reviewed` even though both notes are attached.
+/// populated. `Implemented` is the last position on the progression,
+/// so it is what a complete note set derives to even though the
+/// review and decision notes are still attached and still rendered.
 #[test]
 fn summarize_plan_projects_implemented_at_when_implemented() {
     let tmp = TempDir::new().unwrap();
@@ -389,7 +417,7 @@ fn summarize_plan_projects_implemented_at_when_implemented() {
     assert_eq!(
         summary.reviewed_at.map(|t| t.as_millis()),
         Some(3),
-        "reviewed_at must still surface even though state overrides to implemented",
+        "reviewed_at must still surface even though the state is implemented",
     );
     assert_eq!(summary.state(), PlanState::Implemented);
 }

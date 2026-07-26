@@ -39,7 +39,10 @@
 //! Reviewer feedback stays *out* of the composed prompt: per
 //! `docs/plans/2026-05-11-agent-plans.md` §"Implementer prompt
 //! construction" reviewer feedback drives the *decision*, not the
-//! execution. The review note is therefore not consulted here.
+//! execution. The review note is therefore not read for prompt
+//! composition — though since slice 1 the workflow does require one
+//! to exist, because `implement` runs only from `accepted` and a
+//! verdict is only reachable through `review`.
 //!
 //! # Error handling
 //!
@@ -841,9 +844,10 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nReplace bar with baz.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
-        record_decision(&bailiff, plan_id, Decision::Accepted).await;
-        // Slice 1: `implement` is legal only from `reviewed`.
+        // `implement` is legal only from `accepted`, which under the
+        // shipped order means both a review and a verdict.
         record_review(&bailiff, plan_id).await;
+        record_decision(&bailiff, plan_id, Decision::Accepted).await;
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
@@ -1023,6 +1027,8 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nDo a thing.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
+        // A verdict presupposes a review under the shipped order.
+        record_review(&bailiff, plan_id).await;
         record_decision(&bailiff, plan_id, Decision::Rejected).await;
 
         let err = tokio::time::timeout(
@@ -1059,21 +1065,20 @@ mod end_to_end_tests {
     /// `IllegalTransition` on a repeat call, without opening a new
     /// session or running the implementer agent a second time. Guards
     /// the codex-flagged footgun: the implementer holds
-    /// Behaviour delta (slice 1): implementing an accepted plan that
-    /// has **not been reviewed** is refused, pre-RPC.
+    /// Behaviour delta (slice 1): implementing a reviewed plan that
+    /// has **no verdict yet** is refused, pre-RPC.
     ///
-    /// The pre-slice gate checked submission -> decision ->
-    /// `Accepted` -> no prior implement, and never read the review
-    /// note, so an accepted-but-unreviewed plan went straight to a
-    /// `WorkspaceWrite`-capable agent run. This is the tightening
-    /// that makes review-before-implement policy rather than
-    /// convention.
+    /// The pre-slice gate never read the review note at all, so it
+    /// could not distinguish these states; and because the operator's
+    /// verdict is the last gate before a `WorkspaceWrite`-capable
+    /// agent run, "reviewed but nobody has decided" must not reach
+    /// it.
     ///
     /// Unlike its siblings this test needs no VM: the gate fires
     /// before any RPC, so it does not depend on the workspace
     /// plumbing that has the round-trip tests ignored.
     #[tokio::test]
-    async fn submit_implement_refuses_an_unreviewed_plan_before_any_rpc() {
+    async fn submit_implement_refuses_an_undecided_plan_before_any_rpc() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
         let (state, socket_path, broker_task) = spawn_broker(&tmp, signing_key.clone()).await;
@@ -1087,8 +1092,8 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nDo a thing.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
-        record_decision(&bailiff, plan_id, Decision::Accepted).await;
-        // Deliberately no `record_review`.
+        record_review(&bailiff, plan_id).await;
+        // Deliberately no `record_decision`.
 
         let err = tokio::time::timeout(
             Duration::from_secs(15),
@@ -1102,7 +1107,7 @@ mod end_to_end_tests {
         )
         .await
         .expect("submit_implement must return within 15s")
-        .expect_err("an unreviewed plan must not be implementable");
+        .expect_err("an undecided plan must not be implementable");
 
         match &err {
             SubmitImplementError::IllegalTransition {
@@ -1110,12 +1115,12 @@ mod end_to_end_tests {
                 source,
             } => {
                 assert_eq!(*found, plan_id);
-                assert_eq!(source.state, PlanState::Accepted);
+                assert_eq!(source.state, PlanState::Reviewed);
                 assert_eq!(source.stage, PlanStage::Implement);
                 assert!(
                     source
                         .to_string()
-                        .contains("run `bailiff plan review` first"),
+                        .contains("run `bailiff plan decide` first"),
                     "{source}",
                 );
             }
@@ -1160,9 +1165,10 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nDo a thing.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
-        record_decision(&bailiff, plan_id, Decision::Accepted).await;
-        // Slice 1: `implement` is legal only from `reviewed`.
+        // `implement` is legal only from `accepted`, which under the
+        // shipped order means both a review and a verdict.
         record_review(&bailiff, plan_id).await;
+        record_decision(&bailiff, plan_id, Decision::Accepted).await;
 
         // First call must succeed and stamp an implement note.
         let first = tokio::time::timeout(
@@ -1281,9 +1287,10 @@ mod end_to_end_tests {
         let plan_body = "# Plan\n\nDo a thing.\n";
         let plan_id =
             record_submission(&bailiff, &client, &writ_repo_path, &allowed, plan_body).await;
-        record_decision(&bailiff, plan_id, Decision::Accepted).await;
-        // Slice 1: `implement` is legal only from `reviewed`.
+        // `implement` is legal only from `accepted`, which under the
+        // shipped order means both a review and a verdict.
         record_review(&bailiff, plan_id).await;
+        record_decision(&bailiff, plan_id, Decision::Accepted).await;
 
         // Three concurrent calls is enough to exercise the
         // queue-on-`acquire` path while keeping the test runtime

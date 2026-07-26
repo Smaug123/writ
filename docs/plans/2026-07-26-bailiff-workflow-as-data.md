@@ -141,24 +141,42 @@ implementations have already earned, and design fan-out without building it.**
 ## Behaviour change (decided, not incidental)
 
 The four relations cannot be unified without choosing one. The choice is to
-tighten to the intended workflow:
+tighten to the workflow the original design specifies:
 
 ```
-              before                          after
-decide     :  (no precondition)            :  Submitted
-review     :  Submitted                    :  Accepted
-implement  :  Accepted && !Implemented     :  Reviewed && !Implemented
+              before                        after
+submit     :  (no precondition)          :  Absent
+review     :  Submitted                  :  Submitted   (unchanged)
+decide     :  (no precondition)          :  Reviewed
+implement  :  Accepted && !Implemented   :  Accepted
 ```
 
-Three deltas. `bailiff` is a workspace member with no dependents
-(only its own `bin/` consumes the library), so nothing in-tree needs migrating,
-but **any operator flow that skips `review` stops working**, and
-`architecture.md` §5.11's "decide and review deliberately do not gate" sentence
-becomes false and must change in the same slice. Each delta gets a named test
-asserting the *new* refusal, so the change is pinned rather than absorbed.
+**Review precedes the decision.** `2026-05-11-agent-plans.md` says so three
+times — "plan submission, plan review by other agents, a decision gate", "the
+**review → decide → execute** cycle works", and "reviewer feedback is for the
+decision, not for execution" — and `submit_implement`'s own docstring cites the
+last of those as the reason it keeps the review note out of the implementer's
+prompt. The pre-slice code did not enforce any order, and the display layer's
+"highest stage reached" rule silently assumed the opposite one (it ranked
+`Reviewed` above `Accepted`), which is why `{submission, review, decision}`
+rendered as `reviewed` rather than as the verdict it carries.
 
-`Corrupt` stays representable after the tightening — a manually deleted
-submission note still produces it — and denies every stage.
+This ordering was got wrong once during implementation: an earlier draft of this
+plan enforced `decide` → `review`, derived from the *shipped gate code* rather
+than from the design doc, and shipped it. Codex review caught the symptom — the
+reviewer prompt says `# Proposed plan`, which would have become a lie — and the
+order was corrected before merge. The prompt label needs no change under the
+corrected order.
+
+`bailiff` is a workspace member with no dependents (only its own `bin/` consumes
+the library), so nothing in-tree needed migrating, but **any operator flow that
+runs `decide` before `review` stops working**, and `architecture.md` §5.11's
+"decide and review deliberately do not gate" sentence becomes false. Each delta
+gets a named test asserting the *new* refusal, so the change is pinned rather
+than absorbed.
+
+`Corrupt` stays representable after the tightening — a manually deleted note
+still produces it — and denies every stage.
 
 ---
 

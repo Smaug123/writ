@@ -56,7 +56,7 @@ Everything below is a consequence of holding those two invariants at once.
 | **`writ-vm-client`** (`crates/writ-vm-client/`) | The guest-side `writ-vm` command surface that runs inside the agent VM. Links no host-only dependency — enforced by the crate graph. Re-exported as `writ::vm_client` under the `vm-client` feature. | `writ-core`, `writ-vm-git`, `writ-agent-run` |
 | **`writ-audit`** (`crates/writ-audit/`) | The append-only SQLite audit log: schema/migrations, the typed row DAOs, and two-phase write helpers. Re-exported as `writ::audit` under the `host` feature. | `writ-core`, `writ-agent-run`, `writ-vm-git` |
 | **`writ`** (root) | The imperative shell: the daemon and all host effects. Binaries `writd`, `writ`, `writ-vm`, `writ-agent-vm-runner`, `writ-agent-vm-pf-helper`. | `writ-core`, `writ-vm-git`, `writ-agent-run`, `writ-vm-client` (opt), `writ-audit` (opt) |
-| **`bailiff`** (`crates/bailiff/`) | A plan-workflow product (submit → decide → review → implement) built *on top of* writ. | `writ` |
+| **`bailiff`** (`crates/bailiff/`) | A plan-workflow product (submit → review → decide → implement) built *on top of* writ. | `writ` |
 
 Dependency direction is strict: `bailiff` → `writ` → {`writ-vm-git`,
 `writ-agent-run`, `writ-vm-client`, `writ-audit`, `writ-core`}. `writ` never
@@ -794,8 +794,8 @@ non-goals; both now exist in read-only form via `ui_http` (see the
 
 ### 5.11 bailiff — workflow on top of writ
 
-**Purpose.** A separate binary implementing a per-plan **submit → decide →
-review → implement** workflow layered on writ's `RunAgent`/`OpenSession` RPCs.
+**Purpose.** A separate binary implementing a per-plan **submit → review →
+decide → implement** workflow layered on writ's `RunAgent`/`OpenSession` RPCs.
 Each step verifies a broker-minted signed run envelope and records a
 bailiff-owned note in bailiff's own bare git repo, keeping product-level
 workflow out of the security-critical broker.
@@ -808,8 +808,11 @@ read,view,note,state}.rs`, `bailiff_decision.rs`, `bailiff_repo_guard.rs`,
 is the observation (which of the four notes exist, plus the decision's outcome),
 `derive` parses it into a `PlanState` (Absent/Submitted/Accepted/Rejected/
 Reviewed/Implemented/Corrupt), and `allows(state, stage)` is the gate every
-mutating verb calls — submit from `Absent`, decide from `Submitted`, review from
-`Accepted`, implement from `Reviewed`. The four ad-hoc idempotency gates are
+mutating verb calls — submit from `Absent`, review from `Submitted`, decide from
+`Reviewed`, implement from `Accepted`. Review precedes the decision because
+reviewer feedback is an input to it (`2026-05-11-agent-plans.md`: "the review →
+decide → execute cycle"; "reviewer feedback is for the decision, not for
+execution"). The four ad-hoc idempotency gates are
 subsumed: a stage is illegal from the state it produces, so "already decided /
 reviewed / implemented" needs no separate check (the write-side
 `write_note_if_absent` rejection remains as the backstop, in the same spirit as
@@ -824,11 +827,12 @@ implementation that walks the relation without consulting the state⇒presence m
 **History.** Until 2026-07-26 this was four disagreeing encodings: `plan_decide`
 read no precondition at all (so it could stamp a verdict on an unsubmitted plan
 and *manufacture* the `Corrupt` row the display layer exists to report),
-`submit_review` gated on the submission alone (so rejected plans reviewed
-happily), `submit_implement` gated on submission → `Accepted` → no prior
-implement but never read the review, and `BailiffPlanSummary::state` derived a
-fourth relation for display. Unifying them tightened three gates; see
-`docs/plans/2026-07-26-bailiff-workflow-as-data.md` for the delta table.
+`submit_review` gated on the submission alone, `submit_implement` gated on
+submission → `Accepted` → no prior implement but never read the review note at
+all, and `BailiffPlanSummary::state` derived a fourth relation for display whose
+"highest stage reached" rule assumed the opposite stage order. Unifying them
+tightened every gate; see `docs/plans/2026-07-26-bailiff-workflow-as-data.md`
+for the delta table.
 
 **Guarantees & invariants.** Each stage attaches a distinct note under one
 per-plan ref `refs/notes/bailiff/v1/plans/<id>` at deterministic per-stage seed

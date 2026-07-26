@@ -10,7 +10,8 @@
 //! - [`crate::bailiff_plan_review::submit_review`] gated on the
 //!   submission only, so a rejected plan reviewed happily;
 //! - [`crate::bailiff_plan_implement::submit_implement`] gated on
-//!   submission + `Accepted` + no prior implement, ignoring review;
+//!   submission + `Accepted` + no prior implement, never reading the
+//!   review note at all;
 //! - `BailiffPlanSummary::state` derived a fourth relation for
 //!   display, preferring "the latest stage present in the data".
 //!
@@ -128,9 +129,16 @@ impl NotePresence {
 plan_enum! {
     /// Where a plan stands, derived from its note set by [`derive_state`].
     ///
-    /// The progression is `Absent` → `Submitted` → (`Accepted` |
-    /// `Rejected`) → `Reviewed` → `Implemented`, with `Rejected`
+    /// The progression is `Absent` → `Submitted` → `Reviewed` →
+    /// (`Accepted` | `Rejected`) → `Implemented`, with `Rejected`
     /// terminal and `Corrupt` off to the side.
+    ///
+    /// Review precedes the decision because reviewer feedback is an
+    /// *input* to it: `docs/plans/2026-05-11-agent-plans.md` specifies
+    /// "the review → decide → execute cycle" and "reviewer feedback is
+    /// for the decision, not for execution", which is also why
+    /// `submit_implement` deliberately keeps the review note out of
+    /// the implementer's prompt.
     pub enum PlanState {
         /// No notes at all. A plan id that has never been submitted;
         /// the only position from which [`PlanStage::Submit`] is legal.
@@ -146,15 +154,16 @@ plan_enum! {
         /// only by manual repo surgery (or by a pre-slice-1 binary),
         /// and denies every stage.
         Corrupt => "corrupt",
-        /// Submission attached, awaiting a verdict.
+        /// Submission attached, awaiting review.
         Submitted => "submitted",
-        /// Submission + an `Accepted` verdict, awaiting review.
+        /// Submitted and reviewed; the reviewer's findings are
+        /// recorded and the plan is awaiting an operator verdict.
+        Reviewed => "reviewed",
+        /// Reviewed and accepted, awaiting implementation.
         Accepted => "accepted",
-        /// Submission + a `Rejected` verdict. Terminal: bailiff does no
+        /// Reviewed and rejected. Terminal: bailiff does no
         /// auto-anything, so the operator submits a fresh plan.
         Rejected => "rejected",
-        /// Accepted and reviewed, awaiting implementation.
-        Reviewed => "reviewed",
         /// Implemented. Terminal.
         Implemented => "implemented",
     }
@@ -199,10 +208,28 @@ impl PlanState {
             PlanState::Corrupt => None,
             PlanState::Absent => Some(NotePresence::NONE),
             PlanState::Submitted => p(None, false, false),
-            PlanState::Accepted => p(Some(Decision::Accepted), false, false),
-            PlanState::Rejected => p(Some(Decision::Rejected), false, false),
-            PlanState::Reviewed => p(Some(Decision::Accepted), true, false),
+            PlanState::Reviewed => p(None, true, false),
+            PlanState::Accepted => p(Some(Decision::Accepted), true, false),
+            PlanState::Rejected => p(Some(Decision::Rejected), true, false),
             PlanState::Implemented => p(Some(Decision::Accepted), true, true),
+        }
+    }
+
+    /// Position along the workflow's progression, or `None` for
+    /// [`PlanState::Corrupt`], which is not on it.
+    ///
+    /// Used to tell "this stage has not become legal yet" from "this
+    /// stage was already passed" — two refusals with opposite
+    /// remedies. `Accepted` and `Rejected` share a rank because they
+    /// are the same step's two outcomes.
+    pub const fn rank(self) -> Option<u8> {
+        match self {
+            PlanState::Corrupt => None,
+            PlanState::Absent => Some(0),
+            PlanState::Submitted => Some(1),
+            PlanState::Reviewed => Some(2),
+            PlanState::Accepted | PlanState::Rejected => Some(3),
+            PlanState::Implemented => Some(4),
         }
     }
 
@@ -229,10 +256,30 @@ impl PlanStage {
     pub const fn legal_predecessors(self) -> &'static [PlanState] {
         match self {
             PlanStage::Submit => &[PlanState::Absent],
-            PlanStage::Decide => &[PlanState::Submitted],
-            PlanStage::Review => &[PlanState::Accepted],
-            PlanStage::Implement => &[PlanState::Reviewed],
+            PlanStage::Review => &[PlanState::Submitted],
+            PlanStage::Decide => &[PlanState::Reviewed],
+            PlanStage::Implement => &[PlanState::Accepted],
         }
+    }
+}
+
+impl PlanStage {
+    /// Did `state` already pass this stage?
+    ///
+    /// True when the plan is strictly beyond every position from which
+    /// the stage could have run — which is exactly the repeated-command
+    /// case (`decide` from `accepted`, `review` from `reviewed`,
+    /// `implement` from `implemented`, `submit` from anything). No
+    /// later stage can make such a request legal, so the remedy is a
+    /// fresh plan, not "run X first".
+    pub fn already_passed_from(self, state: PlanState) -> bool {
+        let Some(rank) = state.rank() else {
+            return false;
+        };
+        self.legal_predecessors()
+            .iter()
+            .filter_map(|p| p.rank())
+            .all(|pred| rank > pred)
     }
 }
 
@@ -297,6 +344,17 @@ impl std::fmt::Display for IllegalTransition {
             PlanState::Corrupt => f.write_str(
                 "this plan's note set is one no legal sequence of stages could have produced; \
                  inspect it with `bailiff plan show` before doing anything else",
+            ),
+            // Repeated command. Pointing at the *next* stage here would
+            // be actively misleading — running it cannot make this
+            // request legal — and this is where the per-verb
+            // "already recorded ... submit a fresh plan" messages the
+            // transition relation replaced used to say so.
+            _ if self.stage.already_passed_from(self.state) => write!(
+                f,
+                "this plan is already past `{}`; bailiff does not re-run a stage — submit a \
+                 fresh plan if you want a different outcome",
+                self.stage,
             ),
             _ => match self.state.next_stage() {
                 Some(next) => write!(f, "run `bailiff plan {next}` first"),

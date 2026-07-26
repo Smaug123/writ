@@ -177,12 +177,15 @@ fn presence_agrees_with_the_transition_relation() {
 /// The deliberate behaviour change, as data. Every note set on which
 /// slice 1 disagrees with the old derivation, and no others.
 ///
-/// Seven of the eight are note sets the old code labelled with a
+/// Two kinds of entry. Most are note sets the old code labelled with a
 /// workflow stage even though no legal sequence produces them —
-/// implement-without-review, review-without-a-verdict, and so on. The
-/// eighth is the empty set, which the old code called `Corrupt`
-/// because a plan ref could not exist without a note; the machine
-/// needs it as `Absent` to have somewhere for `submit` to start.
+/// implement-without-review, a verdict recorded before any review, and
+/// so on. Two are *relabellings*: `{sub, rev, decision}` used to read
+/// as `reviewed` under the old "highest stage reached" rule, and now
+/// reads as the verdict it carries, because the decision is the later
+/// step. The remaining one is the empty set, which the old code called
+/// `Corrupt` because a plan ref could not exist without a note; the
+/// machine needs it as `Absent` for `submit` to start from.
 fn behaviour_delta_table() -> Vec<(NotePresence, &'static str, PlanState)> {
     let p = |submission, decision, review, implement| NotePresence {
         submission,
@@ -195,9 +198,15 @@ fn behaviour_delta_table() -> Vec<(NotePresence, &'static str, PlanState)> {
     vec![
         // Nothing recorded: was the corrupt bucket, now the start.
         (NotePresence::NONE, "corrupt", PlanState::Absent),
-        // Reviewed without a verdict, or against a rejection.
-        (p(true, None, true, false), "reviewed", PlanState::Corrupt),
-        (p(true, rej, true, false), "reviewed", PlanState::Corrupt),
+        // A verdict recorded before any review — the ordering the
+        // design doc rules out, and the gap the old `decide` verb left
+        // wide open.
+        (p(true, acc, false, false), "accepted", PlanState::Corrupt),
+        (p(true, rej, false, false), "rejected", PlanState::Corrupt),
+        // Reviewed *and* decided: the old rule reported the earlier
+        // stage, the relation reports the later one.
+        (p(true, acc, true, false), "reviewed", PlanState::Accepted),
+        (p(true, rej, true, false), "reviewed", PlanState::Rejected),
         // Implemented without some earlier stage.
         (
             p(true, None, false, true),
@@ -244,7 +253,7 @@ fn derive_matches_the_old_derivation_except_on_the_delta_table() {
             "undeclared behaviour change at {presence:?}",
         );
     }
-    assert_eq!(table.len(), 8);
+    assert_eq!(table.len(), 10);
 }
 
 /// `derive` is defined on the whole observation space, and the states
@@ -319,22 +328,29 @@ fn corrupt_denies_every_stage() {
 /// one per delta so a reviewer sees each refusal asserted directly
 /// rather than inferred from a quantified property.
 #[test]
-fn decide_now_requires_a_submission() {
+fn decide_now_requires_a_review() {
+    // `decide` used to read no precondition whatsoever.
     assert!(allows(PlanState::Absent, PlanStage::Decide).is_err());
-    assert!(allows(PlanState::Submitted, PlanStage::Decide).is_ok());
+    assert!(allows(PlanState::Submitted, PlanStage::Decide).is_err());
+    assert!(allows(PlanState::Reviewed, PlanStage::Decide).is_ok());
 }
 
 #[test]
-fn review_now_requires_an_accepted_verdict() {
-    assert!(allows(PlanState::Submitted, PlanStage::Review).is_err());
+fn review_precedes_the_decision() {
+    // Reviewer feedback is an input to the verdict, so review runs on
+    // a plain submission and is not legal once a verdict exists.
+    assert!(allows(PlanState::Submitted, PlanStage::Review).is_ok());
+    assert!(allows(PlanState::Absent, PlanStage::Review).is_err());
+    assert!(allows(PlanState::Accepted, PlanStage::Review).is_err());
     assert!(allows(PlanState::Rejected, PlanStage::Review).is_err());
-    assert!(allows(PlanState::Accepted, PlanStage::Review).is_ok());
 }
 
 #[test]
-fn implement_now_requires_a_review() {
-    assert!(allows(PlanState::Accepted, PlanStage::Implement).is_err());
-    assert!(allows(PlanState::Reviewed, PlanStage::Implement).is_ok());
+fn implement_now_requires_an_accepted_verdict() {
+    assert!(allows(PlanState::Submitted, PlanStage::Implement).is_err());
+    assert!(allows(PlanState::Reviewed, PlanStage::Implement).is_err());
+    assert!(allows(PlanState::Rejected, PlanStage::Implement).is_err());
+    assert!(allows(PlanState::Accepted, PlanStage::Implement).is_ok());
     // The old duplicate gate, now a consequence of the relation.
     assert!(allows(PlanState::Implemented, PlanStage::Implement).is_err());
 }
@@ -344,9 +360,9 @@ fn implement_now_requires_a_review() {
 #[test]
 fn next_stage_follows_the_chain_and_stops_at_terminals() {
     assert_eq!(PlanState::Absent.next_stage(), Some(PlanStage::Submit));
-    assert_eq!(PlanState::Submitted.next_stage(), Some(PlanStage::Decide));
-    assert_eq!(PlanState::Accepted.next_stage(), Some(PlanStage::Review));
-    assert_eq!(PlanState::Reviewed.next_stage(), Some(PlanStage::Implement));
+    assert_eq!(PlanState::Submitted.next_stage(), Some(PlanStage::Review));
+    assert_eq!(PlanState::Reviewed.next_stage(), Some(PlanStage::Decide));
+    assert_eq!(PlanState::Accepted.next_stage(), Some(PlanStage::Implement));
     assert_eq!(PlanState::Rejected.next_stage(), None);
     assert_eq!(PlanState::Implemented.next_stage(), None);
 }
@@ -381,16 +397,119 @@ fn state_and_stage_strings_are_stable() {
 /// hits.
 #[test]
 fn illegal_transition_names_the_operators_next_step() {
-    let err = allows(PlanState::Accepted, PlanStage::Implement).unwrap_err();
+    let err = allows(PlanState::Reviewed, PlanStage::Implement).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("requires reviewed"), "{msg}");
-    assert!(msg.contains("run `bailiff plan review` first"), "{msg}");
+    assert!(msg.contains("requires accepted"), "{msg}");
+    assert!(msg.contains("run `bailiff plan decide` first"), "{msg}");
 
-    let terminal = allows(PlanState::Rejected, PlanStage::Review).unwrap_err();
+    let terminal = allows(PlanState::Rejected, PlanStage::Implement).unwrap_err();
     let msg = terminal.to_string();
     assert!(msg.contains("terminal"), "{msg}");
 
     let corrupt = allows(PlanState::Corrupt, PlanStage::Review).unwrap_err();
     let msg = corrupt.to_string();
     assert!(msg.contains("bailiff plan show"), "{msg}");
+}
+
+/// A repeated command must never be told to run a *later* stage:
+/// nothing downstream can make an already-passed stage legal again.
+///
+/// This is the guidance the per-verb "already recorded ... submit a
+/// fresh plan" messages carried before the transition relation
+/// replaced them; losing it was a real regression, caught in review.
+#[test]
+fn repeating_a_passed_stage_recommends_a_fresh_plan_not_a_later_stage() {
+    for (state, stage) in [
+        (PlanState::Submitted, PlanStage::Submit),
+        (PlanState::Accepted, PlanStage::Decide),
+        (PlanState::Rejected, PlanStage::Decide),
+        (PlanState::Reviewed, PlanStage::Review),
+        (PlanState::Accepted, PlanStage::Review),
+        (PlanState::Implemented, PlanStage::Implement),
+    ] {
+        assert!(
+            stage.already_passed_from(state),
+            "{stage} from {state} is a repeat and must be recognised as one",
+        );
+        let msg = allows(state, stage).unwrap_err().to_string();
+        assert!(msg.contains("already past"), "{msg}");
+        assert!(msg.contains("submit a fresh plan"), "{msg}");
+        assert!(
+            !msg.contains("first"),
+            "a repeated command must not recommend running another stage: {msg}",
+        );
+    }
+}
+
+/// The converse: a stage that has simply not become legal *yet* keeps
+/// the actionable "run X first" hint.
+#[test]
+fn a_not_yet_reachable_stage_still_names_the_next_command() {
+    for (state, stage, expected) in [
+        (PlanState::Absent, PlanStage::Decide, "bailiff plan submit"),
+        (
+            PlanState::Submitted,
+            PlanStage::Implement,
+            "bailiff plan review",
+        ),
+        (
+            PlanState::Reviewed,
+            PlanStage::Implement,
+            "bailiff plan decide",
+        ),
+    ] {
+        assert!(!stage.already_passed_from(state));
+        let msg = allows(state, stage).unwrap_err().to_string();
+        assert!(msg.contains(expected), "{msg}");
+    }
+}
+
+/// `already_passed_from` is derived from `rank`, so the two must agree
+/// with the relation everywhere: a stage can never be both "already
+/// passed" and currently legal.
+#[test]
+fn a_passed_stage_is_never_also_legal() {
+    for &state in PlanState::ALL {
+        for &stage in PlanStage::ALL {
+            if stage.already_passed_from(state) {
+                assert!(
+                    allows(state, stage).is_err(),
+                    "{stage} is both legal from {state} and marked already-passed",
+                );
+            }
+        }
+    }
+}
+
+/// `rank` orders exactly the states the relation can reach, and
+/// `Corrupt` — which is not on the progression — has none.
+#[test]
+fn rank_is_defined_for_every_state_on_the_progression() {
+    assert_eq!(PlanState::Corrupt.rank(), None);
+    for &state in PlanState::ALL {
+        assert_eq!(
+            state.rank().is_some(),
+            state != PlanState::Corrupt,
+            "{state}",
+        );
+    }
+    // Every legal move strictly increases rank, which is what makes
+    // "beyond every predecessor" mean "already passed".
+    for &state in PlanState::ALL {
+        for &stage in PlanStage::ALL {
+            if !stage.legal_predecessors().contains(&state) {
+                continue;
+            }
+            let Some(presence) = state.presence() else {
+                continue;
+            };
+            for outcome in [Decision::Accepted, Decision::Rejected] {
+                let next = derive_state(&write_note(presence, stage, outcome));
+                assert!(
+                    next.rank() > state.rank(),
+                    "{stage} from {state} lands on {next}, which does not advance rank",
+                );
+            }
+        }
+    }
 }
