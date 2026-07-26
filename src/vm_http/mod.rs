@@ -1345,10 +1345,25 @@ fn auth_error_response(scheme: VmHttpAuthScheme, err: VmHttpAuthError) -> VmHttp
 /// Dispatch an authenticated request to its resolved route.
 ///
 /// The `match` is exhaustive over [`VmHttpRoute`], so a new route is a compile
-/// error until it is handled here — and a `Brokered` arm can only reach its
-/// effect's IO by handing the effect to `broker_effect`, which owns the audit
-/// pair. That is what makes "every effect is audited" a property of the routing
-/// table rather than of each handler remembering.
+/// error until it is handled here, and a `Brokered` arm reaches its effect's IO
+/// only through a writer that owns the whole audit pair. That is what makes
+/// "every effect is audited" a property of the routing table rather than of each
+/// handler remembering.
+///
+/// Which writer depends on whether the effect confers authority, and both are
+/// pair-forcing:
+///
+/// - **Two-phase**, via the `broker_effect` driver: the driver holds the
+///   `#[must_use]` guard across the effect, so the request row is durable
+///   *before* the effect and the outcome cannot be skipped. Every arm below but
+///   one.
+/// - **Coalesced**, via `AuditLog::record_effect_coalesced`: one commit for both
+///   rows, used where the effect grants nothing and so needs no pre-durable
+///   request row. `NixCache` is the one arm on this path — it calls its handler
+///   directly rather than the driver, which is why the driver is not the
+///   universal statement here. (The plan's `Durability::Coalesced` driver path
+///   would fold it in; the guarantee is the same either way, since the coalesced
+///   writer is atomic.)
 async fn route_authenticated_vm_http_request<S>(
     route: &VmHttpRoute,
     session: &VmHttpSession,

@@ -292,9 +292,15 @@ work: `EffectAuditTable` describes any `(request, outcome)` table pair, and the
 `begin_effect` records the request row (session-open-checked) and returns a
 `#[must_use]` guard whose `complete` records the matching outcome (refusing one
 whose key disagrees); `record_effect_coalesced` writes both in one commit for the
-authority-free Nix-cache serve. The shared open-session check lives once in
-`validation::check_session_open`. The guard is crate-internal until the VM-HTTP
-driver (§5.6) adopts it; the proxy tables already implement `EffectAuditTable`.
+authority-free Nix-cache serve and for locally-generated proxy responses (a
+denial, an unsupported route), which perform no IO. The shared open-session check
+lives once in `validation::check_session_open`. The VM-HTTP driver (§5.6) has
+adopted the guard, and for the four tables it fully owns — both model proxies,
+Nix-cache, flake-provision — the unguarded half-pair writers are now `#[cfg(test)]`,
+so **the guard is the only way production code can write those tables**. The two
+that keep public unpaired writers do so for stated reasons: `git_push` (boot
+reconciliation appends an outcome for an orphaned carrier) and `agent_run` (the
+request row is minted at run launch, the outcome arrives later).
 
 **The approve-attempt state machine.** `approve_attempt.rs` owns the vocabulary
 and the transition relation of the operator-approve lifecycle, which the DAO

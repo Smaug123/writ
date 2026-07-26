@@ -22,8 +22,8 @@ use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body as HyperBody, Frame};
 
 use crate::audit::{
-    AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, EffectAuditTable, ProxyAuditDecision,
-    ProxyOutcomeRecord, ProxyRequestRecord, RecordedRequest,
+    AUDIT_WRITE_FAILURE_TARGET, AuditLog, EffectAuditTable, ProxyAuditDecision, ProxyOutcomeRecord,
+    ProxyRequestRecord, RecordedRequest,
 };
 use crate::core::{RequestId, SessionId, UnixMillis};
 use crate::openai_chatgpt_auth::ChatgptUpstreamHeaders;
@@ -217,20 +217,6 @@ pub(super) trait ProxyAudit: 'static {
     const DISPLAY_NAME: &'static str;
 }
 
-/// Fields handed to a `ProxyBackend::record_request_audit` call, mirroring
-/// the structurally-identical per-backend request records. Carries the owned
-/// [`ProxyAuditDecision`] the audit-record write expects.
-#[derive(Copy, Clone, Debug)]
-pub(super) struct ProxyRequestFields<'a, R> {
-    pub(super) request_id: RequestId,
-    pub(super) session_id: SessionId,
-    pub(super) received_at: UnixMillis,
-    pub(super) method: &'a str,
-    pub(super) target: &'a str,
-    pub(super) route: R,
-    pub(super) decision: &'a ProxyAuditDecision,
-}
-
 /// Common configuration accessors the generic VM HTTP proxy service
 /// reads from a backend's per-provider config. Per-backend configs
 /// expose more (auth secrets, request caps, anthropic-version, ChatGPT
@@ -296,6 +282,12 @@ pub(super) trait ProxyBackend: ProxyAudit + Sized {
     /// [`OUTCOME_AUDIT_KIND`](Self::OUTCOME_AUDIT_KIND) so the diagnostic still
     /// names the streaming path.
     const STREAMING_OUTCOME_AUDIT_KIND: &'static str;
+    /// `kind = …` field on the tracing record emitted when the *coalesced*
+    /// request+outcome write for a locally-generated response fails
+    /// ([`record_proxy_local_response`]). Distinct from the two-phase kinds
+    /// because one commit failed, not one half of a pair — there is no partial
+    /// state to go looking for.
+    const LOCAL_RESPONSE_AUDIT_KIND: &'static str;
 
     /// Classify a guest-facing request target into one of this
     /// backend's audit routes, or `None` if the target is not a proxy
@@ -371,24 +363,6 @@ pub(super) trait ProxyBackend: ProxyAudit + Sized {
     where
         S: SecretStore + Send + Sync + ?Sized;
 
-    /// Persist a per-backend proxy-request audit record (translating
-    /// from the shared `ProxyRequestFields` to the per-backend
-    /// `*ProxyRequestRecord` shape). Fallible because the route
-    /// dispatcher converts an audit-write failure into a 500 to the
-    /// guest, separately from the tracing record.
-    fn record_request_audit(
-        audit_log: &AuditLog,
-        fields: ProxyRequestFields<'_, Self::Route>,
-    ) -> Result<(), AuditError>;
-
-    /// Persist a per-backend proxy-outcome audit record. Used from the
-    /// route dispatcher; the streaming-Drop path uses
-    /// `ProxyAudit::record_outcome` instead, which is infallible.
-    fn record_outcome_audit(
-        audit_log: &AuditLog,
-        fields: ProxyOutcomeFields<'_>,
-    ) -> Result<(), AuditError>;
-
     /// Wrap an opened `ProxyStream<Self>` into the carrier variant the
     /// VM HTTP dispatcher uses. Today this is `VmHttpDispatch::ClaudeProxyStream`
     /// or `VmHttpDispatch::OpenAiProxyStream`; the trait method keeps
@@ -410,22 +384,6 @@ pub(super) struct OpenAiBackend;
 
 impl ProxyAudit for OpenAiBackend {
     const DISPLAY_NAME: &'static str = "OpenAI";
-}
-
-/// Fields handed to a `ProxyAudit::record_outcome` call. The two
-/// existing audit-record types (`ClaudeProxyOutcomeRecord` /
-/// `OpenAiProxyOutcomeRecord`) are nominally distinct but structurally
-/// identical; this struct lets the caller build them once and the
-/// trait impl pick the right one.
-#[derive(Copy, Clone, Debug)]
-pub(super) struct ProxyOutcomeFields<'a> {
-    pub(super) request_id: RequestId,
-    pub(super) completed_at: UnixMillis,
-    pub(super) http_status: u16,
-    pub(super) upstream_url: Option<&'a str>,
-    pub(super) upstream_status: Option<u16>,
-    pub(super) response_bytes: u64,
-    pub(super) error: Option<&'static str>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1150,9 +1108,19 @@ fn deny_decision(reason: &str) -> ProxyAuditDecision {
     }
 }
 
-/// Generic helper for recording a locally-generated VM HTTP proxy
-/// response (not an upstream fetch). Replaces the per-backend
-/// `record_*_proxy_local_response` functions.
+/// Record a locally-generated VM HTTP proxy response — an auth denial, an
+/// unsupported route, a method-not-allowed — and return it.
+///
+/// Both audit rows are written in **one commit**, through the shared coalesced
+/// guard writer. That is the right durability here precisely because this path
+/// performs no IO: nothing happens between the two rows, so there is nothing a
+/// pre-durable request row could describe. Coalescing also means a refused
+/// outcome takes the request row down with it, rather than leaving a dangling
+/// row that [`reconcile_unpaired_effect_rows`](crate::boot_reconcile) would
+/// report at boot as a request that may have performed an effect.
+///
+/// The upstream-fetch paths keep the two-phase guard (`broker_effect`): there,
+/// the request row *must* be durable before the fetch.
 pub(super) fn record_proxy_local_response<B, S>(
     service: &VmHttpProxyService<B, S>,
     session: &VmHttpSession,
@@ -1167,75 +1135,39 @@ where
     S: SecretStore + Send + Sync + 'static,
 {
     let request_id = RequestId::new();
-    if let Err(failure) = record_proxy_request_or_500::<B>(
-        &service.broker_state.audit,
-        ProxyRequestFields {
-            request_id,
-            session_id: session.session_id(),
-            received_at: UnixMillis::now(),
-            method: &request.method,
-            target: &request.target,
-            route,
-            decision: &decision,
-        },
-    ) {
-        return failure;
-    }
-    if let Err(failure) = record_proxy_outcome_or_500::<B>(
-        &service.broker_state.audit,
-        ProxyOutcomeFields {
-            request_id,
-            completed_at: UnixMillis::now(),
-            http_status: response.status.code(),
-            upstream_url: None,
-            upstream_status: None,
-            response_bytes: response.body.len() as u64,
-            error,
-        },
-    ) {
-        return failure;
+    if let Err(err) = service
+        .broker_state
+        .audit
+        .record_effect_coalesced::<B::AuditTable>(
+            &ProxyRequestRecord {
+                request_id,
+                session_id: session.session_id(),
+                received_at: UnixMillis::now(),
+                method: &request.method,
+                target: &request.target,
+                route,
+                decision: &decision,
+            },
+            &ProxyOutcomeRecord {
+                request_id,
+                completed_at: UnixMillis::now(),
+                http_status: response.status.code(),
+                upstream_url: None,
+                upstream_status: None,
+                response_bytes: response.body.len() as u64,
+                error,
+            },
+        )
+    {
+        tracing::error!(
+            target: AUDIT_WRITE_FAILURE_TARGET,
+            kind = B::LOCAL_RESPONSE_AUDIT_KIND,
+            request_id = %request_id,
+            error = %err,
+            "audit write failed",
+        );
+        // Fail closed: an unrecorded denial is still an unaudited answer.
+        return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
     }
     response
-}
-
-fn record_proxy_request_or_500<B: ProxyBackend>(
-    audit_log: &AuditLog,
-    fields: ProxyRequestFields<'_, B::Route>,
-) -> Result<(), VmHttpResponse> {
-    let request_id = fields.request_id;
-    if let Err(err) = B::record_request_audit(audit_log, fields) {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = B::REQUEST_AUDIT_KIND,
-            request_id = %request_id,
-            error = %err,
-            "audit write failed",
-        );
-        return Err(VmHttpResponse::text(
-            VmHttpStatus::InternalServerError,
-            "audit write failed",
-        ));
-    }
-    Ok(())
-}
-
-fn record_proxy_outcome_or_500<B: ProxyBackend>(
-    audit_log: &AuditLog,
-    fields: ProxyOutcomeFields<'_>,
-) -> Result<(), VmHttpResponse> {
-    let request_id = fields.request_id;
-    if let Err(err) = B::record_outcome_audit(audit_log, fields) {
-        tracing::error!(
-            target: AUDIT_WRITE_FAILURE_TARGET,
-            kind = B::OUTCOME_AUDIT_KIND,
-            request_id = %request_id,
-            error = %err,
-            "audit write failed",
-        );
-        return Err(VmHttpResponse::text(
-            VmHttpStatus::InternalServerError,
-            "audit write failed",
-        ));
-    }
-    Ok(())
 }
