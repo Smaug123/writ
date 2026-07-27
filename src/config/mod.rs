@@ -636,14 +636,14 @@ pub fn check_daemon_sections(
     ui_http: Option<&UiHttpConfig>,
 ) -> Result<Option<AgentVmDaemonRuntimeConfig>, Errors<DaemonConfigError>> {
     let mut errors = Accumulator::new();
-    let agent_vm = errors.record_many(
-        agent_vm
-            .map(AgentVmDaemonConfig::to_runtime_config)
-            .transpose(),
-    );
+    let agent_vm = errors.record_many(agent_vm.map(AgentVmDaemonConfig::check).transpose());
     let ui_http = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
     let (agent_vm, _ui_http) = errors.unpack(all_recorded!(agent_vm, ui_http))?;
-    Ok(agent_vm)
+    // Only now, with every section checked, is it right to create anything.
+    agent_vm
+        .map(AgentVmDaemonPlan::materialize)
+        .transpose()
+        .map_err(Errors::map_into)
 }
 
 /// A problem found while turning a [`DaemonConfig`] into runtime state.
@@ -682,17 +682,27 @@ pub enum AgentVmDaemonConfigError {
 }
 
 impl AgentVmDaemonConfig {
-    /// Validate both subsections and report their failures together: the
-    /// lifecycle and vm_http sections are independent, so a mistake in one
-    /// must not hide every mistake in the other.
+    /// Validate both subsections and build the runtime config.
     ///
-    /// Both are *checked* before either is materialized. Lifecycle validation
-    /// touches nothing, and `vm_http`'s filesystem work is deferred into a
-    /// [`VmHttpPlan`], so a config rejected on its text leaves no directories
-    /// behind no matter which section was at fault.
+    /// Equivalent to [`Self::check`] followed by
+    /// [`AgentVmDaemonPlan::materialize`]; a caller that also validates
+    /// *sibling* config sections should use those two directly, so that this
+    /// section creates nothing until those siblings have been checked too.
     pub fn to_runtime_config(
         &self,
     ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
+        self.check()?.materialize()
+    }
+
+    /// Run every check that touches nothing across both subsections, and
+    /// return the plan for the checks that do.
+    ///
+    /// The lifecycle and vm_http sections are independent, so a mistake in one
+    /// must not hide every mistake in the other; both are checked here.
+    /// Lifecycle validation touches nothing, and `vm_http`'s filesystem work is
+    /// deferred into a [`VmHttpPlan`], so a config rejected on its text leaves
+    /// no directories behind no matter which section was at fault.
+    pub fn check(&self) -> Result<AgentVmDaemonPlan, Errors<AgentVmDaemonConfigError>> {
         let mut errors = Accumulator::new();
         let lifecycle = errors.record_many(self.lifecycle.to_runtime_config());
         let vm_http_plan = errors.record_many(self.vm_http.check());
@@ -702,11 +712,30 @@ impl AgentVmDaemonConfig {
         let _bind_addr = errors.record_from(AgentVmDaemonRuntimeConfig::check_bind_addr(
             self.vm_http.bind_addr,
         ));
-        let (lifecycle, vm_http_plan) = errors.unpack(all_recorded!(lifecycle, vm_http_plan))?;
-        // Past this point the config is sound, so creating the broker's
-        // directories is work on behalf of a daemon that will start.
-        let vm_http = vm_http_plan.materialize().map_err(Errors::map_into)?;
-        AgentVmDaemonRuntimeConfig::new(lifecycle, vm_http)
+        let (lifecycle, vm_http) = errors.unpack(all_recorded!(lifecycle, vm_http_plan))?;
+        Ok(AgentVmDaemonPlan { lifecycle, vm_http })
+    }
+}
+
+/// An `agent_vm` section that has passed every check that touches nothing,
+/// carrying its `vm_http` subsection's still-unexecuted [`VmHttpPlan`].
+///
+/// The same split as [`VmHttpPlan`], one level up, so that it *composes*: a
+/// caller validating sibling sections can hold this while it checks them, and
+/// materialize only once the whole config is known good.
+#[derive(Debug)]
+pub struct AgentVmDaemonPlan {
+    lifecycle: AgentVmLifecycleRuntimeConfig,
+    vm_http: VmHttpPlan,
+}
+
+impl AgentVmDaemonPlan {
+    /// Create the planned directories and assemble the runtime config.
+    pub fn materialize(
+        self,
+    ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
+        let vm_http = self.vm_http.materialize().map_err(Errors::map_into)?;
+        AgentVmDaemonRuntimeConfig::new(self.lifecycle, vm_http)
             .map_err(|err| Errors::single(err.into()))
     }
 }

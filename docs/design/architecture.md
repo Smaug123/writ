@@ -277,12 +277,13 @@ the errors come from:
 **Validation is planned, then executed.** `AgentVmHttpConfig::check` runs every
 check that touches nothing and returns a `VmHttpPlan` — the validated runtime
 config plus the directories that still need creating; `VmHttpPlan::materialize`
-carries that out. This is the interpreter pattern applied to config: it is what
-lets `AgentVmDaemonConfig::to_runtime_config` check *both* sections — and the
-daemon-level bind invariant, via `AgentVmDaemonRuntimeConfig::check_bind_addr`,
-which takes the bare address so it cannot hide behind an unrelated fault —
-before anything creates a directory, so a fault anywhere leaves no debris. That
-matters most for `work_root`, where a directory created at the process umask
+carries that out. This is the interpreter pattern applied to config, and it *composes*:
+`AgentVmDaemonConfig::check` holds a `VmHttpPlan` inside an
+`AgentVmDaemonPlan`, and `check_daemon_sections` holds that while it validates
+`ui_http`, so nothing is created until every section — plus the daemon-level
+bind invariant, via `AgentVmDaemonRuntimeConfig::check_bind_addr`, which takes
+the bare address so it cannot hide behind an unrelated fault — has been checked.
+A fault anywhere therefore leaves no debris. That matters most for `work_root`, where a directory created at the process umask
 (0755) would make `validate_existing_work_root` refuse that path on every later
 boot too.
 

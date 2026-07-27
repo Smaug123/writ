@@ -1989,3 +1989,33 @@ fn a_non_wildcard_bind_addr_is_reported_alongside_an_unrelated_vm_http_fault() {
         "unrelated fault missing: {found:#?}",
     );
 }
+
+/// The top-level sections compose the same way the nested ones do: a bad
+/// `ui_http` must not cost a materialized `agent_vm` section. Otherwise the
+/// plan-before-execute guarantee holds only one level deep.
+#[test]
+fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
+    let mut vm_http = valid_agent_vm_http_config();
+    let work_root = unique_config_test_path("ui-http-no-debris");
+    vm_http.work_root = work_root.clone();
+    let agent_vm = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+    let ui_http = UiHttpConfig {
+        bind: "0.0.0.0:7378".parse().unwrap(),
+        bearer_path: None,
+    };
+
+    let errors = check_daemon_sections(Some(&agent_vm), Some(&ui_http)).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, DaemonConfigError::UiHttp(_))),
+        "ui_http failure missing: {errors}",
+    );
+    assert!(
+        !work_root.exists(),
+        "agent_vm work root {work_root:?} was created despite ui_http being invalid",
+    );
+}
