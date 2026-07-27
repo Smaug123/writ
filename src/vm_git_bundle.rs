@@ -159,6 +159,12 @@ pub enum GitCloneBundleRunError {
     BundleInsideMirror(PathBuf),
     #[error("bundle path resolves outside the Git clone work directory: {0}")]
     BundleEscapedWorkDir(PathBuf),
+    /// The bundle target resolves *to* the work directory itself. Reachable
+    /// through the pre-create check, which runs before the bundle exists: a
+    /// symlinked parent can make an otherwise-nested target canonicalise back
+    /// onto the work dir.
+    #[error("bundle path resolves to the Git clone work directory itself: {0}")]
+    BundleIsWorkDir(PathBuf),
     #[error("{step} command could not be spawned: {source}")]
     Spawn {
         step: GitCloneCommandStep,
@@ -789,12 +795,8 @@ impl BundleBoundaryViolation {
 
     fn into_run_error(self, bundle: PathBuf) -> GitCloneBundleRunError {
         match self {
-            // At run time the bundle has already been proved to be a regular
-            // file, so it cannot *be* the work dir; the arm exists because the
-            // mapping is total, not because it is reachable.
-            Self::IsWorkDir | Self::OutsideWorkDir => {
-                GitCloneBundleRunError::BundleEscapedWorkDir(bundle)
-            }
+            Self::IsWorkDir => GitCloneBundleRunError::BundleIsWorkDir(bundle),
+            Self::OutsideWorkDir => GitCloneBundleRunError::BundleEscapedWorkDir(bundle),
             Self::InsideMirror => GitCloneBundleRunError::BundleInsideMirror(bundle),
         }
     }
@@ -1723,6 +1725,37 @@ exit 42
             "unexpected error: {err:?}"
         );
         assert!(!outside.join("out.bundle").exists());
+    }
+
+    /// A nested bundle path whose parent is replaced, during the clone, by a
+    /// symlink that resolves back onto the work dir. The pre-create check runs
+    /// before the bundle exists, so this reaches the boundary predicate with a
+    /// target *equal* to the work dir — the arm that would otherwise have been
+    /// dismissed as unreachable and reported as a plain escape.
+    #[tokio::test]
+    async fn executor_rejects_a_bundle_target_that_resolves_onto_the_work_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        // `work/up` becomes a symlink to the work dir's *parent*, so the
+        // bundle path `work/up/work` has a parent that canonicalises to that
+        // parent — and joining the final component "work" lands exactly on the
+        // work dir itself.
+        let up = work.join("up");
+        let ln = shell_quote(&required_test_tool("ln"));
+        let clone_extra = format!("{ln} -s {} {}\n", shell_quote(dir.path()), shell_quote(&up));
+        let (git, _) = fake_git_program(&dir, &clone_extra, "");
+        // Lexically this is a nested path with no `..` component, so plan-time
+        // validation admits it; only the canonical pass can see where it lands.
+        let plan = plan_with_paths(git, &work, up.join("work"), TEST_GIT_TIMEOUT, 1024);
+
+        let err = run_git_clone_bundle(&plan, &git_secret())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, GitCloneBundleRunError::BundleIsWorkDir(_)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
