@@ -38,6 +38,10 @@ use crate::vm_http::{
     VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError, VmHttpRuntimeConfig,
 };
 
+pub(crate) mod accumulate;
+pub use accumulate::Errors;
+use accumulate::{Accumulator, all_recorded};
+
 mod audit_dir;
 pub use audit_dir::{
     AuditDirNotDedicated, LegacyAuditDbNotMigrated, ensure_audit_db_entry_is_regular_file,
@@ -148,14 +152,18 @@ impl UiHttpConfig {
     /// rather than discovering a public-facing listener — or a
     /// daemon that picks a different port on every restart — by
     /// accident.
-    pub fn validate(&self) -> Result<(), UiHttpConfigError> {
+    ///
+    /// The two faults are independent — `0.0.0.0:0` is both — so both are
+    /// reported rather than only whichever is checked first.
+    pub fn validate(&self) -> Result<(), Errors<UiHttpConfigError>> {
+        let mut errors = Accumulator::new();
         if !self.bind.ip().is_loopback() {
-            return Err(UiHttpConfigError::NonLoopbackBind(self.bind));
+            let _ = errors.record::<()>(Err(UiHttpConfigError::NonLoopbackBind(self.bind)));
         }
         if self.bind.port() == 0 {
-            return Err(UiHttpConfigError::EphemeralPortBind(self.bind));
+            let _ = errors.record::<()>(Err(UiHttpConfigError::EphemeralPortBind(self.bind)));
         }
-        Ok(())
+        errors.finish()
     }
 
     pub fn bearer_path_or_default(&self) -> PathBuf {
@@ -616,6 +624,41 @@ pub enum AgentVmHttpConfigError {
     FlakeProvisionBounds(#[from] FlakeProvisionBoundsError),
 }
 
+/// Validate every daemon section that can be checked before writd takes an
+/// irreversible step, reporting all the failures together.
+///
+/// Takes the sections rather than the whole [`DaemonConfig`] because the
+/// binary destructures it first. Living here — rather than being assembled in
+/// `writd` — keeps the accumulator vocabulary, and in particular the `Failed`
+/// marker, inside this crate.
+pub fn check_daemon_sections(
+    agent_vm: Option<&AgentVmDaemonConfig>,
+    ui_http: Option<&UiHttpConfig>,
+) -> Result<Option<AgentVmDaemonRuntimeConfig>, Errors<DaemonConfigError>> {
+    let mut errors = Accumulator::new();
+    let agent_vm = errors.record_many(agent_vm.map(AgentVmDaemonConfig::check).transpose());
+    let ui_http = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
+    let (agent_vm, _ui_http) = errors.unpack(all_recorded!(agent_vm, ui_http))?;
+    // Only now, with every section checked, is it right to create anything.
+    agent_vm
+        .map(AgentVmDaemonPlan::materialize)
+        .transpose()
+        .map_err(Errors::map_into)
+}
+
+/// A problem found while turning a [`DaemonConfig`] into runtime state.
+///
+/// Exists so failures from the independent top-level sections accumulate into
+/// one report: without a common type, a bad `agent_vm` section would be
+/// reported and a bad `ui_http` section only discovered on the next boot.
+#[derive(Debug, thiserror::Error)]
+pub enum DaemonConfigError {
+    #[error(transparent)]
+    AgentVm(#[from] AgentVmDaemonConfigError),
+    #[error(transparent)]
+    UiHttp(#[from] UiHttpConfigError),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentVmDaemonConfigError {
     #[error(transparent)]
@@ -639,83 +682,375 @@ pub enum AgentVmDaemonConfigError {
 }
 
 impl AgentVmDaemonConfig {
+    /// Validate both subsections and build the runtime config.
+    ///
+    /// Equivalent to [`Self::check`] followed by
+    /// [`AgentVmDaemonPlan::materialize`]; a caller that also validates
+    /// *sibling* config sections should use those two directly, so that this
+    /// section creates nothing until those siblings have been checked too.
     pub fn to_runtime_config(
         &self,
-    ) -> Result<AgentVmDaemonRuntimeConfig, AgentVmDaemonConfigError> {
-        Ok(AgentVmDaemonRuntimeConfig::new(
-            self.lifecycle.to_runtime_config()?,
-            self.vm_http.to_runtime_config()?,
-        )?)
+    ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
+        self.check()?.materialize()
+    }
+
+    /// Run every check that touches nothing across both subsections, and
+    /// return the plan for the checks that do.
+    ///
+    /// The lifecycle and vm_http sections are independent, so a mistake in one
+    /// must not hide every mistake in the other; both are checked here.
+    /// Lifecycle validation touches nothing, and `vm_http`'s filesystem work is
+    /// deferred into a [`VmHttpPlan`], so a config rejected on its text leaves
+    /// no directories behind no matter which section was at fault.
+    pub fn check(&self) -> Result<AgentVmDaemonPlan, Errors<AgentVmDaemonConfigError>> {
+        let mut errors = Accumulator::new();
+        let lifecycle = errors.record_many(self.lifecycle.to_runtime_config());
+        let vm_http_plan = errors.record_many(self.vm_http.check());
+        // The daemon-level bind invariant reads one already-typed field, so it
+        // is checked straight off the raw config: independent of whatever else
+        // the section got wrong, and well before the plan creates anything.
+        let _bind_addr = errors.record_from(AgentVmDaemonRuntimeConfig::check_bind_addr(
+            self.vm_http.bind_addr,
+        ));
+        let (lifecycle, vm_http) = errors.unpack(all_recorded!(lifecycle, vm_http_plan))?;
+        Ok(AgentVmDaemonPlan { lifecycle, vm_http })
+    }
+}
+
+/// An `agent_vm` section that has passed every check that touches nothing,
+/// carrying its `vm_http` subsection's still-unexecuted [`VmHttpPlan`].
+///
+/// The same split as [`VmHttpPlan`], one level up, so that it *composes*: a
+/// caller validating sibling sections can hold this while it checks them, and
+/// materialize only once the whole config is known good.
+#[derive(Debug)]
+pub struct AgentVmDaemonPlan {
+    lifecycle: AgentVmLifecycleRuntimeConfig,
+    vm_http: VmHttpPlan,
+}
+
+impl AgentVmDaemonPlan {
+    /// Create the planned directories and assemble the runtime config.
+    pub fn materialize(
+        self,
+    ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
+        let vm_http = self.vm_http.materialize().map_err(Errors::map_into)?;
+        AgentVmDaemonRuntimeConfig::new(self.lifecycle, vm_http)
+            .map_err(|err| Errors::single(err.into()))
     }
 }
 
 impl AgentVmLifecycleConfig {
+    /// Validate the `lifecycle` section, reporting every independent problem
+    /// in one pass. See [`AgentVmHttpConfig::to_runtime_config`] for the
+    /// shape; the same rules apply here.
     pub fn to_runtime_config(
         &self,
-    ) -> Result<AgentVmLifecycleRuntimeConfig, AgentVmDaemonConfigError> {
-        let ipv4_pool = parse_ipv4_cidr_config("ipv4_pool", &self.ipv4_pool)?;
-        let ipv6_pool = parse_ipv6_cidr_config("ipv6_pool", &self.ipv6_pool)?;
-        let pool = AgentNetworkPool::new(ipv4_pool, ipv6_pool)?;
+    ) -> Result<AgentVmLifecycleRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
+        let mut errors = Accumulator::new();
+        let ipv4_pool = errors.record(parse_ipv4_cidr_config("ipv4_pool", &self.ipv4_pool));
+        let ipv6_pool = errors.record(parse_ipv6_cidr_config("ipv6_pool", &self.ipv6_pool));
+        let pool = all_recorded!(ipv4_pool, ipv6_pool)
+            .and_then(|(v4, v6)| errors.record_from(AgentNetworkPool::new(v4, v6)));
         let state_dir = match &self.state_dir {
-            Some(path) => path.clone(),
-            None => default_agent_vm_state_dir()?,
+            Some(path) => Ok(path.clone()),
+            None => errors.record_from(default_agent_vm_state_dir()),
         };
         // Only the vm arm runs a broker VM, so `broker_image` is meaningful only
         // there. Ignore it entirely for host placement (as documented), so a
         // stray/empty value on a host config can't reject startup and
         // `broker_image()` stays `Some` exactly when placement is `Vm`.
         let broker_image = match self.broker_placement {
-            BrokerPlacement::Vm => self
-                .broker_image
-                .as_ref()
-                .map(|image| ContainerImage::new(image.clone()))
-                .transpose()?,
-            BrokerPlacement::Host => None,
+            BrokerPlacement::Vm => errors.record_from(
+                self.broker_image
+                    .as_ref()
+                    .map(|image| ContainerImage::new(image.clone()))
+                    .transpose(),
+            ),
+            BrokerPlacement::Host => Ok(None),
         };
-        Ok(AgentVmLifecycleRuntimeConfig::new(
+        let image = errors.record_from(ContainerImage::new(self.image.clone()));
+        let resources = errors.record_from(AgentVmResources::new(self.cpus, self.memory_mib));
+
+        let (pool, state_dir, broker_image, image, resources) = errors.unpack(all_recorded!(
+            pool,
+            state_dir,
+            broker_image,
+            image,
+            resources,
+        ))?;
+        AgentVmLifecycleRuntimeConfig::new(
             pool,
             self.subnet_index_min,
             self.subnet_index_max,
             AgentVmSessionStateStore::new(state_dir),
             self.ipv6_mode,
             self.broker_placement,
-            ContainerImage::new(self.image.clone())?,
+            image,
             broker_image,
-            AgentVmResources::new(self.cpus, self.memory_mib)?,
+            resources,
             AgentVmToolPaths::new(
                 self.container.clone(),
                 self.pf_helper.clone(),
                 self.sudo.clone(),
             ),
-        )?)
+        )
+        .map_err(|err| Errors::single(err.into()))
+    }
+}
+
+/// A `vm_http` section that has passed every check that can be made without
+/// touching the filesystem, together with the directories that still have to
+/// be created before the broker can run.
+///
+/// This is the interpreter pattern applied to config validation: [`AgentVmHttpConfig::check`]
+/// computes an inert description of what needs to exist, and
+/// [`VmHttpPlan::materialize`] carries it out. Separating them is what lets a
+/// caller validating *several* sections check all of them before any one of
+/// them creates anything — otherwise a fault in a sibling section would still
+/// leave this one's directories behind.
+#[derive(Debug)]
+pub struct VmHttpPlan {
+    runtime: VmHttpRuntimeConfig,
+    work_root: PathBuf,
+    /// In creation order. The work root is prepared before any of these, so a
+    /// root beneath it is never created by `create_dir_all` at the process
+    /// umask.
+    roots: Vec<RootPlan>,
+}
+
+/// One directory [`VmHttpPlan::materialize`] must create and prove writable.
+#[derive(Debug)]
+struct RootPlan {
+    kind: WritableRoot,
+    path: PathBuf,
+}
+
+impl VmHttpPlan {
+    /// Create the planned directories and prove the broker can write to them,
+    /// accumulating failures across all of them.
+    pub fn materialize(self) -> Result<VmHttpRuntimeConfig, Errors<AgentVmHttpConfigError>> {
+        let mut errors = Accumulator::new();
+        // `prepare_git_work_root` refuses to clone into a work root whose mode
+        // has group/world bits set, but `prepare_writable_root` below creates
+        // the staging/log subdirs with `create_dir_all`, which propagates the
+        // process umask to the freshly-created `work_root` parent (typically
+        // 0755). Ensure work_root itself is 0700 before that runs so the
+        // out-of-the-box defaults — where the user never names `work_root`
+        // explicitly — survive the first clone request.
+        let work_root_ready = errors.record(ensure_vm_http_work_root_private(&self.work_root));
+        // Every root waits on the work root, including one the operator named
+        // explicitly. Whether a named root is *really* a descendant cannot be
+        // decided reliably here: it need not exist yet, so it cannot be
+        // canonicalised, and a lexical `starts_with` is case-sensitive and blind
+        // to symlinks and `..`. Getting that wrong in the permissive direction
+        // mutates the filesystem on behalf of a config that has already been
+        // rejected — a rejected work root is often one that merely *exists* with
+        // loose permissions, and `create_dir_all` of a child inside it succeeds
+        // happily. So take the conservative branch uniformly.
+        //
+        // The cost is one extra round-trip in the narrow case where the work
+        // root and some other root are both broken: the operator learns the
+        // second root is unwritable only after fixing the work root. Every
+        // *textual* fault in those roots was already reported by `check`, which
+        // does not gate on anything.
+        for root in self.roots {
+            let _ = work_root_ready
+                .and_then(|()| errors.record(prepare_writable_root(root.kind, root.path)));
+        }
+        errors.finish().map(|()| self.runtime)
     }
 }
 
 impl AgentVmHttpConfig {
-    pub fn to_runtime_config(&self) -> Result<VmHttpRuntimeConfig, AgentVmHttpConfigError> {
-        let broker_port_range = BrokerPortRange::new(self.broker_port_min, self.broker_port_max)?;
-        let token_env = GitSecretEnvVar::new(self.token_env.clone())?;
-        let credential = GitCredentialBoundary::new(self.askpass_program.clone(), token_env)?;
-        let clone_base_url = GitCloneBaseUrl::parse(&self.git_clone_base_url)?;
-        let git_clone = VmHttpGitCloneConfig::new_with_clone_base_url(
-            self.git_program.clone(),
-            clone_base_url,
-            credential,
-            self.work_root.clone(),
-            Duration::from_secs(self.clone_timeout_secs),
-            self.max_bundle_bytes,
-        )?;
+    /// Validate the whole `vm_http` section and build its runtime config,
+    /// reporting **every** independent problem rather than stopping at the
+    /// first.
+    ///
+    /// Equivalent to [`Self::check`] followed by [`VmHttpPlan::materialize`];
+    /// callers validating several sections should use those two directly, so
+    /// that no section creates anything until all of them have been checked.
+    pub fn to_runtime_config(&self) -> Result<VmHttpRuntimeConfig, Errors<AgentVmHttpConfigError>> {
+        self.check()?.materialize()
+    }
+
+    /// Run every check that touches nothing, and return the plan for the
+    /// checks that do.
+    ///
+    /// The shape is uniform: each check is `record`ed into an accumulator,
+    /// which stores failures instead of short-circuiting, and a check whose
+    /// own inputs failed is *skipped* rather than reported — the operator
+    /// should see a root cause once, not a cascade of its consequences.
+    pub fn check(&self) -> Result<VmHttpPlan, Errors<AgentVmHttpConfigError>> {
+        let mut errors = Accumulator::new();
+
+        // --- Pure checks. Independent of each other and of the filesystem, so
+        // every one of them runs on every call.
+        let broker_port_range = errors.record_from(BrokerPortRange::new(
+            self.broker_port_min,
+            self.broker_port_max,
+        ));
+        let token_env = errors.record_from(GitSecretEnvVar::new(self.token_env.clone()));
+        let clone_base_url = errors.record_from(GitCloneBaseUrl::parse(&self.git_clone_base_url));
+        let trusted_public_keys = errors.record_from(NixTrustedPublicKeys::from_strings(
+            self.nix_cache_trusted_public_keys.clone(),
+        ));
+        let git_push_body_limits = errors.record_from(VmGitPushBodyLimits::new(
+            self.git_push_max_body_bytes,
+            self.git_push_max_metadata_bytes,
+            self.git_push_max_bundle_bytes,
+        ));
+        let claude_proxy = errors.record(
+            self.claude_proxy
+                .as_ref()
+                .map(AgentVmHttpClaudeProxyConfig::to_runtime_config)
+                .transpose(),
+        );
+        let openai_proxy = errors.record(
+            self.openai_proxy
+                .as_ref()
+                .map(AgentVmHttpOpenAiProxyConfig::to_runtime_config)
+                .transpose(),
+        );
+        // The nix-cache URL and its size limits are checked here, separately
+        // from the trusted-key list, so a malformed key cannot hide a malformed
+        // URL; the keys are attached below once both have parsed.
+        let nix_cache = errors.record_from(VmHttpNixCacheConfig::new(
+            &self.nix_cache_url,
+            self.nix_cache_max_metadata_bytes,
+            self.nix_cache_max_nar_bytes,
+        ));
+        // The work root is shape-checked before `ensure_vm_http_work_root_private`
+        // may run: that function creates the directory, and on a relative path it
+        // would create one relative to the daemon's cwd.
+        let work_root = errors.record(check_work_root(&self.work_root));
+        let nix_prewarm_cache_dir = errors.record(
+            self.nix_prewarm_cache_dir
+                .clone()
+                .map(validate_nix_prewarm_cache_dir)
+                .transpose(),
+        );
+        let mirror_cache_dir = errors.record(
+            self.flake_mirror_cache_dir
+                .clone()
+                .map(validate_flake_mirror_cache_dir)
+                .transpose(),
+        );
+        // An explicitly configured root's shape is independent of the work
+        // root, so it is checked even when the work root is broken. A *derived*
+        // root only inherits the work root's fate: reporting it too would just
+        // echo the same mistake back twice.
+        let agent_run_log_root = checked_root(
+            &mut errors,
+            WritableRoot::AgentRunLog,
+            self.agent_run_log_root.as_deref(),
+            "agent-runs",
+            work_root,
+        );
+        let git_push_staging_root = checked_root(
+            &mut errors,
+            WritableRoot::GitPushStaging,
+            self.git_push_staging_root.as_deref(),
+            "git-push-staging",
+            work_root,
+        );
+        // The broker-local flake-input archive lives under work_root by default,
+        // alongside the agent-run and git-push roots. Wiring it as the nix-cache
+        // local cache makes the endpoint serve archived inputs local-first; an
+        // empty directory (nothing provisioned yet) is byte-identical to
+        // upstream-only serving.
+        let flake_input_cache_dir = checked_root(
+            &mut errors,
+            WritableRoot::FlakeInputCache,
+            self.flake_input_cache_dir.as_deref(),
+            "flake-input-cache",
+            work_root,
+        );
+        // Provisioning is switched on by `flake_mirror_cache_dir`, so its knobs
+        // are checked whenever the operator has asked for it — keyed off the
+        // field's *presence*, not off whether its path passed, so a bad mirror
+        // path does not hide bad bounds.
+        let provision_requested = self.flake_mirror_cache_dir.is_some();
+        let flake_provision_bounds = provision_requested
+            .then(|| {
+                errors.record_from(FlakeProvisionBounds::new(
+                    self.flake_provision_max_input_count,
+                    self.flake_provision_max_total_bytes,
+                    Duration::from_secs(self.flake_provision_timeout_secs),
+                ))
+            })
+            .transpose();
+        let flake_materialize_scratch_dir = provision_requested
+            .then(|| match &self.flake_materialize_scratch_dir {
+                Some(path) => errors.record(validate_flake_materialize_scratch_dir(path.clone())),
+                None => work_root.map(|root| root.join("flake-materialize")),
+            })
+            .transpose();
+
+        // Composites, each built from checks that have already passed. Both
+        // are pure, so they belong above the checkpoint.
+        let credential = token_env.and_then(|token_env| {
+            errors.record_from(GitCredentialBoundary::new(
+                self.askpass_program.clone(),
+                token_env,
+            ))
+        });
+        let git_clone = all_recorded!(credential, clone_base_url, work_root).and_then(
+            |(credential, clone_base_url, work_root)| {
+                errors.record_from(VmHttpGitCloneConfig::new_with_clone_base_url(
+                    self.git_program.clone(),
+                    clone_base_url,
+                    credential,
+                    work_root.to_path_buf(),
+                    Duration::from_secs(self.clone_timeout_secs),
+                    self.max_bundle_bytes,
+                ))
+            },
+        );
+
+        let (
+            work_root,
+            broker_port_range,
+            git_clone,
+            nix_cache,
+            trusted_public_keys,
+            claude_proxy,
+            openai_proxy,
+            agent_run_log_root,
+            git_push_staging_root,
+            git_push_body_limits,
+            flake_input_cache_dir,
+            mirror_cache_dir,
+            nix_prewarm_cache_dir,
+            flake_provision_bounds,
+            flake_materialize_scratch_dir,
+        ) = errors.unpack(all_recorded!(
+            work_root,
+            broker_port_range,
+            git_clone,
+            nix_cache,
+            trusted_public_keys,
+            claude_proxy,
+            openai_proxy,
+            agent_run_log_root,
+            git_push_staging_root,
+            git_push_body_limits,
+            flake_input_cache_dir,
+            mirror_cache_dir,
+            nix_prewarm_cache_dir,
+            flake_provision_bounds,
+            flake_materialize_scratch_dir,
+        ))?;
+
+        // Everything below is assembly: every value is already validated, so
+        // there is nothing left that can fail.
+
         // When configured, retain each clone's bare mirror for later
         // flake-input provisioning; the cache creates its (owner-only) directory
         // on first insert. `None` keeps the discard-after-bundle behaviour. The
         // same cache backs the flake-provision endpoint below, so clone +
         // provision share one fetch.
-        let mirror_cache = self
-            .flake_mirror_cache_dir
-            .clone()
-            .map(validate_flake_mirror_cache_dir)
-            .transpose()?
-            .map(MirrorCache::new);
+        let mirror_cache = mirror_cache_dir.map(MirrorCache::new);
         // The eviction bounds only matter when the cache is enabled; pair them
         // with the cache so the clone handler runs a bounded pass after retain.
         let mirror_gc_bounds = mirror_cache.as_ref().map(|_| {
@@ -727,43 +1062,17 @@ impl AgentVmHttpConfig {
         let git_clone = git_clone
             .with_mirror_cache(mirror_cache.clone())
             .with_mirror_gc_bounds(mirror_gc_bounds);
-        // `prepare_git_work_root` refuses to clone into a work root whose mode
-        // has group/world bits set, but `validate_*_root` below creates the
-        // staging/log subdirs with `create_dir_all`, which propagates the
-        // process umask to the freshly-created `work_root` parent (typically
-        // 0755). Ensure work_root itself is 0700 before that runs so the
-        // out-of-the-box defaults — where the user never names `work_root`
-        // explicitly — survive the first clone request.
-        ensure_vm_http_work_root_private(&self.work_root)?;
-        let trusted_public_keys =
-            NixTrustedPublicKeys::from_strings(self.nix_cache_trusted_public_keys.clone())?;
-        // The broker-local flake-input archive lives under work_root by default,
-        // alongside the agent-run and git-push roots. Wiring it as the nix-cache
-        // local cache makes the endpoint serve archived inputs local-first; an
-        // empty directory (nothing provisioned yet) is byte-identical to
-        // upstream-only serving.
-        let flake_input_cache_dir = match &self.flake_input_cache_dir {
-            Some(path) => path.clone(),
-            None => self.work_root.join("flake-input-cache"),
-        };
-        let flake_input_cache_dir = validate_flake_input_cache_dir(flake_input_cache_dir)?;
         // Flake-input provisioning re-derives a checkout from a retained mirror,
         // so it is enabled exactly when the mirror cache is. It archives the
         // committed, locked inputs into the very same shared CA cache the
         // nix-cache endpoint serves local-first, so the guest realises them
         // through the substituter it already trusts.
-        let flake_provision = match mirror_cache {
-            Some(mirror_cache) => {
-                let scratch_root = match &self.flake_materialize_scratch_dir {
-                    Some(path) => path.clone(),
-                    None => self.work_root.join("flake-materialize"),
-                };
-                let scratch_root = validate_flake_materialize_scratch_dir(scratch_root)?;
-                let bounds = FlakeProvisionBounds::new(
-                    self.flake_provision_max_input_count,
-                    self.flake_provision_max_total_bytes,
-                    Duration::from_secs(self.flake_provision_timeout_secs),
-                )?;
+        let flake_provision = match (
+            mirror_cache,
+            flake_materialize_scratch_dir,
+            flake_provision_bounds,
+        ) {
+            (Some(mirror_cache), Some(scratch_root), Some(bounds)) => {
                 let provision = MirrorFlakeProvisionConfig::new(
                     self.git_program.clone(),
                     self.nix_program.clone(),
@@ -774,7 +1083,9 @@ impl AgentVmHttpConfig {
                 );
                 Some(VmHttpFlakeProvisionConfig::new(provision, mirror_cache))
             }
-            None => None,
+            // The scratch dir and bounds are computed exactly when the mirror
+            // cache dir is configured, so the mixed cases cannot arise.
+            _ => None,
         };
         // Local archives served local-first, in order: a durable, operator-
         // managed pre-warmed closure cache (when configured) ahead of the
@@ -783,62 +1094,93 @@ impl AgentVmHttpConfig {
         // created here; an absent/empty dir simply serves nothing. Trust for its
         // signed paths rides the existing `nix_cache_trusted_public_keys`
         // (the same list the guest verifies against), so no separate key.
-        let nix_prewarm_cache_dir = self
-            .nix_prewarm_cache_dir
-            .clone()
-            .map(validate_nix_prewarm_cache_dir)
-            .transpose()?;
         let mut local_cache_dirs = Vec::new();
         if let Some(prewarm) = &nix_prewarm_cache_dir {
             local_cache_dirs.push(prewarm.clone());
         }
-        local_cache_dirs.push(flake_input_cache_dir);
-        let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
-            &self.nix_cache_url,
-            self.nix_cache_max_metadata_bytes,
-            self.nix_cache_max_nar_bytes,
-            trusted_public_keys,
-        )?
-        .with_local_cache_dirs(local_cache_dirs);
-        let claude_proxy = self
-            .claude_proxy
-            .as_ref()
-            .map(AgentVmHttpClaudeProxyConfig::to_runtime_config)
-            .transpose()?;
-        let openai_proxy = self
-            .openai_proxy
-            .as_ref()
-            .map(AgentVmHttpOpenAiProxyConfig::to_runtime_config)
-            .transpose()?;
-        let agent_run_log_root = match &self.agent_run_log_root {
-            Some(path) => path.clone(),
-            None => self.work_root.join("agent-runs"),
-        };
-        let agent_run_log_root = validate_agent_run_log_root(agent_run_log_root)?;
-        let git_push_staging_root = match &self.git_push_staging_root {
-            Some(path) => path.clone(),
-            None => self.work_root.join("git-push-staging"),
-        };
-        let git_push_staging_root = validate_git_push_staging_root(git_push_staging_root)?;
-        let git_push_body_limits = VmGitPushBodyLimits::new(
-            self.git_push_max_body_bytes,
-            self.git_push_max_metadata_bytes,
-            self.git_push_max_bundle_bytes,
-        )?;
-        Ok(VmHttpRuntimeConfig::new_with_proxies(
+        local_cache_dirs.push(flake_input_cache_dir.clone());
+        let nix_cache = nix_cache
+            .with_trusted_public_keys(trusted_public_keys)
+            .with_local_cache_dirs(local_cache_dirs);
+        let runtime = VmHttpRuntimeConfig::new_with_proxies(
             self.bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
             claude_proxy,
             openai_proxy,
-            agent_run_log_root,
-            git_push_staging_root,
+            agent_run_log_root.clone(),
+            git_push_staging_root.clone(),
             git_push_body_limits,
         )
         .with_flake_provision(flake_provision)
-        .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir))
+        .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir);
+        // The directories are named but not yet created; `materialize` does
+        // that, once every section the caller cares about has been checked.
+        // Order matters: the work root is prepared first (see
+        // `VmHttpPlan::materialize`), then these in turn.
+        let roots = vec![
+            RootPlan {
+                kind: WritableRoot::AgentRunLog,
+                path: agent_run_log_root,
+            },
+            RootPlan {
+                kind: WritableRoot::GitPushStaging,
+                path: git_push_staging_root,
+            },
+            RootPlan {
+                kind: WritableRoot::FlakeInputCache,
+                path: flake_input_cache_dir,
+            },
+        ];
+        Ok(VmHttpPlan {
+            runtime,
+            work_root: work_root.to_path_buf(),
+            roots,
+        })
     }
+}
+
+/// Shape-check one writable root: the explicitly configured path when the
+/// operator named one, otherwise `<work_root>/<default_subdir>`.
+///
+/// Kept as a helper because the three roots differ only in their kind, their
+/// field, and their default subdirectory — and because the configured/derived
+/// distinction is the subtle part, worth stating once. A configured path
+/// stands on its own, so it is checked even when the work root is broken; a
+/// derived one inherits the work root's fate, and reporting it too would echo
+/// the same mistake back to the operator twice.
+fn checked_root(
+    errors: &mut Accumulator<AgentVmHttpConfigError>,
+    kind: WritableRoot,
+    configured: Option<&Path>,
+    default_subdir: &str,
+    work_root: Result<&Path, accumulate::Failed>,
+) -> Result<PathBuf, accumulate::Failed> {
+    match configured {
+        Some(path) => errors.record(check_writable_root(kind, path.to_path_buf())),
+        None => work_root.map(|root| root.join(default_subdir)),
+    }
+}
+
+/// Shape-check the configured work root before anything creates it.
+///
+/// Reuses [`GitCloneBundlePlanError`]'s field-tagged variants rather than
+/// inventing a parallel taxonomy: these are the same two checks
+/// [`VmHttpGitCloneConfig::new_with_clone_base_url`] performs, hoisted so they
+/// run before the directory-creating code below rather than after it.
+fn check_work_root(path: &Path) -> Result<&Path, AgentVmHttpConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(GitCloneBundlePlanError::EmptyPath { field: "work_root" }.into());
+    }
+    if !path.is_absolute() {
+        return Err(GitCloneBundlePlanError::RelativePath {
+            field: "work_root",
+            path: path.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(path)
 }
 
 impl AgentVmHttpClaudeProxyConfig {
@@ -949,64 +1291,100 @@ fn validate_existing_work_root(
     Ok(())
 }
 
-fn validate_agent_run_log_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
+/// One of the three writable directories the broker keeps beneath its work
+/// root. All three are validated identically — non-empty, absolute, creatable,
+/// writable — and differ only in which error variants name them and in the
+/// probe filename, so the *kind* is data and the checks are written once.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WritableRoot {
+    AgentRunLog,
+    GitPushStaging,
+    FlakeInputCache,
+}
+
+impl WritableRoot {
+    /// A distinct probe filename per root so two roots that happen to be
+    /// configured to the same directory cannot collide on `create_new`.
+    fn probe_prefix(self) -> &'static str {
+        match self {
+            Self::AgentRunLog => ".writ-agent-run-log-probe",
+            Self::GitPushStaging => ".writ-git-push-staging-probe",
+            Self::FlakeInputCache => ".writ-flake-input-cache-probe",
+        }
+    }
+
+    fn empty(self) -> AgentVmHttpConfigError {
+        match self {
+            Self::AgentRunLog => AgentVmHttpConfigError::EmptyAgentRunLogRoot,
+            Self::GitPushStaging => AgentVmHttpConfigError::EmptyGitPushStagingRoot,
+            Self::FlakeInputCache => AgentVmHttpConfigError::EmptyFlakeInputCacheDir,
+        }
+    }
+
+    fn relative(self, path: PathBuf) -> AgentVmHttpConfigError {
+        match self {
+            Self::AgentRunLog => AgentVmHttpConfigError::RelativeAgentRunLogRoot(path),
+            Self::GitPushStaging => AgentVmHttpConfigError::RelativeGitPushStagingRoot(path),
+            Self::FlakeInputCache => AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path),
+        }
+    }
+
+    fn create(self, path: PathBuf, source: std::io::Error) -> AgentVmHttpConfigError {
+        match self {
+            Self::AgentRunLog => AgentVmHttpConfigError::AgentRunLogRootCreate { path, source },
+            Self::GitPushStaging => {
+                AgentVmHttpConfigError::GitPushStagingRootCreate { path, source }
+            }
+            Self::FlakeInputCache => {
+                AgentVmHttpConfigError::FlakeInputCacheDirCreate { path, source }
+            }
+        }
+    }
+
+    fn probe(self, path: PathBuf, source: std::io::Error) -> AgentVmHttpConfigError {
+        match self {
+            Self::AgentRunLog => AgentVmHttpConfigError::AgentRunLogRootProbe { path, source },
+            Self::GitPushStaging => {
+                AgentVmHttpConfigError::GitPushStagingRootProbe { path, source }
+            }
+            Self::FlakeInputCache => {
+                AgentVmHttpConfigError::FlakeInputCacheDirProbe { path, source }
+            }
+        }
+    }
+}
+
+/// The pure half of validating a writable root: does the *configured text*
+/// name a usable directory?
+///
+/// Split from [`prepare_writable_root`] so a config can be rejected on its
+/// text alone without any directory having been created — a typo should leave
+/// no debris, and the whole point of checking every field in one pass is that
+/// the checks must be safe to run even when a sibling field is broken.
+fn check_writable_root(
+    kind: WritableRoot,
+    path: PathBuf,
+) -> Result<PathBuf, AgentVmHttpConfigError> {
     if path.as_os_str().is_empty() {
-        return Err(AgentVmHttpConfigError::EmptyAgentRunLogRoot);
+        return Err(kind.empty());
     }
     if !path.is_absolute() {
-        return Err(AgentVmHttpConfigError::RelativeAgentRunLogRoot(path));
+        return Err(kind.relative(path));
     }
-    std::fs::create_dir_all(&path).map_err(|source| {
-        AgentVmHttpConfigError::AgentRunLogRootCreate {
-            path: path.clone(),
-            source,
-        }
-    })?;
-    let probe = path.join(format!(
-        ".writ-agent-run-log-probe-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .and_then(|mut file| {
-            use std::io::Write as _;
-            file.write_all(b"probe")?;
-            file.sync_all()
-        })
-        .map_err(|source| AgentVmHttpConfigError::AgentRunLogRootProbe {
-            path: path.clone(),
-            source,
-        })?;
-    std::fs::remove_file(&probe).map_err(|source| {
-        AgentVmHttpConfigError::AgentRunLogRootProbe {
-            path: path.clone(),
-            source,
-        }
-    })?;
     Ok(path)
 }
 
-fn validate_git_push_staging_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(AgentVmHttpConfigError::EmptyGitPushStagingRoot);
-    }
-    if !path.is_absolute() {
-        return Err(AgentVmHttpConfigError::RelativeGitPushStagingRoot(path));
-    }
-    std::fs::create_dir_all(&path).map_err(|source| {
-        AgentVmHttpConfigError::GitPushStagingRootCreate {
-            path: path.clone(),
-            source,
-        }
-    })?;
+/// The effectful half: create the directory if absent, then prove the broker
+/// can actually write into it, rather than discovering otherwise at request
+/// time. Expects a path that has already passed [`check_writable_root`].
+fn prepare_writable_root(
+    kind: WritableRoot,
+    path: PathBuf,
+) -> Result<PathBuf, AgentVmHttpConfigError> {
+    std::fs::create_dir_all(&path).map_err(|source| kind.create(path.clone(), source))?;
     let probe = path.join(format!(
-        ".writ-git-push-staging-probe-{}-{}",
+        "{}-{}-{}",
+        kind.probe_prefix(),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1022,16 +1400,8 @@ fn validate_git_push_staging_root(path: PathBuf) -> Result<PathBuf, AgentVmHttpC
             file.write_all(b"probe")?;
             file.sync_all()
         })
-        .map_err(|source| AgentVmHttpConfigError::GitPushStagingRootProbe {
-            path: path.clone(),
-            source,
-        })?;
-    std::fs::remove_file(&probe).map_err(|source| {
-        AgentVmHttpConfigError::GitPushStagingRootProbe {
-            path: path.clone(),
-            source,
-        }
-    })?;
+        .map_err(|source| kind.probe(path.clone(), source))?;
+    std::fs::remove_file(&probe).map_err(|source| kind.probe(path.clone(), source))?;
     Ok(path)
 }
 
@@ -1113,49 +1483,6 @@ fn validate_flake_materialize_scratch_dir(
             path,
         ));
     }
-    Ok(path)
-}
-
-fn validate_flake_input_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(AgentVmHttpConfigError::EmptyFlakeInputCacheDir);
-    }
-    if !path.is_absolute() {
-        return Err(AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path));
-    }
-    std::fs::create_dir_all(&path).map_err(|source| {
-        AgentVmHttpConfigError::FlakeInputCacheDirCreate {
-            path: path.clone(),
-            source,
-        }
-    })?;
-    let probe = path.join(format!(
-        ".writ-flake-input-cache-probe-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .and_then(|mut file| {
-            use std::io::Write as _;
-            file.write_all(b"probe")?;
-            file.sync_all()
-        })
-        .map_err(|source| AgentVmHttpConfigError::FlakeInputCacheDirProbe {
-            path: path.clone(),
-            source,
-        })?;
-    std::fs::remove_file(&probe).map_err(|source| {
-        AgentVmHttpConfigError::FlakeInputCacheDirProbe {
-            path: path.clone(),
-            source,
-        }
-    })?;
     Ok(path)
 }
 

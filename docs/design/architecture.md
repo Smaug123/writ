@@ -257,6 +257,62 @@ ordering (§4); each connection line is bounded (`MAX_LINE_BYTES`,
 (`decide`, `policy.rs:118`; `is_write`, `policy.rs:148`); config validated at
 load (`deny_unknown_fields` throughout plus explicit `validate()`).
 
+**Config validation accumulates.** Every config check runs on every boot and
+the failures are reported together, rather than one per restart
+(`config/accumulate.rs`). `Accumulator::record` stores a failure instead of
+short-circuiting and hands back a `Failed` marker; `all_recorded!` +
+`Accumulator::unpack` recover the values only when all of them are present.
+`Errors<E>` is a **non-empty** report, always derived from an accumulator's own
+error list, so "rejected with no reasons given" is unrepresentable. (`Failed`
+is crate-private: it says *some* accumulator failed, not *this* one, and Rust
+cannot bind a zero-sized witness to an instance without generative branding —
+so `unpack` never trusts it for the report's contents.) Two rules shape where
+the errors come from:
+
+- A check whose own inputs failed is *skipped*, not reported, so an operator
+  sees a root cause once instead of a cascade of its consequences.
+- Nested reports flatten (`record_many` / `Errors::map_into`), so a bad
+  `lifecycle` section cannot hide every fault in `vm_http`.
+
+**Validation is planned, then executed.** `AgentVmHttpConfig::check` runs every
+check that touches nothing and returns a `VmHttpPlan` — the validated runtime
+config plus the directories that still need creating; `VmHttpPlan::materialize`
+carries that out. This is the interpreter pattern applied to config, and it *composes*:
+`AgentVmDaemonConfig::check` holds a `VmHttpPlan` inside an
+`AgentVmDaemonPlan`, and `check_daemon_sections` holds that while it validates
+`ui_http`, so nothing is created until every section — plus the daemon-level
+bind invariant, via `AgentVmDaemonRuntimeConfig::check_bind_addr`, which takes
+the bare address so it cannot hide behind an unrelated fault — has been checked.
+A fault anywhere therefore leaves no debris. That matters most for `work_root`, where a directory created at the process umask
+(0755) would make `validate_existing_work_root` refuse that path on every later
+boot too.
+
+Inside `materialize` the work root is prepared first, and **every** root waits on
+it, including one the operator named explicitly. Whether a named root is really a
+descendant cannot be decided there — it need not exist yet, so it cannot be
+canonicalised, and a lexical `starts_with` is case-sensitive and blind to
+symlinks and `..`. Guessing permissively would mutate the filesystem for an
+already-rejected config, since a rejected work root is often one that merely
+*exists* with loose permissions and happily accepts `create_dir_all` of a child.
+The cost is one extra round-trip when the work root and another root are both
+broken; textual faults in those roots are unaffected, as `check` reports them
+without gating on anything.
+
+This split leaves one place an operator can still need two passes: once for what
+the config says, once for what the filesystem permits.
+
+**Known granularity limit.** Leaf constructors (`VmHttpNixCacheConfig::new`,
+`VmGitPushBodyLimits::new`, the proxy configs, …) are still fail-fast, so each
+counts as *one* check: setting two bad fields within a single constructor
+reports only the first. The section-level tiering that cost a restart per
+mistake is gone; per-field accumulation inside those constructors would mean
+reworking them across `vm_http`, `writ-core`, and the lifecycle module.
+
+`writd` calls `check_daemon_sections`, which validates `agent_vm` and `ui_http`
+together, up front, before the socket bind, the signing key, and the reconcile
+passes — so a bad `ui_http.bind` is reported alongside everything else rather
+than after all of that succeeds.
+
 **Neighbours.** Calls audit, credential minting, the git pipeline
 (staged-push), and the VM sandbox (`AgentVmDaemon`). Called by the `writ` CLI
 over the socket; guests reach the *separate* `vm_http` surface (§5.6), not this

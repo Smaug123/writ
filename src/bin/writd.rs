@@ -19,9 +19,10 @@ use writ::boot_reconcile::{
 use writ::broker_entrypoint::{BrokerArgs, run_broker};
 use writ::broker_session::BrokerSessionSpec;
 use writ::config::{
-    DaemonConfig, LegacyAuditDbNotMigrated, SecretStoreConfig, default_audit_db_path,
-    default_config_path, ensure_audit_db_entry_is_regular_file, ensure_audit_dir_is_dedicated,
-    legacy_audit_db_needs_migration, legacy_default_audit_db_path, path_entry_present,
+    DaemonConfig, LegacyAuditDbNotMigrated, SecretStoreConfig, check_daemon_sections,
+    default_audit_db_path, default_config_path, ensure_audit_db_entry_is_regular_file,
+    ensure_audit_dir_is_dedicated, legacy_audit_db_needs_migration, legacy_default_audit_db_path,
+    path_entry_present,
 };
 use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
@@ -216,14 +217,19 @@ async fn run_host_daemon(
         std::fs::create_dir_all(parent)?;
     }
 
+    // Validate every section that can be checked before the daemon starts
+    // taking irreversible steps, and report all the failures together. An
+    // operator fixing a config should get the whole list, not one problem per
+    // restart — which is also why `ui_http` is checked *here* rather than at
+    // the point its listener is bound, hundreds of lines and one socket bind,
+    // one signing key and two reconcile passes later.
+    let agent_vm = check_daemon_sections(agent_vm.as_ref(), ui_http.as_ref())
+        .map_err(|errors| errors.to_string())?;
+
     // Attach the vm-arm host facts (raw config text + effective audit DB path)
     // the broker-VM placement needs but cannot read from the parsed config. A
     // no-op for host placement, so it is unconditional here.
-    let agent_vm = agent_vm
-        .as_ref()
-        .map(|agent_vm| agent_vm.to_runtime_config())
-        .transpose()?
-        .map(|cfg| cfg.with_broker_vm_host_facts(&json, &audit_db_path));
+    let agent_vm = agent_vm.map(|cfg| cfg.with_broker_vm_host_facts(&json, &audit_db_path));
 
     // Under vm placement the audit directory is mounted read-write into a broker
     // VM, so the audit DB path must not redirect the host's open. A compromised
@@ -499,7 +505,7 @@ async fn run_host_daemon(
     }
 
     if let Some(ui_http) = ui_http {
-        ui_http.validate()?;
+        // Already validated up front, alongside the rest of the config.
         // Inside this block we also bind the UI listener before
         // touching the bearer, so a stale UI-port collision doesn't
         // overwrite the live daemon's bearer either.
