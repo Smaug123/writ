@@ -107,6 +107,19 @@ impl VmHttpNixCacheConfig {
         })
     }
 
+    /// Trust `keys` when verifying signed narinfos, replacing whatever
+    /// [`Self::new`] left in place.
+    ///
+    /// The builder form exists so a caller validating a whole config can check
+    /// the URL and the key list as *independent* inputs and report both
+    /// failures, rather than being forced to have parsed the keys before it may
+    /// even attempt the URL.
+    #[must_use]
+    pub fn with_trusted_public_keys(mut self, trusted_public_keys: NixTrustedPublicKeys) -> Self {
+        self.trusted_public_keys = trusted_public_keys;
+        self
+    }
+
     /// Serve the broker's local archives `dirs` local-first, in order (see
     /// [`VmHttpNixCacheConfig::local_cache_dirs`]). An empty vec disables local
     /// serving. The directories need not exist yet — an absent dir is treated as

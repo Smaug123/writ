@@ -39,7 +39,8 @@ use crate::audit::{AuditError, AuditLog};
 use crate::broker_protocol::BrokerReadyDoc;
 use crate::broker_session::{BearerTokenFileError, BrokerSessionSpec, read_bearer_token_file};
 use crate::config::{
-    AgentVmHttpConfigError, DaemonConfig, SecretStoreConfig, default_audit_db_path,
+    AgentVmHttpConfigError, DaemonConfig, SecretStoreConfig, accumulate::Errors,
+    default_audit_db_path,
 };
 use crate::core::{AgentKind, AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
 use crate::github::GitHubMinter;
@@ -108,8 +109,11 @@ pub enum BrokerRunError {
     },
     #[error("broker mode requires an `agent_vm` config section to source the vm_http runtime")]
     AgentVmConfigMissing,
+    /// Carries the whole report, not one failure: the broker VM's stderr is
+    /// often all the operator sees of a version-skewed or malformed config, so
+    /// it should name every problem at once.
     #[error("invalid vm_http config: {0}")]
-    VmHttpConfig(#[from] AgentVmHttpConfigError),
+    VmHttpConfig(#[from] Errors<AgentVmHttpConfigError>),
     #[error(transparent)]
     BearerToken(#[from] BearerTokenFileError),
     #[error("session spec broker_port is invalid: {source}")]

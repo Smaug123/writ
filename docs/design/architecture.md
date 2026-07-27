@@ -257,6 +257,31 @@ ordering (§4); each connection line is bounded (`MAX_LINE_BYTES`,
 (`decide`, `policy.rs:118`; `is_write`, `policy.rs:148`); config validated at
 load (`deny_unknown_fields` throughout plus explicit `validate()`).
 
+**Config validation accumulates.** Every config check runs on every boot and
+the failures are reported together, rather than one per restart
+(`config/accumulate.rs`). `Accumulator::record` stores a failure instead of
+short-circuiting and hands back a `Failed` witness; `all_recorded!` +
+`Accumulator::unpack` recover the values only when all of them are present.
+`Errors<E>` is a **non-empty** report — surrendering a `Failed` is the only way
+to build one — so "rejected with no reasons given" is unrepresentable. Three
+rules shape where the errors come from:
+
+- A check whose own inputs failed is *skipped*, not reported, so an operator
+  sees a root cause once instead of a cascade of its consequences.
+- Nested reports flatten (`record_many`), so a bad `lifecycle` section cannot
+  hide every fault in `vm_http`.
+- `Accumulator::checkpoint` splits each validator into checks that mutate
+  nothing and checks that create directories, and stops between them. A config
+  rejected on its text alone therefore leaves no debris — which matters most
+  for `work_root`, where a directory created at the process umask (0755) would
+  make `validate_existing_work_root` refuse that path on every later boot too.
+  This is the only remaining place an operator can need two passes: once for
+  what the config says, once for what the filesystem permits.
+
+`writd` validates `agent_vm` and `ui_http` together, up front, before the
+socket bind, the signing key, and the reconcile passes — so a bad `ui_http.bind`
+is reported alongside everything else rather than after all of that succeeds.
+
 **Neighbours.** Calls audit, credential minting, the git pipeline
 (staged-push), and the VM sandbox (`AgentVmDaemon`). Called by the `writ` CLI
 over the socket; guests reach the *separate* `vm_http` surface (§5.6), not this

@@ -96,7 +96,7 @@ fn ui_http_validate_rejects_non_loopback_bind() {
         bind: "0.0.0.0:7378".parse().unwrap(),
         bearer_path: None,
     };
-    let err = cfg.validate().expect_err("non-loopback rejected");
+    let err = sole_error(cfg.validate());
     assert!(matches!(err, UiHttpConfigError::NonLoopbackBind(_)));
 }
 
@@ -106,10 +106,31 @@ fn ui_http_validate_rejects_ephemeral_port() {
         bind: "127.0.0.1:0".parse().unwrap(),
         bearer_path: None,
     };
-    let err = cfg.validate().expect_err("port 0 rejected");
+    let err = sole_error(cfg.validate());
     assert!(
         matches!(err, UiHttpConfigError::EphemeralPortBind(addr) if addr.port() == 0),
         "got: {err:?}"
+    );
+}
+
+/// `0.0.0.0:0` is wrong twice over, and the two faults are independent, so
+/// both are named rather than only whichever is checked first.
+#[test]
+fn ui_http_validate_reports_a_doubly_bad_bind_in_full() {
+    let cfg = UiHttpConfig {
+        bind: "0.0.0.0:0".parse().unwrap(),
+        bearer_path: None,
+    };
+    let errors = cfg.validate().expect_err("0.0.0.0:0 is rejected");
+    assert_eq!(errors.len(), 2, "got: {errors}");
+    assert!(matches!(
+        errors.first(),
+        UiHttpConfigError::NonLoopbackBind(_)
+    ));
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, UiHttpConfigError::EphemeralPortBind(_)))
     );
 }
 
@@ -452,6 +473,29 @@ fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
     assert_eq!(claude_proxy.auth_kind(), VmHttpClaudeProxyAuthKind::OAuth);
 }
 
+/// The single failure a config with exactly one mistake in it must produce.
+///
+/// Asserting *soleness* rather than "the first failure matches" is what keeps
+/// accumulation honest: now that validation no longer stops at the first
+/// error, a check that fires spuriously alongside the real one — or a root
+/// cause that cascades into echoes of itself — shows up right here instead of
+/// as noise in an operator's terminal.
+#[track_caller]
+fn sole_error<T, E: std::fmt::Display>(result: Result<T, Errors<E>>) -> E {
+    let Err(errors) = result else {
+        panic!("expected the config to be rejected, but it was accepted");
+    };
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one failure, got {errors}",
+    );
+    errors
+        .into_vec()
+        .pop()
+        .expect("an Errors report is non-empty by construction")
+}
+
 fn unique_config_test_path(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -565,10 +609,10 @@ fn broker_placement_vm_without_broker_image_is_rejected() {
     let cfg: AgentVmLifecycleConfig =
         serde_json::from_str(&agent_vm_lifecycle_json(r#""broker_placement": "vm","#)).unwrap();
     assert!(matches!(
-        cfg.to_runtime_config(),
-        Err(AgentVmDaemonConfigError::LifecycleRuntime(
+        sole_error(cfg.to_runtime_config()),
+        AgentVmDaemonConfigError::LifecycleRuntime(
             AgentVmLifecycleRuntimeConfigError::BrokerImageRequiredForVmPlacement
-        ))
+        )
     ));
 }
 
@@ -651,10 +695,10 @@ fn agent_vm_config_rejects_non_wildcard_vm_http_bind_address() {
     };
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmDaemonConfigError::Runtime(
+        sole_error(c.to_runtime_config()),
+        AgentVmDaemonConfigError::Runtime(
             AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(addr)
-        )) if addr == Ipv4Addr::LOCALHOST
+        ) if addr == Ipv4Addr::LOCALHOST
     ));
 }
 
@@ -664,10 +708,8 @@ fn agent_vm_http_config_rejects_privileged_broker_port() {
     c.broker_port_min = 80;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::BrokerPortRange(
-            AgentVmConfigError::PrivilegedBrokerPort(80)
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::BrokerPortRange(AgentVmConfigError::PrivilegedBrokerPort(80))
     ));
 }
 
@@ -678,13 +720,11 @@ fn agent_vm_http_config_rejects_empty_broker_port_range() {
     c.broker_port_max = 18080;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::BrokerPortRange(
-            AgentVmConfigError::EmptyBrokerPortRange {
-                min: 18081,
-                max: 18080
-            }
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::BrokerPortRange(AgentVmConfigError::EmptyBrokerPortRange {
+            min: 18081,
+            max: 18080
+        })
     ));
 }
 
@@ -694,10 +734,10 @@ fn agent_vm_http_config_rejects_invalid_token_env() {
     c.token_env = "bad-name".into();
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::TokenEnv(
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::TokenEnv(
             GitSecretEnvVarError::InvalidByte(raw)
-        )) if raw == "bad-name"
+        ) if raw == "bad-name"
     ));
 }
 
@@ -707,12 +747,10 @@ fn agent_vm_http_config_rejects_empty_git_program() {
     c.git_program = PathBuf::new();
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitClone(
-            GitCloneBundlePlanError::EmptyPath {
-                field: "git_program"
-            }
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::EmptyPath {
+            field: "git_program"
+        })
     ));
 }
 
@@ -722,18 +760,16 @@ fn agent_vm_http_config_rejects_unsafe_git_clone_base_url() {
     c.git_clone_base_url = "ssh://github.com".into();
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitClone(
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitClone(
             GitCloneBundlePlanError::UnsupportedGitCloneBaseUrlScheme { scheme, .. }
-        )) if scheme == "ssh"
+        ) if scheme == "ssh"
     ));
 
     c.git_clone_base_url = "https://user:token@github.com".into();
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitClone(
-            GitCloneBundlePlanError::GitCloneBaseUrlHasCredentials(_)
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::GitCloneBaseUrlHasCredentials(_))
     ));
 }
 
@@ -743,13 +779,13 @@ fn agent_vm_http_config_rejects_relative_askpass_program() {
     c.askpass_program = PathBuf::from("askpass");
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitClone(
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitClone(
             GitCloneBundlePlanError::RelativePath {
                 field: "askpass_program",
                 path
             }
-        )) if path.as_os_str() == "askpass"
+        ) if path.as_os_str() == "askpass"
     ));
 }
 
@@ -759,13 +795,13 @@ fn agent_vm_http_config_rejects_relative_work_root() {
     c.work_root = PathBuf::from("relative");
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitClone(
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitClone(
             GitCloneBundlePlanError::RelativePath {
                 field: "work_root",
                 path
             }
-        )) if path.as_os_str() == "relative"
+        ) if path.as_os_str() == "relative"
     ));
 }
 
@@ -775,10 +811,8 @@ fn agent_vm_http_config_rejects_zero_clone_timeout() {
     c.clone_timeout_secs = 0;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitClone(
-            GitCloneBundlePlanError::ZeroTimeout
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::ZeroTimeout)
     ));
 }
 
@@ -788,10 +822,8 @@ fn agent_vm_http_config_rejects_zero_max_bundle_bytes() {
     c.max_bundle_bytes = 0;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitClone(
-            GitCloneBundlePlanError::ZeroMaxBundleBytes
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::ZeroMaxBundleBytes)
     ));
 }
 
@@ -801,10 +833,10 @@ fn agent_vm_http_config_rejects_invalid_nix_cache_url() {
     c.nix_cache_url = "file:///nix/cache".into();
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::NixCache(
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::NixCache(
             VmHttpNixCacheConfigError::UnsupportedUpstreamScheme { .. }
-        ))
+        )
     ));
 }
 
@@ -814,10 +846,8 @@ fn agent_vm_http_config_rejects_zero_nix_cache_metadata_limit() {
     c.nix_cache_max_metadata_bytes = 0;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::NixCache(
-            VmHttpNixCacheConfigError::EmptyMaxMetadataBytes
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::NixCache(VmHttpNixCacheConfigError::EmptyMaxMetadataBytes)
     ));
 }
 
@@ -827,10 +857,8 @@ fn agent_vm_http_config_rejects_zero_nix_cache_nar_limit() {
     c.nix_cache_max_nar_bytes = 0;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::NixCache(
-            VmHttpNixCacheConfigError::EmptyMaxNarBytes
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::NixCache(VmHttpNixCacheConfigError::EmptyMaxNarBytes)
     ));
 }
 
@@ -843,8 +871,8 @@ fn agent_vm_http_config_rejects_invalid_nix_cache_trusted_public_key() {
     )];
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::NixTrustedPublicKeys(err))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::NixTrustedPublicKeys(err)
             if err.index() == 0 && err.raw().starts_with("cache key:")
     ));
 }
@@ -863,10 +891,10 @@ fn agent_vm_http_config_rejects_invalid_claude_proxy_url() {
     });
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::ClaudeProxy(
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::ClaudeProxy(
             VmHttpClaudeProxyConfigError::UnsupportedUpstreamScheme { .. }
-        ))
+        )
     ));
 }
 
@@ -884,10 +912,8 @@ fn agent_vm_http_config_rejects_zero_claude_proxy_request_limit() {
     });
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::ClaudeProxy(
-            VmHttpClaudeProxyConfigError::EmptyMaxRequestBytes
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::ClaudeProxy(VmHttpClaudeProxyConfigError::EmptyMaxRequestBytes)
     ));
 }
 
@@ -931,8 +957,8 @@ fn agent_vm_http_config_rejects_relative_agent_run_log_root() {
     c.agent_run_log_root = Some(PathBuf::from("agent-runs"));
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::RelativeAgentRunLogRoot(path))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::RelativeAgentRunLogRoot(path)
             if path.as_os_str() == "agent-runs"
     ));
 }
@@ -946,11 +972,11 @@ fn agent_vm_http_config_rejects_unwritable_agent_run_log_root() {
     c.agent_run_log_root = Some(path.clone());
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::AgentRunLogRootCreate {
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::AgentRunLogRootCreate {
             path: failed,
             ..
-        }) if failed == path
+        } if failed == path
     ));
 }
 
@@ -985,8 +1011,8 @@ fn agent_vm_http_config_rejects_relative_git_push_staging_root() {
     c.git_push_staging_root = Some(PathBuf::from("git-push-staging"));
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::RelativeGitPushStagingRoot(path))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::RelativeGitPushStagingRoot(path)
             if path.as_os_str() == "git-push-staging"
     ));
 }
@@ -1000,11 +1026,11 @@ fn agent_vm_http_config_rejects_unwritable_git_push_staging_root() {
     c.git_push_staging_root = Some(path.clone());
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitPushStagingRootCreate {
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitPushStagingRootCreate {
             path: failed,
             ..
-        }) if failed == path
+        } if failed == path
     ));
 }
 
@@ -1028,8 +1054,8 @@ fn agent_vm_http_config_rejects_relative_flake_input_cache_dir() {
     c.flake_input_cache_dir = Some(PathBuf::from("flake-input-cache"));
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path)
             if path.as_os_str() == "flake-input-cache"
     ));
 }
@@ -1090,8 +1116,8 @@ fn agent_vm_http_config_rejects_relative_prewarm_cache_dir() {
     c.nix_prewarm_cache_dir = Some(PathBuf::from("nix-prewarm-cache"));
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::RelativeNixPrewarmCacheDir(path))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::RelativeNixPrewarmCacheDir(path)
             if path.as_os_str() == "nix-prewarm-cache"
     ));
 }
@@ -1110,8 +1136,8 @@ fn agent_vm_http_config_rejects_prewarm_cache_dir_that_is_not_a_directory() {
     std::fs::remove_file(&not_a_dir).ok();
 
     assert!(matches!(
-        result,
-        Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. })
+        sole_error(result),
+        AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. }
             if path == not_a_dir
     ));
 }
@@ -1141,8 +1167,8 @@ fn agent_vm_http_config_rejects_non_searchable_prewarm_cache_dir() {
     std::fs::remove_dir(&dir).ok();
 
     assert!(matches!(
-        result,
-        Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. })
+        sole_error(result),
+        AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. }
             if path == dir
     ));
 }
@@ -1170,8 +1196,8 @@ fn agent_vm_http_config_rejects_non_readable_prewarm_cache_dir() {
     std::fs::remove_dir(&dir).ok();
 
     assert!(matches!(
-        result,
-        Err(AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. })
+        sole_error(result),
+        AgentVmHttpConfigError::NixPrewarmCacheDirUnusable { path, .. }
             if path == dir
     ));
 }
@@ -1221,8 +1247,8 @@ fn agent_vm_http_config_rejects_relative_flake_mirror_cache_dir() {
     c.flake_mirror_cache_dir = Some(PathBuf::from("flake-mirror-cache"));
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path)
             if path.as_os_str() == "flake-mirror-cache"
     ));
 }
@@ -1254,8 +1280,8 @@ fn agent_vm_http_config_rejects_relative_flake_materialize_scratch_dir() {
     c.flake_materialize_scratch_dir = Some(PathBuf::from("flake-materialize"));
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::RelativeFlakeMaterializeScratchDir(path))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::RelativeFlakeMaterializeScratchDir(path)
             if path.as_os_str() == "flake-materialize"
     ));
 }
@@ -1267,8 +1293,8 @@ fn agent_vm_http_config_rejects_zero_flake_provision_input_bound() {
     c.flake_provision_max_input_count = 0;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::FlakeProvisionBounds(_))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::FlakeProvisionBounds(_)
     ));
 }
 
@@ -1281,11 +1307,11 @@ fn agent_vm_http_config_rejects_unwritable_flake_input_cache_dir() {
     c.flake_input_cache_dir = Some(path.clone());
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::FlakeInputCacheDirCreate {
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::FlakeInputCacheDirCreate {
             path: failed,
             ..
-        }) if failed == path
+        } if failed == path
     ));
 }
 
@@ -1295,10 +1321,8 @@ fn agent_vm_http_config_rejects_zero_git_push_body_limit() {
     c.git_push_max_metadata_bytes = 0;
 
     assert!(matches!(
-        c.to_runtime_config(),
-        Err(AgentVmHttpConfigError::GitPushBodyLimits(
-            VmGitPushBodyLimitsError::EmptyMaxMetadataBytes
-        ))
+        sole_error(c.to_runtime_config()),
+        AgentVmHttpConfigError::GitPushBodyLimits(VmGitPushBodyLimitsError::EmptyMaxMetadataBytes)
     ));
 }
 
@@ -1343,7 +1367,7 @@ fn agent_vm_http_config_rejects_existing_work_root_with_loose_perms() {
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
 
-    let err = c.to_runtime_config().expect_err("loose perms rejected");
+    let err = sole_error(c.to_runtime_config());
     assert!(
         matches!(
             err,
@@ -1382,7 +1406,7 @@ fn agent_vm_http_config_rejects_work_root_that_is_a_file() {
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
 
-    let err = c.to_runtime_config().expect_err("non-directory rejected");
+    let err = sole_error(c.to_runtime_config());
     assert!(
         matches!(
             err,
@@ -1612,4 +1636,163 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
         fp,
         "fingerprint is stable across boots — same key material",
     );
+}
+
+// --- Accumulating validation -------------------------------------------
+//
+// A daemon that stops at the first bad field costs the operator a restart per
+// mistake. These tests pin the contract that one pass reports every
+// independent problem, that a check whose inputs are broken is *skipped*
+// rather than reported as an invented failure, and that a config rejected on
+// its text alone touches no filesystem.
+
+/// Every field below is wrong, and every one of them is independent of the
+/// others, so a single pass must name all of them.
+#[test]
+fn agent_vm_http_config_reports_every_independent_failure() {
+    let mut c = valid_agent_vm_http_config();
+    c.broker_port_min = 80;
+    c.git_clone_base_url = "ssh://github.com".into();
+    c.nix_cache_url = "not-a-url".into();
+    c.nix_cache_trusted_public_keys = vec!["missing-the-colon".into()];
+    c.agent_run_log_root = Some(PathBuf::from("relative/log-root"));
+    c.git_push_staging_root = Some(PathBuf::from("relative/staging"));
+    c.git_push_max_body_bytes = 0;
+    c.flake_mirror_cache_dir = Some(PathBuf::from("relative/mirrors"));
+    c.nix_prewarm_cache_dir = Some(PathBuf::from("relative/prewarm"));
+
+    let errors = c.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    for expected in [
+        "broker port",
+        "ssh",
+        "not-a-url",
+        "missing-the-colon",
+        "agent run log root",
+        "git push staging root",
+        "flake mirror cache dir",
+        "nix pre-warm cache dir",
+    ] {
+        assert!(
+            found.iter().any(|error| error.contains(expected)),
+            "no reported failure mentions {expected:?}; got {found:#?}",
+        );
+    }
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmHttpConfigError::GitPushBodyLimits(_))),
+        "zero git push body limit not reported; got {found:#?}",
+    );
+    assert_eq!(errors.len(), 9, "unexpected failure set: {found:#?}");
+}
+
+/// The lifecycle and vm_http sections are independent, so a mistake in one
+/// must not hide every mistake in the other.
+#[test]
+fn agent_vm_daemon_config_reports_lifecycle_and_vm_http_failures_together() {
+    let mut lifecycle = valid_agent_vm_lifecycle_config();
+    lifecycle.ipv4_pool = "not-a-cidr".into();
+    lifecycle.cpus = 0;
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.nix_cache_url = "not-a-url".into();
+    vm_http.git_push_max_body_bytes = 0;
+
+    let config = AgentVmDaemonConfig { lifecycle, vm_http };
+    let errors = config.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmDaemonConfigError::InvalidCidr { .. })),
+        "lifecycle CIDR failure missing from {found:#?}",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmDaemonConfigError::VmHttp(_))),
+        "vm_http failures missing from {found:#?}",
+    );
+    assert_eq!(errors.len(), 4, "unexpected failure set: {found:#?}");
+}
+
+/// Both CIDR pools are parsed independently; a bad v4 pool must not mask a
+/// bad v6 pool.
+#[test]
+fn agent_vm_lifecycle_config_reports_both_bad_cidr_pools() {
+    let mut c = valid_agent_vm_lifecycle_config();
+    c.ipv4_pool = "not-a-cidr".into();
+    c.ipv6_pool = "also-not-a-cidr".into();
+
+    let errors = c.to_runtime_config().unwrap_err();
+    let fields: Vec<&'static str> = errors
+        .iter()
+        .filter_map(|error| match error {
+            AgentVmDaemonConfigError::InvalidCidr { field, .. } => Some(*field),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fields, vec!["ipv4_pool", "ipv6_pool"]);
+}
+
+/// A check whose inputs are themselves invalid is skipped, not reported: the
+/// operator should see the root cause once, not a cascade of consequences.
+#[test]
+fn a_failed_input_skips_its_dependents_without_inventing_failures() {
+    let mut c = valid_agent_vm_http_config();
+    c.token_env = "not a valid env var".into();
+
+    let errors = c.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert_eq!(errors.len(), 1, "expected only the root cause: {found:#?}");
+    assert!(matches!(
+        errors.first(),
+        AgentVmHttpConfigError::TokenEnv(_)
+    ));
+}
+
+/// A config rejected on its text alone must not have created directories on
+/// the way to that verdict — otherwise a typo leaves debris behind, and (for
+/// the work root specifically) a half-created directory at the process umask
+/// turns a transient mistake into one that the *next* boot also rejects.
+#[test]
+fn a_textually_invalid_config_creates_no_directories() {
+    let mut c = valid_agent_vm_http_config();
+    let work_root = unique_config_test_path("no-debris-work-root");
+    c.work_root = work_root.clone();
+    c.nix_cache_url = "not-a-url".into();
+
+    let errors = c.to_runtime_config().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("not-a-url"))
+    );
+    assert!(
+        !work_root.exists(),
+        "work root {work_root:?} was created despite the config being rejected",
+    );
+}
+
+/// A relative work root is reported once, naming the field, and does not
+/// cause a directory to be created relative to the daemon's cwd.
+#[test]
+fn a_relative_work_root_is_reported_once_and_creates_nothing() {
+    let mut c = valid_agent_vm_http_config();
+    c.work_root = PathBuf::from("writ-relative-work-root-should-not-appear");
+
+    let errors = c.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::RelativePath {
+                field: "work_root",
+                ..
+            })
+        )),
+        "relative work root not reported: {found:#?}",
+    );
+    assert_eq!(errors.len(), 1, "unexpected failure set: {found:#?}");
+    assert!(!PathBuf::from("writ-relative-work-root-should-not-appear").exists());
 }
