@@ -45,6 +45,21 @@ pub enum AgentRunTerminalStatus {
     Failed,
 }
 
+/// What an agent run's stream looks like **in the audit log**: the bytes that
+/// are actually at `path`, plus whether there were more.
+///
+/// `byte_len` and `sha256_hex` describe the retained bytes — the file — and
+/// nothing else. That is the only reading under which they can be checked
+/// against anything: the row is what survives, and the row's `path` is what an
+/// operator opens. When `truncated`, the stream *was* longer, and how much
+/// longer is deliberately not recorded, because on the VM path that number is
+/// a claim by an untrusted guest.
+///
+/// A run that has just been captured knows more than this — see
+/// [`AgentRunStreamCapture`], which carries both the retained and the whole
+/// stream and projects down to this type. Keep the two apart: this one is a
+/// lossy projection, and it is also what gets read back out of SQLite, where
+/// the fuller information no longer exists.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentRunStreamSummary {
     pub path: PathBuf,
@@ -354,6 +369,84 @@ mod process_runner {
         DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES,
     };
 
+    /// One captured stream, as measured at the moment of capture: both the
+    /// bytes kept on disk and the whole stream that went past.
+    ///
+    /// Two pairs, because the two quantities answer different questions and
+    /// conflating them is how a truncation offset ends up pointing past the
+    /// bytes it describes. `retained_*` describes the file at `path` — what an
+    /// operator can open, and what the audit row stores. `full_*` describes
+    /// everything the child emitted, which is what the guest reports upstream
+    /// so the host can see how much was lost.
+    ///
+    /// They coincide exactly when nothing was dropped, which is why
+    /// [`truncated`](Self::truncated) is derived rather than stored: a capture
+    /// claiming truncation while having kept the whole stream is not a state
+    /// worth being able to build.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct AgentRunStreamCapture {
+        pub path: PathBuf,
+        /// Length of the bytes at `path`.
+        pub retained_byte_len: u64,
+        /// SHA-256 of the bytes at `path`.
+        pub retained_sha256_hex: String,
+        /// Length of the whole stream, retained or not.
+        pub full_byte_len: u64,
+        /// SHA-256 of the whole stream, retained or not.
+        pub full_sha256_hex: String,
+    }
+
+    impl AgentRunStreamCapture {
+        /// Whether the stream outran the capture cap. Derived: it is exactly
+        /// "we kept less than we saw".
+        pub fn truncated(&self) -> bool {
+            self.full_byte_len > self.retained_byte_len
+        }
+
+        /// Project onto the audit-facing [`AgentRunStreamSummary`], keeping the
+        /// pair that describes the bytes on disk.
+        ///
+        /// This is the *only* way a summary is built from a capture, which is
+        /// what makes the summary's meaning uniform no matter which arm of
+        /// `RunAgent` produced it. The host arm records this directly; on the VM
+        /// path the guest sends both pairs and the broker re-derives the same
+        /// projection from bytes it has verified for itself.
+        pub fn to_summary(&self) -> AgentRunStreamSummary {
+            AgentRunStreamSummary {
+                path: self.path.clone(),
+                byte_len: self.retained_byte_len,
+                sha256_hex: self.retained_sha256_hex.clone(),
+                truncated: self.truncated(),
+            }
+        }
+    }
+
+    /// A finished agent run as measured by whoever ran it, before any of it is
+    /// narrowed for the audit log.
+    ///
+    /// [`AgentRunOutcome`] is the same run seen through the audit row's
+    /// vocabulary; [`to_outcome`](Self::to_outcome) is the narrowing.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct AgentRunCapture {
+        pub run_id: AgentRunId,
+        pub status: AgentRunTerminalStatus,
+        pub exit_code: i32,
+        pub stdout: AgentRunStreamCapture,
+        pub stderr: AgentRunStreamCapture,
+    }
+
+    impl AgentRunCapture {
+        pub fn to_outcome(&self) -> AgentRunOutcome {
+            AgentRunOutcome {
+                run_id: self.run_id,
+                status: self.status.clone(),
+                exit_code: self.exit_code,
+                stdout: self.stdout.to_summary(),
+                stderr: self.stderr.to_summary(),
+            }
+        }
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct AgentProcessPlan {
         run_id: AgentRunId,
@@ -461,7 +554,7 @@ mod process_runner {
         plan: &AgentProcessPlan,
         prompt: &AgentPrompt,
         log_root: &Path,
-    ) -> Result<AgentRunOutcome, AgentProcessRunError> {
+    ) -> Result<AgentRunCapture, AgentProcessRunError> {
         // Stream files are durable audit artifacts. The lifecycle owner must
         // define retention and quota policy for this log root.
         ensure_private_dir(log_root)?;
@@ -518,7 +611,7 @@ mod process_runner {
         let stdout = join_capture_thread("stdout", stdout_thread)??;
         let stderr = join_capture_thread("stderr", stderr_thread)??;
         let exit_code = exit_code(status);
-        Ok(AgentRunOutcome {
+        Ok(AgentRunCapture {
             run_id: plan.run_id,
             status: if status.success() {
                 AgentRunTerminalStatus::Succeeded
@@ -565,16 +658,27 @@ mod process_runner {
         }
     }
 
-    fn capture_stream<R: Read>(
+    /// Drain `reader` to EOF, keeping at most `max_capture_bytes` of it at
+    /// `path` and measuring both what was kept and what went past.
+    ///
+    /// Always drains: bytes past the cap are read and dropped rather than left
+    /// in the pipe, so a child that writes more than the cap is never blocked
+    /// on a full buffer.
+    ///
+    /// `pub(super)` so the crate's tests can drive it over an in-memory reader.
+    /// Its contract is about bytes, not processes; pinning it through a shell
+    /// script would mostly test the script.
+    pub(super) fn capture_stream<R: Read>(
         mut reader: R,
         path: PathBuf,
         max_capture_bytes: u64,
-    ) -> Result<AgentRunStreamSummary, AgentProcessRunError> {
+    ) -> Result<AgentRunStreamCapture, AgentProcessRunError> {
         let mut file = create_private_file(&path)?;
         let mut total = 0u64;
         let mut captured = 0u64;
         let mut buffer = [0u8; 8192];
         let mut hash_context = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut retained_hash_context = ring::digest::Context::new(&ring::digest::SHA256);
         loop {
             let read =
                 reader
@@ -592,12 +696,13 @@ mod process_runner {
             if captured < max_capture_bytes {
                 let remaining = (max_capture_bytes - captured) as usize;
                 let to_write = remaining.min(read);
-                file.write_all(&chunk[..to_write]).map_err(|source| {
-                    AgentProcessRunError::StreamCapture {
+                let kept = &chunk[..to_write];
+                file.write_all(kept)
+                    .map_err(|source| AgentProcessRunError::StreamCapture {
                         path: path.clone(),
                         source,
-                    }
-                })?;
+                    })?;
+                retained_hash_context.update(kept);
                 captured += to_write as u64;
             }
         }
@@ -606,11 +711,12 @@ mod process_runner {
                 path: path.clone(),
                 source,
             })?;
-        Ok(AgentRunStreamSummary {
+        Ok(AgentRunStreamCapture {
             path,
-            byte_len: total,
-            sha256_hex: super::hex_lower(hash_context.finish().as_ref()),
-            truncated: total > max_capture_bytes,
+            retained_byte_len: captured,
+            retained_sha256_hex: super::hex_lower(retained_hash_context.finish().as_ref()),
+            full_byte_len: total,
+            full_sha256_hex: super::hex_lower(hash_context.finish().as_ref()),
         })
     }
 
@@ -705,8 +811,8 @@ mod process_runner {
 
     fn join_capture_thread(
         stream: &'static str,
-        thread: thread::JoinHandle<Result<AgentRunStreamSummary, AgentProcessRunError>>,
-    ) -> Result<Result<AgentRunStreamSummary, AgentProcessRunError>, AgentProcessRunError> {
+        thread: thread::JoinHandle<Result<AgentRunStreamCapture, AgentProcessRunError>>,
+    ) -> Result<Result<AgentRunStreamCapture, AgentProcessRunError>, AgentProcessRunError> {
         thread
             .join()
             .map_err(|panic| AgentProcessRunError::StreamThread {
@@ -727,7 +833,10 @@ mod process_runner {
 }
 
 #[cfg(any(feature = "host", feature = "vm-client"))]
-pub use process_runner::{AgentProcessPlan, AgentProcessRunError, run_agent_process};
+pub use process_runner::{
+    AgentProcessPlan, AgentProcessRunError, AgentRunCapture, AgentRunStreamCapture,
+    run_agent_process,
+};
 
 #[cfg(test)]
 mod tests {
@@ -932,10 +1041,19 @@ mod tests {
             fs::read_to_string(&outcome.stderr.path).unwrap(),
             "fake stderr\n"
         );
-        assert_eq!(outcome.stdout.byte_len, "fake stdout\n".len() as u64);
-        assert_eq!(outcome.stderr.byte_len, "fake stderr\n".len() as u64);
-        assert!(!outcome.stdout.truncated);
-        assert!(!outcome.stderr.truncated);
+        // Nothing was dropped, so the retained and full pairs coincide.
+        assert_eq!(
+            outcome.stdout.retained_byte_len,
+            "fake stdout\n".len() as u64
+        );
+        assert_eq!(outcome.stdout.full_byte_len, "fake stdout\n".len() as u64);
+        assert_eq!(
+            outcome.stderr.retained_byte_len,
+            "fake stderr\n".len() as u64
+        );
+        assert_eq!(outcome.stderr.full_byte_len, "fake stderr\n".len() as u64);
+        assert!(!outcome.stdout.truncated());
+        assert!(!outcome.stderr.truncated());
         #[cfg(unix)]
         {
             assert_eq!(
@@ -1071,6 +1189,55 @@ mod tests {
     }
 
     #[cfg(feature = "host")]
+    proptest! {
+        /// The oracle for what a capture's two pairs mean.
+        ///
+        /// `retained_*` must describe the bytes on disk — checkable by reading
+        /// the file back — and `full_*` must describe the whole stream, at
+        /// every cap either side of the stream's length. Getting this wrong is
+        /// not a cosmetic mislabelling: the audit row keeps only one pair, and
+        /// the signed envelope derives its truncation offset from it, so a
+        /// summary carrying the full length would mark a cut point past the
+        /// bytes it is describing.
+        #[test]
+        fn a_capture_measures_both_what_it_kept_and_what_it_saw(
+            stream in prop::collection::vec(any::<u8>(), 0..4096),
+            cap in 0u64..4096,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("stream.log");
+
+            let capture = process_runner::capture_stream(
+                std::io::Cursor::new(stream.clone()),
+                path.clone(),
+                cap,
+            )
+                .map_err(|err| TestCaseError::fail(format!("{err}")))?;
+
+            let on_disk = fs::read(&path).unwrap();
+            // What is kept is a prefix of what was seen, bounded by the cap.
+            prop_assert_eq!(&on_disk[..], &stream[..on_disk.len()]);
+            prop_assert!(on_disk.len() as u64 <= cap);
+            // The retained pair describes the file, exactly.
+            prop_assert_eq!(capture.retained_byte_len, on_disk.len() as u64);
+            prop_assert_eq!(&capture.retained_sha256_hex, &sha256_hex(&on_disk));
+            // The full pair describes the stream, however much was kept.
+            prop_assert_eq!(capture.full_byte_len, stream.len() as u64);
+            prop_assert_eq!(&capture.full_sha256_hex, &sha256_hex(&stream));
+            // Truncation is derived from the two, never asserted on its own.
+            prop_assert_eq!(capture.truncated(), on_disk.len() < stream.len());
+
+            // The projection the audit row stores keeps the pair that describes
+            // the file — the one an operator can verify against `path`.
+            let summary = capture.to_summary();
+            prop_assert_eq!(&summary.path, &path);
+            prop_assert_eq!(summary.byte_len, capture.retained_byte_len);
+            prop_assert_eq!(&summary.sha256_hex, &capture.retained_sha256_hex);
+            prop_assert_eq!(summary.truncated, capture.truncated());
+        }
+    }
+
+    #[cfg(feature = "host")]
     #[test]
     fn fake_agent_large_streams_are_drained_counted_and_truncated() {
         let dir = tempfile::tempdir().unwrap();
@@ -1084,12 +1251,22 @@ mod tests {
         let outcome = run_agent_process(&plan, &prompt, &dir.path().join("logs")).unwrap();
 
         assert_eq!(outcome.status, AgentRunTerminalStatus::Succeeded);
-        assert_eq!(outcome.stdout.byte_len, 4096);
-        assert_eq!(outcome.stderr.byte_len, 4096);
-        assert!(outcome.stdout.truncated);
-        assert!(outcome.stderr.truncated);
+        // The child emitted 4096 bytes; 128 of them survive on disk. Both
+        // numbers are recorded, and the retained one is the one that describes
+        // the file — which is what the audit row will keep.
+        assert_eq!(outcome.stdout.full_byte_len, 4096);
+        assert_eq!(outcome.stderr.full_byte_len, 4096);
+        assert_eq!(outcome.stdout.retained_byte_len, 128);
+        assert_eq!(outcome.stderr.retained_byte_len, 128);
+        assert!(outcome.stdout.truncated());
+        assert!(outcome.stderr.truncated());
         assert_eq!(fs::metadata(&outcome.stdout.path).unwrap().len(), 128);
         assert_eq!(fs::metadata(&outcome.stderr.path).unwrap().len(), 128);
+        assert_eq!(outcome.stdout.to_summary().byte_len, 128);
+        assert_eq!(
+            outcome.stdout.to_summary().sha256_hex,
+            sha256_hex(&fs::read(&outcome.stdout.path).unwrap())
+        );
     }
 
     #[cfg(feature = "host")]

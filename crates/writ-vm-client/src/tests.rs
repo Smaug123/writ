@@ -363,21 +363,23 @@ async fn upload_agent_run_outcome_posts_stream_metadata_and_retained_bytes() {
     let stderr_path = dir.path().join("stderr.log");
     fs::write(&stdout_path, b"Hello from Claude\n").unwrap();
     fs::write(&stderr_path, b"").unwrap();
-    let outcome = AgentRunOutcome {
+    let outcome = AgentRunCapture {
         run_id,
         status: writ_agent_run::AgentRunTerminalStatus::Succeeded,
         exit_code: 0,
-        stdout: AgentRunStreamSummary {
+        stdout: AgentRunStreamCapture {
             path: stdout_path,
-            byte_len: 18,
-            sha256_hex: writ_agent_run::sha256_hex(b"Hello from Claude\n"),
-            truncated: false,
+            retained_byte_len: 18,
+            retained_sha256_hex: writ_agent_run::sha256_hex(b"Hello from Claude\n"),
+            full_byte_len: 18,
+            full_sha256_hex: writ_agent_run::sha256_hex(b"Hello from Claude\n"),
         },
-        stderr: AgentRunStreamSummary {
+        stderr: AgentRunStreamCapture {
             path: stderr_path,
-            byte_len: 0,
-            sha256_hex: writ_agent_run::sha256_hex(b""),
-            truncated: false,
+            retained_byte_len: 0,
+            retained_sha256_hex: writ_agent_run::sha256_hex(b""),
+            full_byte_len: 0,
+            full_sha256_hex: writ_agent_run::sha256_hex(b""),
         },
     };
     let (broker_url, captured) = serve_once(http_response("200 OK", "text/plain", b"ok")).await;
@@ -403,6 +405,66 @@ async fn upload_agent_run_outcome_posts_stream_metadata_and_retained_bytes() {
         "{request}"
     );
     assert!(!request.contains("Hello from Claude"), "{request}");
+}
+
+/// A truncated stream is the case where the capture's two pairs disagree, so it
+/// is the case that pins which one goes where on the wire: `byte_len` /
+/// `sha256_hex` report the whole stream the guest saw, while `retained_*`
+/// describe only the bytes actually being sent. The broker trusts the second
+/// pair (it can check it against the payload) and treats the first as a claim.
+#[tokio::test]
+async fn upload_agent_run_outcome_reports_the_whole_stream_and_sends_only_what_it_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let run_id: AgentRunId = "00000000-0000-0000-0000-000000000503".parse().unwrap();
+    let stdout_path = dir.path().join("stdout.log");
+    let stderr_path = dir.path().join("stderr.log");
+    // The child emitted "abcdef"; only "abc" survived the capture cap.
+    fs::write(&stdout_path, b"abc").unwrap();
+    fs::write(&stderr_path, b"").unwrap();
+    let outcome = AgentRunCapture {
+        run_id,
+        status: writ_agent_run::AgentRunTerminalStatus::Succeeded,
+        exit_code: 0,
+        stdout: AgentRunStreamCapture {
+            path: stdout_path,
+            retained_byte_len: 3,
+            retained_sha256_hex: writ_agent_run::sha256_hex(b"abc"),
+            full_byte_len: 6,
+            full_sha256_hex: writ_agent_run::sha256_hex(b"abcdef"),
+        },
+        stderr: AgentRunStreamCapture {
+            path: stderr_path,
+            retained_byte_len: 0,
+            retained_sha256_hex: writ_agent_run::sha256_hex(b""),
+            full_byte_len: 0,
+            full_sha256_hex: writ_agent_run::sha256_hex(b""),
+        },
+    };
+    let (broker_url, captured) = serve_once(http_response("200 OK", "text/plain", b"ok")).await;
+    let config = VmClientConfig::new(broker_url, "writ-vm-secret").unwrap();
+
+    upload_agent_run_outcome(&config, &outcome).await.unwrap();
+
+    let request = captured.lock().unwrap().clone();
+    // The whole stream's length and hash.
+    assert!(request.contains(r#""byte_len":6"#), "{request}");
+    assert!(
+        request.contains(&format!(
+            r#""sha256_hex":"{}""#,
+            writ_agent_run::sha256_hex(b"abcdef")
+        )),
+        "{request}"
+    );
+    assert!(request.contains(r#""truncated":true"#), "{request}");
+    // ...and only the bytes that survived, with a hash of exactly those.
+    assert!(request.contains(r#""retained_base64":"YWJj""#), "{request}");
+    assert!(
+        request.contains(&format!(
+            r#""retained_sha256_hex":"{}""#,
+            writ_agent_run::sha256_hex(b"abc")
+        )),
+        "{request}"
+    );
 }
 
 #[tokio::test]
@@ -1934,26 +1996,28 @@ where
     (method, target)
 }
 
-fn sample_agent_run_outcome(dir: &Path, run_id: AgentRunId) -> AgentRunOutcome {
+fn sample_agent_run_outcome(dir: &Path, run_id: AgentRunId) -> AgentRunCapture {
     let stdout_path = dir.join("stdout.log");
     let stderr_path = dir.join("stderr.log");
     fs::write(&stdout_path, b"out").unwrap();
     fs::write(&stderr_path, b"err").unwrap();
-    AgentRunOutcome {
+    AgentRunCapture {
         run_id,
         status: writ_agent_run::AgentRunTerminalStatus::Succeeded,
         exit_code: 0,
-        stdout: AgentRunStreamSummary {
+        stdout: AgentRunStreamCapture {
             path: stdout_path,
-            byte_len: 3,
-            sha256_hex: writ_agent_run::sha256_hex(b"out"),
-            truncated: false,
+            retained_byte_len: 3,
+            retained_sha256_hex: writ_agent_run::sha256_hex(b"out"),
+            full_byte_len: 3,
+            full_sha256_hex: writ_agent_run::sha256_hex(b"out"),
         },
-        stderr: AgentRunStreamSummary {
+        stderr: AgentRunStreamCapture {
             path: stderr_path,
-            byte_len: 3,
-            sha256_hex: writ_agent_run::sha256_hex(b"err"),
-            truncated: false,
+            retained_byte_len: 3,
+            retained_sha256_hex: writ_agent_run::sha256_hex(b"err"),
+            full_byte_len: 3,
+            full_sha256_hex: writ_agent_run::sha256_hex(b"err"),
         },
     }
 }

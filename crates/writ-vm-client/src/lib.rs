@@ -14,7 +14,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use reqwest::Url;
 
 use writ_agent_run::{
-    AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
+    AgentPrompt, AgentRunCapture, AgentRunId, AgentRunStreamCapture, AgentRunStreamUpload,
     VmAgentRunConfigResponse, VmAgentRunOutcomeUpload, vm_agent_run_config_path,
     vm_agent_run_outcome_path,
 };
@@ -511,19 +511,26 @@ pub async fn fetch_agent_run_config(
         .map_err(VmClientError::from)
 }
 
+/// Report a finished run to the broker.
+///
+/// Takes the [`AgentRunCapture`] rather than the narrowed
+/// [`AgentRunOutcome`](writ_agent_run::AgentRunOutcome) because the wire carries
+/// *both* of the capture's pairs: the full stream's length and hash (what the
+/// guest saw) alongside the retained bytes (what it can prove). The broker
+/// trusts only the latter, and narrows to a summary itself.
 pub async fn upload_agent_run_outcome(
     config: &VmClientConfig,
-    outcome: &AgentRunOutcome,
+    capture: &AgentRunCapture,
 ) -> Result<(), VmClientError> {
     let upload = VmAgentRunOutcomeUpload {
-        run_id: outcome.run_id,
-        status: outcome.status.clone(),
-        exit_code: outcome.exit_code,
-        stdout: agent_run_stream_upload(&outcome.stdout)?,
-        stderr: agent_run_stream_upload(&outcome.stderr)?,
+        run_id: capture.run_id,
+        status: capture.status.clone(),
+        exit_code: capture.exit_code,
+        stdout: agent_run_stream_upload(&capture.stdout)?,
+        stderr: agent_run_stream_upload(&capture.stderr)?,
     };
     let response = config
-        .post(&vm_agent_run_outcome_path(outcome.run_id))
+        .post(&vm_agent_run_outcome_path(capture.run_id))
         .json(&upload)
         .send()
         .await?;
@@ -747,18 +754,26 @@ async fn fetch_git_clone_bundle(
     read_bounded_bundle_body(response, config.max_bundle_bytes()).await
 }
 
+/// Build one stream's wire form from its capture.
+///
+/// `byte_len`/`sha256_hex` carry the *whole* stream and `retained_*` the bytes
+/// actually being sent; the broker checks the latter against the payload and
+/// treats the former as an untrusted claim. The retained hash is computed from
+/// the bytes read here rather than copied from the capture, so the two retained
+/// fields always describe the same bytes — the field is a checksum of this
+/// payload, not a second-hand assertion about a file.
 fn agent_run_stream_upload(
-    summary: &AgentRunStreamSummary,
+    capture: &AgentRunStreamCapture,
 ) -> Result<AgentRunStreamUpload, VmClientError> {
-    let retained = fs::read(&summary.path).map_err(|source| VmClientError::Io {
+    let retained = fs::read(&capture.path).map_err(|source| VmClientError::Io {
         operation: "read agent run stream",
-        path: summary.path.clone(),
+        path: capture.path.clone(),
         source,
     })?;
     Ok(AgentRunStreamUpload {
-        byte_len: summary.byte_len,
-        sha256_hex: summary.sha256_hex.clone(),
-        truncated: summary.truncated,
+        byte_len: capture.full_byte_len,
+        sha256_hex: capture.full_sha256_hex.clone(),
+        truncated: capture.truncated(),
         retained_sha256_hex: writ_agent_run::sha256_hex(&retained),
         retained_base64: base64_standard(&retained),
     })
