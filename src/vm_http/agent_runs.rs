@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_run::{
-    AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunStreamUpload,
-    VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX, VmAgentRunConfigResponse,
-    VmAgentRunOutcomeUpload,
+    AgentPrompt, AgentRunId, AgentRunOutcome, AgentRunStreamCapture, AgentRunStreamSummary,
+    AgentRunStreamUpload, VM_AGENT_RUN_OUTCOME_PATH_SUFFIX, VM_AGENT_RUN_PATH_PREFIX,
+    VmAgentRunConfigResponse, VmAgentRunOutcomeUpload,
 };
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AgentRunAuditRecord, AgentRunAuditTable,
@@ -449,12 +449,6 @@ fn materialize_agent_run_stream(
         ));
     }
 
-    let (audited_byte_len, audited_sha256_hex) = if upload.truncated {
-        (retained_len, upload.retained_sha256_hex)
-    } else {
-        (upload.byte_len, upload.sha256_hex)
-    };
-
     write_private_file(path, &retained).map_err(|err| {
         tracing::error!(
             target: AUDIT_WRITE_FAILURE_TARGET,
@@ -468,12 +462,27 @@ fn materialize_agent_run_stream(
             "agent run log write failed",
         )
     })?;
-    Ok(AgentRunStreamSummary {
+    // Every check above has run, so the untrusted upload has been parsed into
+    // something with the shape of a capture: `retained_*` are the bytes just
+    // written (their hash verified against them), and `full_*` are the guest's
+    // claims about the whole stream. Narrowing it with the same `to_summary`
+    // the host-spawn path uses is what keeps a truncated stream meaning one
+    // thing in the audit row regardless of which arm produced it.
+    //
+    // Deriving `truncated` from the two lengths agrees with the guest's own
+    // flag, rather than replacing it: the checks above accept the upload only
+    // when `truncated` implies `retained_len < byte_len` and `!truncated`
+    // implies `retained_len == byte_len`, so past this point the flag and the
+    // comparison are the same predicate. The comparison is the one kept because
+    // it cannot disagree with the bytes on disk.
+    Ok(AgentRunStreamCapture {
         path: path.to_path_buf(),
-        byte_len: audited_byte_len,
-        sha256_hex: audited_sha256_hex,
-        truncated: upload.truncated,
-    })
+        retained_byte_len: retained_len,
+        retained_sha256_hex: upload.retained_sha256_hex,
+        full_byte_len: upload.byte_len,
+        full_sha256_hex: upload.sha256_hex,
+    }
+    .to_summary())
 }
 
 fn is_sha256_hex(raw: &str) -> bool {
@@ -1069,5 +1078,9 @@ mod tests {
             outcome.outcome.stdout.sha256_hex,
             crate::agent_run::sha256_hex(b"H")
         );
+        // The row's `truncated` is derived from "kept less than was claimed",
+        // not copied from the guest's flag — and on an accepted upload the two
+        // agree, which is what lets the derivation stand in for the flag.
+        assert!(outcome.outcome.stdout.truncated);
     }
 }
