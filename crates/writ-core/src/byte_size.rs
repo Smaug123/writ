@@ -46,16 +46,22 @@ impl ByteSize {
     /// Kibibytes, mebibytes, gibibytes. Named constructors because the tree
     /// previously spelled the same quantity `256 << 20` in one place and
     /// `512 * 1024 * 1024` in another, and neither reads as its magnitude.
+    ///
+    /// Saturating, not wrapping: an absurd `count` yields the largest
+    /// representable limit rather than — in a release build, silently — a tiny
+    /// one. Turning a large safety limit into a small one by arithmetic is
+    /// exactly the failure this type exists to prevent, so it must not be
+    /// reachable through the type's own constructors.
     pub const fn kib(count: u64) -> Self {
-        Self(count * 1024)
+        Self(count.saturating_mul(1024))
     }
 
     pub const fn mib(count: u64) -> Self {
-        Self(count * 1024 * 1024)
+        Self(count.saturating_mul(1024 * 1024))
     }
 
     pub const fn gib(count: u64) -> Self {
-        Self(count * 1024 * 1024 * 1024)
+        Self(count.saturating_mul(1024 * 1024 * 1024))
     }
 
     /// Measure something already in memory. Infallible: `usize` fits in `u64`
@@ -150,6 +156,26 @@ mod tests {
         fn saturating_add_never_wraps(a: u64, b: u64) {
             let sum = ByteSize::from_bytes(a).saturating_add(ByteSize::from_bytes(b));
             prop_assert!(sum.get() >= a.max(b));
+        }
+
+        /// Nor can scaling. A constructor that wrapped would turn a huge
+        /// configured limit into a small one — the precise failure this type is
+        /// meant to make unreachable — so every scale is monotonic in its
+        /// count and never smaller than the count itself.
+        #[test]
+        fn scale_constructors_never_wrap(count: u64) {
+            for scaled in [
+                ByteSize::kib(count),
+                ByteSize::mib(count),
+                ByteSize::gib(count),
+            ] {
+                prop_assert!(
+                    scaled.get() >= count,
+                    "scaling {count} produced the smaller {scaled}",
+                );
+            }
+            prop_assert!(ByteSize::kib(count) <= ByteSize::mib(count));
+            prop_assert!(ByteSize::mib(count) <= ByteSize::gib(count));
         }
     }
 
