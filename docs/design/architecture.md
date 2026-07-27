@@ -278,13 +278,18 @@ the errors come from:
 check that touches nothing and returns a `VmHttpPlan` — the validated runtime
 config plus the directories that still need creating; `VmHttpPlan::materialize`
 carries that out. This is the interpreter pattern applied to config: it is what
-lets `AgentVmDaemonConfig::to_runtime_config` check *both* sections before
-either creates anything, so a fault anywhere leaves no debris. That matters most
-for `work_root`, where a directory created at the process umask (0755) would
-make `validate_existing_work_root` refuse that path on every later boot too. The
-work root is prepared before the roots beneath it; a root the operator
-configured *outside* the work root does not derive from it and is probed
-independently, so an unusable work root cannot suppress its report.
+lets `AgentVmDaemonConfig::to_runtime_config` check *both* sections — and the
+daemon-level invariants that span them, via
+`AgentVmDaemonRuntimeConfig::check_vm_http` — before anything creates a
+directory, so a fault anywhere leaves no debris. That matters most for
+`work_root`, where a directory created at the process umask (0755) would make
+`validate_existing_work_root` refuse that path on every later boot too. The work
+root is prepared before the roots beneath it; only *derived* roots wait on it,
+since a root the operator configured explicitly is news of its own and gating it
+would hide that. There is deliberately no containment test on configured roots:
+whenever the work root cannot be prepared it already exists or cannot be created
+at all, so `create_dir_all` beneath it fails rather than quietly bringing it into
+being at the umask.
 
 This split leaves one place an operator can still need two passes: once for what
 the config says, once for what the filesystem permits.

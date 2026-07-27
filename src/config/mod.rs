@@ -696,9 +696,18 @@ impl AgentVmDaemonConfig {
         let mut errors = Accumulator::new();
         let lifecycle = errors.record_many(self.lifecycle.to_runtime_config());
         let vm_http_plan = errors.record_many(self.vm_http.check());
+        // The daemon-level invariants relate the sections to each other, so
+        // they are checked against the *planned* vm_http config: a rejection
+        // here then costs no directories, and lands in this report rather than
+        // after it.
+        let vm_http_plan = vm_http_plan.and_then(|plan| {
+            errors
+                .record_from(AgentVmDaemonRuntimeConfig::check_vm_http(plan.runtime()))
+                .map(|()| plan)
+        });
         let (lifecycle, vm_http_plan) = errors.unpack(all_recorded!(lifecycle, vm_http_plan))?;
-        // Past this point the config is textually sound, so creating the
-        // broker's directories is work on behalf of a daemon that will start.
+        // Past this point the config is sound, so creating the broker's
+        // directories is work on behalf of a daemon that will start.
         let vm_http = vm_http_plan.materialize().map_err(Errors::map_into)?;
         AgentVmDaemonRuntimeConfig::new(lifecycle, vm_http)
             .map_err(|err| Errors::single(err.into()))
@@ -798,6 +807,13 @@ struct RootPlan {
 }
 
 impl VmHttpPlan {
+    /// The validated runtime config, before its directories exist. Lets a
+    /// caller check invariants that span sections while a rejection still
+    /// costs nothing.
+    pub fn runtime(&self) -> &VmHttpRuntimeConfig {
+        &self.runtime
+    }
+
     /// Create the planned directories and prove the broker can write to them,
     /// accumulating failures across all of them.
     pub fn materialize(self) -> Result<VmHttpRuntimeConfig, Errors<AgentVmHttpConfigError>> {
@@ -1084,19 +1100,16 @@ impl AgentVmHttpConfig {
                 WritableRoot::AgentRunLog,
                 agent_run_log_root,
                 self.agent_run_log_root.is_none(),
-                work_root,
             ),
             root_plan(
                 WritableRoot::GitPushStaging,
                 git_push_staging_root,
                 self.git_push_staging_root.is_none(),
-                work_root,
             ),
             root_plan(
                 WritableRoot::FlakeInputCache,
                 flake_input_cache_dir,
                 self.flake_input_cache_dir.is_none(),
-                work_root,
             ),
         ];
         Ok(VmHttpPlan {
@@ -1109,17 +1122,32 @@ impl AgentVmHttpConfig {
 
 /// Decide whether preparing `path` has to wait for the work root.
 ///
-/// A derived root lives under the work root by construction. A configured one
-/// usually does not — and when it does not, gating it on the work root would
-/// suppress its own failure behind the work root's, so it is probed
-/// independently. The `starts_with` test keeps the gate for a configured root
-/// that the operator happened to point inside the work root anyway.
-fn root_plan(kind: WritableRoot, path: PathBuf, derived: bool, work_root: &Path) -> RootPlan {
-    let under_work_root = derived || path.starts_with(work_root);
+/// Exactly the derived roots, and no containment test on configured ones.
+/// That is not an approximation — it is what the dependency actually is:
+///
+/// - A *derived* root is `<work_root>/<subdir>`, so a failure preparing it
+///   when the work root itself could not be prepared says nothing the work
+///   root's own error has not already said. Gating suppresses the echo.
+/// - A *configured* root is the operator's own statement, so its failure is
+///   news even when the work root is broken, and gating would hide it.
+///
+/// A containment test would only matter if creating a child could quietly
+/// bring the work root into being at the process umask — the hazard the
+/// ordering in [`VmHttpPlan::materialize`] exists to prevent. It cannot:
+/// whenever `ensure_vm_http_work_root_private` fails, the work root either
+/// already exists (wrong mode, or not a directory) or could not be created at
+/// all, and in every one of those cases `create_dir_all` on a path beneath it
+/// fails too rather than replacing it. Pinned by
+/// `a_root_under_an_unpreparable_work_root_fails_rather_than_creating_it`.
+///
+/// So there is nothing for a lexical `starts_with` — which is case-sensitive,
+/// blind to symlinks and `..`, and would be wrong in both directions on a
+/// macOS `/tmp` vs `/private/tmp` alias — to buy here.
+fn root_plan(kind: WritableRoot, path: PathBuf, derived: bool) -> RootPlan {
     RootPlan {
         kind,
         path,
-        under_work_root,
+        under_work_root: derived,
     }
 }
 

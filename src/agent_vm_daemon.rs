@@ -434,12 +434,24 @@ impl AgentVmDaemonRuntimeConfig {
         lifecycle: AgentVmLifecycleRuntimeConfig,
         vm_http: VmHttpRuntimeConfig,
     ) -> Result<Self, AgentVmDaemonRuntimeConfigError> {
+        Self::check_vm_http(&vm_http)?;
+        Ok(Self { lifecycle, vm_http })
+    }
+
+    /// The daemon-level invariant [`Self::new`] enforces, exposed separately so
+    /// config validation can check it against a *planned* `vm_http` config —
+    /// before the plan creates any directories, and early enough that the
+    /// failure joins the rest of the config report instead of arriving after
+    /// it. `new` still runs it, so this is one definition, not two.
+    pub fn check_vm_http(
+        vm_http: &VmHttpRuntimeConfig,
+    ) -> Result<(), AgentVmDaemonRuntimeConfigError> {
         if !vm_http.bind_addr().is_unspecified() {
             return Err(AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(
                 vm_http.bind_addr(),
             ));
         }
-        Ok(Self { lifecycle, vm_http })
+        Ok(())
     }
 
     /// Attach the vm-arm host facts to the lifecycle config (see

@@ -1859,3 +1859,70 @@ fn an_explicit_root_outside_the_work_root_is_probed_even_when_the_work_root_fail
         "explicit log root failure suppressed by the work root: {found:#?}",
     );
 }
+
+/// The daemon-level bind invariant holds over the *planned* vm_http config, so
+/// it must be checked before any directory is created — and reported next to
+/// its sibling sections' faults rather than after them.
+#[test]
+fn a_non_wildcard_bind_addr_is_reported_with_its_siblings_and_creates_nothing() {
+    let mut lifecycle = valid_agent_vm_lifecycle_config();
+    lifecycle.cpus = 0;
+    let mut vm_http = valid_agent_vm_http_config();
+    let work_root = unique_config_test_path("bind-addr-no-debris");
+    vm_http.work_root = work_root.clone();
+    vm_http.bind_addr = Ipv4Addr::new(127, 0, 0, 1);
+
+    let config = AgentVmDaemonConfig { lifecycle, vm_http };
+    let errors = config.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AgentVmDaemonConfigError::Runtime(
+                AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(_)
+            )
+        )),
+        "bind address failure missing: {found:#?}",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmDaemonConfigError::Lifecycle(_))),
+        "sibling lifecycle failure missing: {found:#?}",
+    );
+    assert!(
+        !work_root.exists(),
+        "work root {work_root:?} was created despite the bind address being invalid",
+    );
+}
+
+/// A work root that cannot be prepared cannot be *silently* replaced by
+/// `create_dir_all` on a root beneath it: the child creation fails too. This is
+/// the property that lets an explicitly configured root be probed
+/// independently of the work root without reopening the umask hazard.
+#[test]
+fn a_root_under_an_unpreparable_work_root_fails_rather_than_creating_it() {
+    let temp = tempfile::tempdir().unwrap();
+    // A work root that is a regular file: `ensure_vm_http_work_root_private`
+    // rejects it, and `create_dir_all` of a child cannot replace it.
+    let work_root = temp.path().join("work-root-is-a-file");
+    std::fs::write(&work_root, b"not a directory").unwrap();
+
+    let mut c = valid_agent_vm_http_config();
+    c.work_root = work_root.clone();
+    c.agent_run_log_root = Some(work_root.join("logs"));
+
+    let errors = c.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmHttpConfigError::WorkRootNotDirectory { .. })),
+        "work root failure missing: {found:#?}",
+    );
+    assert!(
+        work_root.is_file(),
+        "the work root was replaced by a directory while preparing a root beneath it",
+    );
+}
