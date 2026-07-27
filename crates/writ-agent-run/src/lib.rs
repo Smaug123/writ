@@ -506,12 +506,13 @@ mod process_runner {
             move || capture_stream(stderr, stderr_path, max_stderr)
         });
 
-        child
-            .stdin
-            .take()
-            .expect("stdin was configured as piped before spawn")
-            .write_all(prompt.as_bytes())
-            .map_err(AgentProcessRunError::PromptWrite)?;
+        write_prompt_to_stdin(
+            child
+                .stdin
+                .take()
+                .expect("stdin was configured as piped before spawn"),
+            prompt,
+        )?;
 
         let status = child.wait().map_err(AgentProcessRunError::Wait)?;
         let stdout = join_capture_thread("stdout", stdout_thread)??;
@@ -528,6 +529,40 @@ mod process_runner {
             stdout,
             stderr,
         })
+    }
+
+    /// Feed the prompt to the child on stdin, tolerating a broken pipe.
+    ///
+    /// An agent that exits before consuming its whole prompt — one that fails
+    /// fast, or simply does not read stdin — leaves the parent writing into a
+    /// pipe whose read end has closed, which is `EPIPE`. That is a fact about
+    /// how the agent behaved, not a failure of the run: the child still has an
+    /// exit status and streams, and those are exactly what the caller wants to
+    /// record.
+    ///
+    /// Treating it as fatal cost the guest path its outcome entirely.
+    /// `writ-vm`'s stage runner propagates this error *before* it uploads an
+    /// outcome, so an agent that died in milliseconds left its `agent_run` row
+    /// unpaired and made writd wait out the full 30-minute
+    /// `RUN_AGENT_VM_TIMEOUT` for a result that was never coming. The host-spawn
+    /// path had always tolerated the same broken pipe; now both do.
+    ///
+    /// Every other write error stays fatal. Those describe a parent that cannot
+    /// deliver the prompt, not a child that declined to read it — and a run
+    /// whose agent was fed a *truncated* prompt is not the run that was asked
+    /// for, so it must not be reported as one.
+    ///
+    /// Takes `stdin` by value: dropping it closes the pipe, which is what tells
+    /// a child that *does* read to stop waiting for more.
+    fn write_prompt_to_stdin(
+        mut stdin: std::process::ChildStdin,
+        prompt: &AgentPrompt,
+    ) -> Result<(), AgentProcessRunError> {
+        match stdin.write_all(prompt.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(err) => Err(AgentProcessRunError::PromptWrite(err)),
+        }
     }
 
     fn capture_stream<R: Read>(
@@ -961,6 +996,80 @@ mod tests {
         );
     }
 
+    /// An agent that exits without reading its prompt still produces a run.
+    ///
+    /// The prompt is larger than any platform's pipe buffer, so the write
+    /// cannot complete into the kernel and then find the child gone: it must
+    /// still be writing when the read end closes, which is `EPIPE`. That makes
+    /// the broken pipe deterministic rather than a race the test might miss.
+    ///
+    /// What matters is that the child's exit status and streams survive it —
+    /// this is a fact about how the agent chose to behave, not a failure of the
+    /// run.
+    #[cfg(feature = "host")]
+    #[test]
+    fn an_agent_that_ignores_its_prompt_still_yields_an_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_ignore_stdin_fake_agent(dir.path(), 3);
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000105".parse().unwrap();
+        // Comfortably past the 16-64 KiB a pipe will hold, and within
+        // MAX_AGENT_PROMPT_BYTES.
+        let prompt = AgentPrompt::new("p".repeat(256 * 1024));
+        let plan = AgentProcessPlan::new(run_id, fake, [] as [OsString; 0]).unwrap();
+
+        let outcome = run_agent_process(&plan, &prompt, &dir.path().join("logs")).unwrap();
+
+        assert_eq!(outcome.status, AgentRunTerminalStatus::Failed);
+        assert_eq!(outcome.exit_code, 3);
+        assert_eq!(
+            fs::read_to_string(&outcome.stdout.path).unwrap(),
+            "ignored your prompt\n"
+        );
+    }
+
+    #[cfg(feature = "host")]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(12))]
+
+        /// Whether the prompt fits the pipe buffer decides whether the write
+        /// finishes before the child is gone — so it decides whether `EPIPE`
+        /// happens at all. An agent that ignores stdin must yield the same
+        /// outcome either side of that boundary: the run is defined by how the
+        /// child terminated, not by how much of the prompt the kernel happened
+        /// to accept first.
+        ///
+        /// Few cases on purpose: each one spawns a real process.
+        #[test]
+        fn an_ignored_prompt_yields_the_childs_own_outcome_at_any_size(
+            // Spans a pipe buffer (16-64 KiB) from well under to well over.
+            prompt_bytes in 0usize..=(256 * 1024),
+            exit_code in 0i32..=255,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = write_ignore_stdin_fake_agent(dir.path(), exit_code);
+            let prompt = AgentPrompt::new("p".repeat(prompt_bytes));
+            let plan =
+                AgentProcessPlan::new(AgentRunId::new(), fake, [] as [OsString; 0]).unwrap();
+
+            let outcome = run_agent_process(&plan, &prompt, &dir.path().join("logs"))
+                .map_err(|err| TestCaseError::fail(format!("{err}")))?;
+
+            prop_assert_eq!(outcome.exit_code, exit_code);
+            prop_assert_eq!(
+                &outcome.status,
+                if exit_code == 0 {
+                    &AgentRunTerminalStatus::Succeeded
+                } else {
+                    &AgentRunTerminalStatus::Failed
+                }
+            );
+            prop_assert_eq!(
+                fs::read_to_string(&outcome.stdout.path).unwrap(),
+                "ignored your prompt\n"
+            );
+        }
+    }
+
     #[cfg(feature = "host")]
     #[test]
     fn fake_agent_large_streams_are_drained_counted_and_truncated() {
@@ -1037,6 +1146,21 @@ mod tests {
              cat > \"$1\"\n\
              printf '%s' '{stdout}'\n\
              printf '%s' '{stderr}' >&2\n\
+             exit {exit_code}\n",
+        );
+        fs::write(&path, script).unwrap();
+        make_executable(&path);
+        path
+    }
+
+    /// An agent that never reads stdin and exits at once, closing the read end
+    /// of the prompt pipe under the writer's feet.
+    #[cfg(feature = "host")]
+    fn write_ignore_stdin_fake_agent(dir: &Path, exit_code: i32) -> std::path::PathBuf {
+        let path = dir.join("ignore-stdin-agent.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf 'ignored your prompt\\n'\n\
              exit {exit_code}\n",
         );
         fs::write(&path, script).unwrap();
