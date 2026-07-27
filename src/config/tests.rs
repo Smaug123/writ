@@ -1796,3 +1796,66 @@ fn a_relative_work_root_is_reported_once_and_creates_nothing() {
     assert_eq!(errors.len(), 1, "unexpected failure set: {found:#?}");
     assert!(!PathBuf::from("writ-relative-work-root-should-not-appear").exists());
 }
+
+/// A failure in one section must not let a *sibling* section create
+/// directories on the way to the same rejection. Lifecycle validation is
+/// pure, so nothing about a bad `ipv4_pool` should cost the operator a
+/// half-built `vm_http` work root.
+#[test]
+fn a_bad_lifecycle_section_creates_no_vm_http_directories() {
+    let mut lifecycle = valid_agent_vm_lifecycle_config();
+    lifecycle.ipv4_pool = "not-a-cidr".into();
+    let mut vm_http = valid_agent_vm_http_config();
+    let work_root = unique_config_test_path("sibling-no-debris");
+    vm_http.work_root = work_root.clone();
+
+    let config = AgentVmDaemonConfig { lifecycle, vm_http };
+    let errors = config.to_runtime_config().unwrap_err();
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmDaemonConfigError::InvalidCidr { .. })),
+        "lifecycle failure missing: {errors}",
+    );
+    assert!(
+        !work_root.exists(),
+        "vm_http work root {work_root:?} was created despite the lifecycle section being invalid",
+    );
+}
+
+/// An explicitly configured root outside the work root does not derive from
+/// it, so a work root the broker cannot prepare must not suppress the report
+/// on that root.
+#[test]
+fn an_explicit_root_outside_the_work_root_is_probed_even_when_the_work_root_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+    // A work root that exists with group/world bits: rejected by the
+    // filesystem half of validation, not the textual half.
+    let work_root = temp.path().join("loose-work-root");
+    std::fs::create_dir(&work_root).unwrap();
+    std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // An explicit log root elsewhere that cannot be created: it is a file.
+    let log_root = temp.path().join("log-root-is-a-file");
+    std::fs::write(&log_root, b"not a directory").unwrap();
+
+    let mut c = valid_agent_vm_http_config();
+    c.work_root = work_root.clone();
+    c.agent_run_log_root = Some(log_root.clone());
+
+    let errors = c.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmHttpConfigError::WorkRootInsecure { .. })),
+        "work root failure missing: {found:#?}",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmHttpConfigError::AgentRunLogRootCreate { .. })),
+        "explicit log root failure suppressed by the work root: {found:#?}",
+    );
+}

@@ -10,13 +10,21 @@
 //! The primitives are:
 //!
 //! - [`Errors`], a **non-empty** list of failures. "Rejected, but here are no
-//!   reasons" is not representable.
+//!   reasons" is not representable: every constructor takes at least one
+//!   error, and a report is only ever built from an accumulator's own
+//!   non-empty error list.
 //! - [`Accumulator`], which records `Result`s without short-circuiting.
-//! - [`Failed`], a witness that at least one failure was recorded. It is what
-//!   makes [`Errors`]'s non-emptiness a compile-time property rather than a
-//!   convention: the only way to obtain an [`Errors`] from an accumulator is
-//!   to surrender a `Failed`, and the only way to mint a `Failed` is for
-//!   [`Accumulator::record`] to have pushed an error.
+//! - [`Failed`], a witness that a failure was recorded, minted only by
+//!   [`Accumulator::record`] on the path where it pushes an error.
+//!
+//! A `Failed` says only "*some* accumulator failed", not "*this* one did" —
+//! Rust cannot tie a zero-sized witness to the instance that produced it
+//! without generative branding, which would be far heavier than this problem
+//! deserves. So the witness is never trusted for the report's contents:
+//! [`Accumulator::unpack`] always derives the failures from its own stored
+//! list, and `Failed` is crate-private precisely so the handful of
+//! macro-and-accumulator pairings that could mix instances stay checkable by
+//! reading them.
 //!
 //! The intended shape at a call site is: record each independent check, then
 //! [`Accumulator::unpack`] the recorded values in one go.
@@ -31,18 +39,20 @@
 
 use std::fmt;
 
-/// Proof that at least one failure has been recorded.
+/// Signal that a recorded check failed, so its value is unavailable.
 ///
-/// Zero-sized and deliberately unconstructable outside this module:
-/// [`Accumulator::record`] mints one only on the path where it pushes an
-/// error. [`Accumulator::into_errors`] demands one, which is what makes an
-/// empty [`Errors`] unrepresentable.
+/// Zero-sized and unconstructable outside this module: [`Accumulator::record`]
+/// mints one only on the path where it pushes an error. It carries no payload
+/// — the payload lives in the accumulator — and it is deliberately *not*
+/// treated as proof about any particular accumulator; see the [module
+/// docs](self).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct Failed(());
+pub(crate) struct Failed(());
 
 /// A non-empty list of validation failures, in the order they were found.
 ///
-/// Non-empty by construction — see [`Failed`]. Consumers can therefore
+/// Non-empty by construction: only ever built from an accumulator's own
+/// non-empty error list. Consumers can therefore
 /// render a report without a "no errors" branch that should never happen.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Errors<E> {
@@ -80,6 +90,20 @@ impl<E> Errors<E> {
     /// Every failure, in discovery order.
     pub fn iter(&self) -> impl Iterator<Item = &E> {
         std::iter::once(&self.first).chain(self.rest.iter())
+    }
+
+    /// Convert each failure into a wider error type, keeping the report
+    /// non-empty. This is how a nested validator's report folds into its
+    /// parent's when the parent cannot use `Accumulator::record_many` —
+    /// notably when the nested call happens after the parent's own
+    /// accumulation has already been unpacked.
+    pub fn map_into<F: From<E>>(self) -> Errors<F> {
+        let mut rest = Vec::with_capacity(self.rest.len());
+        rest.extend(self.rest.into_iter().map(F::from));
+        Errors {
+            first: F::from(self.first),
+            rest,
+        }
     }
 
     /// Every failure, in discovery order, by value.
@@ -127,9 +151,12 @@ impl<E: std::error::Error> std::error::Error for Errors<E> {
 
 /// Collects failures from independent checks without short-circuiting.
 ///
-/// See the [module docs](self) for the intended call shape.
+/// Crate-private (unlike [`Errors`], which appears in public error types) so
+/// that [`Failed`] never escapes into an API where a caller could pair a
+/// witness with the wrong accumulator. See the [module docs](self) for the
+/// intended call shape.
 #[derive(Debug)]
-pub struct Accumulator<E> {
+pub(crate) struct Accumulator<E> {
     errors: Vec<E>,
 }
 
@@ -182,43 +209,6 @@ impl<E> Accumulator<E> {
         }
     }
 
-    /// Give up now if anything has already failed; otherwise carry on with the
-    /// same accumulator.
-    ///
-    /// This is the one legitimate reason to stop early, and it is about side
-    /// effects rather than about errors: a group of checks that *creates*
-    /// things should not run on behalf of a config that is already going to be
-    /// rejected. Everything before the checkpoint still accumulates, so a
-    /// checkpoint costs the operator at most one extra round-trip, and only
-    /// when their config was wrong on two quite different axes.
-    pub fn checkpoint(self) -> Result<Self, Errors<E>> {
-        let mut errors = self.errors.into_iter();
-        match errors.next() {
-            None => Ok(Self { errors: Vec::new() }),
-            Some(first) => Err(Errors {
-                first,
-                rest: errors.collect(),
-            }),
-        }
-    }
-
-    /// Surrender the witness for the accumulated report.
-    ///
-    /// Taking `Failed` by value is the whole trick: it can only have come
-    /// from a [`Self::record`] call that pushed an error, so `self.errors` is
-    /// non-empty and the `expect` below is discharged by the type system
-    /// rather than by discipline.
-    pub fn into_errors(self, _witness: Failed) -> Errors<E> {
-        let mut errors = self.errors.into_iter();
-        let first = errors
-            .next()
-            .expect("a Failed witness is minted only when an error is pushed");
-        Errors {
-            first,
-            rest: errors.collect(),
-        }
-    }
-
     /// `Ok(())` when nothing failed, otherwise the whole report.
     pub fn finish(self) -> Result<(), Errors<E>> {
         let mut errors = self.errors.into_iter();
@@ -235,14 +225,22 @@ impl<E> Accumulator<E> {
     /// full report.
     ///
     /// `values` is normally built by [`all_recorded!`], which turns the
-    /// individual `Result<_, Failed>` bindings into one tuple. The
-    /// [`Self::finish`] call on the success path catches checks that were
-    /// recorded but left out of the tuple, so a forgotten binding cannot
-    /// silently drop a failure.
+    /// individual `Result<_, Failed>` bindings into one tuple.
+    ///
+    /// The report always comes from `self`, never from the witness, so a
+    /// check recorded but left out of the tuple still surfaces, and a witness
+    /// from some *other* accumulator cannot fabricate or suppress failures —
+    /// it can only reach the arm below, which is why [`Failed`] does not leave
+    /// this crate.
     pub fn unpack<T>(self, values: Result<T, Failed>) -> Result<T, Errors<E>> {
-        match values {
-            Ok(values) => self.finish().map(|()| values),
-            Err(witness) => Err(self.into_errors(witness)),
+        match (values, self.finish()) {
+            (Ok(values), Ok(())) => Ok(values),
+            (_, Err(errors)) => Err(errors),
+            (Err(Failed(())), Ok(())) => unreachable!(
+                "a Failed witness is minted only by Accumulator::record, which pushes an \
+                 error at the same moment; reaching here means a witness was paired with a \
+                 different accumulator than the one that produced it",
+            ),
         }
     }
 }
@@ -254,11 +252,6 @@ impl<E> Accumulator<E> {
 /// non-short-circuiting, but *using* the values requires all of them, and
 /// this is where that requirement is discharged. Pair it with
 /// [`Accumulator::unpack`].
-/// Exported at the crate root by `macro_rules` convention; use it as
-/// [`crate::config::accumulate::all_recorded`], which is where the re-export
-/// below puts it. The binaries (`writd`) are separate crates, so `pub(crate)`
-/// would not reach them.
-#[macro_export]
 macro_rules! all_recorded {
     ($($value:expr),+ $(,)?) => {
         // An immediately-invoked closure so `?` has a function boundary to
@@ -268,7 +261,7 @@ macro_rules! all_recorded {
     };
 }
 
-pub use crate::all_recorded;
+pub(crate) use all_recorded;
 
 #[cfg(test)]
 mod tests {
@@ -353,12 +346,11 @@ mod tests {
     fn display_mentions_every_failure() {
         proptest!(|(first: String, rest: Vec<String>)| {
             let mut acc = Accumulator::new();
-            let witness = acc.record::<()>(Err(first.clone())).unwrap_err();
+            let _ = acc.record::<()>(Err(first.clone()));
             for error in &rest {
                 let _ = acc.record::<()>(Err(error.clone()));
             }
-            let errors = acc.into_errors(witness);
-            let rendered = errors.to_string();
+            let rendered = acc.finish().unwrap_err().to_string();
             for error in std::iter::once(&first).chain(rest.iter()) {
                 prop_assert!(
                     rendered.contains(error.as_str()),
@@ -381,10 +373,10 @@ mod tests {
     #[test]
     fn several_failures_render_as_a_list() {
         let mut acc = Accumulator::new();
-        let witness = acc.record::<()>(Err("bad port")).unwrap_err();
+        let _ = acc.record::<()>(Err("bad port"));
         let _ = acc.record::<()>(Err("bad url"));
         assert_eq!(
-            acc.into_errors(witness).to_string(),
+            acc.finish().unwrap_err().to_string(),
             "2 problems found:\n  - bad port\n  - bad url"
         );
     }
@@ -402,9 +394,9 @@ mod tests {
         }
 
         let mut inner = Accumulator::new();
-        let witness = inner.record::<()>(Err("inner one")).unwrap_err();
+        let _ = inner.record::<()>(Err("inner one"));
         let _ = inner.record::<()>(Err("inner two"));
-        let inner: Result<(), _> = Err(inner.into_errors(witness));
+        let inner: Result<(), _> = Err(inner.finish().unwrap_err());
 
         let mut outer = Accumulator::<Outer>::new();
         let _ = outer.record_many(inner);

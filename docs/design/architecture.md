@@ -260,27 +260,46 @@ load (`deny_unknown_fields` throughout plus explicit `validate()`).
 **Config validation accumulates.** Every config check runs on every boot and
 the failures are reported together, rather than one per restart
 (`config/accumulate.rs`). `Accumulator::record` stores a failure instead of
-short-circuiting and hands back a `Failed` witness; `all_recorded!` +
+short-circuiting and hands back a `Failed` marker; `all_recorded!` +
 `Accumulator::unpack` recover the values only when all of them are present.
-`Errors<E>` is a **non-empty** report — surrendering a `Failed` is the only way
-to build one — so "rejected with no reasons given" is unrepresentable. Three
-rules shape where the errors come from:
+`Errors<E>` is a **non-empty** report, always derived from an accumulator's own
+error list, so "rejected with no reasons given" is unrepresentable. (`Failed`
+is crate-private: it says *some* accumulator failed, not *this* one, and Rust
+cannot bind a zero-sized witness to an instance without generative branding —
+so `unpack` never trusts it for the report's contents.) Two rules shape where
+the errors come from:
 
 - A check whose own inputs failed is *skipped*, not reported, so an operator
   sees a root cause once instead of a cascade of its consequences.
-- Nested reports flatten (`record_many`), so a bad `lifecycle` section cannot
-  hide every fault in `vm_http`.
-- `Accumulator::checkpoint` splits each validator into checks that mutate
-  nothing and checks that create directories, and stops between them. A config
-  rejected on its text alone therefore leaves no debris — which matters most
-  for `work_root`, where a directory created at the process umask (0755) would
-  make `validate_existing_work_root` refuse that path on every later boot too.
-  This is the only remaining place an operator can need two passes: once for
-  what the config says, once for what the filesystem permits.
+- Nested reports flatten (`record_many` / `Errors::map_into`), so a bad
+  `lifecycle` section cannot hide every fault in `vm_http`.
 
-`writd` validates `agent_vm` and `ui_http` together, up front, before the
-socket bind, the signing key, and the reconcile passes — so a bad `ui_http.bind`
-is reported alongside everything else rather than after all of that succeeds.
+**Validation is planned, then executed.** `AgentVmHttpConfig::check` runs every
+check that touches nothing and returns a `VmHttpPlan` — the validated runtime
+config plus the directories that still need creating; `VmHttpPlan::materialize`
+carries that out. This is the interpreter pattern applied to config: it is what
+lets `AgentVmDaemonConfig::to_runtime_config` check *both* sections before
+either creates anything, so a fault anywhere leaves no debris. That matters most
+for `work_root`, where a directory created at the process umask (0755) would
+make `validate_existing_work_root` refuse that path on every later boot too. The
+work root is prepared before the roots beneath it; a root the operator
+configured *outside* the work root does not derive from it and is probed
+independently, so an unusable work root cannot suppress its report.
+
+This split leaves one place an operator can still need two passes: once for what
+the config says, once for what the filesystem permits.
+
+**Known granularity limit.** Leaf constructors (`VmHttpNixCacheConfig::new`,
+`VmGitPushBodyLimits::new`, the proxy configs, …) are still fail-fast, so each
+counts as *one* check: setting two bad fields within a single constructor
+reports only the first. The section-level tiering that cost a restart per
+mistake is gone; per-field accumulation inside those constructors would mean
+reworking them across `vm_http`, `writ-core`, and the lifecycle module.
+
+`writd` calls `check_daemon_sections`, which validates `agent_vm` and `ui_http`
+together, up front, before the socket bind, the signing key, and the reconcile
+passes — so a bad `ui_http.bind` is reported alongside everything else rather
+than after all of that succeeds.
 
 **Neighbours.** Calls audit, credential minting, the git pipeline
 (staged-push), and the VM sandbox (`AgentVmDaemon`). Called by the `writ` CLI

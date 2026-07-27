@@ -18,12 +18,11 @@ use writ::boot_reconcile::{
 };
 use writ::broker_entrypoint::{BrokerArgs, run_broker};
 use writ::broker_session::BrokerSessionSpec;
-use writ::config::accumulate::{Accumulator, all_recorded};
 use writ::config::{
-    AgentVmDaemonConfig, DaemonConfig, DaemonConfigError, LegacyAuditDbNotMigrated,
-    SecretStoreConfig, UiHttpConfig, default_audit_db_path, default_config_path,
-    ensure_audit_db_entry_is_regular_file, ensure_audit_dir_is_dedicated,
-    legacy_audit_db_needs_migration, legacy_default_audit_db_path, path_entry_present,
+    DaemonConfig, LegacyAuditDbNotMigrated, SecretStoreConfig, check_daemon_sections,
+    default_audit_db_path, default_config_path, ensure_audit_db_entry_is_regular_file,
+    ensure_audit_dir_is_dedicated, legacy_audit_db_needs_migration, legacy_default_audit_db_path,
+    path_entry_present,
 };
 use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
@@ -224,17 +223,7 @@ async fn run_host_daemon(
     // restart — which is also why `ui_http` is checked *here* rather than at
     // the point its listener is bound, hundreds of lines and one socket bind,
     // one signing key and two reconcile passes later.
-    let mut config_errors = Accumulator::<DaemonConfigError>::new();
-    let agent_vm = config_errors.record_many(
-        agent_vm
-            .as_ref()
-            .map(AgentVmDaemonConfig::to_runtime_config)
-            .transpose(),
-    );
-    let ui_http_checked =
-        config_errors.record_many(ui_http.as_ref().map(UiHttpConfig::validate).transpose());
-    let (agent_vm, _ui_http_checked) = config_errors
-        .unpack(all_recorded!(agent_vm, ui_http_checked))
+    let agent_vm = check_daemon_sections(agent_vm.as_ref(), ui_http.as_ref())
         .map_err(|errors| errors.to_string())?;
 
     // Attach the vm-arm host facts (raw config text + effective audit DB path)

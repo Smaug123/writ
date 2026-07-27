@@ -39,8 +39,7 @@ use crate::audit::{AuditError, AuditLog};
 use crate::broker_protocol::BrokerReadyDoc;
 use crate::broker_session::{BearerTokenFileError, BrokerSessionSpec, read_bearer_token_file};
 use crate::config::{
-    AgentVmHttpConfigError, DaemonConfig, SecretStoreConfig, accumulate::Errors,
-    default_audit_db_path,
+    AgentVmHttpConfigError, DaemonConfig, Errors, SecretStoreConfig, default_audit_db_path,
 };
 use crate::core::{AgentKind, AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
 use crate::github::GitHubMinter;

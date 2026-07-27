@@ -38,8 +38,9 @@ use crate::vm_http::{
     VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError, VmHttpRuntimeConfig,
 };
 
-pub mod accumulate;
-use accumulate::{Accumulator, Errors, all_recorded};
+pub(crate) mod accumulate;
+pub use accumulate::Errors;
+use accumulate::{Accumulator, all_recorded};
 
 mod audit_dir;
 pub use audit_dir::{
@@ -623,6 +624,28 @@ pub enum AgentVmHttpConfigError {
     FlakeProvisionBounds(#[from] FlakeProvisionBoundsError),
 }
 
+/// Validate every daemon section that can be checked before writd takes an
+/// irreversible step, reporting all the failures together.
+///
+/// Takes the sections rather than the whole [`DaemonConfig`] because the
+/// binary destructures it first. Living here — rather than being assembled in
+/// `writd` — keeps the accumulator vocabulary, and in particular the `Failed`
+/// marker, inside this crate.
+pub fn check_daemon_sections(
+    agent_vm: Option<&AgentVmDaemonConfig>,
+    ui_http: Option<&UiHttpConfig>,
+) -> Result<Option<AgentVmDaemonRuntimeConfig>, Errors<DaemonConfigError>> {
+    let mut errors = Accumulator::new();
+    let agent_vm = errors.record_many(
+        agent_vm
+            .map(AgentVmDaemonConfig::to_runtime_config)
+            .transpose(),
+    );
+    let ui_http = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
+    let (agent_vm, _ui_http) = errors.unpack(all_recorded!(agent_vm, ui_http))?;
+    Ok(agent_vm)
+}
+
 /// A problem found while turning a [`DaemonConfig`] into runtime state.
 ///
 /// Exists so failures from the independent top-level sections accumulate into
@@ -662,13 +685,21 @@ impl AgentVmDaemonConfig {
     /// Validate both subsections and report their failures together: the
     /// lifecycle and vm_http sections are independent, so a mistake in one
     /// must not hide every mistake in the other.
+    ///
+    /// Both are *checked* before either is materialized. Lifecycle validation
+    /// touches nothing, and `vm_http`'s filesystem work is deferred into a
+    /// [`VmHttpPlan`], so a config rejected on its text leaves no directories
+    /// behind no matter which section was at fault.
     pub fn to_runtime_config(
         &self,
     ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
         let mut errors = Accumulator::new();
         let lifecycle = errors.record_many(self.lifecycle.to_runtime_config());
-        let vm_http = errors.record_many(self.vm_http.to_runtime_config());
-        let (lifecycle, vm_http) = errors.unpack(all_recorded!(lifecycle, vm_http))?;
+        let vm_http_plan = errors.record_many(self.vm_http.check());
+        let (lifecycle, vm_http_plan) = errors.unpack(all_recorded!(lifecycle, vm_http_plan))?;
+        // Past this point the config is textually sound, so creating the
+        // broker's directories is work on behalf of a daemon that will start.
+        let vm_http = vm_http_plan.materialize().map_err(Errors::map_into)?;
         AgentVmDaemonRuntimeConfig::new(lifecycle, vm_http)
             .map_err(|err| Errors::single(err.into()))
     }
@@ -733,18 +764,84 @@ impl AgentVmLifecycleConfig {
     }
 }
 
+/// A `vm_http` section that has passed every check that can be made without
+/// touching the filesystem, together with the directories that still have to
+/// be created before the broker can run.
+///
+/// This is the interpreter pattern applied to config validation: [`AgentVmHttpConfig::check`]
+/// computes an inert description of what needs to exist, and
+/// [`VmHttpPlan::materialize`] carries it out. Separating them is what lets a
+/// caller validating *several* sections check all of them before any one of
+/// them creates anything — otherwise a fault in a sibling section would still
+/// leave this one's directories behind.
+#[derive(Debug)]
+pub struct VmHttpPlan {
+    runtime: VmHttpRuntimeConfig,
+    work_root: PathBuf,
+    /// In creation order. The work root is prepared before any of these, so a
+    /// root beneath it is never created by `create_dir_all` at the process
+    /// umask.
+    roots: Vec<RootPlan>,
+}
+
+/// One directory [`VmHttpPlan::materialize`] must create and prove writable.
+#[derive(Debug)]
+struct RootPlan {
+    kind: WritableRoot,
+    path: PathBuf,
+    /// Whether preparing this root depends on the work root being prepared
+    /// first. True for roots derived from the work root, and for an explicitly
+    /// configured root that happens to sit inside it; false for a configured
+    /// root elsewhere on disk, which stands entirely on its own and so must
+    /// still be probed when the work root is unusable.
+    under_work_root: bool,
+}
+
+impl VmHttpPlan {
+    /// Create the planned directories and prove the broker can write to them,
+    /// accumulating failures across all of them.
+    pub fn materialize(self) -> Result<VmHttpRuntimeConfig, Errors<AgentVmHttpConfigError>> {
+        let mut errors = Accumulator::new();
+        // `prepare_git_work_root` refuses to clone into a work root whose mode
+        // has group/world bits set, but `prepare_writable_root` below creates
+        // the staging/log subdirs with `create_dir_all`, which propagates the
+        // process umask to the freshly-created `work_root` parent (typically
+        // 0755). Ensure work_root itself is 0700 before that runs so the
+        // out-of-the-box defaults — where the user never names `work_root`
+        // explicitly — survive the first clone request.
+        let work_root_ready = errors.record(ensure_vm_http_work_root_private(&self.work_root));
+        for root in self.roots {
+            let gate = if root.under_work_root {
+                work_root_ready
+            } else {
+                Ok(())
+            };
+            let _ = gate.and_then(|()| errors.record(prepare_writable_root(root.kind, root.path)));
+        }
+        errors.finish().map(|()| self.runtime)
+    }
+}
+
 impl AgentVmHttpConfig {
     /// Validate the whole `vm_http` section and build its runtime config,
     /// reporting **every** independent problem rather than stopping at the
     /// first.
     ///
+    /// Equivalent to [`Self::check`] followed by [`VmHttpPlan::materialize`];
+    /// callers validating several sections should use those two directly, so
+    /// that no section creates anything until all of them have been checked.
+    pub fn to_runtime_config(&self) -> Result<VmHttpRuntimeConfig, Errors<AgentVmHttpConfigError>> {
+        self.check()?.materialize()
+    }
+
+    /// Run every check that touches nothing, and return the plan for the
+    /// checks that do.
+    ///
     /// The shape is uniform: each check is `record`ed into an accumulator,
     /// which stores failures instead of short-circuiting, and a check whose
     /// own inputs failed is *skipped* rather than reported — the operator
-    /// should see a root cause once, not a cascade of its consequences. All
-    /// the pure checks run before any filesystem effect, so a config rejected
-    /// on its text alone leaves no directories behind.
-    pub fn to_runtime_config(&self) -> Result<VmHttpRuntimeConfig, Errors<AgentVmHttpConfigError>> {
+    /// should see a root cause once, not a cascade of its consequences.
+    pub fn check(&self) -> Result<VmHttpPlan, Errors<AgentVmHttpConfigError>> {
         let mut errors = Accumulator::new();
 
         // --- Pure checks. Independent of each other and of the filesystem, so
@@ -871,41 +968,8 @@ impl AgentVmHttpConfig {
             },
         );
 
-        // --- Checkpoint. Nothing above this line has touched the filesystem;
-        // everything below it creates directories. Stop here if the config is
-        // already wrong, so a rejected config leaves no debris behind — and in
-        // particular so a work root created at the process umask (0755) cannot
-        // turn one bad boot into a permanently rejected one, since
-        // `validate_existing_work_root` would refuse that directory ever after.
-        //
-        // This is the one place where an operator can still need two passes:
-        // once for what their config *says*, and once for what their
-        // filesystem *permits*. Both halves accumulate internally.
-        let mut errors = errors.checkpoint()?;
-
-        // `prepare_git_work_root` refuses to clone into a work root whose mode
-        // has group/world bits set, but `prepare_writable_root` below creates
-        // the staging/log subdirs with `create_dir_all`, which propagates the
-        // process umask to the freshly-created `work_root` parent (typically
-        // 0755). Ensure work_root itself is 0700 before that runs so the
-        // out-of-the-box defaults — where the user never names `work_root`
-        // explicitly — survive the first clone request.
-        let work_root_ready =
-            work_root.and_then(|root| errors.record(ensure_vm_http_work_root_private(root)));
-        let agent_run_log_root =
-            all_recorded!(work_root_ready, agent_run_log_root).and_then(|((), path)| {
-                errors.record(prepare_writable_root(WritableRoot::AgentRunLog, path))
-            });
-        let git_push_staging_root =
-            all_recorded!(work_root_ready, git_push_staging_root).and_then(|((), path)| {
-                errors.record(prepare_writable_root(WritableRoot::GitPushStaging, path))
-            });
-        let flake_input_cache_dir =
-            all_recorded!(work_root_ready, flake_input_cache_dir).and_then(|((), path)| {
-                errors.record(prepare_writable_root(WritableRoot::FlakeInputCache, path))
-            });
-
         let (
+            work_root,
             broker_port_range,
             git_clone,
             nix_cache,
@@ -921,6 +985,7 @@ impl AgentVmHttpConfig {
             flake_provision_bounds,
             flake_materialize_scratch_dir,
         ) = errors.unpack(all_recorded!(
+            work_root,
             broker_port_range,
             git_clone,
             nix_cache,
@@ -993,23 +1058,68 @@ impl AgentVmHttpConfig {
         if let Some(prewarm) = &nix_prewarm_cache_dir {
             local_cache_dirs.push(prewarm.clone());
         }
-        local_cache_dirs.push(flake_input_cache_dir);
+        local_cache_dirs.push(flake_input_cache_dir.clone());
         let nix_cache = nix_cache
             .with_trusted_public_keys(trusted_public_keys)
             .with_local_cache_dirs(local_cache_dirs);
-        Ok(VmHttpRuntimeConfig::new_with_proxies(
+        let runtime = VmHttpRuntimeConfig::new_with_proxies(
             self.bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
             claude_proxy,
             openai_proxy,
-            agent_run_log_root,
-            git_push_staging_root,
+            agent_run_log_root.clone(),
+            git_push_staging_root.clone(),
             git_push_body_limits,
         )
         .with_flake_provision(flake_provision)
-        .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir))
+        .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir);
+        // The directories are named but not yet created; `materialize` does
+        // that, once every section the caller cares about has been checked.
+        // Order matters: the work root is prepared first (see
+        // `VmHttpPlan::materialize`), then these in turn.
+        let roots = vec![
+            root_plan(
+                WritableRoot::AgentRunLog,
+                agent_run_log_root,
+                self.agent_run_log_root.is_none(),
+                work_root,
+            ),
+            root_plan(
+                WritableRoot::GitPushStaging,
+                git_push_staging_root,
+                self.git_push_staging_root.is_none(),
+                work_root,
+            ),
+            root_plan(
+                WritableRoot::FlakeInputCache,
+                flake_input_cache_dir,
+                self.flake_input_cache_dir.is_none(),
+                work_root,
+            ),
+        ];
+        Ok(VmHttpPlan {
+            runtime,
+            work_root: work_root.to_path_buf(),
+            roots,
+        })
+    }
+}
+
+/// Decide whether preparing `path` has to wait for the work root.
+///
+/// A derived root lives under the work root by construction. A configured one
+/// usually does not — and when it does not, gating it on the work root would
+/// suppress its own failure behind the work root's, so it is probed
+/// independently. The `starts_with` test keeps the gate for a configured root
+/// that the operator happened to point inside the work root anyway.
+fn root_plan(kind: WritableRoot, path: PathBuf, derived: bool, work_root: &Path) -> RootPlan {
+    let under_work_root = derived || path.starts_with(work_root);
+    RootPlan {
+        kind,
+        path,
+        under_work_root,
     }
 }
 
