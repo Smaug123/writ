@@ -279,17 +279,23 @@ check that touches nothing and returns a `VmHttpPlan` — the validated runtime
 config plus the directories that still need creating; `VmHttpPlan::materialize`
 carries that out. This is the interpreter pattern applied to config: it is what
 lets `AgentVmDaemonConfig::to_runtime_config` check *both* sections — and the
-daemon-level invariants that span them, via
-`AgentVmDaemonRuntimeConfig::check_vm_http` — before anything creates a
-directory, so a fault anywhere leaves no debris. That matters most for
-`work_root`, where a directory created at the process umask (0755) would make
-`validate_existing_work_root` refuse that path on every later boot too. The work
-root is prepared before the roots beneath it; only *derived* roots wait on it,
-since a root the operator configured explicitly is news of its own and gating it
-would hide that. There is deliberately no containment test on configured roots:
-whenever the work root cannot be prepared it already exists or cannot be created
-at all, so `create_dir_all` beneath it fails rather than quietly bringing it into
-being at the umask.
+daemon-level bind invariant, via `AgentVmDaemonRuntimeConfig::check_bind_addr`,
+which takes the bare address so it cannot hide behind an unrelated fault —
+before anything creates a directory, so a fault anywhere leaves no debris. That
+matters most for `work_root`, where a directory created at the process umask
+(0755) would make `validate_existing_work_root` refuse that path on every later
+boot too.
+
+Inside `materialize` the work root is prepared first, and **every** root waits on
+it, including one the operator named explicitly. Whether a named root is really a
+descendant cannot be decided there — it need not exist yet, so it cannot be
+canonicalised, and a lexical `starts_with` is case-sensitive and blind to
+symlinks and `..`. Guessing permissively would mutate the filesystem for an
+already-rejected config, since a rejected work root is often one that merely
+*exists* with loose permissions and happily accepts `create_dir_all` of a child.
+The cost is one extra round-trip when the work root and another root are both
+broken; textual faults in those roots are unaffected, as `check` reports them
+without gating on anything.
 
 This split leaves one place an operator can still need two passes: once for what
 the config says, once for what the filesystem permits.

@@ -696,15 +696,12 @@ impl AgentVmDaemonConfig {
         let mut errors = Accumulator::new();
         let lifecycle = errors.record_many(self.lifecycle.to_runtime_config());
         let vm_http_plan = errors.record_many(self.vm_http.check());
-        // The daemon-level invariants relate the sections to each other, so
-        // they are checked against the *planned* vm_http config: a rejection
-        // here then costs no directories, and lands in this report rather than
-        // after it.
-        let vm_http_plan = vm_http_plan.and_then(|plan| {
-            errors
-                .record_from(AgentVmDaemonRuntimeConfig::check_vm_http(plan.runtime()))
-                .map(|()| plan)
-        });
+        // The daemon-level bind invariant reads one already-typed field, so it
+        // is checked straight off the raw config: independent of whatever else
+        // the section got wrong, and well before the plan creates anything.
+        let _bind_addr = errors.record_from(AgentVmDaemonRuntimeConfig::check_bind_addr(
+            self.vm_http.bind_addr,
+        ));
         let (lifecycle, vm_http_plan) = errors.unpack(all_recorded!(lifecycle, vm_http_plan))?;
         // Past this point the config is sound, so creating the broker's
         // directories is work on behalf of a daemon that will start.
@@ -798,22 +795,9 @@ pub struct VmHttpPlan {
 struct RootPlan {
     kind: WritableRoot,
     path: PathBuf,
-    /// Whether preparing this root depends on the work root being prepared
-    /// first. True for roots derived from the work root, and for an explicitly
-    /// configured root that happens to sit inside it; false for a configured
-    /// root elsewhere on disk, which stands entirely on its own and so must
-    /// still be probed when the work root is unusable.
-    under_work_root: bool,
 }
 
 impl VmHttpPlan {
-    /// The validated runtime config, before its directories exist. Lets a
-    /// caller check invariants that span sections while a rejection still
-    /// costs nothing.
-    pub fn runtime(&self) -> &VmHttpRuntimeConfig {
-        &self.runtime
-    }
-
     /// Create the planned directories and prove the broker can write to them,
     /// accumulating failures across all of them.
     pub fn materialize(self) -> Result<VmHttpRuntimeConfig, Errors<AgentVmHttpConfigError>> {
@@ -826,13 +810,24 @@ impl VmHttpPlan {
         // out-of-the-box defaults — where the user never names `work_root`
         // explicitly — survive the first clone request.
         let work_root_ready = errors.record(ensure_vm_http_work_root_private(&self.work_root));
+        // Every root waits on the work root, including one the operator named
+        // explicitly. Whether a named root is *really* a descendant cannot be
+        // decided reliably here: it need not exist yet, so it cannot be
+        // canonicalised, and a lexical `starts_with` is case-sensitive and blind
+        // to symlinks and `..`. Getting that wrong in the permissive direction
+        // mutates the filesystem on behalf of a config that has already been
+        // rejected — a rejected work root is often one that merely *exists* with
+        // loose permissions, and `create_dir_all` of a child inside it succeeds
+        // happily. So take the conservative branch uniformly.
+        //
+        // The cost is one extra round-trip in the narrow case where the work
+        // root and some other root are both broken: the operator learns the
+        // second root is unwritable only after fixing the work root. Every
+        // *textual* fault in those roots was already reported by `check`, which
+        // does not gate on anything.
         for root in self.roots {
-            let gate = if root.under_work_root {
-                work_root_ready
-            } else {
-                Ok(())
-            };
-            let _ = gate.and_then(|()| errors.record(prepare_writable_root(root.kind, root.path)));
+            let _ = work_root_ready
+                .and_then(|()| errors.record(prepare_writable_root(root.kind, root.path)));
         }
         errors.finish().map(|()| self.runtime)
     }
@@ -1096,58 +1091,24 @@ impl AgentVmHttpConfig {
         // Order matters: the work root is prepared first (see
         // `VmHttpPlan::materialize`), then these in turn.
         let roots = vec![
-            root_plan(
-                WritableRoot::AgentRunLog,
-                agent_run_log_root,
-                self.agent_run_log_root.is_none(),
-            ),
-            root_plan(
-                WritableRoot::GitPushStaging,
-                git_push_staging_root,
-                self.git_push_staging_root.is_none(),
-            ),
-            root_plan(
-                WritableRoot::FlakeInputCache,
-                flake_input_cache_dir,
-                self.flake_input_cache_dir.is_none(),
-            ),
+            RootPlan {
+                kind: WritableRoot::AgentRunLog,
+                path: agent_run_log_root,
+            },
+            RootPlan {
+                kind: WritableRoot::GitPushStaging,
+                path: git_push_staging_root,
+            },
+            RootPlan {
+                kind: WritableRoot::FlakeInputCache,
+                path: flake_input_cache_dir,
+            },
         ];
         Ok(VmHttpPlan {
             runtime,
             work_root: work_root.to_path_buf(),
             roots,
         })
-    }
-}
-
-/// Decide whether preparing `path` has to wait for the work root.
-///
-/// Exactly the derived roots, and no containment test on configured ones.
-/// That is not an approximation — it is what the dependency actually is:
-///
-/// - A *derived* root is `<work_root>/<subdir>`, so a failure preparing it
-///   when the work root itself could not be prepared says nothing the work
-///   root's own error has not already said. Gating suppresses the echo.
-/// - A *configured* root is the operator's own statement, so its failure is
-///   news even when the work root is broken, and gating would hide it.
-///
-/// A containment test would only matter if creating a child could quietly
-/// bring the work root into being at the process umask — the hazard the
-/// ordering in [`VmHttpPlan::materialize`] exists to prevent. It cannot:
-/// whenever `ensure_vm_http_work_root_private` fails, the work root either
-/// already exists (wrong mode, or not a directory) or could not be created at
-/// all, and in every one of those cases `create_dir_all` on a path beneath it
-/// fails too rather than replacing it. Pinned by
-/// `a_root_under_an_unpreparable_work_root_fails_rather_than_creating_it`.
-///
-/// So there is nothing for a lexical `starts_with` — which is case-sensitive,
-/// blind to symlinks and `..`, and would be wrong in both directions on a
-/// macOS `/tmp` vs `/private/tmp` alias — to buy here.
-fn root_plan(kind: WritableRoot, path: PathBuf, derived: bool) -> RootPlan {
-    RootPlan {
-        kind,
-        path,
-        under_work_root: derived,
     }
 }
 

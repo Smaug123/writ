@@ -1824,19 +1824,20 @@ fn a_bad_lifecycle_section_creates_no_vm_http_directories() {
     );
 }
 
-/// An explicitly configured root outside the work root does not derive from
-/// it, so a work root the broker cannot prepare must not suppress the report
-/// on that root.
+/// Once the work root is rejected, no root is created or probed — not even one
+/// the operator named outside it. The containment question cannot be decided
+/// for a path that does not exist yet, so materialization takes the
+/// conservative branch uniformly rather than risk mutating on behalf of a
+/// config that has already been refused. Textual faults in those roots are
+/// unaffected: `check` reports them without gating on anything.
 #[test]
-fn an_explicit_root_outside_the_work_root_is_probed_even_when_the_work_root_fails() {
+fn a_rejected_work_root_suppresses_every_root_probe() {
     use std::os::unix::fs::PermissionsExt as _;
     let temp = tempfile::tempdir().unwrap();
-    // A work root that exists with group/world bits: rejected by the
-    // filesystem half of validation, not the textual half.
     let work_root = temp.path().join("loose-work-root");
     std::fs::create_dir(&work_root).unwrap();
     std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // An explicit log root elsewhere that cannot be created: it is a file.
+    // An explicit log root elsewhere, which would fail its probe if attempted.
     let log_root = temp.path().join("log-root-is-a-file");
     std::fs::write(&log_root, b"not a directory").unwrap();
 
@@ -1852,11 +1853,14 @@ fn an_explicit_root_outside_the_work_root_is_probed_even_when_the_work_root_fail
             .any(|error| matches!(error, AgentVmHttpConfigError::WorkRootInsecure { .. })),
         "work root failure missing: {found:#?}",
     );
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected only the work root failure: {found:#?}"
+    );
     assert!(
-        errors
-            .iter()
-            .any(|error| matches!(error, AgentVmHttpConfigError::AgentRunLogRootCreate { .. })),
-        "explicit log root failure suppressed by the work root: {found:#?}",
+        log_root.is_file(),
+        "the explicit log root was mutated after the work root was rejected",
     );
 }
 
@@ -1924,5 +1928,64 @@ fn a_root_under_an_unpreparable_work_root_fails_rather_than_creating_it() {
     assert!(
         work_root.is_file(),
         "the work root was replaced by a directory while preparing a root beneath it",
+    );
+}
+
+/// A work root rejected for loose permissions still *exists*, so `create_dir_all`
+/// of a child inside it succeeds. Nothing may be created once the work root has
+/// been rejected, whether the root beneath it was derived or named outright.
+#[test]
+fn a_rejected_work_root_creates_no_roots_beneath_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+    let work_root = temp.path().join("loose-work-root");
+    std::fs::create_dir(&work_root).unwrap();
+    std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log_root = work_root.join("logs");
+
+    let mut c = valid_agent_vm_http_config();
+    c.work_root = work_root.clone();
+    c.agent_run_log_root = Some(log_root.clone());
+
+    let errors = c.to_runtime_config().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, AgentVmHttpConfigError::WorkRootInsecure { .. })),
+        "work root failure missing: {errors}",
+    );
+    assert!(
+        !log_root.exists(),
+        "{log_root:?} was created inside a work root that had just been rejected",
+    );
+}
+
+/// The bind address is a plain typed field, independent of everything else in
+/// the section, so an unrelated fault elsewhere must not defer it to the next
+/// restart.
+#[test]
+fn a_non_wildcard_bind_addr_is_reported_alongside_an_unrelated_vm_http_fault() {
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.bind_addr = Ipv4Addr::new(127, 0, 0, 1);
+    vm_http.nix_cache_url = "not-a-url".into();
+
+    let config = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+    let errors = config.to_runtime_config().unwrap_err();
+    let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AgentVmDaemonConfigError::Runtime(
+                AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(_)
+            )
+        )),
+        "bind address failure deferred behind an unrelated fault: {found:#?}",
+    );
+    assert!(
+        found.iter().any(|error| error.contains("not-a-url")),
+        "unrelated fault missing: {found:#?}",
     );
 }

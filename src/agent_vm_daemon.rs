@@ -434,21 +434,23 @@ impl AgentVmDaemonRuntimeConfig {
         lifecycle: AgentVmLifecycleRuntimeConfig,
         vm_http: VmHttpRuntimeConfig,
     ) -> Result<Self, AgentVmDaemonRuntimeConfigError> {
-        Self::check_vm_http(&vm_http)?;
+        Self::check_bind_addr(vm_http.bind_addr())?;
         Ok(Self { lifecycle, vm_http })
     }
 
-    /// The daemon-level invariant [`Self::new`] enforces, exposed separately so
-    /// config validation can check it against a *planned* `vm_http` config —
-    /// before the plan creates any directories, and early enough that the
-    /// failure joins the rest of the config report instead of arriving after
-    /// it. `new` still runs it, so this is one definition, not two.
-    pub fn check_vm_http(
-        vm_http: &VmHttpRuntimeConfig,
-    ) -> Result<(), AgentVmDaemonRuntimeConfigError> {
-        if !vm_http.bind_addr().is_unspecified() {
+    /// The daemon-level invariant [`Self::new`] enforces, over the one field it
+    /// actually reads.
+    ///
+    /// Exposed separately, and taking the bare address rather than a built
+    /// `VmHttpRuntimeConfig`, so config validation can check it as what it is:
+    /// an independent field. Demanding the whole runtime config would make this
+    /// failure hide behind any *other* fault in the section, and would push it
+    /// after the point where the section's directories get created. `new` still
+    /// calls it, so there is one definition rather than two.
+    pub fn check_bind_addr(bind_addr: Ipv4Addr) -> Result<(), AgentVmDaemonRuntimeConfigError> {
+        if !bind_addr.is_unspecified() {
             return Err(AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(
-                vm_http.bind_addr(),
+                bind_addr,
             ));
         }
         Ok(())
