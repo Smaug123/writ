@@ -332,13 +332,13 @@ pub(super) fn git_clone_config_for_test(
         credential,
         temp.path().join("git-work"),
         TEST_GIT_CLONE_TIMEOUT,
-        1024,
+        ByteSize::kib(1),
     )
     .unwrap()
 }
 
 pub(super) fn nix_cache_config_for_test() -> VmHttpNixCacheConfig {
-    VmHttpNixCacheConfig::new("http://127.0.0.1:9", 1024, 1024).unwrap()
+    VmHttpNixCacheConfig::new("http://127.0.0.1:9", ByteSize::kib(1), ByteSize::kib(1)).unwrap()
 }
 
 /// Bind a free TCP port and release it, returning the port number — so a
@@ -370,7 +370,12 @@ async fn prepare_on_listener_uses_the_provided_bearer_and_bound_port() {
         nix_cache_config_for_test(),
         temp.path().join("agent-run-logs"),
         temp.path().join("git-push-staging"),
-        VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
+        VmGitPushBodyLimits::new(
+            ByteSize::from_bytes(65 * 1024 * 1024),
+            ByteSize::kib(16),
+            ByteSize::mib(64),
+        )
+        .unwrap(),
     );
     let port = free_port().await;
     let listener = bind_vm_http_listener(Ipv4Addr::LOCALHOST, BrokerPort::new(port).unwrap())
@@ -889,7 +894,7 @@ async fn a_mismatched_declaration_names_the_stale_side() {
 #[tokio::test]
 async fn the_contract_check_runs_before_the_body_is_read() {
     let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-    let oversized = (MAX_VM_HTTP_BODY_BYTES + 1).to_string();
+    let oversized = (MAX_VM_HTTP_BODY_BYTES.get() + 1).to_string();
 
     let response = dispatch_vm_http_head_and_body(
         &session,
@@ -1001,7 +1006,7 @@ async fn dispatch_declaring(
 #[tokio::test]
 async fn authorization_runs_before_body_limit_enforcement() {
     let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(10, 1, 2, 0), 24).unwrap());
-    let oversized = (MAX_VM_HTTP_BODY_BYTES + 1).to_string();
+    let oversized = (MAX_VM_HTTP_BODY_BYTES.get() + 1).to_string();
     let response = dispatch_vm_http_head_and_body(
         &session,
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 12345)),
@@ -1055,7 +1060,12 @@ async fn prepare_vm_http_session_returns_in_range_broker_port_and_redacted_token
         nix_cache_config_for_test(),
         temp.path().join("agent-runs"),
         temp.path().join("git-push-staging"),
-        VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
+        VmGitPushBodyLimits::new(
+            ByteSize::from_bytes(65 * 1024 * 1024),
+            ByteSize::kib(16),
+            ByteSize::mib(64),
+        )
+        .unwrap(),
     );
     let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
     let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
@@ -1083,7 +1093,12 @@ async fn running_runtime_serves_session_and_shuts_down() {
         nix_cache_config_for_test(),
         temp.path().join("agent-runs"),
         temp.path().join("git-push-staging"),
-        VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
+        VmGitPushBodyLimits::new(
+            ByteSize::from_bytes(65 * 1024 * 1024),
+            ByteSize::kib(16),
+            ByteSize::mib(64),
+        )
+        .unwrap(),
     );
     let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
     let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
@@ -1584,8 +1599,8 @@ mod brokered_route_audit_oracle {
                             VmHttpClaudeProxyAuthKind::XApiKey,
                             "2024-10-22",
                             std::time::Duration::from_secs(5),
-                            4096,
-                            4096,
+                            ByteSize::from_bytes(4096),
+                            ByteSize::from_bytes(4096),
                         )
                         .unwrap(),
                     )
@@ -1599,8 +1614,8 @@ mod brokered_route_audit_oracle {
                             openai_key,
                             VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
                             std::time::Duration::from_secs(5),
-                            4096,
-                            4096,
+                            ByteSize::from_bytes(4096),
+                            ByteSize::from_bytes(4096),
                         )
                         .unwrap(),
                     )
@@ -1613,7 +1628,12 @@ mod brokered_route_audit_oracle {
                 git_push: Some(VmHttpGitPushService::new(
                     Arc::clone(&state),
                     Arc::new(GitPushStagingStore::open(temp.path().join("staging")).unwrap()),
-                    VmGitPushBodyLimits::new(64 * 1024, 8 * 1024, 64 * 1024).unwrap(),
+                    VmGitPushBodyLimits::new(
+                        ByteSize::kib(64),
+                        ByteSize::kib(8),
+                        ByteSize::kib(64),
+                    )
+                    .unwrap(),
                 )),
                 flake_provision: Some(VmHttpFlakeProvisionService::new(
                     Arc::clone(&state),
@@ -1625,7 +1645,7 @@ mod brokered_route_audit_oracle {
                             temp.path().join("flake-input-cache"),
                             crate::flake_lock::FlakeProvisionBounds::new(
                                 64,
-                                1 << 30,
+                                ByteSize::gib(1),
                                 std::time::Duration::from_secs(120),
                             )
                             .unwrap(),

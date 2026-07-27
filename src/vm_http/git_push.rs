@@ -399,6 +399,7 @@ fn body_error_message(err: &VmGitPushBodyError) -> String {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::Arc;
+    use writ_core::byte_size::ByteSize;
 
     use tempfile::TempDir;
 
@@ -422,7 +423,7 @@ mod tests {
     };
 
     fn test_body_limits() -> VmGitPushBodyLimits {
-        VmGitPushBodyLimits::new(64 * 1024, 8 * 1024, 64 * 1024).unwrap()
+        VmGitPushBodyLimits::new(ByteSize::kib(64), ByteSize::kib(8), ByteSize::kib(64)).unwrap()
     }
 
     fn open_test_staging_store() -> (Arc<GitPushStagingStore>, TempDir) {
@@ -925,7 +926,12 @@ mod tests {
         open_audit_session(&state, session.session_id());
         let (staging, _tmp) = open_test_staging_store();
         // Tight body cap so an oversized request is cheap to construct.
-        let tight = VmGitPushBodyLimits::new(128, 64, 64).unwrap();
+        let tight = VmGitPushBodyLimits::new(
+            ByteSize::from_bytes(128),
+            ByteSize::from_bytes(64),
+            ByteSize::from_bytes(64),
+        )
+        .unwrap();
         let service = VmHttpGitPushService::new(Arc::clone(&state), Arc::clone(&staging), tight);
 
         let bearer_auth = bearer(token().as_str());
@@ -1026,7 +1032,7 @@ mod tests {
             reconcile_orphaned_staged_carriers(
                 &state.audit,
                 &staging,
-                crate::git_push_staging::recovery_receipt_bound(64 * 1024),
+                crate::git_push_staging::recovery_receipt_bound(ByteSize::kib(64)),
                 UnixMillis::now(),
             )
             .unwrap();

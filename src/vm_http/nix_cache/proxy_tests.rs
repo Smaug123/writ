@@ -33,7 +33,12 @@ async fn nix_cache_info_route_proxies_bounded_upstream_metadata() {
         .await;
     let service = VmHttpNixCacheService::new(
         Arc::clone(&state),
-        VmHttpNixCacheConfig::new(format!("{}/cache", upstream.uri()), 1024, 1024).unwrap(),
+        VmHttpNixCacheConfig::new(
+            format!("{}/cache", upstream.uri()),
+            ByteSize::kib(1),
+            ByteSize::kib(1),
+        )
+        .unwrap(),
     );
 
     let response =

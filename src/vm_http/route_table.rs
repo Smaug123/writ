@@ -30,6 +30,7 @@
 
 use crate::agent_run::AgentRunId;
 use crate::secret::SecretStore;
+use writ_core::byte_size::ByteSize;
 
 use super::agent_runs::{parse_agent_run_config_target, parse_agent_run_outcome_target};
 use super::flake_provision::is_flake_provision_target;
@@ -295,18 +296,18 @@ impl VmHttpRoute {
         &self,
         request: &VmHttpRequest,
         services: &VmHttpServices<S>,
-    ) -> Option<usize> {
+    ) -> Option<ByteSize> {
         match self {
             // The cache serves reads; it never reads a request body.
             Self::Brokered(BrokeredRoute::NixCache) => None,
             Self::Brokered(BrokeredRoute::ClaudeProxy) => services
                 .claude_proxy
                 .as_ref()
-                .map(|service| service.config.max_request_bytes()),
+                .map(|service| ByteSize::of(service.config.max_request_bytes())),
             Self::Brokered(BrokeredRoute::OpenAiProxy) => services
                 .openai_proxy
                 .as_ref()
-                .map(|service| service.config.max_request_bytes()),
+                .map(|service| ByteSize::of(service.config.max_request_bytes())),
             Self::Brokered(BrokeredRoute::GitPush) => (request.method == "POST")
                 .then(|| {
                     services

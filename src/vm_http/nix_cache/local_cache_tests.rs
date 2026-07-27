@@ -145,8 +145,8 @@ async fn local_cache_miss_falls_through_to_signed_upstream() {
         Arc::clone(&state),
         VmHttpNixCacheConfig::new_with_trusted_public_keys(
             upstream.uri(),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
             NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
         )
         .unwrap()
@@ -853,8 +853,8 @@ async fn upstream_admitted_nar_is_not_shadowed_by_a_local_file() {
         Arc::clone(&state),
         VmHttpNixCacheConfig::new_with_trusted_public_keys(
             upstream.uri(),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
             NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
         )
         .unwrap()
@@ -1252,8 +1252,8 @@ async fn prewarm_view_narinfo_miss_is_a_404_not_an_upstream_proxy() {
         Arc::clone(&state),
         VmHttpNixCacheConfig::new_with_trusted_public_keys(
             upstream.uri(),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
             NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
         )
         .unwrap()

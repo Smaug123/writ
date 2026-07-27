@@ -293,7 +293,7 @@ impl BrokeredEffect for FlakeProvisionEffect {
                     request_id: report.request_id(),
                     input_count: report.input_count() as u64,
                     archived_path_count: report.archived_path_count(),
-                    archived_bytes: report.archived_bytes(),
+                    archived_bytes: report.archived_bytes().get(),
                 },
             ),
             // A run that started and failed is a host fault, never a lock
@@ -487,6 +487,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
     use std::time::Duration;
+    use writ_core::byte_size::ByteSize;
 
     use wiremock::MockServer;
 
@@ -538,7 +539,7 @@ mod tests {
             nix_program,
             root.join("materialize"),
             root.join("flake-input-cache"),
-            FlakeProvisionBounds::new(64, 1 << 30, Duration::from_secs(120)).unwrap(),
+            FlakeProvisionBounds::new(64, ByteSize::gib(1), Duration::from_secs(120)).unwrap(),
             Duration::from_secs(120),
         );
         let config =

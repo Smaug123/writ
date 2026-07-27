@@ -6,6 +6,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use writ_core::byte_size::ByteSize;
 
 use crate::clean_git::{
     CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env, run_clean_git_capture_stdout,
@@ -40,7 +41,7 @@ pub struct VmHttpGitCloneConfig {
     credential: GitCredentialBoundary,
     work_root: PathBuf,
     timeout: std::time::Duration,
-    max_bundle_bytes: u64,
+    max_bundle_bytes: ByteSize,
     /// When set, the bare mirror produced for each clone is retained in this
     /// `(repo, rev)`-keyed cache (for later flake-input provisioning) instead of
     /// being discarded. `None` keeps the historical behaviour: the work dir,
@@ -76,7 +77,7 @@ impl VmHttpGitCloneConfig {
         credential: GitCredentialBoundary,
         work_root: impl Into<PathBuf>,
         timeout: std::time::Duration,
-        max_bundle_bytes: u64,
+        max_bundle_bytes: ByteSize,
     ) -> Result<Self, GitCloneBundlePlanError> {
         Self::new_with_clone_base_url(
             git_program,
@@ -94,7 +95,7 @@ impl VmHttpGitCloneConfig {
         credential: GitCredentialBoundary,
         work_root: impl Into<PathBuf>,
         timeout: std::time::Duration,
-        max_bundle_bytes: u64,
+        max_bundle_bytes: ByteSize,
     ) -> Result<Self, GitCloneBundlePlanError> {
         let git_program = git_program.into();
         let work_root = work_root.into();
@@ -115,7 +116,7 @@ impl VmHttpGitCloneConfig {
         if timeout.is_zero() {
             return Err(GitCloneBundlePlanError::ZeroTimeout);
         }
-        if max_bundle_bytes == 0 {
+        if max_bundle_bytes.is_zero() {
             return Err(GitCloneBundlePlanError::ZeroMaxBundleBytes);
         }
         Ok(Self {
@@ -614,7 +615,7 @@ mod tests {
             .unwrap(),
             PathBuf::from("/tmp/writ-clone"),
             clone_timeout,
-            1 << 20,
+            ByteSize::from_bytes(1 << 20),
         )
         .unwrap();
 

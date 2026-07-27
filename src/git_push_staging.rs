@@ -25,6 +25,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use writ_core::byte_size::ByteSize;
 
 use crate::core::{RequestId, UnixMillis};
 use crate::vm_git::{VmGitPushMetadata, VmGitPushStagedReceipt};
@@ -38,7 +39,7 @@ const BUNDLE_FILE: &str = "bundle";
 /// metadata it is derived from — the `request_id` UUID, the `staged_at`
 /// timestamp, and JSON key differences. Generous: the real overhead is a
 /// few hundred bytes. Used by [`recovery_receipt_bound`].
-pub const RECEIPT_METADATA_OVERHEAD_BYTES: u64 = 4096;
+pub const RECEIPT_METADATA_OVERHEAD_BYTES: ByteSize = ByteSize::kib(4);
 
 /// The largest `entry.json` the recovery sweep should read, given the
 /// broker's configured `git_push_max_metadata_bytes`. A receipt is the
@@ -51,8 +52,8 @@ pub const RECEIPT_METADATA_OVERHEAD_BYTES: u64 = 4096;
 /// [`GitPushStagingStore::list_entries_for_recovery`]; a hard-coded cap
 /// would wrongly classify a legitimate carrier as corrupt whenever an
 /// operator raised the metadata limit past it.
-pub fn recovery_receipt_bound(max_metadata_bytes: usize) -> u64 {
-    (max_metadata_bytes as u64).saturating_add(RECEIPT_METADATA_OVERHEAD_BYTES)
+pub fn recovery_receipt_bound(max_metadata_bytes: ByteSize) -> ByteSize {
+    max_metadata_bytes.saturating_add(RECEIPT_METADATA_OVERHEAD_BYTES)
 }
 
 /// A staged push as stored on disk: the receipt that was returned to the
@@ -239,7 +240,7 @@ impl GitPushStagingStore {
     /// receipts the request path actually accepts.
     pub fn list_entries_for_recovery(
         &self,
-        max_receipt_bytes: u64,
+        max_receipt_bytes: ByteSize,
     ) -> Result<Vec<Result<VmGitPushStagedReceipt, StagingError>>, StagingError> {
         let dir = self.root.join(STAGED_DIR);
         let read = match fs::read_dir(&dir) {
@@ -279,7 +280,7 @@ impl GitPushStagingStore {
     fn probe_recoverable_entry(
         &self,
         name: &OsStr,
-        max_receipt_bytes: u64,
+        max_receipt_bytes: ByteSize,
     ) -> Result<VmGitPushStagedReceipt, StagingError> {
         let request_id = parse_request_id_from_dirname(name)?;
         // Guard the receipt *before* `load_receipt`'s unbounded `fs::read`:
@@ -306,12 +307,12 @@ impl GitPushStagingStore {
     fn verify_receipt_readable(
         &self,
         request_id: RequestId,
-        max_receipt_bytes: u64,
+        max_receipt_bytes: ByteSize,
     ) -> Result<(), StagingError> {
         let path = self.staged_path(request_id).join(ENTRY_FILE);
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_file() => {
-                if meta.len() > max_receipt_bytes {
+                if ByteSize::from_bytes(meta.len()) > max_receipt_bytes {
                     Err(StagingError::Corrupt {
                         request_id,
                         message: format!(
@@ -1065,7 +1066,7 @@ mod tests {
                 .unwrap();
         }
         let mut got: Vec<RequestId> = store
-            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
             .unwrap()
             .into_iter()
             .map(|r| r.unwrap().push_request_id())
@@ -1081,7 +1082,7 @@ mod tests {
         let (store, _tmp) = open_store();
         assert!(
             store
-                .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+                .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
                 .unwrap()
                 .is_empty()
         );
@@ -1120,7 +1121,7 @@ mod tests {
 
         // ...but the recovery enumeration isolates it.
         let entries = store
-            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
             .unwrap();
         assert_eq!(entries.len(), 2);
         let mut healthy_seen = false;
@@ -1156,7 +1157,7 @@ mod tests {
         fs::remove_file(store.staged_path(id).join(BUNDLE_FILE)).unwrap();
 
         let entries = store
-            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
@@ -1186,7 +1187,7 @@ mod tests {
         fs::create_dir(&bundle).unwrap();
 
         let entries = store
-            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
@@ -1216,7 +1217,7 @@ mod tests {
         fs::create_dir(&entry).unwrap();
 
         let entries = store
-            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
@@ -1247,14 +1248,18 @@ mod tests {
         assert!(receipt_len > 1, "sanity: receipt has content");
 
         // A bound below the receipt rejects it as too large...
-        let under = store.list_entries_for_recovery(receipt_len - 1).unwrap();
+        let under = store
+            .list_entries_for_recovery(ByteSize::from_bytes(receipt_len - 1))
+            .unwrap();
         assert!(matches!(
             under.into_iter().next().unwrap(),
             Err(StagingError::Corrupt { request_id, .. }) if request_id == id
         ));
 
         // ...and a bound at or above it admits the carrier.
-        let over = store.list_entries_for_recovery(receipt_len).unwrap();
+        let over = store
+            .list_entries_for_recovery(ByteSize::from_bytes(receipt_len))
+            .unwrap();
         assert_eq!(
             over.into_iter().next().unwrap().unwrap().push_request_id(),
             id,
@@ -1264,12 +1269,15 @@ mod tests {
     #[test]
     fn recovery_receipt_bound_adds_fixed_overhead() {
         assert_eq!(
-            recovery_receipt_bound(16 * 1024),
-            16 * 1024 + RECEIPT_METADATA_OVERHEAD_BYTES,
+            recovery_receipt_bound(ByteSize::kib(16)),
+            ByteSize::kib(16).saturating_add(RECEIPT_METADATA_OVERHEAD_BYTES),
         );
         // Saturates rather than overflowing (panicking) on an absurd
         // configured limit.
-        assert!(recovery_receipt_bound(usize::MAX) >= usize::MAX as u64);
+        assert!(
+            recovery_receipt_bound(ByteSize::from_bytes(u64::MAX))
+                >= ByteSize::from_bytes(u64::MAX)
+        );
     }
 
     /// A symlinked `entry.json` or `bundle` — a shape `stage()` never
@@ -1301,7 +1309,7 @@ mod tests {
             symlink(&target, &path).unwrap();
 
             let entries = store
-                .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+                .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
                 .unwrap();
             assert_eq!(entries.len(), 1);
             assert!(
@@ -1349,7 +1357,7 @@ mod tests {
         fs::write(store.root().join(STAGED_DIR).join("stray-file"), b"junk").unwrap();
 
         let entries = store
-            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
             .unwrap();
         assert_eq!(
             entries.len(),
@@ -1382,7 +1390,7 @@ mod tests {
         fs::create_dir(store.root().join(STAGED_DIR).join("not-a-uuid")).unwrap();
 
         let entries = store
-            .list_entries_for_recovery(recovery_receipt_bound(64 * 1024))
+            .list_entries_for_recovery(recovery_receipt_bound(ByteSize::kib(64)))
             .unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|e| matches!(

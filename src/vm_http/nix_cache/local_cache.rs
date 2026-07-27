@@ -4,6 +4,7 @@
 //! grows or is swapped after classification cannot blow the bound.
 
 use std::path::Path;
+use writ_core::byte_size::ByteSize;
 
 /// Outcome of a bounded read of a local-archive file.
 pub(super) enum LocalCacheFile {
@@ -57,7 +58,7 @@ async fn lstat_local_cache_file(path: &Path) -> LocalCacheLstat {
 /// to require a *regular* file — validating the object actually opened, not a
 /// name re-stat. A Nix file cache holds only regular files, so this rejects
 /// nothing legitimate.
-pub(super) async fn read_local_cache_file(path: &Path, max: u64) -> LocalCacheFile {
+pub(super) async fn read_local_cache_file(path: &Path, max: ByteSize) -> LocalCacheFile {
     use tokio::io::AsyncReadExt as _;
 
     let file = match tokio::fs::OpenOptions::new()
@@ -87,12 +88,12 @@ pub(super) async fn read_local_cache_file(path: &Path, max: u64) -> LocalCacheFi
     }
     // Read at most `max + 1` bytes: reaching the cap means the file is over
     // budget, without ever holding more than `max + 1` bytes in memory.
-    let cap = max.saturating_add(1);
+    let cap = max.saturating_add(ByteSize::from_bytes(1));
     let mut body = Vec::new();
-    if let Err(err) = file.take(cap).read_to_end(&mut body).await {
+    if let Err(err) = file.take(cap.get()).read_to_end(&mut body).await {
         return LocalCacheFile::Io(err);
     }
-    if body.len() as u64 > max {
+    if ByteSize::of(body.len()) > max {
         return LocalCacheFile::TooLarge;
     }
     LocalCacheFile::Bytes(body)
@@ -111,11 +112,13 @@ pub(super) enum LocalCacheStat {
 /// Stat a local-archive file, enforcing `max` fail-closed and mapping an absent
 /// (or non-regular, including symlink) file to [`LocalCacheStat::Missing`].
 /// Returns the byte length without opening the body.
-pub(super) async fn stat_local_cache_file(path: &Path, max: u64) -> LocalCacheStat {
+pub(super) async fn stat_local_cache_file(path: &Path, max: ByteSize) -> LocalCacheStat {
     match lstat_local_cache_file(path).await {
         LocalCacheLstat::Missing => LocalCacheStat::Missing,
         LocalCacheLstat::Io(err) => LocalCacheStat::Io(err),
-        LocalCacheLstat::RegularFile { len } if len > max => LocalCacheStat::TooLarge,
+        LocalCacheLstat::RegularFile { len } if ByteSize::from_bytes(len) > max => {
+            LocalCacheStat::TooLarge
+        }
         LocalCacheLstat::RegularFile { len } => LocalCacheStat::Len(len),
     }
 }

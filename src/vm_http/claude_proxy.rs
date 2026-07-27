@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use writ_core::byte_size::ByteSize;
 
 use serde::Deserialize;
 
@@ -37,7 +38,7 @@ pub struct VmHttpClaudeProxyConfig {
     anthropic_version: reqwest::header::HeaderValue,
     timeout: std::time::Duration,
     max_request_bytes: usize,
-    max_response_bytes: u64,
+    max_response_bytes: ByteSize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -113,8 +114,8 @@ impl VmHttpClaudeProxyConfig {
         auth_secret: SecretKey,
         auth_kind: VmHttpClaudeProxyAuthKind,
         timeout: std::time::Duration,
-        max_request_bytes: u64,
-        max_response_bytes: u64,
+        max_request_bytes: ByteSize,
+        max_response_bytes: ByteSize,
     ) -> Result<Self, VmHttpClaudeProxyConfigError> {
         Self::new_with_anthropic_version(
             upstream_base_url,
@@ -133,8 +134,8 @@ impl VmHttpClaudeProxyConfig {
         auth_kind: VmHttpClaudeProxyAuthKind,
         anthropic_version: impl AsRef<str>,
         timeout: std::time::Duration,
-        max_request_bytes: u64,
-        max_response_bytes: u64,
+        max_request_bytes: ByteSize,
+        max_response_bytes: ByteSize,
     ) -> Result<Self, VmHttpClaudeProxyConfigError> {
         let raw = upstream_base_url.as_ref();
         let raw_anthropic_version = anthropic_version.as_ref();
@@ -153,12 +154,13 @@ impl VmHttpClaudeProxyConfig {
         if timeout.is_zero() {
             return Err(VmHttpClaudeProxyConfigError::EmptyTimeout);
         }
-        if max_request_bytes == 0 {
+        if max_request_bytes.is_zero() {
             return Err(VmHttpClaudeProxyConfigError::EmptyMaxRequestBytes);
         }
-        let max_request_bytes = usize::try_from(max_request_bytes)
-            .map_err(|_| VmHttpClaudeProxyConfigError::MaxRequestBytesTooLarge)?;
-        if max_response_bytes == 0 {
+        let max_request_bytes = max_request_bytes
+            .to_usize()
+            .ok_or(VmHttpClaudeProxyConfigError::MaxRequestBytesTooLarge)?;
+        if max_response_bytes.is_zero() {
             return Err(VmHttpClaudeProxyConfigError::EmptyMaxResponseBytes);
         }
         let mut url = reqwest::Url::parse(raw).map_err(|err| {
@@ -218,7 +220,7 @@ impl VmHttpClaudeProxyConfig {
         self.max_request_bytes
     }
 
-    pub fn max_response_bytes(&self) -> u64 {
+    pub fn max_response_bytes(&self) -> ByteSize {
         self.max_response_bytes
     }
 }
@@ -232,7 +234,7 @@ impl ProxyBackendConfig for VmHttpClaudeProxyConfig {
         self.timeout
     }
 
-    fn max_response_bytes(&self) -> u64 {
+    fn max_response_bytes(&self) -> ByteSize {
         self.max_response_bytes
     }
 }
@@ -562,8 +564,8 @@ mod tests {
             SecretKey::new("anthropic-api-key").unwrap(),
             VmHttpClaudeProxyAuthKind::XApiKey,
             std::time::Duration::from_secs(5),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
         )
         .unwrap();
 
@@ -618,8 +620,8 @@ mod tests {
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 "2024-10-22",
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -775,8 +777,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -844,8 +846,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -907,8 +909,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -961,8 +963,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1008,8 +1010,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1061,8 +1063,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::AuthorizationBearer,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1128,8 +1130,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::OAuth,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1215,8 +1217,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1270,8 +1272,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1330,8 +1332,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1417,8 +1419,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_secs(5),
-                1024,
-                5,
+                ByteSize::kib(1),
+                ByteSize::from_bytes(5),
             )
             .unwrap(),
         )
@@ -1499,8 +1501,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1562,8 +1564,8 @@ mod tests {
                 secret_key,
                 VmHttpClaudeProxyAuthKind::XApiKey,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )

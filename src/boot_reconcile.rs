@@ -47,6 +47,7 @@ use crate::audit::{
 use crate::core::{ApproveAttemptId, RequestId, UnixMillis};
 use crate::git_push_staging::GitPushStagingStore;
 use crate::vm_git::VmGitPushStagedReceipt;
+use writ_core::byte_size::ByteSize;
 
 /// Detail string written to `git_push_approve_attempt.failure_detail`
 /// when boot reconcile transitions a `Started` attempt to
@@ -275,7 +276,7 @@ pub const RECOVERED_STAGED_CARRIER_MESSAGE: &str =
 pub fn reconcile_orphaned_staged_carriers(
     audit: &AuditLog,
     staging: &GitPushStagingStore,
-    max_receipt_bytes: u64,
+    max_receipt_bytes: ByteSize,
     now: UnixMillis,
 ) -> Result<Vec<RequestId>, AuditError> {
     let carriers = match staging.list_entries_for_recovery(max_receipt_bytes) {
@@ -990,7 +991,7 @@ mod tests {
         let recovered = reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();
@@ -1018,7 +1019,7 @@ mod tests {
         let recovered = reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();
@@ -1044,7 +1045,7 @@ mod tests {
         let recovered = reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();
@@ -1059,7 +1060,7 @@ mod tests {
         let recovered = reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();
@@ -1078,7 +1079,7 @@ mod tests {
         let recovered = reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();
@@ -1098,7 +1099,7 @@ mod tests {
         reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();
@@ -1152,7 +1153,7 @@ mod tests {
         let recovered = reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();
@@ -1198,7 +1199,7 @@ mod tests {
         let recovered = reconcile_orphaned_staged_carriers(
             &log,
             &staging,
-            recovery_receipt_bound(16 * 1024),
+            recovery_receipt_bound(ByteSize::kib(16)),
             now(),
         )
         .unwrap();

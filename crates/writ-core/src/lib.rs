@@ -16,6 +16,7 @@
 //! `crate::telemetry`, etc. continue to resolve unchanged.
 
 pub mod bearer;
+pub mod byte_size;
 pub mod core;
 pub mod git_env;
 pub mod process_spawn;

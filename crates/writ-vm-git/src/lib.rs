@@ -13,6 +13,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use writ_core::byte_size::ByteSize;
 use writ_core::core::{
     CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, UnixMillis,
 };
@@ -495,9 +496,9 @@ pub struct GitObjectId(String);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct VmGitPushBodyLimits {
-    max_body_bytes: usize,
-    max_metadata_bytes: usize,
-    max_bundle_bytes: usize,
+    max_body_bytes: ByteSize,
+    max_metadata_bytes: ByteSize,
+    max_bundle_bytes: ByteSize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -645,7 +646,10 @@ pub enum VmGitPushRequestError {
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum VmGitPushBodyError {
     #[error("VM Git push body is too large: {bytes} bytes exceeds limit {max_body_bytes}")]
-    BodyTooLarge { bytes: usize, max_body_bytes: usize },
+    BodyTooLarge {
+        bytes: ByteSize,
+        max_body_bytes: ByteSize,
+    },
     #[error("VM Git push body is missing the 8-byte metadata length prefix")]
     MissingMetadataLength,
     #[error("VM Git push metadata length {metadata_bytes} exceeds body length {body_bytes}")]
@@ -655,8 +659,8 @@ pub enum VmGitPushBodyError {
     },
     #[error("VM Git push metadata is too large: {bytes} bytes exceeds limit {max_metadata_bytes}")]
     MetadataTooLarge {
-        bytes: usize,
-        max_metadata_bytes: usize,
+        bytes: ByteSize,
+        max_metadata_bytes: ByteSize,
     },
     #[error("VM Git push metadata length cannot fit in memory: {0}")]
     MetadataLengthOverflow(u64),
@@ -666,8 +670,8 @@ pub enum VmGitPushBodyError {
     EmptyBundle,
     #[error("Git push bundle is too large: {bytes} bytes exceeds limit {max_bundle_bytes}")]
     BundleTooLarge {
-        bytes: usize,
-        max_bundle_bytes: usize,
+        bytes: ByteSize,
+        max_bundle_bytes: ByteSize,
     },
 }
 
@@ -1026,17 +1030,17 @@ impl<'de> Deserialize<'de> for GitObjectId {
 
 impl VmGitPushBodyLimits {
     pub fn new(
-        max_body_bytes: usize,
-        max_metadata_bytes: usize,
-        max_bundle_bytes: usize,
+        max_body_bytes: ByteSize,
+        max_metadata_bytes: ByteSize,
+        max_bundle_bytes: ByteSize,
     ) -> Result<Self, VmGitPushBodyLimitsError> {
-        if max_body_bytes == 0 {
+        if max_body_bytes.is_zero() {
             return Err(VmGitPushBodyLimitsError::EmptyMaxBodyBytes);
         }
-        if max_metadata_bytes == 0 {
+        if max_metadata_bytes.is_zero() {
             return Err(VmGitPushBodyLimitsError::EmptyMaxMetadataBytes);
         }
-        if max_bundle_bytes == 0 {
+        if max_bundle_bytes.is_zero() {
             return Err(VmGitPushBodyLimitsError::EmptyMaxBundleBytes);
         }
         Ok(Self {
@@ -1046,15 +1050,15 @@ impl VmGitPushBodyLimits {
         })
     }
 
-    pub fn max_body_bytes(&self) -> usize {
+    pub fn max_body_bytes(&self) -> ByteSize {
         self.max_body_bytes
     }
 
-    pub fn max_metadata_bytes(&self) -> usize {
+    pub fn max_metadata_bytes(&self) -> ByteSize {
         self.max_metadata_bytes
     }
 
-    pub fn max_bundle_bytes(&self) -> usize {
+    pub fn max_bundle_bytes(&self) -> ByteSize {
         self.max_bundle_bytes
     }
 }
@@ -1244,9 +1248,9 @@ pub fn parse_vm_git_push_request_body(
     body: &[u8],
     limits: VmGitPushBodyLimits,
 ) -> Result<VmGitPushRequest, VmGitPushBodyError> {
-    if body.len() > limits.max_body_bytes() {
+    if ByteSize::of(body.len()) > limits.max_body_bytes() {
         return Err(VmGitPushBodyError::BodyTooLarge {
-            bytes: body.len(),
+            bytes: ByteSize::of(body.len()),
             max_body_bytes: limits.max_body_bytes(),
         });
     }
@@ -1261,9 +1265,9 @@ pub fn parse_vm_git_push_request_body(
     let metadata_bytes_u64 = u64::from_be_bytes(metadata_len_bytes);
     let metadata_bytes = usize::try_from(metadata_bytes_u64)
         .map_err(|_| VmGitPushBodyError::MetadataLengthOverflow(metadata_bytes_u64))?;
-    if metadata_bytes > limits.max_metadata_bytes() {
+    if ByteSize::of(metadata_bytes) > limits.max_metadata_bytes() {
         return Err(VmGitPushBodyError::MetadataTooLarge {
-            bytes: metadata_bytes,
+            bytes: ByteSize::of(metadata_bytes),
             max_metadata_bytes: limits.max_metadata_bytes(),
         });
     }
@@ -1285,9 +1289,9 @@ pub fn parse_vm_git_push_request_body(
     )
     .map_err(|err| VmGitPushBodyError::InvalidMetadata(err.to_string()))?;
     let bundle = body[metadata_end..].to_vec();
-    if bundle.len() > limits.max_bundle_bytes() {
+    if ByteSize::of(bundle.len()) > limits.max_bundle_bytes() {
         return Err(VmGitPushBodyError::BundleTooLarge {
-            bytes: bundle.len(),
+            bytes: ByteSize::of(bundle.len()),
             max_bundle_bytes: limits.max_bundle_bytes(),
         });
     }

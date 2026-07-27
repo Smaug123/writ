@@ -80,7 +80,12 @@ pub(super) fn nix_cache_service_for_test_with_limits(
 ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
     VmHttpNixCacheService::new(
         Arc::clone(state),
-        VmHttpNixCacheConfig::new(server.uri(), max_metadata_bytes, max_nar_bytes).unwrap(),
+        VmHttpNixCacheConfig::new(
+            server.uri(),
+            ByteSize::from_bytes(max_metadata_bytes),
+            ByteSize::from_bytes(max_nar_bytes),
+        )
+        .unwrap(),
     )
 }
 
@@ -102,8 +107,8 @@ pub(super) fn signed_nix_cache_service_for_test_with_limits(
         Arc::clone(state),
         VmHttpNixCacheConfig::new_with_trusted_public_keys(
             server.uri(),
-            max_metadata_bytes,
-            max_nar_bytes,
+            ByteSize::from_bytes(max_metadata_bytes),
+            ByteSize::from_bytes(max_nar_bytes),
             NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
         )
         .unwrap(),
@@ -120,8 +125,8 @@ pub(super) fn signed_nix_cache_service_for_test_with_key(
         Arc::clone(state),
         VmHttpNixCacheConfig::new_with_trusted_public_keys(
             server.uri(),
-            4096,
-            max_nar_bytes,
+            ByteSize::from_bytes(4096),
+            ByteSize::from_bytes(max_nar_bytes),
             NixTrustedPublicKeys::from_strings([trusted_key]).unwrap(),
         )
         .unwrap(),
@@ -137,9 +142,13 @@ pub(super) fn nix_cache_service_with_local_cache(
 ) -> VmHttpNixCacheService<Box<dyn SecretStore>> {
     VmHttpNixCacheService::new(
         Arc::clone(state),
-        VmHttpNixCacheConfig::new(upstream_url, max_metadata_bytes, max_nar_bytes)
-            .unwrap()
-            .with_local_cache_dirs(vec![cache_dir.to_path_buf()]),
+        VmHttpNixCacheConfig::new(
+            upstream_url,
+            ByteSize::from_bytes(max_metadata_bytes),
+            ByteSize::from_bytes(max_nar_bytes),
+        )
+        .unwrap()
+        .with_local_cache_dirs(vec![cache_dir.to_path_buf()]),
     )
 }
 
@@ -179,8 +188,8 @@ pub(super) fn nix_cache_service_with_local_cache_dirs_and_trusted_keys(
         Arc::clone(state),
         VmHttpNixCacheConfig::new_with_trusted_public_keys(
             upstream_url,
-            max_metadata_bytes,
-            max_nar_bytes,
+            ByteSize::from_bytes(max_metadata_bytes),
+            ByteSize::from_bytes(max_nar_bytes),
             trusted_keys,
         )
         .unwrap()

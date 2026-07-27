@@ -6,6 +6,7 @@
 use crate::nix_binary_cache::{
     NixCacheNarFileName, NixNarBodyHashError, NixNarCompression, NixNarHash, NixNarInfo, NixNarSize,
 };
+use writ_core::byte_size::ByteSize;
 
 const XZ_DECODER_MEMLIMIT_OVERHEAD: u64 = 16 * 1024 * 1024;
 
@@ -63,29 +64,32 @@ pub(super) enum VmHttpNixCacheNarVerifyError {
 }
 
 pub(super) fn validate_nar_content_length(
-    content_length: Option<u64>,
-    max: u64,
-) -> Result<u64, VmHttpNixCacheNarLengthError> {
+    content_length: Option<ByteSize>,
+    max: ByteSize,
+) -> Result<ByteSize, VmHttpNixCacheNarLengthError> {
     let Some(content_length) = content_length else {
         return Err(VmHttpNixCacheNarLengthError::Missing);
     };
     if content_length > max {
         return Err(VmHttpNixCacheNarLengthError::TooLarge {
-            max,
-            actual: content_length,
+            max: max.get(),
+            actual: content_length.get(),
         });
     }
     Ok(content_length)
 }
 
 pub(super) fn validate_nar_body_length(
-    actual: u64,
-    expected: u64,
+    actual: ByteSize,
+    expected: ByteSize,
 ) -> Result<(), VmHttpNixCacheNarBodyLengthError> {
     if actual == expected {
         Ok(())
     } else {
-        Err(VmHttpNixCacheNarBodyLengthError::Mismatch { expected, actual })
+        Err(VmHttpNixCacheNarBodyLengthError::Mismatch {
+            expected: expected.get(),
+            actual: actual.get(),
+        })
     }
 }
 
@@ -120,7 +124,7 @@ impl VmHttpNixCacheNarVerifyError {
 pub(super) async fn verify_nar_body_on_blocking_thread(
     admission: VmHttpNixCacheAdmittedNar,
     body: Vec<u8>,
-    max_nar_bytes: u64,
+    max_nar_bytes: ByteSize,
 ) -> Result<Vec<u8>, VmHttpNixCacheNarVerifyError> {
     tokio::task::spawn_blocking(move || {
         verify_nar_body(&admission, &body, max_nar_bytes)?;
@@ -135,7 +139,7 @@ pub(super) async fn verify_nar_body_on_blocking_thread(
 pub(super) fn verify_nar_body(
     admission: &VmHttpNixCacheAdmittedNar,
     body: &[u8],
-    max_nar_bytes: u64,
+    max_nar_bytes: ByteSize,
 ) -> Result<(), VmHttpNixCacheNarVerifyError> {
     match admission.compression {
         NixNarCompression::None => verify_raw_nar_body(admission, body),
@@ -174,7 +178,7 @@ fn verify_raw_nar_body(
 fn decode_xz_nar_body(
     body: &[u8],
     expected_size: u64,
-    max_nar_bytes: u64,
+    max_nar_bytes: ByteSize,
 ) -> Result<Vec<u8>, VmHttpNixCacheNarVerifyError> {
     let memlimit = xz_decoder_memlimit(max_nar_bytes)?;
     let stream = xz2::stream::Stream::new_stream_decoder(memlimit, xz2::stream::CONCATENATED)
@@ -241,8 +245,9 @@ fn read_decoded_bounded(
     Ok(decoded)
 }
 
-fn xz_decoder_memlimit(max_nar_bytes: u64) -> Result<u64, VmHttpNixCacheNarVerifyError> {
+fn xz_decoder_memlimit(max_nar_bytes: ByteSize) -> Result<u64, VmHttpNixCacheNarVerifyError> {
     max_nar_bytes
+        .get()
         .checked_add(XZ_DECODER_MEMLIMIT_OVERHEAD)
         .ok_or_else(|| VmHttpNixCacheNarVerifyError::Decode {
             message: format!(
@@ -288,7 +293,7 @@ mod spec {
                 NixNarCompression::Zstd => zstd_nar_body_for(&raw_body),
             };
             let admission = admitted_nar_for_body("generated.nar", compression, &raw_body);
-            verify_nar_body(&admission, &wire_body, 512).unwrap();
+            verify_nar_body(&admission, &wire_body, ByteSize::from_bytes(512)).unwrap();
         }
     }
 }

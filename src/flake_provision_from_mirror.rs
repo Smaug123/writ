@@ -160,12 +160,13 @@ pub async fn admit_flake_provision_from_cached_mirror(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use writ_core::byte_size::ByteSize;
 
     use super::*;
     use crate::flake_fixtures::{fake_nix_archiving, no_input_flake_mirror, tool_on_path};
 
     fn bounds() -> FlakeProvisionBounds {
-        FlakeProvisionBounds::new(64, 1 << 30, Duration::from_secs(120)).unwrap()
+        FlakeProvisionBounds::new(64, ByteSize::gib(1), Duration::from_secs(120)).unwrap()
     }
 
     fn config(

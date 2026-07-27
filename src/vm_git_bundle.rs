@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
+use writ_core::byte_size::ByteSize;
 
 use crate::clean_git::{
     self, CleanGitEnv, CleanGitError, CleanGitInvocation, clean_git_config_env,
@@ -56,13 +57,13 @@ pub struct GitCloneBundlePlan {
     mirror_dir: PathBuf,
     bundle_path: PathBuf,
     timeout: Duration,
-    max_bundle_bytes: u64,
+    max_bundle_bytes: ByteSize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitCloneBundleRunOutput {
     bundle_path: PathBuf,
-    bundle_bytes: u64,
+    bundle_bytes: ByteSize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -214,7 +215,10 @@ pub enum GitCloneBundleRunError {
     #[error("bundle path is not a regular file: {0}")]
     BundleNotAFile(PathBuf),
     #[error("bundle is too large: {bytes} bytes exceeds limit {max_bundle_bytes}")]
-    BundleTooLarge { bytes: u64, max_bundle_bytes: u64 },
+    BundleTooLarge {
+        bytes: ByteSize,
+        max_bundle_bytes: ByteSize,
+    },
 }
 
 impl GitCredentialBoundary {
@@ -365,7 +369,7 @@ impl GitCloneBundleRunOutput {
         &self.bundle_path
     }
 
-    pub fn bundle_bytes(&self) -> u64 {
+    pub fn bundle_bytes(&self) -> ByteSize {
         self.bundle_bytes
     }
 }
@@ -387,7 +391,7 @@ impl GitCloneBundlePlan {
         work_dir: impl Into<PathBuf>,
         bundle_path: impl Into<PathBuf>,
         timeout: Duration,
-        max_bundle_bytes: u64,
+        max_bundle_bytes: ByteSize,
     ) -> Result<Self, GitCloneBundlePlanError> {
         Self::new_with_source(
             git_program,
@@ -407,7 +411,7 @@ impl GitCloneBundlePlan {
         work_dir: impl Into<PathBuf>,
         bundle_path: impl Into<PathBuf>,
         timeout: Duration,
-        max_bundle_bytes: u64,
+        max_bundle_bytes: ByteSize,
     ) -> Result<Self, GitCloneBundlePlanError> {
         let git_program = git_program.into();
         let work_dir = work_dir.into();
@@ -418,7 +422,7 @@ impl GitCloneBundlePlan {
         if timeout.is_zero() {
             return Err(GitCloneBundlePlanError::ZeroTimeout);
         }
-        if max_bundle_bytes == 0 {
+        if max_bundle_bytes.is_zero() {
             return Err(GitCloneBundlePlanError::ZeroMaxBundleBytes);
         }
 
@@ -481,7 +485,7 @@ impl GitCloneBundlePlan {
         self.timeout
     }
 
-    pub fn max_bundle_bytes(&self) -> u64 {
+    pub fn max_bundle_bytes(&self) -> ByteSize {
         self.max_bundle_bytes
     }
 
@@ -715,7 +719,7 @@ async fn verify_bundle_output(
             plan.bundle_path().to_path_buf(),
         ));
     }
-    let bytes = metadata.len();
+    let bytes = ByteSize::from_bytes(metadata.len());
     if bytes > plan.max_bundle_bytes() {
         return Err(GitCloneBundleRunError::BundleTooLarge {
             bytes,
@@ -912,7 +916,7 @@ mod tests {
             "/tmp/writ-clone-work",
             "/tmp/writ-clone-work/out.bundle",
             Duration::from_secs(30),
-            64 * 1024 * 1024,
+            ByteSize::mib(64),
         )
         .unwrap()
     }
@@ -922,7 +926,7 @@ mod tests {
         work_dir: impl Into<PathBuf>,
         bundle_path: impl Into<PathBuf>,
         timeout: Duration,
-        max_bundle_bytes: u64,
+        max_bundle_bytes: ByteSize,
     ) -> GitCloneBundlePlan {
         GitCloneBundlePlan::new(
             git_program,
@@ -1189,7 +1193,7 @@ exit 42
             "/tmp/writ-clone-work",
             "/tmp/writ-clone-work/out.bundle",
             Duration::from_secs(30),
-            64 * 1024 * 1024,
+            ByteSize::mib(64),
         )
         .unwrap();
         let repo_url = github_https_url(&clone_repo);
@@ -1347,7 +1351,7 @@ exit 42
                 "/tmp/writ-clone-work",
                 "/tmp/writ-clone-work/out.bundle",
                 Duration::from_secs(30),
-                64 * 1024 * 1024,
+                ByteSize::mib(64),
             ).unwrap();
             let clone_args = plan.commands().clone_mirror().display_args_lossy();
             prop_assert!(clone_args.contains(&expected_url));
@@ -1414,7 +1418,7 @@ exit 42
                 "relative-work",
                 "/tmp/out.bundle",
                 Duration::from_secs(1),
-                1,
+                ByteSize::from_bytes(1),
             ),
             Err(GitCloneBundlePlanError::RelativePath {
                 field: "work_dir",
@@ -1430,7 +1434,7 @@ exit 42
                 "/tmp/work",
                 "relative.bundle",
                 Duration::from_secs(1),
-                1,
+                ByteSize::from_bytes(1),
             ),
             Err(GitCloneBundlePlanError::RelativePath {
                 field: "bundle_path",
@@ -1446,7 +1450,7 @@ exit 42
                 "/tmp/work",
                 "/tmp/out.bundle",
                 Duration::from_secs(1),
-                1,
+                ByteSize::from_bytes(1),
             ),
             Err(GitCloneBundlePlanError::BundleOutsideWorkDir(
                 PathBuf::from("/tmp/out.bundle")
@@ -1461,7 +1465,7 @@ exit 42
                 "/tmp/work",
                 "/tmp/work",
                 Duration::from_secs(1),
-                1,
+                ByteSize::from_bytes(1),
             ),
             Err(GitCloneBundlePlanError::BundlePathIsWorkDir(PathBuf::from(
                 "/tmp/work"
@@ -1476,7 +1480,7 @@ exit 42
                 "/tmp/work",
                 "/tmp/work/../out.bundle",
                 Duration::from_secs(1),
-                1,
+                ByteSize::from_bytes(1),
             ),
             Err(GitCloneBundlePlanError::BundleOutsideWorkDir(
                 PathBuf::from("/tmp/out.bundle")
@@ -1491,7 +1495,7 @@ exit 42
                 "/tmp/work",
                 "/tmp/work/mirror.git/out.bundle",
                 Duration::from_secs(1),
-                1,
+                ByteSize::from_bytes(1),
             ),
             Err(GitCloneBundlePlanError::BundleInsideMirror(PathBuf::from(
                 "/tmp/work/mirror.git/out.bundle"
@@ -1506,7 +1510,7 @@ exit 42
                 "/tmp/work",
                 "/tmp/work/out.bundle",
                 Duration::ZERO,
-                1,
+                ByteSize::from_bytes(1),
             ),
             Err(GitCloneBundlePlanError::ZeroTimeout)
         );
@@ -1518,7 +1522,7 @@ exit 42
                 "/tmp/work",
                 "/tmp/work/out.bundle",
                 Duration::from_secs(1),
-                0,
+                ByteSize::from_bytes(0),
             ),
             Err(GitCloneBundlePlanError::ZeroMaxBundleBytes)
         );
@@ -1606,12 +1610,15 @@ exit 42
         let (git, log) = fake_git_program(&dir, "", "");
         let work = dir.path().join("work");
         let bundle = work.join("out.bundle");
-        let plan = plan_with_paths(git, &work, &bundle, TEST_GIT_TIMEOUT, 1024);
+        let plan = plan_with_paths(git, &work, &bundle, TEST_GIT_TIMEOUT, ByteSize::kib(1));
 
         let output = run_git_clone_bundle(&plan, &git_secret()).await.unwrap();
 
         assert_eq!(output.bundle_path(), bundle);
-        assert_eq!(output.bundle_bytes(), "fake-bundle".len() as u64);
+        assert_eq!(
+            output.bundle_bytes(),
+            ByteSize::from_bytes("fake-bundle".len() as u64)
+        );
         let work_mode = std::fs::metadata(&work).unwrap().permissions().mode() & 0o777;
         assert_eq!(work_mode, 0o700);
         let log = std::fs::read_to_string(log).unwrap();
@@ -1634,7 +1641,13 @@ exit 42
         let (git, _) = fake_git_program(&dir, "", "");
         let work = dir.path().join("work");
         std::fs::create_dir(&work).unwrap();
-        let plan = plan_with_paths(git, &work, work.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
+        let plan = plan_with_paths(
+            git,
+            &work,
+            work.join("out.bundle"),
+            TEST_GIT_TIMEOUT,
+            ByteSize::kib(1),
+        );
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1686,7 +1699,13 @@ exit 42
         let ln = shell_quote(&required_test_tool("ln"));
         let clone_extra = format!("{ln} -s \"$9\" {}\n", shell_quote(&link));
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
-        let plan = plan_with_paths(git, &work, link.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
+        let plan = plan_with_paths(
+            git,
+            &work,
+            link.join("out.bundle"),
+            TEST_GIT_TIMEOUT,
+            ByteSize::kib(1),
+        );
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1714,7 +1733,13 @@ exit 42
             shell_quote(&link)
         );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
-        let plan = plan_with_paths(git, &work, link.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
+        let plan = plan_with_paths(
+            git,
+            &work,
+            link.join("out.bundle"),
+            TEST_GIT_TIMEOUT,
+            ByteSize::kib(1),
+        );
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1746,7 +1771,13 @@ exit 42
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         // Lexically this is a nested path with no `..` component, so plan-time
         // validation admits it; only the canonical pass can see where it lands.
-        let plan = plan_with_paths(git, &work, up.join("work"), TEST_GIT_TIMEOUT, 1024);
+        let plan = plan_with_paths(
+            git,
+            &work,
+            up.join("work"),
+            TEST_GIT_TIMEOUT,
+            ByteSize::kib(1),
+        );
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1767,7 +1798,7 @@ exit 42
         let bundle = work.join("out.bundle");
         let target = work.join("missing-target");
         std::os::unix::fs::symlink(&target, &bundle).unwrap();
-        let plan = plan_with_paths(git, &work, &bundle, TEST_GIT_TIMEOUT, 1024);
+        let plan = plan_with_paths(git, &work, &bundle, TEST_GIT_TIMEOUT, ByteSize::kib(1));
 
         let err = reject_existing_bundle(&plan).await.unwrap_err();
 
@@ -1795,7 +1826,7 @@ exit 42
             &work,
             work.join("out.bundle"),
             Duration::from_millis(250),
-            1024,
+            ByteSize::kib(1),
         );
 
         let err = run_git_clone_bundle(&plan, &git_secret())
@@ -1837,7 +1868,7 @@ exit 42
             &work,
             work.join("out.bundle"),
             Duration::from_secs(30),
-            1024,
+            ByteSize::kib(1),
         );
         let secret = git_secret();
 
@@ -1871,7 +1902,13 @@ exit 42
         );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         let work = dir.path().join("work");
-        let plan = plan_with_paths(git, &work, work.join("out.bundle"), TEST_GIT_TIMEOUT, 1024);
+        let plan = plan_with_paths(
+            git,
+            &work,
+            work.join("out.bundle"),
+            TEST_GIT_TIMEOUT,
+            ByteSize::kib(1),
+        );
 
         run_git_clone_bundle(&plan, &git_secret()).await.unwrap();
 
@@ -1887,7 +1924,13 @@ exit 42
         let dir = tempfile::tempdir().unwrap();
         let (git, _) = fake_git_program(&dir, "", "");
         let work = dir.path().join("work");
-        let plan = plan_with_paths(git, &work, work.join("out.bundle"), TEST_GIT_TIMEOUT, 4);
+        let plan = plan_with_paths(
+            git,
+            &work,
+            work.join("out.bundle"),
+            TEST_GIT_TIMEOUT,
+            ByteSize::from_bytes(4),
+        );
 
         let err = run_git_clone_bundle(&plan, &git_secret())
             .await
@@ -1898,8 +1941,9 @@ exit 42
                 err,
                 GitCloneBundleRunError::BundleTooLarge {
                     bytes,
-                    max_bundle_bytes: 4,
-                } if bytes == "fake-bundle".len() as u64
+                    max_bundle_bytes,
+                } if bytes == ByteSize::of("fake-bundle".len())
+                    && max_bundle_bytes == ByteSize::from_bytes(4)
             ),
             "unexpected error: {err:?}"
         );
@@ -1926,7 +1970,7 @@ exit 42
             "/tmp/work",
             "/tmp/work/out.bundle",
             Duration::from_secs(1),
-            1,
+            ByteSize::from_bytes(1),
         )
         .unwrap();
 

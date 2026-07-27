@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use writ_core::byte_size::ByteSize;
 
 use crate::agent_run::sha256_hex;
 use crate::core::RepoRef;
@@ -202,11 +203,11 @@ impl Drop for MirrorPinGuard {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MirrorCacheBounds {
     max_entries: usize,
-    max_bytes: u64,
+    max_bytes: ByteSize,
 }
 
 impl MirrorCacheBounds {
-    pub fn new(max_entries: usize, max_bytes: u64) -> Self {
+    pub fn new(max_entries: usize, max_bytes: ByteSize) -> Self {
         Self {
             max_entries,
             max_bytes,
@@ -350,7 +351,7 @@ impl MirrorCache {
 
         let mut entries = self.scan_entries();
         let mut total_entries = entries.len();
-        let mut total_bytes: u64 = entries.iter().map(|entry| entry.bytes).sum();
+        let mut total_bytes = ByteSize::from_bytes(entries.iter().map(|entry| entry.bytes).sum());
         if total_entries <= bounds.max_entries && total_bytes <= bounds.max_bytes {
             return MirrorEvictionOutcome::default();
         }
@@ -376,7 +377,8 @@ impl MirrorCache {
                 if std::fs::rename(&entry.path, &deleting).is_ok() {
                     claimed.push((deleting, entry.bytes));
                     total_entries -= 1;
-                    total_bytes = total_bytes.saturating_sub(entry.bytes);
+                    total_bytes =
+                        ByteSize::from_bytes(total_bytes.get().saturating_sub(entry.bytes));
                 }
             }
         }
@@ -819,7 +821,10 @@ mod tests {
         let a = insert_sized(&cache, tmp.path(), 1, 16);
         let b = insert_sized(&cache, tmp.path(), 2, 16);
 
-        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(8, u64::MAX));
+        let outcome = cache.evict_to_bounds(
+            &pins,
+            MirrorCacheBounds::new(8, ByteSize::from_bytes(u64::MAX)),
+        );
 
         assert_eq!(outcome, MirrorEvictionOutcome::default());
         assert!(cache.get(&a).is_some());
@@ -839,7 +844,10 @@ mod tests {
             age_entry(&cache, key, 100 - (i as u64) * 10);
         }
 
-        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(2, u64::MAX));
+        let outcome = cache.evict_to_bounds(
+            &pins,
+            MirrorCacheBounds::new(2, ByteSize::from_bytes(u64::MAX)),
+        );
 
         assert_eq!(outcome.evicted, 2);
         assert_eq!(outcome.retained_pinned, 0);
@@ -862,7 +870,10 @@ mod tests {
             age_entry(&cache, key, 100 - (i as u64) * 10);
         }
 
-        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(usize::MAX, 1536));
+        let outcome = cache.evict_to_bounds(
+            &pins,
+            MirrorCacheBounds::new(usize::MAX, ByteSize::from_bytes(1536)),
+        );
 
         assert_eq!(outcome.evicted, 2);
         assert!(outcome.bytes_freed >= 2048, "freed both payloads");
@@ -884,7 +895,10 @@ mod tests {
         // Pin the oldest; it is the natural first eviction victim but must be
         // kept, so the bound is met by evicting the (newer) unpinned entry.
         let guard = pins.pin(old.slug());
-        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(1, u64::MAX));
+        let outcome = cache.evict_to_bounds(
+            &pins,
+            MirrorCacheBounds::new(1, ByteSize::from_bytes(u64::MAX)),
+        );
 
         assert_eq!(outcome.retained_pinned, 1);
         assert_eq!(outcome.evicted, 1);
@@ -893,7 +907,10 @@ mod tests {
 
         // Once unpinned, a later pass can reclaim it.
         drop(guard);
-        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(0, u64::MAX));
+        let outcome = cache.evict_to_bounds(
+            &pins,
+            MirrorCacheBounds::new(0, ByteSize::from_bytes(u64::MAX)),
+        );
         assert_eq!(outcome.evicted, 1);
         assert!(cache.get(&old).is_none(), "evictable once unpinned");
     }
@@ -917,7 +934,7 @@ mod tests {
         // over-budget snapshot and removing extra entries.
         let (c1, p1) = (cache.clone(), pins.clone());
         let (c2, p2) = (cache.clone(), pins.clone());
-        let bounds = MirrorCacheBounds::new(4, u64::MAX);
+        let bounds = MirrorCacheBounds::new(4, ByteSize::from_bytes(u64::MAX));
         let h1 = std::thread::spawn(move || c1.evict_to_bounds(&p1, bounds));
         let h2 = std::thread::spawn(move || c2.evict_to_bounds(&p2, bounds));
         h1.join().unwrap();
@@ -938,13 +955,19 @@ mod tests {
         let g2 = pins.pin(key.slug());
         drop(g1);
         // One guard still held: eviction must still skip it.
-        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(0, u64::MAX));
+        let outcome = cache.evict_to_bounds(
+            &pins,
+            MirrorCacheBounds::new(0, ByteSize::from_bytes(u64::MAX)),
+        );
         assert_eq!(outcome.retained_pinned, 1);
         assert_eq!(outcome.evicted, 0);
         assert!(cache.get(&key).is_some());
 
         drop(g2);
-        let outcome = cache.evict_to_bounds(&pins, MirrorCacheBounds::new(0, u64::MAX));
+        let outcome = cache.evict_to_bounds(
+            &pins,
+            MirrorCacheBounds::new(0, ByteSize::from_bytes(u64::MAX)),
+        );
         assert_eq!(outcome.evicted, 1);
         assert!(cache.get(&key).is_none());
     }

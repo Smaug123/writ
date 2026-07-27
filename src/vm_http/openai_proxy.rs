@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use writ_core::byte_size::ByteSize;
 
 use serde::Deserialize;
 
@@ -39,7 +40,7 @@ pub struct VmHttpOpenAiProxyConfig {
     chatgpt_refresh_url: reqwest::Url,
     timeout: std::time::Duration,
     max_request_bytes: usize,
-    max_response_bytes: u64,
+    max_response_bytes: ByteSize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -100,8 +101,8 @@ impl VmHttpOpenAiProxyConfig {
         auth_secret: SecretKey,
         auth_kind: VmHttpOpenAiProxyAuthKind,
         timeout: std::time::Duration,
-        max_request_bytes: u64,
-        max_response_bytes: u64,
+        max_request_bytes: ByteSize,
+        max_response_bytes: ByteSize,
     ) -> Result<Self, VmHttpOpenAiProxyConfigError> {
         let raw = upstream_base_url.as_ref();
         if raw.is_empty() {
@@ -110,12 +111,13 @@ impl VmHttpOpenAiProxyConfig {
         if timeout.is_zero() {
             return Err(VmHttpOpenAiProxyConfigError::EmptyTimeout);
         }
-        if max_request_bytes == 0 {
+        if max_request_bytes.is_zero() {
             return Err(VmHttpOpenAiProxyConfigError::EmptyMaxRequestBytes);
         }
-        let max_request_bytes = usize::try_from(max_request_bytes)
-            .map_err(|_| VmHttpOpenAiProxyConfigError::MaxRequestBytesTooLarge)?;
-        if max_response_bytes == 0 {
+        let max_request_bytes = max_request_bytes
+            .to_usize()
+            .ok_or(VmHttpOpenAiProxyConfigError::MaxRequestBytesTooLarge)?;
+        if max_response_bytes.is_zero() {
             return Err(VmHttpOpenAiProxyConfigError::EmptyMaxResponseBytes);
         }
         let mut url = reqwest::Url::parse(raw).map_err(|err| {
@@ -202,7 +204,7 @@ impl VmHttpOpenAiProxyConfig {
         self.max_request_bytes
     }
 
-    pub fn max_response_bytes(&self) -> u64 {
+    pub fn max_response_bytes(&self) -> ByteSize {
         self.max_response_bytes
     }
 }
@@ -216,7 +218,7 @@ impl ProxyBackendConfig for VmHttpOpenAiProxyConfig {
         self.timeout
     }
 
-    fn max_response_bytes(&self) -> u64 {
+    fn max_response_bytes(&self) -> ByteSize {
         self.max_response_bytes
     }
 }
@@ -802,8 +804,8 @@ mod tests {
             secret,
             VmHttpOpenAiProxyAuthKind::ChatgptOauth,
             std::time::Duration::from_secs(5),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
         )
         .unwrap();
         assert_eq!(
@@ -820,8 +822,8 @@ mod tests {
             secret,
             VmHttpOpenAiProxyAuthKind::ChatgptOauth,
             std::time::Duration::from_secs(5),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
         )
         .unwrap()
         .with_chatgpt_refresh_url("https://example.test/refresh")
@@ -840,8 +842,8 @@ mod tests {
             secret,
             VmHttpOpenAiProxyAuthKind::ChatgptOauth,
             std::time::Duration::from_secs(5),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
         )
         .unwrap()
         .with_chatgpt_refresh_url("not-a-url")
@@ -860,8 +862,8 @@ mod tests {
             secret,
             VmHttpOpenAiProxyAuthKind::ChatgptOauth,
             std::time::Duration::from_secs(5),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
         )
         .unwrap()
         .with_chatgpt_refresh_url("ftp://example.test/refresh")
@@ -882,8 +884,8 @@ mod tests {
                 SecretKey::new("openai-chatgpt-auth").unwrap(),
                 VmHttpOpenAiProxyAuthKind::ChatgptOauth,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap()
         };
@@ -919,8 +921,8 @@ mod tests {
             SecretKey::new("openai-api-key").unwrap(),
             VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
             std::time::Duration::from_secs(5),
-            1024,
-            1024,
+            ByteSize::kib(1),
+            ByteSize::kib(1),
         )
         .unwrap();
         assert!(
@@ -960,8 +962,8 @@ mod tests {
                 secret_key,
                 VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1077,8 +1079,8 @@ mod tests {
                 secret_key,
                 VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1137,8 +1139,8 @@ mod tests {
                 secret_key,
                 VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
                 std::time::Duration::from_millis(10),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1231,8 +1233,8 @@ mod tests {
                 secret_key,
                 VmHttpOpenAiProxyAuthKind::ChatgptOauth,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )
@@ -1333,8 +1335,8 @@ mod tests {
                 secret_key.clone(),
                 VmHttpOpenAiProxyAuthKind::ChatgptOauth,
                 std::time::Duration::from_secs(5),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap()
             .with_chatgpt_refresh_url(format!("{}/oauth/token", refresh_server.uri()))
@@ -1403,8 +1405,8 @@ mod tests {
                 secret_key,
                 VmHttpOpenAiProxyAuthKind::ChatgptOauth,
                 std::time::Duration::from_millis(50),
-                1024,
-                1024,
+                ByteSize::kib(1),
+                ByteSize::kib(1),
             )
             .unwrap(),
         )

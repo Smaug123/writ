@@ -14,13 +14,16 @@ use crate::nix_binary_cache::NixNarCompression;
 
 #[test]
 fn nix_cache_nar_length_must_be_declared_and_bounded() {
-    assert_eq!(validate_nar_content_length(Some(42), 42), Ok(42));
     assert_eq!(
-        validate_nar_content_length(None, 42),
+        validate_nar_content_length(Some(ByteSize::from_bytes(42)), ByteSize::from_bytes(42)),
+        Ok(ByteSize::from_bytes(42))
+    );
+    assert_eq!(
+        validate_nar_content_length(None, ByteSize::from_bytes(42)),
         Err(VmHttpNixCacheNarLengthError::Missing)
     );
     assert_eq!(
-        validate_nar_content_length(Some(43), 42),
+        validate_nar_content_length(Some(ByteSize::from_bytes(43)), ByteSize::from_bytes(42)),
         Err(VmHttpNixCacheNarLengthError::TooLarge {
             max: 42,
             actual: 43
@@ -34,7 +37,7 @@ fn xz_nar_body_rejects_decoded_size_smaller_than_signed_size() {
     let short_body = &raw_body[..raw_body.len() - 1];
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Xz, &raw_body);
 
-    let result = verify_nar_body(&admission, &xz_nar_body_for(short_body), 1024);
+    let result = verify_nar_body(&admission, &xz_nar_body_for(short_body), ByteSize::kib(1));
 
     assert_eq!(
         result,
@@ -50,7 +53,12 @@ fn xz_nar_body_accepts_concatenated_streams() {
     let raw_body = test_raw_nar_body();
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Xz, &raw_body);
 
-    verify_nar_body(&admission, &multi_stream_xz_body_for(&raw_body), 1024).unwrap();
+    verify_nar_body(
+        &admission,
+        &multi_stream_xz_body_for(&raw_body),
+        ByteSize::kib(1),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -58,7 +66,7 @@ fn zstd_nar_body_round_trips_against_admitted_metadata() {
     let raw_body = test_raw_nar_body();
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Zstd, &raw_body);
 
-    verify_nar_body(&admission, &zstd_nar_body_for(&raw_body), 1024).unwrap();
+    verify_nar_body(&admission, &zstd_nar_body_for(&raw_body), ByteSize::kib(1)).unwrap();
 }
 
 #[test]
@@ -66,7 +74,12 @@ fn zstd_nar_body_accepts_concatenated_frames() {
     let raw_body = test_raw_nar_body();
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Zstd, &raw_body);
 
-    verify_nar_body(&admission, &multi_stream_zstd_body_for(&raw_body), 1024).unwrap();
+    verify_nar_body(
+        &admission,
+        &multi_stream_zstd_body_for(&raw_body),
+        ByteSize::kib(1),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -75,7 +88,7 @@ fn zstd_nar_body_rejects_decoded_size_smaller_than_signed_size() {
     let short_body = &raw_body[..raw_body.len() - 1];
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Zstd, &raw_body);
 
-    let result = verify_nar_body(&admission, &zstd_nar_body_for(short_body), 1024);
+    let result = verify_nar_body(&admission, &zstd_nar_body_for(short_body), ByteSize::kib(1));
 
     assert_eq!(
         result,
@@ -96,7 +109,7 @@ fn zstd_nar_body_rejects_corrupt_frame() {
     wire[corrupt_index] ^= 0xff;
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Zstd, &raw_body);
 
-    let result = verify_nar_body(&admission, &wire, 1024);
+    let result = verify_nar_body(&admission, &wire, ByteSize::kib(1));
 
     assert!(
         matches!(result, Err(VmHttpNixCacheNarVerifyError::Decode { .. })),
@@ -113,7 +126,7 @@ fn zstd_nar_body_rejects_window_larger_than_decoder_ceiling() {
     let hostile = zstd_nar_body_with_window_log(&raw_body, ZSTD_DECODER_WINDOW_LOG_MAX + 1);
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Zstd, &raw_body);
 
-    let result = verify_nar_body(&admission, &hostile, 1024);
+    let result = verify_nar_body(&admission, &hostile, ByteSize::kib(1));
 
     assert!(
         matches!(result, Err(VmHttpNixCacheNarVerifyError::Decode { .. })),
@@ -132,5 +145,5 @@ fn zstd_nar_body_accepts_the_window_cache_nixos_org_advertises() {
     let wire = zstd_nar_body_with_window_log(&raw_body, CACHE_WINDOW_LOG);
     let admission = admitted_nar_for_body(TEST_NAR_FILE, NixNarCompression::Zstd, &raw_body);
 
-    verify_nar_body(&admission, &wire, 1024).unwrap();
+    verify_nar_body(&admission, &wire, ByteSize::kib(1)).unwrap();
 }
