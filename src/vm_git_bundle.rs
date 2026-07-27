@@ -159,6 +159,12 @@ pub enum GitCloneBundleRunError {
     BundleInsideMirror(PathBuf),
     #[error("bundle path resolves outside the Git clone work directory: {0}")]
     BundleEscapedWorkDir(PathBuf),
+    /// The bundle target resolves *to* the work directory itself. Reachable
+    /// through the pre-create check, which runs before the bundle exists: a
+    /// symlinked parent can make an otherwise-nested target canonicalise back
+    /// onto the work dir.
+    #[error("bundle path resolves to the Git clone work directory itself: {0}")]
+    BundleIsWorkDir(PathBuf),
     #[error("{step} command could not be spawned: {source}")]
     Spawn {
         step: GitCloneCommandStep,
@@ -419,16 +425,16 @@ impl GitCloneBundlePlan {
         let work_dir = normalize_absolute_path_lexically(work_dir);
         let bundle_path = normalize_absolute_path_lexically(bundle_path);
         let mirror_dir = work_dir.join(DEFAULT_MIRROR_DIR_NAME);
-        if bundle_path == work_dir {
-            return Err(GitCloneBundlePlanError::BundlePathIsWorkDir(bundle_path));
-        }
-        if !bundle_path.starts_with(&work_dir) {
-            return Err(GitCloneBundlePlanError::BundleOutsideWorkDir(bundle_path));
-        }
-        // The executor slice must repeat this check after canonicalising the
-        // created paths so symlinks cannot move the bundle into the mirror.
-        if bundle_path.starts_with(&mirror_dir) {
-            return Err(GitCloneBundlePlanError::BundleInsideMirror(bundle_path));
+        // Lexical evidence: these paths need not exist yet, so they cannot be
+        // canonicalised. The executor re-runs *this same predicate* against
+        // canonicalised paths once they do (see `validate_bundle_location`), so
+        // a symlink cannot alias its way past the check after the fact.
+        let boundary = BundleBoundary {
+            work_dir: &work_dir,
+            mirror_dir: &mirror_dir,
+        };
+        if let Err(violation) = boundary.check(&bundle_path) {
+            return Err(violation.into_plan_error(bundle_path));
         }
 
         Ok(Self {
@@ -739,35 +745,79 @@ async fn canonicalize_path(
         })
 }
 
-/// The one runtime boundary check on a bundle path: it must sit under the
-/// broker-owned work dir and must not sit under the mirror inside it.
+/// Where a bundle is allowed to sit: under the broker-owned work dir, and not
+/// under the mirror inside it.
 ///
-/// Both assertions live here, against one pair of freshly-canonicalised
-/// directories, because they are one question — "is this path somewhere we are
-/// willing to write a bundle?" — and splitting them invited exactly the drift
-/// that used to exist: two callers each canonicalised `work_dir` and `mirror_dir`
-/// separately and repeated the comparisons, so the two checks could be updated
-/// out of step and a reader could not tell whether they still agreed.
+/// This is the *policy*, defined once. It is asked twice — lexically at plan
+/// time, when the paths need not exist yet, and against freshly-canonicalised
+/// paths at run time, when a symlink could otherwise have aliased the bundle
+/// somewhere else since. Those two differ only in the *evidence* they are given;
+/// having them differ in the question as well is what previously let the checks
+/// drift out of step, with no reader able to tell whether they still agreed.
+struct BundleBoundary<'a> {
+    work_dir: &'a Path,
+    mirror_dir: &'a Path,
+}
+
+/// How a bundle path fails [`BundleBoundary::check`]. Deliberately phase-neutral:
+/// each phase maps it to its own error type, so the predicate stays one
+/// definition while the diagnostics stay specific about when it was asked.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BundleBoundaryViolation {
+    IsWorkDir,
+    OutsideWorkDir,
+    InsideMirror,
+}
+
+impl BundleBoundary<'_> {
+    fn check(&self, bundle: &Path) -> Result<(), BundleBoundaryViolation> {
+        if bundle == self.work_dir {
+            return Err(BundleBoundaryViolation::IsWorkDir);
+        }
+        if !bundle.starts_with(self.work_dir) {
+            return Err(BundleBoundaryViolation::OutsideWorkDir);
+        }
+        if bundle.starts_with(self.mirror_dir) {
+            return Err(BundleBoundaryViolation::InsideMirror);
+        }
+        Ok(())
+    }
+}
+
+impl BundleBoundaryViolation {
+    fn into_plan_error(self, bundle: PathBuf) -> GitCloneBundlePlanError {
+        match self {
+            Self::IsWorkDir => GitCloneBundlePlanError::BundlePathIsWorkDir(bundle),
+            Self::OutsideWorkDir => GitCloneBundlePlanError::BundleOutsideWorkDir(bundle),
+            Self::InsideMirror => GitCloneBundlePlanError::BundleInsideMirror(bundle),
+        }
+    }
+
+    fn into_run_error(self, bundle: PathBuf) -> GitCloneBundleRunError {
+        match self {
+            Self::IsWorkDir => GitCloneBundleRunError::BundleIsWorkDir(bundle),
+            Self::OutsideWorkDir => GitCloneBundleRunError::BundleEscapedWorkDir(bundle),
+            Self::InsideMirror => GitCloneBundleRunError::BundleInsideMirror(bundle),
+        }
+    }
+}
+
+/// Ask [`BundleBoundary`] the run-time question, against canonical paths.
 ///
-/// `bundle` must already be canonical. It is compared against canonical
-/// directories, so a symlink cannot alias its way past either check.
+/// `bundle` must already be canonical, and the directories are canonicalised
+/// here, so a symlink cannot alias its way past the check.
 async fn validate_bundle_location(
     plan: &GitCloneBundlePlan,
     bundle: &Path,
 ) -> Result<(), GitCloneBundleRunError> {
     let work_dir = canonicalize_path("work_dir", plan.work_dir()).await?;
-    if !bundle.starts_with(&work_dir) {
-        return Err(GitCloneBundleRunError::BundleEscapedWorkDir(
-            bundle.to_path_buf(),
-        ));
+    let mirror_dir = canonicalize_path("mirror_dir", plan.mirror_dir()).await?;
+    BundleBoundary {
+        work_dir: &work_dir,
+        mirror_dir: &mirror_dir,
     }
-    let mirror = canonicalize_path("mirror_dir", plan.mirror_dir()).await?;
-    if bundle.starts_with(&mirror) {
-        return Err(GitCloneBundleRunError::BundleInsideMirror(
-            bundle.to_path_buf(),
-        ));
-    }
-    Ok(())
+    .check(bundle)
+    .map_err(|violation| violation.into_run_error(bundle.to_path_buf()))
 }
 
 fn normalize_absolute_path_lexically(path: PathBuf) -> PathBuf {
@@ -1147,7 +1197,104 @@ exit 42
         (plan, repo_url, expected_ref)
     }
 
+    /// Path components that stay inside one directory level: no separators, no
+    /// `.`/`..`, so a generated path's shape is exactly what it reads as.
+    fn path_segment_strategy() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(vec!['a', 'b', 'm', '-', '_', '1']),
+            1..6,
+        )
+        .prop_map(|chars| chars.into_iter().collect::<String>())
+        .prop_filter("segment must not be a relative-path component", |s| {
+            s != "." && s != ".."
+        })
+    }
+
+    /// An absolute path under `/w`, sometimes reaching into the mirror and
+    /// sometimes escaping the work dir entirely, so the generator exercises
+    /// every arm of the predicate rather than just the accepting one.
+    fn bundle_candidate_strategy() -> impl Strategy<Value = PathBuf> {
+        prop::collection::vec(path_segment_strategy(), 0..4).prop_flat_map(|tail| {
+            prop::sample::select(vec!["/w", "/w/mirror.git", "/elsewhere", "/"]).prop_map(
+                move |root| {
+                    let mut path = PathBuf::from(root);
+                    for segment in &tail {
+                        path.push(segment);
+                    }
+                    path
+                },
+            )
+        })
+    }
+
     proptest! {
+        /// The predicate's contract, stated independently of how it is
+        /// implemented. Both phases — lexical at plan time, canonical at run
+        /// time — ask exactly this, so pinning it here is what stops the two
+        /// drifting apart again.
+        #[test]
+        fn bundle_boundary_admits_exactly_the_paths_it_promises(
+            bundle in bundle_candidate_strategy(),
+        ) {
+            let work_dir = PathBuf::from("/w");
+            let mirror_dir = work_dir.join(DEFAULT_MIRROR_DIR_NAME);
+            let boundary = BundleBoundary {
+                work_dir: &work_dir,
+                mirror_dir: &mirror_dir,
+            };
+
+            let inside_work_dir = bundle.starts_with(&work_dir) && bundle != work_dir;
+            let inside_mirror = bundle.starts_with(&mirror_dir);
+            let should_admit = inside_work_dir && !inside_mirror;
+
+            match boundary.check(&bundle) {
+                Ok(()) => prop_assert!(
+                    should_admit,
+                    "admitted {bundle:?}, which is not strictly under {work_dir:?} outside {mirror_dir:?}",
+                ),
+                Err(violation) => {
+                    prop_assert!(!should_admit, "rejected admissible {bundle:?} as {violation:?}");
+                    // The reported reason must be the true one, not merely *a*
+                    // reason: an operator reading "inside the mirror" for a path
+                    // that is nowhere near it would be misled.
+                    let expected = if bundle == work_dir {
+                        BundleBoundaryViolation::IsWorkDir
+                    } else if !bundle.starts_with(&work_dir) {
+                        BundleBoundaryViolation::OutsideWorkDir
+                    } else {
+                        BundleBoundaryViolation::InsideMirror
+                    };
+                    prop_assert_eq!(violation, expected, "wrong reason for {:?}", bundle);
+                }
+            }
+        }
+
+        /// Whatever the predicate rejects, both phases reject — and each reports
+        /// it in its own vocabulary. This is the anti-drift property: the two
+        /// phases differ in the evidence they are given, never in the question.
+        #[test]
+        fn both_phases_map_every_violation_to_their_own_error(
+            bundle in bundle_candidate_strategy(),
+        ) {
+            let work_dir = PathBuf::from("/w");
+            let mirror_dir = work_dir.join(DEFAULT_MIRROR_DIR_NAME);
+            let boundary = BundleBoundary {
+                work_dir: &work_dir,
+                mirror_dir: &mirror_dir,
+            };
+            let Err(violation) = boundary.check(&bundle) else {
+                return Ok(());
+            };
+            let plan_error = violation.into_plan_error(bundle.clone());
+            let run_error = violation.into_run_error(bundle.clone());
+            prop_assert_eq!(
+                matches!(plan_error, GitCloneBundlePlanError::BundleInsideMirror(_)),
+                matches!(run_error, GitCloneBundleRunError::BundleInsideMirror(_)),
+                "phases disagree on whether {:?} is a mirror escape",
+                bundle,
+            );
+        }
+
         #[test]
         fn plan_argv_contains_only_expected_dynamic_inputs(
             owner in owner_strategy(),
@@ -1578,6 +1725,37 @@ exit 42
             "unexpected error: {err:?}"
         );
         assert!(!outside.join("out.bundle").exists());
+    }
+
+    /// A nested bundle path whose parent is replaced, during the clone, by a
+    /// symlink that resolves back onto the work dir. The pre-create check runs
+    /// before the bundle exists, so this reaches the boundary predicate with a
+    /// target *equal* to the work dir — the arm that would otherwise have been
+    /// dismissed as unreachable and reported as a plain escape.
+    #[tokio::test]
+    async fn executor_rejects_a_bundle_target_that_resolves_onto_the_work_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        // `work/up` becomes a symlink to the work dir's *parent*, so the
+        // bundle path `work/up/work` has a parent that canonicalises to that
+        // parent — and joining the final component "work" lands exactly on the
+        // work dir itself.
+        let up = work.join("up");
+        let ln = shell_quote(&required_test_tool("ln"));
+        let clone_extra = format!("{ln} -s {} {}\n", shell_quote(dir.path()), shell_quote(&up));
+        let (git, _) = fake_git_program(&dir, &clone_extra, "");
+        // Lexically this is a nested path with no `..` component, so plan-time
+        // validation admits it; only the canonical pass can see where it lands.
+        let plan = plan_with_paths(git, &work, up.join("work"), TEST_GIT_TIMEOUT, 1024);
+
+        let err = run_git_clone_bundle(&plan, &git_secret())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, GitCloneBundleRunError::BundleIsWorkDir(_)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
