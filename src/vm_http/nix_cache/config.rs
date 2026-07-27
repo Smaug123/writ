@@ -4,13 +4,15 @@
 
 use std::path::PathBuf;
 
+use writ_core::byte_size::ByteSize;
+
 use crate::nix_binary_cache::NixTrustedPublicKeys;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpNixCacheConfig {
     upstream_base_url: reqwest::Url,
-    max_metadata_bytes: u64,
-    max_nar_bytes: u64,
+    max_metadata_bytes: ByteSize,
+    max_nar_bytes: ByteSize,
     trusted_public_keys: NixTrustedPublicKeys,
     /// The broker's local archives, served *local-first* and in order ahead of
     /// the upstream proxy: for a requested hash the first dir holding a
@@ -45,8 +47,8 @@ pub enum VmHttpNixCacheConfigError {
 impl VmHttpNixCacheConfig {
     pub fn new(
         upstream_base_url: impl AsRef<str>,
-        max_metadata_bytes: u64,
-        max_nar_bytes: u64,
+        max_metadata_bytes: ByteSize,
+        max_nar_bytes: ByteSize,
     ) -> Result<Self, VmHttpNixCacheConfigError> {
         Self::new_with_trusted_public_keys(
             upstream_base_url,
@@ -58,18 +60,18 @@ impl VmHttpNixCacheConfig {
 
     pub fn new_with_trusted_public_keys(
         upstream_base_url: impl AsRef<str>,
-        max_metadata_bytes: u64,
-        max_nar_bytes: u64,
+        max_metadata_bytes: ByteSize,
+        max_nar_bytes: ByteSize,
         trusted_public_keys: NixTrustedPublicKeys,
     ) -> Result<Self, VmHttpNixCacheConfigError> {
         let raw = upstream_base_url.as_ref();
         if raw.is_empty() {
             return Err(VmHttpNixCacheConfigError::EmptyUpstreamUrl);
         }
-        if max_metadata_bytes == 0 {
+        if max_metadata_bytes.is_zero() {
             return Err(VmHttpNixCacheConfigError::EmptyMaxMetadataBytes);
         }
-        if max_nar_bytes == 0 {
+        if max_nar_bytes.is_zero() {
             return Err(VmHttpNixCacheConfigError::EmptyMaxNarBytes);
         }
         let mut url = reqwest::Url::parse(raw).map_err(|err| {
@@ -139,11 +141,11 @@ impl VmHttpNixCacheConfig {
         &self.local_cache_dirs
     }
 
-    pub fn max_metadata_bytes(&self) -> u64 {
+    pub fn max_metadata_bytes(&self) -> ByteSize {
         self.max_metadata_bytes
     }
 
-    pub fn max_nar_bytes(&self) -> u64 {
+    pub fn max_nar_bytes(&self) -> ByteSize {
         self.max_nar_bytes
     }
 

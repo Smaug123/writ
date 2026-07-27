@@ -354,9 +354,12 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
     );
     assert_eq!(
         runtime.vm_http().nix_cache().max_metadata_bytes(),
-        1_048_576
+        ByteSize::from_bytes(1_048_576)
     );
-    assert_eq!(runtime.vm_http().nix_cache().max_nar_bytes(), 67_108_864);
+    assert_eq!(
+        runtime.vm_http().nix_cache().max_nar_bytes(),
+        ByteSize::from_bytes(67_108_864)
+    );
     // Omitted from JSON, so the local flake-input cache defaults under
     // work_root and is the sole local cache dir wired into the nix-cache
     // config (no pre-warm dir configured).
@@ -384,7 +387,10 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
         "2023-06-01"
     );
     assert_eq!(claude_proxy.max_request_bytes(), 2_097_152);
-    assert_eq!(claude_proxy.max_response_bytes(), 8_388_608);
+    assert_eq!(
+        claude_proxy.max_response_bytes(),
+        ByteSize::from_bytes(8_388_608)
+    );
     assert_eq!(runtime.vm_http().agent_run_log_root(), agent_run_log_root);
     assert_eq!(
         runtime.vm_http().git_push_staging_root(),
@@ -520,11 +526,11 @@ fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
         token_env: "WRIT_GIT_TOKEN".into(),
         work_root,
         clone_timeout_secs: 30,
-        max_bundle_bytes: 1_048_576,
+        max_bundle_bytes: ByteSize::from_bytes(1_048_576),
         nix_cache_url: "https://cache.nixos.org".into(),
         nix_cache_trusted_public_keys: Vec::new(),
-        nix_cache_max_metadata_bytes: 1_048_576,
-        nix_cache_max_nar_bytes: 67_108_864,
+        nix_cache_max_metadata_bytes: ByteSize::from_bytes(1_048_576),
+        nix_cache_max_nar_bytes: ByteSize::from_bytes(67_108_864),
         flake_input_cache_dir: None,
         nix_prewarm_cache_dir: None,
         flake_mirror_cache_dir: None,
@@ -819,7 +825,7 @@ fn agent_vm_http_config_rejects_zero_clone_timeout() {
 #[test]
 fn agent_vm_http_config_rejects_zero_max_bundle_bytes() {
     let mut c = valid_agent_vm_http_config();
-    c.max_bundle_bytes = 0;
+    c.max_bundle_bytes = ByteSize::from_bytes(0);
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
@@ -843,7 +849,7 @@ fn agent_vm_http_config_rejects_invalid_nix_cache_url() {
 #[test]
 fn agent_vm_http_config_rejects_zero_nix_cache_metadata_limit() {
     let mut c = valid_agent_vm_http_config();
-    c.nix_cache_max_metadata_bytes = 0;
+    c.nix_cache_max_metadata_bytes = ByteSize::from_bytes(0);
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
@@ -854,7 +860,7 @@ fn agent_vm_http_config_rejects_zero_nix_cache_metadata_limit() {
 #[test]
 fn agent_vm_http_config_rejects_zero_nix_cache_nar_limit() {
     let mut c = valid_agent_vm_http_config();
-    c.nix_cache_max_nar_bytes = 0;
+    c.nix_cache_max_nar_bytes = ByteSize::from_bytes(0);
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
@@ -886,8 +892,8 @@ fn agent_vm_http_config_rejects_invalid_claude_proxy_url() {
         auth_kind: VmHttpClaudeProxyAuthKind::XApiKey,
         anthropic_version: DEFAULT_CLAUDE_ANTHROPIC_VERSION.into(),
         timeout_secs: 60,
-        max_request_bytes: 1_048_576,
-        max_response_bytes: 8_388_608,
+        max_request_bytes: ByteSize::from_bytes(1_048_576),
+        max_response_bytes: ByteSize::from_bytes(8_388_608),
     });
 
     assert!(matches!(
@@ -907,8 +913,8 @@ fn agent_vm_http_config_rejects_zero_claude_proxy_request_limit() {
         auth_kind: VmHttpClaudeProxyAuthKind::XApiKey,
         anthropic_version: DEFAULT_CLAUDE_ANTHROPIC_VERSION.into(),
         timeout_secs: 60,
-        max_request_bytes: 0,
-        max_response_bytes: 8_388_608,
+        max_request_bytes: ByteSize::from_bytes(0),
+        max_response_bytes: ByteSize::from_bytes(8_388_608),
     });
 
     assert!(matches!(
@@ -935,14 +941,14 @@ fn agent_vm_http_config_applies_defaults_for_omitted_fields() {
     assert_eq!(c.token_env, "WRIT_GIT_TOKEN");
     assert_eq!(c.work_root, default_vm_http_work_root());
     assert_eq!(c.clone_timeout_secs, 300);
-    assert_eq!(c.max_bundle_bytes, 64 * 1024 * 1024);
+    assert_eq!(c.max_bundle_bytes, ByteSize::mib(64));
     assert_eq!(c.nix_cache_url, "https://cache.nixos.org");
     assert_eq!(
         c.nix_cache_trusted_public_keys,
         vec!["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=".to_string()]
     );
-    assert_eq!(c.nix_cache_max_metadata_bytes, 1024 * 1024);
-    assert_eq!(c.nix_cache_max_nar_bytes, 512 * 1024 * 1024);
+    assert_eq!(c.nix_cache_max_metadata_bytes, ByteSize::mib(1));
+    assert_eq!(c.nix_cache_max_nar_bytes, ByteSize::mib(512));
     assert!(c.claude_proxy.is_none());
     assert!(c.openai_proxy.is_none());
     assert!(c.agent_run_log_root.is_none());
@@ -1230,14 +1236,17 @@ fn agent_vm_http_config_pairs_gc_bounds_with_the_mirror_cache() {
     let mut c = valid_agent_vm_http_config();
     c.flake_mirror_cache_dir = Some(unique_config_test_path("flake-mirror-cache"));
     c.flake_mirror_cache_max_entries = 7;
-    c.flake_mirror_cache_max_bytes = 4096;
+    c.flake_mirror_cache_max_bytes = ByteSize::from_bytes(4096);
 
     let runtime = c.to_runtime_config().unwrap();
 
     // Eviction bounds are wired exactly when the cache they bound exists.
     assert_eq!(
         runtime.git_clone().mirror_gc_bounds(),
-        Some(crate::vm_git_mirror_cache::MirrorCacheBounds::new(7, 4096))
+        Some(crate::vm_git_mirror_cache::MirrorCacheBounds::new(
+            7,
+            ByteSize::from_bytes(4096)
+        ))
     );
 }
 
@@ -1318,7 +1327,7 @@ fn agent_vm_http_config_rejects_unwritable_flake_input_cache_dir() {
 #[test]
 fn agent_vm_http_config_rejects_zero_git_push_body_limit() {
     let mut c = valid_agent_vm_http_config();
-    c.git_push_max_metadata_bytes = 0;
+    c.git_push_max_metadata_bytes = ByteSize::from_bytes(0);
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
@@ -1657,7 +1666,7 @@ fn agent_vm_http_config_reports_every_independent_failure() {
     c.nix_cache_trusted_public_keys = vec!["missing-the-colon".into()];
     c.agent_run_log_root = Some(PathBuf::from("relative/log-root"));
     c.git_push_staging_root = Some(PathBuf::from("relative/staging"));
-    c.git_push_max_body_bytes = 0;
+    c.git_push_max_body_bytes = ByteSize::from_bytes(0);
     c.flake_mirror_cache_dir = Some(PathBuf::from("relative/mirrors"));
     c.nix_prewarm_cache_dir = Some(PathBuf::from("relative/prewarm"));
 
@@ -1696,7 +1705,7 @@ fn agent_vm_daemon_config_reports_lifecycle_and_vm_http_failures_together() {
     lifecycle.cpus = 0;
     let mut vm_http = valid_agent_vm_http_config();
     vm_http.nix_cache_url = "not-a-url".into();
-    vm_http.git_push_max_body_bytes = 0;
+    vm_http.git_push_max_body_bytes = ByteSize::from_bytes(0);
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
     let errors = config.to_runtime_config().unwrap_err();

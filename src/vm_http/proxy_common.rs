@@ -14,6 +14,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use writ_core::byte_size::ByteSize;
 
 use bytes::Bytes;
 use futures_util::Stream;
@@ -177,7 +178,7 @@ impl ProxyUpstreamBodyError {
 /// the configured `max` byte count would be exceeded.
 pub(super) async fn read_upstream_body_bounded(
     mut response: reqwest::Response,
-    max: u64,
+    max: ByteSize,
 ) -> Result<Vec<u8>, ProxyUpstreamBodyError> {
     let mut body = Vec::new();
     loop {
@@ -195,9 +196,9 @@ pub(super) async fn read_upstream_body_bounded(
         let new_len = (body.len() as u64)
             .checked_add(chunk_len)
             .expect("HTTP response byte count overflowed before configured bound check");
-        if new_len > max {
+        if ByteSize::from_bytes(new_len) > max {
             return Err(ProxyUpstreamBodyError::ResponseTooLarge {
-                max,
+                max: max.get(),
                 bytes_read: new_len,
             });
         }
@@ -225,7 +226,7 @@ pub(super) trait ProxyAudit: 'static {
 pub(super) trait ProxyBackendConfig: Clone + Send + Sync + 'static {
     fn upstream_base_url(&self) -> &reqwest::Url;
     fn timeout(&self) -> std::time::Duration;
-    fn max_response_bytes(&self) -> u64;
+    fn max_response_bytes(&self) -> ByteSize;
 }
 
 /// Per-backend behaviour the VM HTTP proxy dispatcher relies on.
@@ -407,7 +408,7 @@ pub(super) struct ProxyStreamBody<B: ProxyBackend> {
     pub(super) request_id: RequestId,
     pub(super) upstream_url: String,
     pub(super) upstream_status: u16,
-    pub(super) max_response_bytes: u64,
+    pub(super) max_response_bytes: ByteSize,
     pub(super) response_bytes: u64,
     pub(super) state: ProxyStreamState,
 }
@@ -454,7 +455,7 @@ impl<B: ProxyBackend> HyperBody for ProxyStreamBody<B> {
                     .response_bytes
                     .checked_add(chunk_len)
                     .expect("HTTP response byte count overflowed before configured bound check");
-                if new_len > me.max_response_bytes {
+                if ByteSize::from_bytes(new_len) > me.max_response_bytes {
                     me.response_bytes = new_len;
                     me.state = ProxyStreamState::OverMax;
                     // Abort rather than ending the body cleanly, for the same
@@ -545,7 +546,7 @@ pub(super) struct PendingProxyStream<B: ProxyBackend> {
     pub(super) upstream_status: u16,
     pub(super) content_type: &'static str,
     pub(super) headers: Vec<VmHttpResponseHeader>,
-    pub(super) max_response_bytes: u64,
+    pub(super) max_response_bytes: ByteSize,
     pub(super) _backend: PhantomData<fn() -> B>,
 }
 

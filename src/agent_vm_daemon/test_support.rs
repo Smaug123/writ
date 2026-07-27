@@ -12,6 +12,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
+use writ_core::byte_size::ByteSize;
 
 use crate::audit::AuditLog;
 use crate::core::{
@@ -548,13 +549,13 @@ fn daemon_config_inner(
         credential,
         dir.join("git-work"),
         std::time::Duration::from_secs(1),
-        1024 * 1024,
+        ByteSize::mib(1),
     )
     .unwrap();
     let nix_cache = VmHttpNixCacheConfig::new_with_trusted_public_keys(
         "http://127.0.0.1:9",
-        1024 * 1024,
-        1024 * 1024,
+        ByteSize::mib(1),
+        ByteSize::mib(1),
         NixTrustedPublicKeys::from_strings([TEST_NIX_CACHE_PUBLIC_KEY]).unwrap(),
     )
     .unwrap()
@@ -569,7 +570,12 @@ fn daemon_config_inner(
                 nix_cache,
                 dir.join("agent-runs"),
                 dir.join("git-push-staging"),
-                VmGitPushBodyLimits::new(65 * 1024 * 1024, 16 * 1024, 64 * 1024 * 1024).unwrap(),
+                VmGitPushBodyLimits::new(
+                    ByteSize::from_bytes(65 * 1024 * 1024),
+                    ByteSize::kib(16),
+                    ByteSize::mib(64),
+                )
+                .unwrap(),
             )
             .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir),
         )

@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use writ_core::byte_size::ByteSize;
 
 use serde::Deserialize;
 
@@ -83,7 +84,7 @@ pub enum FlakeInputClass {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct FlakeProvisionBounds {
     max_input_count: usize,
-    max_total_bytes: u64,
+    max_total_bytes: ByteSize,
     timeout: Duration,
 }
 
@@ -521,13 +522,13 @@ fn is_unique_local_v6(v6: std::net::Ipv6Addr) -> bool {
 impl FlakeProvisionBounds {
     pub fn new(
         max_input_count: usize,
-        max_total_bytes: u64,
+        max_total_bytes: ByteSize,
         timeout: Duration,
     ) -> Result<Self, FlakeProvisionBoundsError> {
         if max_input_count == 0 {
             return Err(FlakeProvisionBoundsError::EmptyMaxInputCount);
         }
-        if max_total_bytes == 0 {
+        if max_total_bytes.is_zero() {
             return Err(FlakeProvisionBoundsError::EmptyMaxTotalBytes);
         }
         if timeout.is_zero() {
@@ -544,7 +545,7 @@ impl FlakeProvisionBounds {
         self.max_input_count
     }
 
-    pub fn max_total_bytes(&self) -> u64 {
+    pub fn max_total_bytes(&self) -> ByteSize {
         self.max_total_bytes
     }
 
@@ -658,7 +659,8 @@ mod tests {
     use serde_json::{Value, json};
 
     fn bounds(max_input_count: usize) -> FlakeProvisionBounds {
-        FlakeProvisionBounds::new(max_input_count, 1 << 30, Duration::from_secs(300)).unwrap()
+        FlakeProvisionBounds::new(max_input_count, ByteSize::gib(1), Duration::from_secs(300))
+            .unwrap()
     }
 
     /// Build a minimal flake.lock JSON from `(node_id, locked_json)` inputs:
@@ -997,15 +999,17 @@ mod tests {
     #[test]
     fn bounds_reject_degenerate_values() {
         assert_eq!(
-            FlakeProvisionBounds::new(0, 1, Duration::from_secs(1)).unwrap_err(),
+            FlakeProvisionBounds::new(0, ByteSize::from_bytes(1), Duration::from_secs(1))
+                .unwrap_err(),
             FlakeProvisionBoundsError::EmptyMaxInputCount
         );
         assert_eq!(
-            FlakeProvisionBounds::new(1, 0, Duration::from_secs(1)).unwrap_err(),
+            FlakeProvisionBounds::new(1, ByteSize::from_bytes(0), Duration::from_secs(1))
+                .unwrap_err(),
             FlakeProvisionBoundsError::EmptyMaxTotalBytes
         );
         assert_eq!(
-            FlakeProvisionBounds::new(1, 1, Duration::ZERO).unwrap_err(),
+            FlakeProvisionBounds::new(1, ByteSize::from_bytes(1), Duration::ZERO).unwrap_err(),
             FlakeProvisionBoundsError::EmptyTimeout
         );
     }

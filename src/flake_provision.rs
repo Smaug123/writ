@@ -56,6 +56,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
+use writ_core::byte_size::ByteSize;
 
 use tokio::process::Command;
 
@@ -74,7 +75,7 @@ pub struct FlakeProvisionReport {
     request_id: RequestId,
     input_count: usize,
     archived_path_count: u64,
-    archived_bytes: u64,
+    archived_bytes: ByteSize,
 }
 
 impl FlakeProvisionReport {
@@ -95,7 +96,7 @@ impl FlakeProvisionReport {
     }
 
     /// Total on-disk size of the cache after the archive.
-    pub fn archived_bytes(&self) -> u64 {
+    pub fn archived_bytes(&self) -> ByteSize {
         self.archived_bytes
     }
 }
@@ -136,8 +137,8 @@ pub enum FlakeProvisionError {
          the over-budget cache is not provisioned (fail-closed)"
     )]
     OverBudget {
-        archived_bytes: u64,
-        max_total_bytes: u64,
+        archived_bytes: ByteSize,
+        max_total_bytes: ByteSize,
     },
 }
 
@@ -205,7 +206,7 @@ impl PerformedFlakeProvision {
         match self {
             Self::Provisioned(report) => FlakeProvisionResult::Success {
                 archived_path_count: report.archived_path_count,
-                archived_bytes: report.archived_bytes,
+                archived_bytes: report.archived_bytes.get(),
             },
             Self::Failed { message, .. } => FlakeProvisionResult::Failure { error: message },
         }
@@ -635,7 +636,7 @@ impl Drop for StagingCleanup {
 
 /// Recursively sum the regular-file bytes under `dir` and count `*.narinfo`
 /// files (= store paths archived into the cache).
-fn scan_cache(dir: &Path) -> std::io::Result<(u64, u64)> {
+fn scan_cache(dir: &Path) -> std::io::Result<(u64, ByteSize)> {
     let mut narinfo_count = 0u64;
     let mut total_bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -653,7 +654,7 @@ fn scan_cache(dir: &Path) -> std::io::Result<(u64, u64)> {
             }
         }
     }
-    Ok((narinfo_count, total_bytes))
+    Ok((narinfo_count, ByteSize::from_bytes(total_bytes)))
 }
 
 #[cfg(test)]
@@ -672,7 +673,7 @@ mod tests {
         }
     }
 
-    fn bounds(max_total_bytes: u64) -> FlakeProvisionBounds {
+    fn bounds(max_total_bytes: ByteSize) -> FlakeProvisionBounds {
         FlakeProvisionBounds::new(64, max_total_bytes, Duration::from_secs(120)).unwrap()
     }
 
@@ -746,7 +747,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         write_no_input_flake(flake.path());
 
-        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(1 << 30))
+        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(ByteSize::gib(1)))
             .await
             .expect("a no-input flake is admissible");
 
@@ -761,7 +762,7 @@ mod tests {
             "the flake's own source path should be archived, got {}",
             report.archived_path_count()
         );
-        assert!(report.archived_bytes() > 0);
+        assert!(report.archived_bytes() > ByteSize::from_bytes(0));
 
         // The cache really holds narinfos.
         let (narinfos, _) = scan_cache(cache.path()).unwrap();
@@ -779,9 +780,14 @@ mod tests {
         write_no_input_flake(flake.path());
 
         // A 1-byte cap is exceeded by any real archive.
-        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(1))
-            .await
-            .expect("the lock is admissible; the budget is what fails");
+        let performed = admit_and_run(
+            &nix,
+            flake.path(),
+            cache.path(),
+            bounds(ByteSize::from_bytes(1)),
+        )
+        .await
+        .expect("the lock is admissible; the budget is what fails");
 
         let (is_success, error) = audit_outcome(&performed);
         assert!(!is_success, "a 1-byte budget must fail closed");
@@ -818,7 +824,7 @@ mod tests {
         write_no_input_flake(flake.path());
         let nix = fake_nix_failing(flake.path(), 3);
 
-        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(1 << 30))
+        let performed = admit_and_run(&nix, flake.path(), cache.path(), bounds(ByteSize::gib(1)))
             .await
             .expect("a no-input flake is admissible");
 
@@ -847,7 +853,7 @@ mod tests {
         let cache_dir = cache.path().join("cache");
         write_no_input_flake(flake.path());
 
-        admit_and_run(&nix, flake.path(), &cache_dir, bounds(1 << 30))
+        admit_and_run(&nix, flake.path(), &cache_dir, bounds(ByteSize::gib(1)))
             .await
             .expect("a no-input flake is admissible")
             .into_result()
@@ -860,7 +866,7 @@ mod tests {
 
         // Reprovision: a union merge must add this flake's entries without
         // dropping the foreign one.
-        admit_and_run(&nix, flake.path(), &cache_dir, bounds(1 << 30))
+        admit_and_run(&nix, flake.path(), &cache_dir, bounds(ByteSize::gib(1)))
             .await
             .expect("a no-input flake is admissible")
             .into_result()
@@ -903,7 +909,7 @@ mod tests {
             Path::new("nix"),
             flake.path(),
             cache.path(),
-            bounds(1 << 30),
+            bounds(ByteSize::gib(1)),
         )
         .await
         .expect_err("a missing lock must be refused");
@@ -933,7 +939,7 @@ mod tests {
             Path::new("nix"),
             flake.path(),
             cache.path(),
-            bounds(1 << 30),
+            bounds(ByteSize::gib(1)),
         )
         .await
         .expect_err("an ssh input must be refused");

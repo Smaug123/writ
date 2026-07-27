@@ -42,6 +42,7 @@ pub use openai_proxy::{
 };
 use proxy_common::{ClaudeBackend, OpenAiBackend, ProxyEffect, ProxyStream};
 use route_table::{BrokeredRoute, ContractCheck, PlainRoute, VmHttpRoute};
+use writ_core::byte_size::ByteSize;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -68,8 +69,8 @@ use crate::vm_git::{
     GuestContract, VM_HTTP_CONTRACT_HEADER, VM_HTTP_CONTRACT_VERSION, VmGitPushBodyLimits,
 };
 
-const MAX_VM_HTTP_BODY_BYTES: usize = 64 * 1024;
-const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_VM_HTTP_BODY_BYTES: ByteSize = ByteSize::kib(64);
+const MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES: ByteSize = ByteSize::mib(4);
 const VM_HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
 const MAX_VM_HTTP_CONNECTIONS: usize = 256;
@@ -1230,14 +1231,25 @@ where
 
 async fn read_request_body_with_limit<B>(
     body: B,
-    max: usize,
+    max: ByteSize,
     read_timeout: std::time::Duration,
 ) -> Result<Vec<u8>, VmHttpResponse>
 where
     B: HyperBody<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let limited = Limited::new(body, max);
+    // The one place a configured cap has to become a `usize`, because that is
+    // what the body reader counts in. A cap this platform cannot address is a
+    // limit it cannot enforce by buffering, so refuse rather than clamp to
+    // something the operator did not ask for. Unreachable on a 64-bit host,
+    // which is every host writ builds for.
+    let Some(max_bytes) = max.to_usize() else {
+        return Err(VmHttpResponse::text(
+            VmHttpStatus::InternalServerError,
+            "configured request body limit exceeds this platform's addressable size",
+        ));
+    };
+    let limited = Limited::new(body, max_bytes);
     match tokio::time::timeout(read_timeout, limited.collect()).await {
         Err(_) => Err(VmHttpResponse::text(
             VmHttpStatus::BadRequest,

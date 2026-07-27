@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use writ_core::byte_size::ByteSize;
 
 use crate::agent_vm_daemon::{
     AgentVmDaemonRuntimeConfig, AgentVmDaemonRuntimeConfigError, AgentVmLifecycleRuntimeConfig,
@@ -408,15 +409,15 @@ pub struct AgentVmHttpConfig {
     #[serde(default = "default_clone_timeout_secs")]
     pub clone_timeout_secs: u64,
     #[serde(default = "default_max_bundle_bytes")]
-    pub max_bundle_bytes: u64,
+    pub max_bundle_bytes: ByteSize,
     #[serde(default = "default_nix_cache_url")]
     pub nix_cache_url: String,
     #[serde(default = "default_nix_cache_trusted_public_keys")]
     pub nix_cache_trusted_public_keys: Vec<String>,
     #[serde(default = "default_nix_cache_max_metadata_bytes")]
-    pub nix_cache_max_metadata_bytes: u64,
+    pub nix_cache_max_metadata_bytes: ByteSize,
     #[serde(default = "default_nix_cache_max_nar_bytes")]
-    pub nix_cache_max_nar_bytes: u64,
+    pub nix_cache_max_nar_bytes: ByteSize,
     /// Directory of the broker-local, content-addressed flake-input cache the
     /// nix-cache endpoint serves local-first (before proxying upstream).
     /// `None` defaults to `<work_root>/flake-input-cache`. Flake-input
@@ -458,7 +459,7 @@ pub struct AgentVmHttpConfig {
     /// Eviction ceiling on the total bytes the retained mirrors occupy. See
     /// `flake_mirror_cache_max_entries`.
     #[serde(default = "default_flake_mirror_cache_max_bytes")]
-    pub flake_mirror_cache_max_bytes: u64,
+    pub flake_mirror_cache_max_bytes: ByteSize,
     /// Directory under which the broker materialises throwaway local clones to
     /// run `nix flake archive` against. `None` defaults to
     /// `<work_root>/flake-materialize`. Created owner-only (0700).
@@ -471,7 +472,7 @@ pub struct AgentVmHttpConfig {
     /// Maximum total bytes the broker will archive for one provision request;
     /// an over-budget archive is not published (fail-closed).
     #[serde(default = "default_flake_provision_max_total_bytes")]
-    pub flake_provision_max_total_bytes: u64,
+    pub flake_provision_max_total_bytes: ByteSize,
     /// Timeout (seconds) for the `nix flake archive` step of one provision
     /// request.
     #[serde(default = "default_flake_provision_timeout_secs")]
@@ -485,11 +486,11 @@ pub struct AgentVmHttpConfig {
     #[serde(default)]
     pub git_push_staging_root: Option<PathBuf>,
     #[serde(default = "default_git_push_max_body_bytes")]
-    pub git_push_max_body_bytes: usize,
+    pub git_push_max_body_bytes: ByteSize,
     #[serde(default = "default_git_push_max_metadata_bytes")]
-    pub git_push_max_metadata_bytes: usize,
+    pub git_push_max_metadata_bytes: ByteSize,
     #[serde(default = "default_git_push_max_bundle_bytes")]
-    pub git_push_max_bundle_bytes: usize,
+    pub git_push_max_bundle_bytes: ByteSize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,8 +502,8 @@ pub struct AgentVmHttpClaudeProxyConfig {
     #[serde(default = "default_claude_anthropic_version")]
     pub anthropic_version: String,
     pub timeout_secs: u64,
-    pub max_request_bytes: u64,
-    pub max_response_bytes: u64,
+    pub max_request_bytes: ByteSize,
+    pub max_response_bytes: ByteSize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,8 +513,8 @@ pub struct AgentVmHttpOpenAiProxyConfig {
     pub auth_secret: SecretKey,
     pub auth_kind: VmHttpOpenAiProxyAuthKind,
     pub timeout_secs: u64,
-    pub max_request_bytes: u64,
-    pub max_response_bytes: u64,
+    pub max_request_bytes: ByteSize,
+    pub max_response_bytes: ByteSize,
 }
 
 /// Which secret backend to use. The file backend is recommended for
@@ -1486,17 +1487,17 @@ fn validate_flake_materialize_scratch_dir(
     Ok(path)
 }
 
-fn default_git_push_max_body_bytes() -> usize {
+fn default_git_push_max_body_bytes() -> ByteSize {
     // 65 MiB: headroom over the bundle limit for metadata + framing overhead.
-    65 * 1024 * 1024
+    ByteSize::mib(65)
 }
 
-fn default_git_push_max_metadata_bytes() -> usize {
-    16 * 1024
+fn default_git_push_max_metadata_bytes() -> ByteSize {
+    ByteSize::kib(16)
 }
 
-fn default_git_push_max_bundle_bytes() -> usize {
-    64 * 1024 * 1024
+fn default_git_push_max_bundle_bytes() -> ByteSize {
+    ByteSize::mib(64)
 }
 
 fn default_claude_anthropic_version() -> String {
@@ -1539,8 +1540,8 @@ fn default_vm_http_nix_program() -> PathBuf {
 fn default_flake_provision_max_input_count() -> usize {
     256
 }
-fn default_flake_provision_max_total_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
+fn default_flake_provision_max_total_bytes() -> ByteSize {
+    ByteSize::gib(2)
 }
 fn default_flake_provision_timeout_secs() -> u64 {
     600
@@ -1548,8 +1549,8 @@ fn default_flake_provision_timeout_secs() -> u64 {
 fn default_flake_mirror_cache_max_entries() -> usize {
     64
 }
-fn default_flake_mirror_cache_max_bytes() -> u64 {
-    10 * 1024 * 1024 * 1024
+fn default_flake_mirror_cache_max_bytes() -> ByteSize {
+    ByteSize::gib(10)
 }
 
 /// Crate-visible so the promote-config wiring test can assert against
@@ -1560,8 +1561,8 @@ pub(crate) fn default_clone_timeout_secs() -> u64 {
     300
 }
 
-fn default_max_bundle_bytes() -> u64 {
-    64 * 1024 * 1024
+fn default_max_bundle_bytes() -> ByteSize {
+    ByteSize::mib(64)
 }
 
 fn default_nix_cache_url() -> String {
@@ -1578,12 +1579,12 @@ fn default_nix_cache_trusted_public_keys() -> Vec<String> {
     vec!["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=".into()]
 }
 
-fn default_nix_cache_max_metadata_bytes() -> u64 {
-    1024 * 1024
+fn default_nix_cache_max_metadata_bytes() -> ByteSize {
+    ByteSize::mib(1)
 }
 
-fn default_nix_cache_max_nar_bytes() -> u64 {
-    512 * 1024 * 1024
+fn default_nix_cache_max_nar_bytes() -> ByteSize {
+    ByteSize::mib(512)
 }
 
 /// Default agent-VM working directory. Sits under `$XDG_STATE_HOME/writ/`

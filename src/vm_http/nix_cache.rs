@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use writ_core::byte_size::ByteSize;
 
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, NixCacheAuditDecision, NixCacheAuditRoute,
@@ -457,8 +458,8 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             );
         }
         if is_head {
-            let response =
-                VmHttpResponse::text(VmHttpStatus::Ok, "").with_content_length(content_length);
+            let response = VmHttpResponse::text(VmHttpStatus::Ok, "")
+                .with_content_length(content_length.map(ByteSize::get));
             return VmHttpNixCacheProxyFetch {
                 upstream_url,
                 upstream_status: Some(200),
@@ -638,7 +639,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 status: VmHttpStatus::Ok,
                 content_type: "application/x-nix-nar",
                 body: Vec::new(),
-                content_length: Some(content_length),
+                content_length: Some(content_length.get()),
                 www_authenticate: None,
                 headers: Vec::new(),
             };
@@ -666,7 +667,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 );
             }
         };
-        if let Err(err) = validate_nar_body_length(body.len() as u64, content_length) {
+        if let Err(err) = validate_nar_body_length(ByteSize::of(body.len()), content_length) {
             let response =
                 VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
             return VmHttpNixCacheProxyFetch {
@@ -712,7 +713,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 // this content type for both raw and compressed NAR payloads.
                 content_type: "application/x-nix-nar",
                 body,
-                content_length: Some(content_length),
+                content_length: Some(content_length.get()),
                 www_authenticate: None,
                 headers: Vec::new(),
             },
@@ -948,8 +949,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         let admission = VmHttpNixCacheAdmittedNar::from_narinfo(narinfo);
         let actual = admission.nar_size.get();
         let max = self.config.max_nar_bytes();
-        if actual > max {
-            return Err(VmHttpNixCacheNarAdmissionError::NarSizeTooLarge { max, actual });
+        if ByteSize::from_bytes(actual) > max {
+            return Err(VmHttpNixCacheNarAdmissionError::NarSizeTooLarge {
+                max: max.get(),
+                actual,
+            });
         }
         admission
             .nar_hash
@@ -994,19 +998,20 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
     }
 }
 
-fn upstream_content_length(response: &reqwest::Response) -> Option<u64> {
+fn upstream_content_length(response: &reqwest::Response) -> Option<ByteSize> {
     response
         .headers()
         .get(reqwest::header::CONTENT_LENGTH)?
         .to_str()
         .ok()?
-        .parse()
+        .parse::<u64>()
         .ok()
+        .map(ByteSize::from_bytes)
 }
 
 async fn read_upstream_body_bounded(
     mut response: reqwest::Response,
-    max: u64,
+    max: ByteSize,
 ) -> Result<Vec<u8>, VmHttpNixCacheBodyReadError> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
@@ -1014,8 +1019,8 @@ async fn read_upstream_body_bounded(
         let new_len = (body.len() as u64)
             .checked_add(chunk_len)
             .expect("HTTP response byte count overflowed before configured bound check");
-        if new_len > max {
-            return Err(VmHttpNixCacheBodyReadError::ResponseTooLarge { max });
+        if ByteSize::from_bytes(new_len) > max {
+            return Err(VmHttpNixCacheBodyReadError::ResponseTooLarge { max: max.get() });
         }
         body.extend_from_slice(&chunk);
     }

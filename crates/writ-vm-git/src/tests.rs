@@ -4,6 +4,7 @@ use super::*;
 use proptest::prelude::*;
 use std::path::PathBuf;
 use std::process::Command;
+use writ_core::byte_size::ByteSize;
 use writ_core::git_env::apply_clean_git_config;
 
 fn repo(owner: &str, name: &str) -> GitCloneRepo {
@@ -144,7 +145,7 @@ fn push_request() -> VmGitPushRequest {
 }
 
 fn push_limits() -> VmGitPushBodyLimits {
-    VmGitPushBodyLimits::new(4096, 1024, 1024).unwrap()
+    VmGitPushBodyLimits::new(ByteSize::of(4096), ByteSize::of(1024), ByteSize::of(1024)).unwrap()
 }
 
 fn required_test_tool(name: &str) -> PathBuf {
@@ -596,18 +597,31 @@ fn push_request_body_parser_enforces_independent_limits() {
     assert!(matches!(
         parse_vm_git_push_request_body(
             &body,
-            VmGitPushBodyLimits::new(body.len() - 1, 1024, 1024).unwrap()
+            VmGitPushBodyLimits::new(
+                ByteSize::of(body.len() - 1),
+                ByteSize::of(1024),
+                ByteSize::of(1024)
+            )
+            .unwrap()
         ),
         Err(VmGitPushBodyError::BodyTooLarge { .. })
     ));
 
     assert!(matches!(
-        parse_vm_git_push_request_body(&body, VmGitPushBodyLimits::new(4096, 1, 1024).unwrap()),
+        parse_vm_git_push_request_body(
+            &body,
+            VmGitPushBodyLimits::new(ByteSize::of(4096), ByteSize::of(1), ByteSize::of(1024))
+                .unwrap()
+        ),
         Err(VmGitPushBodyError::MetadataTooLarge { .. })
     ));
 
     assert!(matches!(
-        parse_vm_git_push_request_body(&body, VmGitPushBodyLimits::new(4096, 1024, 1).unwrap()),
+        parse_vm_git_push_request_body(
+            &body,
+            VmGitPushBodyLimits::new(ByteSize::of(4096), ByteSize::of(1024), ByteSize::of(1))
+                .unwrap()
+        ),
         Err(VmGitPushBodyError::BundleTooLarge { .. })
     ));
 }
