@@ -989,22 +989,26 @@ row before they are signed, and a mismatch refuses rather than vouches. The
 recorded hash is writ's own: computed by the host arm's capture, or re-derived
 by the broker from the guest's upload before writing it (§5.6 checks the
 guest's claim against the bytes at that point). The check is total — length and
-hash of the *whole* file, not of the prefix that gets signed — because reading
-to EOF is unavoidable anyway (it is the only way to know the file ran past the
-envelope cap), so the whole-file digest costs hashing and no extra IO. The
-read stops one byte past the length the row records: a file that keeps growing
-has no EOF, and a host-spawned agent that leaves a helper appending to its own
-stream file would otherwise choose how long writ reads and hashes for it. The
-row's length bounds the read in time the way the envelope cap bounds it in
-memory. The file is also opened `O_NONBLOCK|O_NOFOLLOW` and `fstat`ed for
-"regular file" before any of it is read — a path is not a file, and the
-host-spawn arm's agent runs as writd's own user, so it can leave a FIFO where
-its log used to be; opening one blocks before any check could run. Checking the
-descriptor rather than the path is what makes that a check rather than a race. Checking
-only the prefix would let a tamperer who keeps the length above the cap buy a
-signature over bytes the row contradicts. Both crates hash a stream through one
-`writ_agent_run::Sha256Stream`, so the capture's digest and this re-read's are
-comparable by construction.
+hash of the *whole* file, not of the prefix that gets signed. That costs
+nothing extra: the read already has to continue past the envelope cap (the only
+way to know the file ran over it), so hashing what it reads is the whole of the
+additional work, and checking only the prefix would let a tamperer who keeps
+the length above the cap buy a signature the row contradicts.
+
+The read ends one byte past the length the row records, rather than at EOF: a
+file that keeps growing has no EOF, and a host-spawned agent that leaves a
+helper appending to its own stream file would otherwise choose how long writ
+reads and hashes for it. That one byte is all a mismatch needs. So the row's
+length bounds the read in time the way the envelope cap bounds it in memory.
+
+The file is also opened `O_NONBLOCK|O_NOFOLLOW` and `fstat`ed for "regular
+file" before any of it is read — a path is not a file, and the host-spawn arm's
+agent runs as writd's own user, so it can leave a FIFO where its log used to
+be; opening one blocks before any check could run. Checking the descriptor
+rather than the path is what makes that a check rather than a race.
+
+Both crates hash a stream through one `writ_agent_run::Sha256Stream`, so the
+capture's digest and this re-read's are comparable by construction.
 
 ### 5.10 Clients & UI
 
