@@ -222,9 +222,26 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         }
     };
 
-    // `run_agent_process` is blocking (it spawns, writes the prompt, and
-    // joins two capture threads), so it runs on the blocking pool rather
-    // than stalling this reactor thread for the length of an agent run.
+    // `run_agent_process` is blocking (it spawns, writes the prompt, and joins
+    // two capture threads), so it goes to the blocking pool rather than
+    // stalling this reactor thread for the length of an agent run.
+    //
+    // **What one in-flight host run costs**, since agent runs are long and
+    // this arm has no timeout of its own (`RUN_AGENT_VM_TIMEOUT` bounds only
+    // the VM arm): one thread from tokio's blocking pool — 512 by default,
+    // shared with every other `spawn_blocking` in the daemon, including the
+    // notes write below — plus the two OS threads the helper uses for the
+    // captures, plus the child, all for the run's full duration. So N
+    // concurrent host runs hold N of those 512 and 2N OS threads, and a hung
+    // agent holds its share until the daemon restarts.
+    //
+    // Nothing bounds N. That is not new — nothing bounded concurrent
+    // `RunAgent` calls on either arm before this either, and the previous
+    // async spawn held tokio tasks instead — but the resource is now a capped
+    // shared pool rather than the scheduler, so the ceiling is closer.
+    // Bounding it properly needs a concurrency policy for agent runs (a limit,
+    // a queue discipline, and a wire answer for "too many in flight") that
+    // covers both arms; tracked separately rather than guessed at here.
     let log_root = spawn_config.log_root.as_path().to_path_buf();
     let captured = tokio::task::spawn_blocking(move || {
         crate::agent_run::run_agent_process(&plan, &prompt, &log_root)
