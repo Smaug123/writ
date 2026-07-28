@@ -748,11 +748,18 @@ impl AgentRunLogRoot {
     ///
     /// Owner-only is not decoration. Per-run subdirectories hold agent output
     /// that `agent_run_outcome` rows point at, and a group- or world-writable
-    /// parent lets another local user rename or delete them, silently
+    /// root lets another local user rename or delete them, silently
     /// invalidating what the audit log claims is on disk. The runtime already
     /// insists on this — `writ_agent_run`'s `ensure_private_dir` chmods the
     /// root to 0700 before each run — so creating it any other way here would
     /// only mean the mode changed out from under the operator later.
+    ///
+    /// The claim stops at this directory. A hostile local user who can write
+    /// an *ancestor* of the root can still replace the entry, and nothing here
+    /// prevents that — but such a user can equally reach the secret store, the
+    /// notes repo, and the audit DB, none of which validate their ancestor
+    /// chains either. Path trust for writ's durable directories is one
+    /// question to answer uniformly, not per-root.
     ///
     /// The mode applies to every component this creates, which is what makes
     /// the *nested* case safe: an operator who keeps the old
