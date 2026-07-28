@@ -173,8 +173,10 @@ mod tests {
         panic!("git must be on PATH for flake_materialize tests");
     }
 
+    use crate::flake_fixtures::git_failure;
+
     fn git(program: &Path, args: &[&str], cwd: &Path) {
-        let status = apply_clean_git_config(&mut std::process::Command::new(program))
+        let out = apply_clean_git_config(&mut std::process::Command::new(program))
             .args(args)
             .current_dir(cwd)
             .env("GIT_AUTHOR_NAME", "t")
@@ -182,11 +184,9 @@ mod tests {
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@e")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "git {args:?} failed");
+        assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
     }
 
     fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
@@ -196,7 +196,7 @@ mod tests {
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?} failed");
+        assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 

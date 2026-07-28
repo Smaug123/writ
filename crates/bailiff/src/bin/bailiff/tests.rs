@@ -52,7 +52,7 @@ fn plan_submit_parses_minimum_required_flags() {
         PathBuf::from("/etc/bailiff/allowed_signers")
     );
     assert!(plan_id.is_none());
-    assert_eq!(purpose, "plan-submit");
+    assert_eq!(purpose.as_str(), "plan-submit");
     assert!(label.is_none());
     assert_eq!(agent, AgentKind::Claude);
     assert!(model.is_none());
@@ -114,7 +114,7 @@ fn plan_submit_accepts_every_optional_flag() {
         Some(std::path::Path::new("/var/writ"))
     );
     assert_eq!(plan_id.unwrap().to_string(), plan_id_str);
-    assert_eq!(purpose, "plan-submit:rev-2");
+    assert_eq!(purpose.as_str(), "plan-submit:rev-2");
     assert_eq!(label.as_deref(), Some("feature 42"));
     assert_eq!(agent, AgentKind::Codex);
     assert_eq!(model.as_deref(), Some("gpt-test"));
@@ -435,7 +435,7 @@ fn plan_review_parses_minimum_required_flags() {
         writ_allowed_signers,
         PathBuf::from("/etc/bailiff/allowed_signers")
     );
-    assert_eq!(purpose, "plan-review");
+    assert_eq!(purpose.as_str(), "plan-review");
     assert!(label.is_none());
     assert_eq!(agent, AgentKind::Claude);
     assert!(model.is_none());
@@ -497,7 +497,7 @@ fn plan_review_accepts_every_optional_flag() {
         writ_repo.as_deref(),
         Some(std::path::Path::new("/var/writ"))
     );
-    assert_eq!(purpose, "plan-review:rev-2");
+    assert_eq!(purpose.as_str(), "plan-review:rev-2");
     assert_eq!(label.as_deref(), Some("feature 42 review"));
     assert_eq!(agent, AgentKind::Codex);
     assert_eq!(model.as_deref(), Some("gpt-test"));
@@ -803,7 +803,7 @@ fn plan_implement_parses_minimum_required_flags() {
         writ_allowed_signers,
         PathBuf::from("/etc/bailiff/allowed_signers")
     );
-    assert_eq!(purpose, "plan-implement");
+    assert_eq!(purpose.as_str(), "plan-implement");
     assert_eq!(agent, AgentKind::Claude);
     assert_eq!(model, "claude-opus-4-7");
 }
@@ -861,7 +861,7 @@ fn plan_implement_accepts_every_optional_flag() {
         writ_repo.as_deref(),
         Some(std::path::Path::new("/var/writ"))
     );
-    assert_eq!(purpose, "plan-implement:rev-2");
+    assert_eq!(purpose.as_str(), "plan-implement:rev-2");
     assert_eq!(agent, AgentKind::Codex);
     assert_eq!(model, "gpt-test");
 }

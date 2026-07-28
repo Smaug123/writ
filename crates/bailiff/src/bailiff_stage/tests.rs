@@ -185,7 +185,7 @@ fn sample_inputs() -> StageRunInputs {
                 name: "writ".into(),
             },
         }],
-        purpose: "plan-implement".into(),
+        purpose: "plan-implement".parse().unwrap(),
         writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
     }
 }

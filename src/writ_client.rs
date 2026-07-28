@@ -57,7 +57,7 @@ pub struct RunAgentCompleted {
 pub struct RunAgentRequest {
     pub prompt: AgentPrompt,
     pub capabilities: Vec<CapabilitySet>,
-    pub purpose: String,
+    pub purpose: crate::agent_run::RunPurpose,
     pub output_ref: NotesRef,
     /// Optional audit session id binding the run. When `Some`, the
     /// caller has already opened the session via
@@ -379,7 +379,7 @@ mod tests {
         RunAgentRequest {
             prompt: AgentPrompt::new("noop"),
             capabilities: vec![],
-            purpose: "test".to_string(),
+            purpose: "test".parse().unwrap(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: None,
             workspace: None,
@@ -532,7 +532,7 @@ mod tests {
         .await;
 
         let mut req = sample_request();
-        req.purpose = "plan-stage:abc123".to_string();
+        req.purpose = "plan-stage:abc123".parse().unwrap();
         let client = WritClient::new(&broker.socket_path);
         client.run_agent(req.clone()).await.unwrap();
 
@@ -543,7 +543,7 @@ mod tests {
                 output_ref,
                 ..
             } => {
-                assert_eq!(purpose, "plan-stage:abc123");
+                assert_eq!(purpose.as_str(), "plan-stage:abc123");
                 assert_eq!(output_ref, &req.output_ref);
             }
             other => panic!("expected RunAgent, got {other:?}"),
@@ -1115,7 +1115,7 @@ mod end_to_end_tests {
                         name: "writ".into(),
                     },
                 }],
-                purpose: "round-trip-test".into(),
+                purpose: "round-trip-test".parse().unwrap(),
                 output_ref: output_ref.clone(),
                 session_id: Some(session_id),
                 workspace: None,
@@ -1284,7 +1284,7 @@ mod end_to_end_tests {
                         name: "writ".into(),
                     },
                 }],
-                purpose: "large-prompt".into(),
+                purpose: "large-prompt".parse().unwrap(),
                 output_ref,
                 session_id: Some(session_id),
                 workspace: None,

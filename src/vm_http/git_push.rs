@@ -729,6 +729,7 @@ mod tests {
                 agent_kind: AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: Some(correlation.clone()),
+                purpose: None,
             })
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();
@@ -802,6 +803,7 @@ mod tests {
                 agent_kind: AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
+                purpose: None,
             })
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();

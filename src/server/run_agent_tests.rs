@@ -28,7 +28,7 @@ async fn run_agent_dispatch_errors_when_not_configured() {
                     name: "writ".into(),
                 },
             }],
-            purpose: "test".into(),
+            purpose: "test".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: None,
             workspace: None,
@@ -70,7 +70,7 @@ async fn run_agent_rejects_workspace_write_without_workspace_bootstrap() {
                     name: "writ".into(),
                 },
             }],
-            purpose: "implement-stage".into(),
+            purpose: "implement-stage".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: None,
             workspace: None,
@@ -113,7 +113,7 @@ async fn run_agent_with_workspace_reports_unconfigured_vm_runtime() {
                     name: "writ".into(),
                 },
             }],
-            purpose: "implement-stage".into(),
+            purpose: "implement-stage".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: None,
             workspace: Some(crate::vm_git::AgentVmWorkspaceBootstrap {
@@ -180,7 +180,7 @@ async fn run_agent_round_trip_signs_and_writes_note() {
                     name: "writ".into(),
                 },
             }],
-            purpose: "round-trip-test".into(),
+            purpose: "round-trip-test".parse().unwrap(),
             output_ref: output_ref.clone(),
             session_id: Some(session_id),
             workspace: None,
@@ -266,7 +266,7 @@ async fn run_agent_signs_non_zero_exit() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("ignored"),
             capabilities: Vec::new(),
-            purpose: "non-zero-exit".into(),
+            purpose: "non-zero-exit".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -325,7 +325,7 @@ async fn run_agent_captures_stderr_in_envelope() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("ignored"),
             capabilities: Vec::new(),
-            purpose: "stderr-capture".into(),
+            purpose: "stderr-capture".parse().unwrap(),
             output_ref: output_ref.clone(),
             session_id: Some(session_id),
             workspace: None,
@@ -403,7 +403,7 @@ async fn run_agent_caps_stream_capture_records_truncation() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("ignored"),
             capabilities: Vec::new(),
-            purpose: "truncation".into(),
+            purpose: "truncation".parse().unwrap(),
             output_ref: output_ref.clone(),
             session_id: Some(session_id),
             workspace: None,
@@ -498,7 +498,7 @@ async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "bound-session".into(),
+            purpose: "bound-session".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -536,7 +536,7 @@ async fn run_agent_rejects_unknown_session_id() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "unknown-session".into(),
+            purpose: "unknown-session".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(bogus),
             workspace: None,
@@ -586,7 +586,7 @@ async fn run_agent_rejects_closed_session_id() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "closed-session".into(),
+            purpose: "closed-session".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -628,7 +628,7 @@ async fn a_host_spawned_run_records_an_audit_pair_naming_its_streams() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new(prompt_text),
             capabilities: Vec::new(),
-            purpose: "audit-pair".into(),
+            purpose: "audit-pair".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -707,7 +707,7 @@ async fn the_signed_envelope_and_the_audit_row_name_the_same_run() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "provenance".into(),
+            purpose: "provenance".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -755,7 +755,7 @@ async fn run_agent_refuses_a_host_spawn_with_no_session() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "sessionless".into(),
+            purpose: "sessionless".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: None,
             workspace: None,
@@ -812,7 +812,7 @@ async fn run_agent_refuses_a_host_spawn_whose_session_never_named_an_agent() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "no-agent-kind".into(),
+            purpose: "no-agent-kind".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -870,7 +870,7 @@ async fn run_agent_refuses_a_session_opened_for_a_different_agent_than_it_spawns
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "kind-mismatch".into(),
+            purpose: "kind-mismatch".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -919,7 +919,7 @@ async fn the_audit_row_records_the_configured_agent_kind() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "configured-kind".into(),
+            purpose: "configured-kind".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -946,6 +946,52 @@ async fn the_audit_row_records_the_configured_agent_kind() {
     );
 }
 
+/// The caller's `purpose` lands on the audit row verbatim.
+///
+/// The value used here is the one that forced `purpose` to be its own
+/// column rather than a reuse of `correlation_id`: the colon in
+/// bailiff's `review:plan-abc` is outside that column's character class,
+/// so routing a purpose through it would have turned a valid request
+/// into a parse error.
+#[tokio::test]
+async fn a_host_spawned_run_records_the_callers_purpose() {
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "review:plan-abc".parse().unwrap(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let run_id = match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata, ..
+        } => signed_metadata.run_id,
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+
+    let request = state.audit.get_agent_run(run_id).unwrap().unwrap();
+    assert_eq!(
+        request.purpose.as_ref().map(|p| p.as_str()),
+        Some("review:plan-abc"),
+    );
+    // The two tags are independent: `RunAgent` has no correlation id to
+    // give, so recording a purpose must not invent one.
+    assert!(request.correlation_id.is_none());
+}
+
 /// An agent that exits non-zero still *ran*, so its outcome row is
 /// `Failed` with the exit code — not a missing row. The plan is explicit
 /// that writ signs the partial and the audit row records the non-zero exit.
@@ -961,7 +1007,7 @@ async fn a_failed_host_spawn_records_a_failed_outcome() {
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("ignored"),
             capabilities: Vec::new(),
-            purpose: "failed-run".into(),
+            purpose: "failed-run".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -1016,7 +1062,7 @@ async fn a_host_spawn_that_cannot_start_leaves_its_run_row_for_reconciliation() 
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("hi"),
             capabilities: Vec::new(),
-            purpose: "unspawnable".into(),
+            purpose: "unspawnable".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,
@@ -1121,7 +1167,7 @@ async fn one_agreement_case(
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("prompt"),
             capabilities: Vec::new(),
-            purpose: "agreement".into(),
+            purpose: "agreement".parse().unwrap(),
             output_ref: output_ref.clone(),
             session_id: Some(session_id),
             workspace: None,
@@ -1252,7 +1298,7 @@ async fn run_one_agent(args: Vec<String>) -> (RunAgentFixture, SignedRunMetadata
         ClientMessage::RunAgent {
             prompt: crate::agent_run::AgentPrompt::new("provenance prompt"),
             capabilities: Vec::new(),
-            purpose: "provenance".into(),
+            purpose: "provenance".parse().unwrap(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_id: Some(session_id),
             workspace: None,

@@ -45,7 +45,7 @@ use bailiff::bailiff_stage::open_plan_stage;
 use bailiff::output::{
     write_bailiff_plan_dossier, write_bailiff_plan_list, write_bailiff_plan_show,
 };
-use writ::agent_run::AgentPrompt;
+use writ::agent_run::{AgentPrompt, RunPurpose};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
@@ -125,9 +125,11 @@ enum PlanCmd {
         #[arg(long)]
         plan_id: Option<PlanId>,
         /// Opaque tag recorded verbatim on writ's audit row and on
-        /// the bailiff-side plan note. Defaults to `"plan-submit"`.
-        #[arg(long, default_value = "plan-submit")]
-        purpose: String,
+        /// the bailiff-side plan note. Defaults to
+        /// `"plan-submit"`. Printable ASCII, at most 128 bytes,
+        /// no leading or trailing space.
+        #[arg(long, default_value = "plan-submit", value_parser = parse_run_purpose)]
+        purpose: RunPurpose,
         /// Human-readable session label stored in writ's audit
         /// log. Informational only; useful for cross-referencing
         /// when an operator inspects writ's session table.
@@ -237,9 +239,11 @@ enum PlanCmd {
         #[arg(long)]
         writ_allowed_signers: PathBuf,
         /// Opaque tag recorded verbatim on writ's audit row and on
-        /// the bailiff-side review note. Defaults to `"plan-review"`.
-        #[arg(long, default_value = "plan-review")]
-        purpose: String,
+        /// the bailiff-side review note. Defaults to
+        /// `"plan-review"`. Printable ASCII, at most 128 bytes,
+        /// no leading or trailing space.
+        #[arg(long, default_value = "plan-review", value_parser = parse_run_purpose)]
+        purpose: RunPurpose,
         /// Human-readable session label stored in writ's audit log.
         /// Informational only.
         #[arg(long)]
@@ -337,9 +341,10 @@ enum PlanCmd {
         writ_allowed_signers: PathBuf,
         /// Opaque tag recorded verbatim on writ's audit row and on
         /// the bailiff-side implement note. Defaults to
-        /// `"plan-implement"`.
-        #[arg(long, default_value = "plan-implement")]
-        purpose: String,
+        /// `"plan-implement"`. Printable ASCII, at most 128 bytes, no
+        /// leading or trailing space.
+        #[arg(long, default_value = "plan-implement", value_parser = parse_run_purpose)]
+        purpose: RunPurpose,
         /// Coarse agent identity passed to writ's VM dispatch arm.
         /// With `WorkspaceWrite` granted, this field selects which
         /// GitHub App writ uses to mint push credentials. Defaults
@@ -483,6 +488,17 @@ enum PlanCmd {
 
 fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
     raw.parse::<AgentKind>().map_err(|e| e.to_string())
+}
+
+/// clap value parser for `--purpose`.
+///
+/// Parsing here rather than at the writ call means an unusable purpose
+/// costs the operator a re-run of the command, not a half-finished
+/// workflow: by the time `RunAgent` is sent, bailiff has taken the plan
+/// lock and opened a writ session, and failing then means unwinding
+/// both to report a typo.
+fn parse_run_purpose(raw: &str) -> Result<RunPurpose, String> {
+    raw.parse::<RunPurpose>().map_err(|e| e.to_string())
 }
 
 /// clap value parser for `--workspace-warm`. Matches the JSON
@@ -686,7 +702,7 @@ async fn plan_submit(
     writ_repo: Option<PathBuf>,
     writ_allowed_signers: PathBuf,
     plan_id: Option<PlanId>,
-    purpose: String,
+    purpose: RunPurpose,
     label: Option<String>,
     agent: AgentKind,
     model: Option<String>,
@@ -772,7 +788,7 @@ async fn plan_review(
     bailiff_repo: Option<PathBuf>,
     writ_repo: Option<PathBuf>,
     writ_allowed_signers: PathBuf,
-    purpose: String,
+    purpose: RunPurpose,
     label: Option<String>,
     agent: AgentKind,
     model: Option<String>,
@@ -894,7 +910,7 @@ async fn plan_implement(
     bailiff_repo: Option<PathBuf>,
     writ_repo: Option<PathBuf>,
     writ_allowed_signers: PathBuf,
-    purpose: String,
+    purpose: RunPurpose,
     agent: AgentKind,
     model: String,
     workspace_warm: WorkspaceWarmMode,

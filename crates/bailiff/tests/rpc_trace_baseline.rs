@@ -288,7 +288,7 @@ impl WritSide {
     fn plan_note(&self, plan_id: PlanId) -> PlanNote {
         PlanNote {
             plan_id,
-            purpose: "plan-submit".into(),
+            purpose: "plan-submit".parse().unwrap(),
             writ_output_oid: self.oid.clone(),
             signed_metadata: self.metadata.clone(),
             signature: self.signature.clone(),
@@ -298,7 +298,7 @@ impl WritSide {
     fn review_note(&self, plan_id: PlanId) -> ReviewNote {
         ReviewNote {
             plan_id,
-            purpose: "plan-review".into(),
+            purpose: "plan-review".parse().unwrap(),
             writ_output_oid: self.oid.clone(),
             signed_metadata: self.metadata.clone(),
             signature: self.signature.clone(),
@@ -323,7 +323,7 @@ fn submit_inputs(plan_id: PlanId) -> SubmitPlanInputs {
     SubmitPlanInputs {
         prompt: AgentPrompt::try_new("Draft a plan.").unwrap(),
         capabilities: vec![CapabilitySet::WorkspaceRead { repo: repo_ref() }],
-        purpose: "plan-submit".into(),
+        purpose: "plan-submit".parse().unwrap(),
         writ_output_ref: writ_output_ref(),
         session_label: Some("plan-submit:trace".into()),
         session_agent_kind: Some(AgentKind::Claude),
@@ -337,7 +337,7 @@ fn review_inputs(plan_id: PlanId) -> SubmitReviewInputs {
         plan_id,
         reviewer_instructions: AgentPrompt::try_new("Evaluate.").unwrap(),
         capabilities: vec![CapabilitySet::WorkspaceRead { repo: repo_ref() }],
-        purpose: "plan-review".into(),
+        purpose: "plan-review".parse().unwrap(),
         writ_output_ref: writ_output_ref(),
         session_label: Some("plan-review:trace".into()),
         session_agent_kind: Some(AgentKind::Claude),
@@ -350,7 +350,7 @@ fn implement_inputs(plan_id: PlanId) -> SubmitImplementInputs {
         plan_id,
         feature_prompt: AgentPrompt::try_new("Build it.").unwrap(),
         capabilities: vec![CapabilitySet::WorkspaceWrite { repo: repo_ref() }],
-        purpose: "plan-implement".into(),
+        purpose: "plan-implement".parse().unwrap(),
         writ_output_ref: writ_output_ref(),
         session_agent_kind: AgentKind::Claude,
         session_agent_model: "claude-test".into(),
@@ -969,7 +969,7 @@ async fn review_failures_before_open_session_emit_nothing() {
             plan_submission_seed_blob_bytes(plan_id),
             PlanNote {
                 plan_id,
-                purpose: "plan-submit".into(),
+                purpose: "plan-submit".parse().unwrap(),
                 writ_output_oid: writ.untrusted_oid.clone(),
                 signed_metadata: writ.untrusted_metadata.clone(),
                 signature: writ.untrusted_signature.clone(),
@@ -1125,7 +1125,7 @@ async fn implement_failures_before_run_agent_emit_nothing() {
             plan_submission_seed_blob_bytes(plan_id),
             PlanNote {
                 plan_id,
-                purpose: "plan-submit".into(),
+                purpose: "plan-submit".parse().unwrap(),
                 writ_output_oid: writ.untrusted_oid.clone(),
                 signed_metadata: writ.untrusted_metadata.clone(),
                 signature: writ.untrusted_signature.clone(),

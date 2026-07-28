@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 7;
+pub(super) const SCHEMA_VERSION: i32 = 8;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -95,6 +95,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "0007_approve_attempt_mint_ledger",
         sql: include_str!("migrations/0007_approve_attempt_mint_ledger.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "0008_agent_run_purpose",
+        sql: include_str!("migrations/0008_agent_run_purpose.sql"),
     },
 ];
 

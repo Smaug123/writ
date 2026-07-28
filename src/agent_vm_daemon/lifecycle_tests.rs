@@ -76,7 +76,7 @@ async fn vm_broker_placement_rejects_agent_run_sessions() {
                 warm: WorkspaceWarmMode::None,
             },
             crate::agent_run::AgentPrompt::new("do it"),
-            None,
+            crate::agent_vm_daemon::AgentRunTags::default(),
         )
         .await
         .unwrap_err();

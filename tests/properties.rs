@@ -531,6 +531,7 @@ proptest! {
             agent_kind: AgentKind::Claude,
             prompt: AgentPrompt::try_new("p").unwrap().summary(),
             correlation_id: Some(c.clone()),
+            purpose: None,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();

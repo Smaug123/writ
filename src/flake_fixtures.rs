@@ -48,8 +48,33 @@ pub(crate) fn tool_on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Render a failed fixture `git` invocation with everything needed to
+/// diagnose it from a CI log alone.
+///
+/// This exists because it once wasn't there. A nix-sandbox CI run failed
+/// with `git ["clone", "-q", "--mirror", ...] failed` and nothing else:
+/// the helpers ran git with `stderr(Stdio::null())`, so the one place
+/// git explains itself was discarded before anyone could read it. An
+/// intermittent failure that cannot be diagnosed after the fact is one
+/// that has to be reproduced to be understood, and a rare one may never
+/// be. Exit status, stderr, and the working directory are cheap to keep
+/// and are the whole diagnosis.
+///
+/// `stdout` is included too: `git` writes some errors there, and a
+/// fixture command that succeeds prints nothing, so this costs no noise
+/// on the happy path.
+pub(crate) fn git_failure(args: &[&str], cwd: &Path, out: &std::process::Output) -> String {
+    format!(
+        "git {args:?} in {} failed: {}\n--- stderr ---\n{}\n--- stdout ---\n{}",
+        cwd.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim(),
+        String::from_utf8_lossy(&out.stdout).trim(),
+    )
+}
+
 pub(crate) fn git(program: &Path, args: &[&str], cwd: &Path) {
-    let status = apply_clean_git_config(&mut std::process::Command::new(program))
+    let out = apply_clean_git_config(&mut std::process::Command::new(program))
         .args(args)
         .current_dir(cwd)
         .env("GIT_AUTHOR_NAME", "t")
@@ -57,11 +82,9 @@ pub(crate) fn git(program: &Path, args: &[&str], cwd: &Path) {
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@e")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "git {args:?} failed");
+    assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
 }
 
 fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
@@ -71,7 +94,7 @@ fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?} failed");
+    assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -158,4 +181,54 @@ printf 'StorePath: /nix/store/00000000000000000000000000000000-fixture\nURL: nar
 /// failure path (`nix flake archive exited with …`).
 pub(crate) fn fake_nix_failing(root: &Path, code: u8) -> PathBuf {
     write_fake_nix(root, &format!("#!/bin/sh\nexit {code}\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failing fixture `git` reports git's own explanation.
+    ///
+    /// The regression this pins is a silent one: the helpers used to run
+    /// git with `stderr(Stdio::null())` and assert `"git {args:?}
+    /// failed"`, so a CI failure carried the command and nothing about
+    /// why it failed. Asserting on a *real* failing invocation rather
+    /// than a synthesised `Output` is the point — it is the plumbing
+    /// (that stderr is captured at all) that broke, not the formatting.
+    #[test]
+    fn a_failed_fixture_git_reports_gits_own_stderr() {
+        let Some(git_program) = tool_on_path("git") else {
+            eprintln!("skipping: git must be on PATH");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let args = ["clone", "-q", "--mirror", "definitely-not-a-repo", "dest"];
+
+        // Drive the helper itself, not a hand-built `Output`: what broke
+        // was the plumbing (stderr was routed to `Stdio::null()` before
+        // anything could read it), so a test that formats its own
+        // `Output` would still pass with the bug present. The panic
+        // message printed by the default hook during this is expected.
+        let panic = std::panic::catch_unwind(|| git(&git_program, &args, temp.path()))
+            .expect_err("cloning a nonexistent repository must fail");
+        let rendered = panic
+            .downcast_ref::<String>()
+            .expect("assert! panics with a formatted String")
+            .clone();
+        assert!(
+            rendered.contains("definitely-not-a-repo"),
+            "must name the command: {rendered}",
+        );
+        assert!(
+            rendered.contains(temp.path().to_str().unwrap()),
+            "must name the working directory: {rendered}",
+        );
+        // git's own words. Without this the message is a tautology: the
+        // command failed, which we already knew from the assertion.
+        assert!(
+            rendered.to_lowercase().contains("repository")
+                || rendered.to_lowercase().contains("does not exist"),
+            "must carry git's stderr: {rendered}",
+        );
+    }
 }

@@ -1578,6 +1578,7 @@ mod brokered_route_audit_oracle {
                     agent_kind: AgentKind::Claude,
                     prompt: crate::agent_run::AgentPrompt::new("prompt").summary(),
                     correlation_id: None,
+                    purpose: None,
                 })
                 .unwrap();
 

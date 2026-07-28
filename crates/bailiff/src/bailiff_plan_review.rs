@@ -49,7 +49,7 @@ use crate::bailiff_stage::{
     StageNoteSlot, StageNoteTarget, StageRunInputs, compose_with_plan_body, open_plan_stage,
     run_under_owned_session,
 };
-use writ::agent_run::{AgentPrompt, AgentPromptError};
+use writ::agent_run::{AgentPrompt, AgentPromptError, RunPurpose};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
@@ -81,7 +81,10 @@ pub struct SubmitReviewInputs {
     /// Opaque tag bailiff sends on `RunAgent`. Writ stores it
     /// verbatim in its audit row and on the review note in bailiff's
     /// repo; useful for cross-correlation, never policy-interpreted.
-    pub purpose: String,
+    ///
+    /// Parsed at bailiff's CLI boundary, so a purpose writ would refuse
+    /// fails before any session is opened or audit row spent.
+    pub purpose: RunPurpose,
     /// Notes ref bailiff asks writ to write the reviewer envelope
     /// to. Today this is always `refs/notes/writ/v1/agent-outputs`;
     /// surfacing it as a parameter (rather than a constant) keeps
@@ -562,7 +565,7 @@ mod end_to_end_tests {
                     name: "writ".into(),
                 },
             }],
-            purpose: "plan-submit".into(),
+            purpose: "plan-submit".parse().unwrap(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_label: Some("plan-submit:test".into()),
             session_agent_kind: Some(AgentKind::Claude),
@@ -613,7 +616,7 @@ mod end_to_end_tests {
                     name: "writ".into(),
                 },
             }],
-            purpose: "plan-review".into(),
+            purpose: "plan-review".parse().unwrap(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_label: Some("plan-review:test".into()),
             session_agent_kind: Some(AgentKind::Claude),
@@ -711,7 +714,7 @@ mod end_to_end_tests {
                     name: "writ".into(),
                 },
             }],
-            purpose: "plan-review".into(),
+            purpose: "plan-review".parse().unwrap(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_label: None,
             session_agent_kind: Some(AgentKind::Claude),
@@ -795,7 +798,7 @@ mod end_to_end_tests {
                     name: "writ".into(),
                 },
             }],
-            purpose: "plan-review".into(),
+            purpose: "plan-review".parse().unwrap(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_label: None,
             session_agent_kind: Some(AgentKind::Claude),
@@ -877,7 +880,7 @@ mod end_to_end_tests {
                     name: "writ".into(),
                 },
             }],
-            purpose: "plan-review".into(),
+            purpose: "plan-review".parse().unwrap(),
             writ_output_ref: NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
             session_label: None,
             session_agent_kind: Some(AgentKind::Claude),

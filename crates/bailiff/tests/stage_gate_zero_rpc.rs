@@ -227,7 +227,7 @@ fn plant(repo: &NotesRepo, writ: &WritSide, plan_id: PlanId, state: PlanState) {
     if presence.submission {
         let note = PlanNote {
             plan_id,
-            purpose: "plan-submit".into(),
+            purpose: "plan-submit".parse().unwrap(),
             writ_output_oid: writ.oid.clone(),
             signed_metadata: writ.metadata.clone(),
             signature: writ.signature.clone(),
@@ -242,7 +242,7 @@ fn plant(repo: &NotesRepo, writ: &WritSide, plan_id: PlanId, state: PlanState) {
     if presence.review {
         let note = ReviewNote {
             plan_id,
-            purpose: "plan-review".into(),
+            purpose: "plan-review".parse().unwrap(),
             writ_output_oid: writ.oid.clone(),
             signed_metadata: writ.metadata.clone(),
             signature: writ.signature.clone(),
@@ -271,7 +271,7 @@ fn plant(repo: &NotesRepo, writ: &WritSide, plan_id: PlanId, state: PlanState) {
     if presence.implement {
         let note = ImplementNote {
             plan_id,
-            purpose: "plan-implement".into(),
+            purpose: "plan-implement".parse().unwrap(),
             writ_output_oid: writ.oid.clone(),
             signed_metadata: writ.metadata.clone(),
             signature: writ.signature.clone(),
@@ -315,7 +315,7 @@ async fn drive(
             let inputs = SubmitPlanInputs {
                 prompt: AgentPrompt::try_new("Draft a plan.").unwrap(),
                 capabilities: vec![CapabilitySet::WorkspaceRead { repo: repo_ref() }],
-                purpose: "plan-submit".into(),
+                purpose: "plan-submit".parse().unwrap(),
                 writ_output_ref: writ_output_ref(),
                 session_label: None,
                 session_agent_kind: Some(AgentKind::Claude),
@@ -334,7 +334,7 @@ async fn drive(
                 plan_id,
                 reviewer_instructions: AgentPrompt::try_new("Evaluate.").unwrap(),
                 capabilities: vec![CapabilitySet::WorkspaceRead { repo: repo_ref() }],
-                purpose: "plan-review".into(),
+                purpose: "plan-review".parse().unwrap(),
                 writ_output_ref: writ_output_ref(),
                 session_label: None,
                 session_agent_kind: Some(AgentKind::Claude),
@@ -352,7 +352,7 @@ async fn drive(
                 plan_id,
                 feature_prompt: AgentPrompt::try_new("Build it.").unwrap(),
                 capabilities: vec![CapabilitySet::WorkspaceWrite { repo: repo_ref() }],
-                purpose: "plan-implement".into(),
+                purpose: "plan-implement".parse().unwrap(),
                 writ_output_ref: writ_output_ref(),
                 session_agent_kind: AgentKind::Claude,
                 session_agent_model: "claude-test".into(),

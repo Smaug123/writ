@@ -72,7 +72,7 @@ use crate::bailiff_plan_state::{IllegalTransition, PlanStage, allows};
 pub use crate::bailiff_plan_write::StageNoteTarget;
 use crate::bailiff_plan_write::{WriteStageNoteError, write_stage_note};
 use crate::bailiff_repo_guard::{PlanGuard, PlanGuardError};
-use writ::agent_run::{AgentPrompt, AgentPromptError};
+use writ::agent_run::{AgentPrompt, AgentPromptError, RunPurpose};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, SessionId};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
@@ -439,7 +439,14 @@ pub struct StageRunInputs {
     pub capabilities: Vec<CapabilitySet>,
     /// Opaque tag writ stores verbatim in its audit row and bailiff
     /// stores on the note. Never policy-interpreted.
-    pub purpose: String,
+    ///
+    /// Held as a parsed [`RunPurpose`] so a purpose writ would refuse is
+    /// rejected at bailiff's own CLI boundary, before a session is opened
+    /// and an audit row spent. The note takes the same value as a
+    /// `String`: a note's `purpose` is a historical record that may
+    /// predate the type, so the note reader must stay able to read
+    /// whatever an older bailiff wrote.
+    pub purpose: RunPurpose,
     /// Notes ref writ writes the signed envelope to, and the same ref
     /// the note write later fetches from.
     pub writ_output_ref: NotesRef,
@@ -557,7 +564,7 @@ pub async fn run_under_owned_session(
     inputs: StageRunInputs,
 ) -> Result<StageRun, OwnedSessionRunError> {
     // The same `purpose` and output ref go to writ and onto the note.
-    let purpose = inputs.purpose.clone();
+    let purpose = inputs.purpose.to_string();
     let writ_output_ref = inputs.writ_output_ref.clone();
 
     let session_id = client
@@ -699,7 +706,7 @@ pub async fn run_under_broker_session(
     note: StageNoteTarget,
     inputs: StageRunInputs,
 ) -> Result<StageRun, BrokerSessionRunError> {
-    let purpose = inputs.purpose.clone();
+    let purpose = inputs.purpose.to_string();
     let writ_output_ref = inputs.writ_output_ref.clone();
 
     let completed = client

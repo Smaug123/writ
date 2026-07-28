@@ -590,6 +590,7 @@ mod tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
+                purpose: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -673,6 +674,7 @@ mod tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
+                purpose: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -734,6 +736,7 @@ mod tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
+                purpose: None,
             })
             .unwrap();
         let empty = AgentRunStreamUpload {
@@ -995,6 +998,7 @@ mod tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 prompt: AgentPrompt::new("prompt").summary(),
                 correlation_id: None,
+                purpose: None,
             })
             .unwrap();
         let temp = tempfile::tempdir().unwrap();

@@ -37,6 +37,7 @@ fn seed_synthetic_outcome(
             agent_kind: AgentKind::Claude,
             prompt: crate::agent_run::AgentPrompt::new("test").summary(),
             correlation_id: None,
+            purpose: None,
         })
         .unwrap();
     let stream = |label: &str| AgentRunStreamSummary {

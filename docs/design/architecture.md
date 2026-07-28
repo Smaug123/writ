@@ -468,6 +468,43 @@ This is also why `EFFECT_AUDIT_PAIRS` excludes `agent_run`: an unpaired row
 there is indistinguishable from a run still in flight, so the generic boot scan
 would false-positive on every live run.
 
+**The two caller tags on an `agent_run` row.** `correlation_id` and `purpose`
+are both opaque strings writ stores and never interprets, but they arrive from
+different RPCs and neither substitutes for the other. `RunAgent` carries a
+`purpose` and no correlation id; `StartAgentRun` the reverse. `AgentRunTags`
+bundles them so each call site states which it is supplying and which it is
+not, rather than passing a lengthening tail of positional `Option`s.
+
+They are separate columns because `CorrelationId`'s class (alnum, `-`, `_`) is
+narrow by design — it must not be able to pose as a path segment or URL scheme
+— and rejects the colon in bailiff's `review:plan-abc`. Routing a purpose
+through it would have turned a valid request into a parse error.
+
+`RunPurpose` is therefore its own type: 1..=128 bytes of printable ASCII with
+no leading or trailing space. The class is an allowlist rather than a blocklist
+of dangerous characters, which is what makes it exhaustive — it excludes NUL,
+CR/LF, ESC, C1, zero-width spaces, and bidi overrides by construction, so two
+purposes cannot be unequal as join keys while rendering identically. Allowing
+Unicode could not deliver that: it would need a format-character blocklist that
+is wrong by default whenever Unicode gains a member, and would still admit the
+homoglyphs (Cyrillic `а` is an ordinary letter) that motivate it. The cost is
+that a purpose is Latin-script; that is a loud parse-time rejection, and the
+class can be widened later without invalidating a single stored value, whereas
+a log full of Unicode purposes could never be narrowed.
+
+The migration-8 CHECK is an *exact* mirror of `RunPurpose::try_new` rather than
+a coarse floor, because printable ASCII is expressible in SQLite's GLOB. That
+matters: `agent_run_from_row` turns an unparseable value into an `Invariant`
+error, so a CHECK any weaker than the parser would admit rows the reader later
+refuses — an audit log that cannot be read back. One clause is subtle and
+load-bearing: `length(cast(purpose AS BLOB)) = length(purpose)` is the only
+guard against an embedded NUL, because both `length()` and `GLOB` stop at the
+first one.
+
+The column is nullable and is not backfilled — a sentinel would be fabricated
+audit data. `NULL` reads as "no purpose was supplied", which covers both rows
+predating the migration and every `StartAgentRun` row permanently.
+
 **The approve-attempt state machine.** `approve_attempt.rs` owns the vocabulary
 and the transition relation of the operator-approve lifecycle, which the DAO
 merely persists. Three layers:
