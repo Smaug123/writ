@@ -1053,6 +1053,68 @@ fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
     assert!(checked.agent_vm.is_none());
 }
 
+/// Preparing the root chmods it, and `set_permissions` follows symlinks — so a
+/// symlinked root would re-mode whatever it points at, which an attacker with
+/// write access to the link's parent gets to choose. Refuse instead, as the
+/// work-root validator does, and leave the target untouched.
+#[test]
+fn a_symlinked_agent_run_log_root_is_refused_rather_than_followed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("someone-elses-directory");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = temp.path().join("log-root-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = AgentRunLogRoot::check(link.clone())
+        .unwrap()
+        .prepare()
+        .unwrap_err();
+
+    assert!(
+        matches!(err, AgentRunLogRootError::Symlink { ref path } if *path == link),
+        "got {err:?}",
+    );
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "the symlink's target was re-moded to {mode:o}");
+}
+
+/// Preparing the log root and materialising the section's own directories are
+/// independent effects, so a bad log root must not defer a bad staging root to
+/// the operator's next attempt. This is the same contract
+/// `check_daemon_sections` holds; the convenience method must not be the
+/// weaker path.
+#[test]
+fn the_direct_runtime_conversion_reports_a_bad_log_root_and_a_bad_staging_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_root = temp.path().join("log-root-is-a-file");
+    std::fs::write(&log_root, b"file").unwrap();
+    let staging_root = temp.path().join("staging-root-is-a-file");
+    std::fs::write(&staging_root, b"file").unwrap();
+
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.work_root = temp.path().join("work-root");
+    vm_http.git_push_staging_root = Some(staging_root);
+    let config = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+
+    let errors = config
+        .to_runtime_config(AgentRunLogRoot::check(log_root).unwrap())
+        .unwrap_err();
+    let rendered = errors.to_string();
+    assert!(
+        rendered.contains("agent run log root"),
+        "expected the log root failure, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("git push staging root"),
+        "expected the staging root failure too, got: {rendered}"
+    );
+}
+
 /// `to_runtime_config` hands back a config that is meant to be *usable*, and
 /// `AgentRunLogRoot` only proves the path is well-formed. Before the hoist the
 /// log root was one of `vm_http`'s own and `materialize` created it, so a

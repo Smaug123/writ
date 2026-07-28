@@ -760,7 +760,24 @@ impl AgentRunLogRoot {
     /// itself, and `ensure_vm_http_work_root_private` refuses a work root with
     /// any group or world bit set. At 0700 it accepts, so the two roots can be
     /// prepared in either order.
+    /// A root that already exists as a **symlink** is refused rather than
+    /// followed. `set_permissions` resolves the link, so chmodding one would
+    /// re-mode whatever it points at — a directory this config never named,
+    /// and one an attacker with write access to the link's parent chooses.
+    /// `ensure_vm_http_work_root_private` refuses a symlinked work root for
+    /// the same reason.
     pub fn prepare(&self) -> Result<(), AgentRunLogRootError> {
+        match std::fs::symlink_metadata(&self.0) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(AgentRunLogRootError::Symlink {
+                    path: self.0.clone(),
+                });
+            }
+            Ok(_) => {}
+            // Absent is the ordinary case; anything else is reported by the
+            // creation attempt below, which names the same path.
+            Err(_) => {}
+        }
         create_private_dir_all(&self.0).map_err(|source| AgentRunLogRootError::Create {
             path: self.0.clone(),
             source,
@@ -798,6 +815,11 @@ fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
 /// wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentRunLogRootError {
+    #[error(
+        "agent run log root {path:?} is a symlink; refusing to follow it, since preparing the \
+         root would re-mode and write into whatever it points at"
+    )]
+    Symlink { path: PathBuf },
     #[error("agent run log root path must not be empty")]
     Empty,
     #[error("agent run log root path must be absolute: {0:?}")]
@@ -866,8 +888,17 @@ impl AgentVmDaemonConfig {
         let mut errors = Accumulator::new();
         let plan = errors.record_many(self.check());
         let prepared = errors.record_from(agent_run_log_root.prepare());
-        let (plan, ()) = errors.unpack(all_recorded!(plan, prepared))?;
-        plan.materialize(agent_run_log_root)
+        // Materialise whenever there is a plan to materialise, *whatever*
+        // preparing the log root did: they are independent effects, and
+        // returning here on a bad log root would hide a bad work or staging
+        // root until the next attempt — the tiering this module exists to
+        // avoid. A failed `check` is different: there is then no plan.
+        let runtime = match plan {
+            Ok(plan) => errors.record_many(plan.materialize(agent_run_log_root.clone())),
+            Err(failed) => Err(failed),
+        };
+        let (runtime, ()) = errors.unpack(all_recorded!(runtime, prepared))?;
+        Ok(runtime)
     }
 
     /// Run every check that touches nothing across both subsections, and
