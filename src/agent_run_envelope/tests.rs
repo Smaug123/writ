@@ -450,3 +450,43 @@ async fn an_over_cap_stream_file_swapped_for_different_bytes_is_refused() {
         "the error must name the stream that changed, got: {message}",
     );
 }
+
+/// The re-read stops as soon as the file is longer than its row says, rather
+/// than draining to EOF.
+///
+/// A file that keeps growing has no EOF: a host-spawned agent that leaves a
+/// detached helper appending to its own stream file could hold `RunAgent`
+/// reading and hashing forever, pinning the blocking-pool thread the run
+/// occupies. The row already fixes the expected length, so one byte past it is
+/// all the evidence a mismatch needs — everything after that is the attacker
+/// choosing how long writ works for them.
+///
+/// Driven through an endless reader, with a timeout so a regression fails the
+/// test instead of hanging it.
+#[tokio::test]
+async fn the_stream_read_stops_once_the_file_outgrows_its_row() {
+    let expected_byte_len = 64u64;
+    let readback = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_capped_and_hashed(
+            tokio::io::repeat(b'x'),
+            crate::server::MAX_RUN_AGENT_STREAM_BYTES,
+            expected_byte_len,
+        ),
+    )
+    .await
+    .expect("the read must not chase an endless file")
+    .expect("an endless reader yields no IO error");
+
+    assert!(
+        readback.file_byte_len > expected_byte_len,
+        "it must read far enough to know the file outgrew its row",
+    );
+    // The bound is the row's length plus whatever one read returned past it,
+    // not the whole stream. Anything near the 4-MiB cap means it kept going.
+    assert!(
+        readback.file_byte_len < crate::server::MAX_RUN_AGENT_STREAM_BYTES as u64,
+        "it read {} bytes chasing a 64-byte row",
+        readback.file_byte_len,
+    );
+}

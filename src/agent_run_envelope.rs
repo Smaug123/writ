@@ -210,25 +210,38 @@ async fn read_stream_capped_from_disk(
         source,
     };
     let file = tokio::fs::File::open(path).await.map_err(read_error)?;
-    let readback = read_capped_and_hashed(file, cap)
+    let readback = read_capped_and_hashed(file, cap, summary.byte_len)
         .await
         .map_err(read_error)?;
     check_matches_summary(stream, summary, &readback)?;
     Ok((readback.retained, readback.capped_at))
 }
 
-/// Read `reader` to EOF, retaining at most `cap` bytes and hashing every byte
-/// that goes past.
+/// Read `reader`, retaining at most `cap` bytes and hashing every byte that
+/// goes past, and stopping once more than `expected_byte_len` have arrived.
 ///
-/// Reading to EOF is not optional: it is the only way to know whether the
-/// stream ran past `cap` at all. Since those bytes are read regardless, the
+/// Reading past `cap` is not optional: it is the only way to know whether the
+/// stream ran over at all. Since those bytes are read regardless, the
 /// whole-file digest costs hashing and no extra IO — which is what lets the
 /// outcome-row check stay total instead of weakening above the cap. Memory
 /// stays bounded at `cap` either way: past it, bytes are hashed and dropped.
 ///
+/// `expected_byte_len` is what the outcome row says the file is, and it bounds
+/// the read in *time* the way `cap` bounds it in memory. A file that keeps
+/// growing has no EOF — a host-spawned agent can leave a detached helper
+/// appending to its own stream file — and draining to EOF would let that agent
+/// decide how long writ reads and hashes for it, pinning the run's
+/// blocking-pool thread. One byte past the recorded length is all the evidence
+/// a mismatch needs, and a mismatch is refused, so there is nothing further to
+/// learn by reading on.
+///
 /// The cap is byte-aligned to whatever the underlying read returned; a single
 /// read is not bisected across the boundary.
-async fn read_capped_and_hashed<R>(mut reader: R, cap: usize) -> std::io::Result<StreamReadback>
+async fn read_capped_and_hashed<R>(
+    mut reader: R,
+    cap: usize,
+    expected_byte_len: u64,
+) -> std::io::Result<StreamReadback>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -252,6 +265,7 @@ where
         digest.update(chunk);
         file_byte_len = file_byte_len.saturating_add(n as u64);
         let room = cap.saturating_sub(retained.len());
+        let outgrew_its_row = file_byte_len > expected_byte_len;
         if room == 0 {
             // Already filled exactly to the cap; more bytes prove it overran.
             capped_at = Some(cap as u64);
@@ -260,6 +274,18 @@ where
         } else {
             retained.extend_from_slice(&chunk[..room]);
             capped_at = Some(cap as u64);
+        }
+        if outgrew_its_row {
+            // The file is already longer than the row claims, so the check
+            // refuses whatever else is in it. Returning a digest of a prefix is
+            // safe precisely because it cannot be mistaken for a match: the
+            // length disagrees on its own.
+            return Ok(StreamReadback {
+                retained,
+                capped_at,
+                file_byte_len,
+                file_sha256_hex: digest.finish_hex(),
+            });
         }
     }
 }
