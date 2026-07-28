@@ -163,6 +163,7 @@ async fn run_host_daemon(
         audit_db: audit_db_config,
         ui_http,
         run_agent,
+        agent_run_log_root,
     } = config;
 
     let socket_path = socket.or(socket_path).unwrap_or_else(default_socket_path);
@@ -223,8 +224,21 @@ async fn run_host_daemon(
     // restart — which is also why `ui_http` is checked *here* rather than at
     // the point its listener is bound, hundreds of lines and one socket bind,
     // one signing key and two reconcile passes later.
-    let agent_vm = check_daemon_sections(agent_vm.as_ref(), ui_http.as_ref())
-        .map_err(|errors| errors.to_string())?;
+    let checked = check_daemon_sections(
+        agent_vm.as_ref(),
+        ui_http.as_ref(),
+        agent_run_log_root.as_deref(),
+    )
+    .map_err(|errors| errors.to_string())?;
+    let agent_vm = checked.agent_vm;
+    // Both `RunAgent` arms write per-run stdout/stderr here, and the absolute
+    // paths land on `agent_run_outcome` rows — so the operator needs to know
+    // which directory this boot resolved, whether they configured it or took
+    // the default.
+    tracing::info!(
+        agent_run_log_root = %checked.agent_run_log_root.display(),
+        "agent run logs directory",
+    );
 
     // Attach the vm-arm host facts (raw config text + effective audit DB path)
     // the broker-VM placement needs but cannot read from the parsed config. A

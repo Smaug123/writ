@@ -120,7 +120,6 @@ pub struct VmHttpRuntimeConfig {
     nix_cache: VmHttpNixCacheConfig,
     claude_proxy: Option<VmHttpClaudeProxyConfig>,
     openai_proxy: Option<VmHttpOpenAiProxyConfig>,
-    agent_run_log_root: PathBuf,
     git_push_staging_root: PathBuf,
     git_push_body_limits: VmGitPushBodyLimits,
     /// Flake-input provisioning. `None` disables the `/v1/nix/flake/provision`
@@ -437,7 +436,6 @@ impl VmHttpRuntimeConfig {
         broker_port_range: BrokerPortRange,
         git_clone: VmHttpGitCloneConfig,
         nix_cache: VmHttpNixCacheConfig,
-        agent_run_log_root: impl Into<PathBuf>,
         git_push_staging_root: impl Into<PathBuf>,
         git_push_body_limits: VmGitPushBodyLimits,
     ) -> Self {
@@ -447,7 +445,6 @@ impl VmHttpRuntimeConfig {
             git_clone,
             nix_cache,
             None,
-            agent_run_log_root,
             git_push_staging_root,
             git_push_body_limits,
         )
@@ -460,7 +457,6 @@ impl VmHttpRuntimeConfig {
         git_clone: VmHttpGitCloneConfig,
         nix_cache: VmHttpNixCacheConfig,
         claude_proxy: Option<VmHttpClaudeProxyConfig>,
-        agent_run_log_root: impl Into<PathBuf>,
         git_push_staging_root: impl Into<PathBuf>,
         git_push_body_limits: VmGitPushBodyLimits,
     ) -> Self {
@@ -471,7 +467,6 @@ impl VmHttpRuntimeConfig {
             nix_cache,
             claude_proxy,
             None,
-            agent_run_log_root,
             git_push_staging_root,
             git_push_body_limits,
         )
@@ -485,7 +480,6 @@ impl VmHttpRuntimeConfig {
         nix_cache: VmHttpNixCacheConfig,
         claude_proxy: Option<VmHttpClaudeProxyConfig>,
         openai_proxy: Option<VmHttpOpenAiProxyConfig>,
-        agent_run_log_root: impl Into<PathBuf>,
         git_push_staging_root: impl Into<PathBuf>,
         git_push_body_limits: VmGitPushBodyLimits,
     ) -> Self {
@@ -496,7 +490,6 @@ impl VmHttpRuntimeConfig {
             nix_cache,
             claude_proxy,
             openai_proxy,
-            agent_run_log_root: agent_run_log_root.into(),
             git_push_staging_root: git_push_staging_root.into(),
             git_push_body_limits,
             flake_provision: None,
@@ -552,10 +545,6 @@ impl VmHttpRuntimeConfig {
 
     pub fn openai_proxy(&self) -> Option<&VmHttpOpenAiProxyConfig> {
         self.openai_proxy.as_ref()
-    }
-
-    pub fn agent_run_log_root(&self) -> &Path {
-        &self.agent_run_log_root
     }
 
     pub fn git_push_staging_root(&self) -> &Path {

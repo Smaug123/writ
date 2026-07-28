@@ -187,7 +187,6 @@ start.
     "nix_cache_max_metadata_bytes": 1048576,
     "nix_cache_max_nar_bytes": 67108864,
     "flake_mirror_cache_dir": "/abs/path/to/writ/flake-mirror-cache",
-    "agent_run_log_root": "/abs/path/to/writ/agent-run-logs",
     "git_push_staging_root": "/abs/path/to/writ/git-push-staging"
   }
 }
@@ -218,8 +217,22 @@ Before that block does anything useful you need four things on disk:
 4. **`git_program`** — absolute path to the git binary you want the
    broker to shell out to. Don't rely on `$PATH`.
 
-`agent_run_log_root` and `git_push_staging_root` are optional; if
-omitted they default to subdirectories of `work_root`.
+`git_push_staging_root` is optional; if omitted it defaults to a
+subdirectory of `work_root`.
+
+`agent_run_log_root` is a **top-level** key, not part of `agent_vm` — both
+ways of running an agent write per-run `stdout.log` / `stderr.log` beneath it,
+so neither section owns it:
+
+```json
+"agent_run_log_root": "/abs/path/to/writ/agent-run-logs"
+```
+
+It is optional and defaults to `$XDG_DATA_HOME/writ/agent-runs` (falling back
+to `~/.local/share/writ/agent-runs`). The daemon creates it at boot and proves
+it writable, so a bad path is a startup error rather than a surprise mid-run.
+Paths recorded on audit rows are absolute, so moving this root leaves logs
+already written where they are.
 
 `flake_mirror_cache_dir` is optional but recommended: setting it turns on
 **flake-input provisioning**, so `writ agent … --warm devshell` works for a

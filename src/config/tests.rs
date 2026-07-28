@@ -326,8 +326,7 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
                     "timeout_secs": 60,
                     "max_request_bytes": 2097152,
                     "max_response_bytes": 8388608
-                },
-                "agent_run_log_root": "/var/folders/writ/agent-runs"
+                }
             }
         }
     }"#,
@@ -335,14 +334,14 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
     .unwrap();
     json["agent_vm"]["vm_http"]["work_root"] =
         serde_json::Value::String(work_root.to_string_lossy().into_owned());
-    json["agent_vm"]["vm_http"]["agent_run_log_root"] =
-        serde_json::Value::String(agent_run_log_root.to_string_lossy().into_owned());
     json["agent_vm"]["vm_http"]["git_push_staging_root"] =
         serde_json::Value::String(git_push_staging_root.to_string_lossy().into_owned());
     let c: DaemonConfig = serde_json::from_value(json).unwrap();
     let agent_vm = c.agent_vm.unwrap();
 
-    let runtime = agent_vm.to_runtime_config().unwrap();
+    let runtime = agent_vm
+        .to_runtime_config(agent_run_log_root.clone())
+        .unwrap();
 
     assert_eq!(runtime.vm_http().bind_addr(), Ipv4Addr::UNSPECIFIED);
     assert_eq!(runtime.vm_http().broker_port_range().min().get(), 18080);
@@ -391,7 +390,7 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
         claude_proxy.max_response_bytes(),
         ByteSize::from_bytes(8_388_608)
     );
-    assert_eq!(runtime.vm_http().agent_run_log_root(), agent_run_log_root);
+    assert_eq!(runtime.agent_run_log_root(), agent_run_log_root);
     assert_eq!(
         runtime.vm_http().git_push_staging_root(),
         git_push_staging_root
@@ -459,8 +458,7 @@ fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
                     "timeout_secs": 60,
                     "max_request_bytes": 2097152,
                     "max_response_bytes": 8388608
-                },
-                "agent_run_log_root": "/var/folders/writ/agent-runs"
+                }
             }
         }
     }"#,
@@ -468,12 +466,12 @@ fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
     .unwrap();
     json["agent_vm"]["vm_http"]["work_root"] =
         serde_json::Value::String(work_root.to_string_lossy().into_owned());
-    json["agent_vm"]["vm_http"]["agent_run_log_root"] =
-        serde_json::Value::String(agent_run_log_root.to_string_lossy().into_owned());
     let c: DaemonConfig = serde_json::from_value(json).unwrap();
     let agent_vm = c.agent_vm.unwrap();
 
-    let runtime = agent_vm.to_runtime_config().unwrap();
+    let runtime = agent_vm
+        .to_runtime_config(agent_run_log_root.clone())
+        .unwrap();
     let claude_proxy = runtime.vm_http().claude_proxy().unwrap();
     assert_eq!(claude_proxy.auth_secret().as_str(), "anthropic-oauth-token");
     assert_eq!(claude_proxy.auth_kind(), VmHttpClaudeProxyAuthKind::OAuth);
@@ -542,7 +540,6 @@ fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
         flake_provision_timeout_secs: default_flake_provision_timeout_secs(),
         claude_proxy: None,
         openai_proxy: None,
-        agent_run_log_root: None,
         git_push_staging_root: None,
         git_push_max_body_bytes: default_git_push_max_body_bytes(),
         git_push_max_metadata_bytes: default_git_push_max_metadata_bytes(),
@@ -701,7 +698,7 @@ fn agent_vm_config_rejects_non_wildcard_vm_http_bind_address() {
     };
 
     assert!(matches!(
-        sole_error(c.to_runtime_config()),
+        sole_error(c.to_runtime_config(unique_config_test_path("agent-runs"))),
         AgentVmDaemonConfigError::Runtime(
             AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(addr)
         ) if addr == Ipv4Addr::LOCALHOST
@@ -951,39 +948,94 @@ fn agent_vm_http_config_applies_defaults_for_omitted_fields() {
     assert_eq!(c.nix_cache_max_nar_bytes, ByteSize::mib(512));
     assert!(c.claude_proxy.is_none());
     assert!(c.openai_proxy.is_none());
-    assert!(c.agent_run_log_root.is_none());
     assert!(c.git_push_staging_root.is_none());
     assert!(c.flake_input_cache_dir.is_none());
     assert!(c.flake_mirror_cache_dir.is_none());
 }
 
+/// Whichever branch it takes, the default log root is an absolute path under
+/// writ's own data directory — never relative, and never under the agent-VM
+/// work root, which is a subsystem's scratch space.
 #[test]
-fn agent_vm_http_config_rejects_relative_agent_run_log_root() {
-    let mut c = valid_agent_vm_http_config();
-    c.agent_run_log_root = Some(PathBuf::from("agent-runs"));
+fn the_default_agent_run_log_root_is_absolute_and_writ_owned() {
+    let root = default_agent_run_log_root();
+    assert!(root.is_absolute(), "{root:?}");
+    assert!(root.ends_with("writ/agent-runs"), "{root:?}");
+}
 
+/// The agent-run log root is a *top-level* key, so it is checked whether or
+/// not an `agent_vm` section exists — a daemon serving only host-spawn
+/// `RunAgent` still writes stream files under it.
+#[test]
+fn daemon_config_rejects_relative_agent_run_log_root() {
     assert!(matches!(
-        sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::RelativeAgentRunLogRoot(path)
+        sole_error(check_daemon_sections(None, None, Some(Path::new("agent-runs")))),
+        DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Relative(path))
             if path.as_os_str() == "agent-runs"
     ));
 }
 
 #[test]
-fn agent_vm_http_config_rejects_unwritable_agent_run_log_root() {
+fn daemon_config_rejects_unwritable_agent_run_log_root() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("not-a-directory");
     std::fs::write(&path, b"file").unwrap();
-    let mut c = valid_agent_vm_http_config();
-    c.agent_run_log_root = Some(path.clone());
 
     assert!(matches!(
-        sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::AgentRunLogRootCreate {
+        sole_error(check_daemon_sections(None, None, Some(&path))),
+        DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Create {
             path: failed,
             ..
-        } if failed == path
+        }) if failed == path
     ));
+}
+
+/// Checking creates the root, so an operator learns at boot that it is
+/// writable rather than at the first `RunAgent`.
+#[test]
+fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("named-explicitly");
+    assert!(!root.exists());
+
+    let checked = check_daemon_sections(None, None, Some(&root)).unwrap();
+
+    assert_eq!(checked.agent_run_log_root, root);
+    assert!(root.is_dir(), "the root must exist after checking");
+    assert!(checked.agent_vm.is_none());
+}
+
+/// Creating the log root and materialising the `agent_vm` section are
+/// independent effects: a broken log root must not hide a broken sibling root,
+/// which is the whole point of accumulating.
+#[test]
+fn a_broken_agent_run_log_root_does_not_hide_a_broken_push_staging_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_root = temp.path().join("log-root-is-a-file");
+    std::fs::write(&log_root, b"file").unwrap();
+    let staging_root = temp.path().join("staging-root-is-a-file");
+    std::fs::write(&staging_root, b"file").unwrap();
+
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.work_root = temp.path().join("work-root");
+    vm_http.git_push_staging_root = Some(staging_root.clone());
+    let agent_vm = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+
+    let Err(errors) = check_daemon_sections(Some(&agent_vm), None, Some(&log_root)) else {
+        panic!("expected the config to be rejected");
+    };
+    let rendered = errors.to_string();
+    assert!(
+        rendered.contains("agent run log root"),
+        "expected the log root failure, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("git push staging root"),
+        "expected the staging root failure too, got: {rendered}"
+    );
 }
 
 /// A typo on a top-level field (e.g. `agentVm` instead of `agent_vm`)
@@ -1664,7 +1716,6 @@ fn agent_vm_http_config_reports_every_independent_failure() {
     c.git_clone_base_url = "ssh://github.com".into();
     c.nix_cache_url = "not-a-url".into();
     c.nix_cache_trusted_public_keys = vec!["missing-the-colon".into()];
-    c.agent_run_log_root = Some(PathBuf::from("relative/log-root"));
     c.git_push_staging_root = Some(PathBuf::from("relative/staging"));
     c.git_push_max_body_bytes = ByteSize::from_bytes(0);
     c.flake_mirror_cache_dir = Some(PathBuf::from("relative/mirrors"));
@@ -1677,7 +1728,6 @@ fn agent_vm_http_config_reports_every_independent_failure() {
         "ssh",
         "not-a-url",
         "missing-the-colon",
-        "agent run log root",
         "git push staging root",
         "flake mirror cache dir",
         "nix pre-warm cache dir",
@@ -1693,7 +1743,7 @@ fn agent_vm_http_config_reports_every_independent_failure() {
             .any(|error| matches!(error, AgentVmHttpConfigError::GitPushBodyLimits(_))),
         "zero git push body limit not reported; got {found:#?}",
     );
-    assert_eq!(errors.len(), 9, "unexpected failure set: {found:#?}");
+    assert_eq!(errors.len(), 8, "unexpected failure set: {found:#?}");
 }
 
 /// The lifecycle and vm_http sections are independent, so a mistake in one
@@ -1708,7 +1758,9 @@ fn agent_vm_daemon_config_reports_lifecycle_and_vm_http_failures_together() {
     vm_http.git_push_max_body_bytes = ByteSize::from_bytes(0);
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
         errors
@@ -1819,7 +1871,9 @@ fn a_bad_lifecycle_section_creates_no_vm_http_directories() {
     vm_http.work_root = work_root.clone();
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .unwrap_err();
 
     assert!(
         errors
@@ -1846,13 +1900,14 @@ fn a_rejected_work_root_suppresses_every_root_probe() {
     let work_root = temp.path().join("loose-work-root");
     std::fs::create_dir(&work_root).unwrap();
     std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // An explicit log root elsewhere, which would fail its probe if attempted.
-    let log_root = temp.path().join("log-root-is-a-file");
-    std::fs::write(&log_root, b"not a directory").unwrap();
+    // An explicit staging root elsewhere, which would fail its probe if
+    // attempted.
+    let staging_root = temp.path().join("staging-root-is-a-file");
+    std::fs::write(&staging_root, b"not a directory").unwrap();
 
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
-    c.agent_run_log_root = Some(log_root.clone());
+    c.git_push_staging_root = Some(staging_root.clone());
 
     let errors = c.to_runtime_config().unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
@@ -1868,8 +1923,8 @@ fn a_rejected_work_root_suppresses_every_root_probe() {
         "expected only the work root failure: {found:#?}"
     );
     assert!(
-        log_root.is_file(),
-        "the explicit log root was mutated after the work root was rejected",
+        staging_root.is_file(),
+        "the explicit staging root was mutated after the work root was rejected",
     );
 }
 
@@ -1886,7 +1941,9 @@ fn a_non_wildcard_bind_addr_is_reported_with_its_siblings_and_creates_nothing() 
     vm_http.bind_addr = Ipv4Addr::new(127, 0, 0, 1);
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
 
     assert!(
@@ -1924,7 +1981,7 @@ fn a_root_under_an_unpreparable_work_root_fails_rather_than_creating_it() {
 
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
-    c.agent_run_log_root = Some(work_root.join("logs"));
+    c.git_push_staging_root = Some(work_root.join("staging"));
 
     let errors = c.to_runtime_config().unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
@@ -1950,11 +2007,11 @@ fn a_rejected_work_root_creates_no_roots_beneath_it() {
     let work_root = temp.path().join("loose-work-root");
     std::fs::create_dir(&work_root).unwrap();
     std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let log_root = work_root.join("logs");
+    let staging_root = work_root.join("staging");
 
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
-    c.agent_run_log_root = Some(log_root.clone());
+    c.git_push_staging_root = Some(staging_root.clone());
 
     let errors = c.to_runtime_config().unwrap_err();
     assert!(
@@ -1964,8 +2021,8 @@ fn a_rejected_work_root_creates_no_roots_beneath_it() {
         "work root failure missing: {errors}",
     );
     assert!(
-        !log_root.exists(),
-        "{log_root:?} was created inside a work root that had just been rejected",
+        !staging_root.exists(),
+        "{staging_root:?} was created inside a work root that had just been rejected",
     );
 }
 
@@ -1982,7 +2039,9 @@ fn a_non_wildcard_bind_addr_is_reported_alongside_an_unrelated_vm_http_fault() {
         lifecycle: valid_agent_vm_lifecycle_config(),
         vm_http,
     };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
         errors.iter().any(|error| matches!(
@@ -2016,7 +2075,12 @@ fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
         bearer_path: None,
     };
 
-    let errors = check_daemon_sections(Some(&agent_vm), Some(&ui_http)).unwrap_err();
+    let errors = check_daemon_sections(
+        Some(&agent_vm),
+        Some(&ui_http),
+        Some(&unique_config_test_path("agent-runs")),
+    )
+    .unwrap_err();
     assert!(
         errors
             .iter()

@@ -118,6 +118,22 @@ pub struct DaemonConfig {
     /// [`RunAgentDaemonConfig`].
     #[serde(default)]
     pub run_agent: Option<RunAgentDaemonConfig>,
+    /// Directory under which writd keeps one subdirectory per agent run
+    /// holding that run's captured `stdout.log` and `stderr.log`. Defaults to
+    /// [`default_agent_run_log_root`].
+    ///
+    /// Top-level rather than under `agent_vm`, because *both* `RunAgent`
+    /// dispatch arms write here: the VM arm materialises the streams the guest
+    /// uploads, and the host-spawn arm captures its child's directly. Neither
+    /// section can own the key — `ClientMessage::StartAgentRun` reaches the VM
+    /// arm with no `run_agent` section configured at all, and a daemon that
+    /// serves only host-spawn runs has no `agent_vm` section.
+    ///
+    /// The paths recorded on `agent_run_outcome` rows are absolute, so moving
+    /// this root leaves already-recorded runs resolvable where they were
+    /// written.
+    #[serde(default)]
+    pub agent_run_log_root: Option<PathBuf>,
 }
 
 /// Configuration for the read-only UI HTTP transport. Distinct from
@@ -482,8 +498,6 @@ pub struct AgentVmHttpConfig {
     #[serde(default)]
     pub openai_proxy: Option<AgentVmHttpOpenAiProxyConfig>,
     #[serde(default)]
-    pub agent_run_log_root: Option<PathBuf>,
-    #[serde(default)]
     pub git_push_staging_root: Option<PathBuf>,
     #[serde(default = "default_git_push_max_body_bytes")]
     pub git_push_max_body_bytes: ByteSize,
@@ -548,20 +562,6 @@ pub enum AgentVmHttpConfigError {
     ClaudeProxy(#[from] VmHttpClaudeProxyConfigError),
     #[error(transparent)]
     OpenAiProxy(#[from] VmHttpOpenAiProxyConfigError),
-    #[error("agent run log root path must not be empty")]
-    EmptyAgentRunLogRoot,
-    #[error("agent run log root path must be absolute: {0:?}")]
-    RelativeAgentRunLogRoot(PathBuf),
-    #[error("agent run log root {path:?} could not be created: {source}")]
-    AgentRunLogRootCreate {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("agent run log root {path:?} is not writable: {source}")]
-    AgentRunLogRootProbe {
-        path: PathBuf,
-        source: std::io::Error,
-    },
     #[error(transparent)]
     GitPushBodyLimits(#[from] VmGitPushBodyLimitsError),
     #[error("git push staging root path must not be empty")]
@@ -625,6 +625,15 @@ pub enum AgentVmHttpConfigError {
     FlakeProvisionBounds(#[from] FlakeProvisionBoundsError),
 }
 
+/// What [`check_daemon_sections`] resolved: the optional agent-VM runtime
+/// config, and the agent-run log root — which is not optional, because both
+/// `RunAgent` dispatch arms write stream files under it.
+#[derive(Debug)]
+pub struct CheckedDaemonSections {
+    pub agent_vm: Option<AgentVmDaemonRuntimeConfig>,
+    pub agent_run_log_root: PathBuf,
+}
+
 /// Validate every daemon section that can be checked before writd takes an
 /// irreversible step, reporting all the failures together.
 ///
@@ -632,19 +641,47 @@ pub enum AgentVmHttpConfigError {
 /// binary destructures it first. Living here — rather than being assembled in
 /// `writd` — keeps the accumulator vocabulary, and in particular the `Failed`
 /// marker, inside this crate.
+///
+/// `agent_run_log_root` is [`DaemonConfig::agent_run_log_root`] verbatim;
+/// `None` resolves to [`default_agent_run_log_root`]. It is checked and
+/// created unconditionally, because it is not a subsystem's directory: a
+/// daemon with neither an `agent_vm` nor a `run_agent` section still refuses
+/// `RunAgent` at dispatch, and one with either of them writes here.
 pub fn check_daemon_sections(
     agent_vm: Option<&AgentVmDaemonConfig>,
     ui_http: Option<&UiHttpConfig>,
-) -> Result<Option<AgentVmDaemonRuntimeConfig>, Errors<DaemonConfigError>> {
+    agent_run_log_root: Option<&Path>,
+) -> Result<CheckedDaemonSections, Errors<DaemonConfigError>> {
     let mut errors = Accumulator::new();
     let agent_vm = errors.record_many(agent_vm.map(AgentVmDaemonConfig::check).transpose());
     let ui_http = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
-    let (agent_vm, _ui_http) = errors.unpack(all_recorded!(agent_vm, ui_http))?;
+    let agent_run_log_root = errors.record_from(check_agent_run_log_root(
+        agent_run_log_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_agent_run_log_root),
+    ));
+    let (agent_vm, _ui_http, agent_run_log_root) =
+        errors.unpack(all_recorded!(agent_vm, ui_http, agent_run_log_root))?;
+
     // Only now, with every section checked, is it right to create anything.
-    agent_vm
-        .map(AgentVmDaemonPlan::materialize)
-        .transpose()
-        .map_err(Errors::map_into)
+    // Creating the log root and materialising the agent-VM plan are
+    // independent effects, so both run and both report: an unwritable log root
+    // must not hide an unwritable push-staging root, and vice versa.
+    // `materialize` is handed the *checked* path rather than waiting on the
+    // prepared one, which is the same path — preparation proves it writable,
+    // it does not rewrite it.
+    let mut errors = Accumulator::new();
+    let prepared = errors.record_from(prepare_agent_run_log_root(&agent_run_log_root));
+    let agent_vm = errors.record_many(
+        agent_vm
+            .map(|plan| plan.materialize(agent_run_log_root.clone()))
+            .transpose(),
+    );
+    let (agent_vm, ()) = errors.unpack(all_recorded!(agent_vm, prepared))?;
+    Ok(CheckedDaemonSections {
+        agent_vm,
+        agent_run_log_root,
+    })
 }
 
 /// A problem found while turning a [`DaemonConfig`] into runtime state.
@@ -658,6 +695,31 @@ pub enum DaemonConfigError {
     AgentVm(#[from] AgentVmDaemonConfigError),
     #[error(transparent)]
     UiHttp(#[from] UiHttpConfigError),
+    #[error(transparent)]
+    AgentRunLogRoot(#[from] AgentRunLogRootError),
+}
+
+/// Faults in the top-level `agent_run_log_root` key.
+///
+/// Its own type, not an `agent_vm` one: the root is where *both* `RunAgent`
+/// arms put an agent's stdout and stderr, so a daemon that serves only
+/// host-spawn runs still has one and can still get it wrong.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentRunLogRootError {
+    #[error("agent run log root path must not be empty")]
+    Empty,
+    #[error("agent run log root path must be absolute: {0:?}")]
+    Relative(PathBuf),
+    #[error("agent run log root {path:?} could not be created: {source}")]
+    Create {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("agent run log root {path:?} is not writable: {source}")]
+    Probe {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -691,8 +753,9 @@ impl AgentVmDaemonConfig {
     /// section creates nothing until those siblings have been checked too.
     pub fn to_runtime_config(
         &self,
+        agent_run_log_root: PathBuf,
     ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
-        self.check()?.materialize()
+        self.check()?.materialize(agent_run_log_root)
     }
 
     /// Run every check that touches nothing across both subsections, and
@@ -732,11 +795,16 @@ pub struct AgentVmDaemonPlan {
 
 impl AgentVmDaemonPlan {
     /// Create the planned directories and assemble the runtime config.
+    ///
+    /// `agent_run_log_root` comes from the top level of the config rather than
+    /// this section (see [`DaemonConfig::agent_run_log_root`]); the agent-VM
+    /// runtime carries it because the VM arm is one of its two writers.
     pub fn materialize(
         self,
+        agent_run_log_root: PathBuf,
     ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
         let vm_http = self.vm_http.materialize().map_err(Errors::map_into)?;
-        AgentVmDaemonRuntimeConfig::new(self.lifecycle, vm_http)
+        AgentVmDaemonRuntimeConfig::new(self.lifecycle, vm_http, agent_run_log_root)
             .map_err(|err| Errors::single(err.into()))
     }
 }
@@ -941,13 +1009,6 @@ impl AgentVmHttpConfig {
         // root, so it is checked even when the work root is broken. A *derived*
         // root only inherits the work root's fate: reporting it too would just
         // echo the same mistake back twice.
-        let agent_run_log_root = checked_root(
-            &mut errors,
-            WritableRoot::AgentRunLog,
-            self.agent_run_log_root.as_deref(),
-            "agent-runs",
-            work_root,
-        );
         let git_push_staging_root = checked_root(
             &mut errors,
             WritableRoot::GitPushStaging,
@@ -1017,7 +1078,6 @@ impl AgentVmHttpConfig {
             trusted_public_keys,
             claude_proxy,
             openai_proxy,
-            agent_run_log_root,
             git_push_staging_root,
             git_push_body_limits,
             flake_input_cache_dir,
@@ -1033,7 +1093,6 @@ impl AgentVmHttpConfig {
             trusted_public_keys,
             claude_proxy,
             openai_proxy,
-            agent_run_log_root,
             git_push_staging_root,
             git_push_body_limits,
             flake_input_cache_dir,
@@ -1110,7 +1169,6 @@ impl AgentVmHttpConfig {
             nix_cache,
             claude_proxy,
             openai_proxy,
-            agent_run_log_root.clone(),
             git_push_staging_root.clone(),
             git_push_body_limits,
         )
@@ -1121,10 +1179,6 @@ impl AgentVmHttpConfig {
         // Order matters: the work root is prepared first (see
         // `VmHttpPlan::materialize`), then these in turn.
         let roots = vec![
-            RootPlan {
-                kind: WritableRoot::AgentRunLog,
-                path: agent_run_log_root,
-            },
             RootPlan {
                 kind: WritableRoot::GitPushStaging,
                 path: git_push_staging_root,
@@ -1145,7 +1199,7 @@ impl AgentVmHttpConfig {
 /// Shape-check one writable root: the explicitly configured path when the
 /// operator named one, otherwise `<work_root>/<default_subdir>`.
 ///
-/// Kept as a helper because the three roots differ only in their kind, their
+/// Kept as a helper because the roots differ only in their kind, their
 /// field, and their default subdirectory — and because the configured/derived
 /// distinction is the subtle part, worth stating once. A configured path
 /// stands on its own, so it is checked even when the work root is broken; a
@@ -1292,13 +1346,17 @@ fn validate_existing_work_root(
     Ok(())
 }
 
-/// One of the three writable directories the broker keeps beneath its work
-/// root. All three are validated identically — non-empty, absolute, creatable,
+/// One of the two writable directories the broker keeps beneath its `vm_http`
+/// work root. Both are validated identically — non-empty, absolute, creatable,
 /// writable — and differ only in which error variants name them and in the
 /// probe filename, so the *kind* is data and the checks are written once.
+///
+/// The agent-run log root is validated the same way but is *not* one of these:
+/// it hangs off the top level of the config, not `vm_http`, because both
+/// `RunAgent` arms write under it. It shares the effectful half
+/// ([`create_and_probe`]) and reports through [`AgentRunLogRootError`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum WritableRoot {
-    AgentRunLog,
     GitPushStaging,
     FlakeInputCache,
 }
@@ -1308,7 +1366,6 @@ impl WritableRoot {
     /// configured to the same directory cannot collide on `create_new`.
     fn probe_prefix(self) -> &'static str {
         match self {
-            Self::AgentRunLog => ".writ-agent-run-log-probe",
             Self::GitPushStaging => ".writ-git-push-staging-probe",
             Self::FlakeInputCache => ".writ-flake-input-cache-probe",
         }
@@ -1316,7 +1373,6 @@ impl WritableRoot {
 
     fn empty(self) -> AgentVmHttpConfigError {
         match self {
-            Self::AgentRunLog => AgentVmHttpConfigError::EmptyAgentRunLogRoot,
             Self::GitPushStaging => AgentVmHttpConfigError::EmptyGitPushStagingRoot,
             Self::FlakeInputCache => AgentVmHttpConfigError::EmptyFlakeInputCacheDir,
         }
@@ -1324,35 +1380,92 @@ impl WritableRoot {
 
     fn relative(self, path: PathBuf) -> AgentVmHttpConfigError {
         match self {
-            Self::AgentRunLog => AgentVmHttpConfigError::RelativeAgentRunLogRoot(path),
             Self::GitPushStaging => AgentVmHttpConfigError::RelativeGitPushStagingRoot(path),
             Self::FlakeInputCache => AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path),
         }
     }
 
-    fn create(self, path: PathBuf, source: std::io::Error) -> AgentVmHttpConfigError {
-        match self {
-            Self::AgentRunLog => AgentVmHttpConfigError::AgentRunLogRootCreate { path, source },
-            Self::GitPushStaging => {
+    fn fault(self, path: PathBuf, fault: RootPreparationFault) -> AgentVmHttpConfigError {
+        match (self, fault) {
+            (Self::GitPushStaging, RootPreparationFault::Create(source)) => {
                 AgentVmHttpConfigError::GitPushStagingRootCreate { path, source }
             }
-            Self::FlakeInputCache => {
-                AgentVmHttpConfigError::FlakeInputCacheDirCreate { path, source }
-            }
-        }
-    }
-
-    fn probe(self, path: PathBuf, source: std::io::Error) -> AgentVmHttpConfigError {
-        match self {
-            Self::AgentRunLog => AgentVmHttpConfigError::AgentRunLogRootProbe { path, source },
-            Self::GitPushStaging => {
+            (Self::GitPushStaging, RootPreparationFault::Probe(source)) => {
                 AgentVmHttpConfigError::GitPushStagingRootProbe { path, source }
             }
-            Self::FlakeInputCache => {
+            (Self::FlakeInputCache, RootPreparationFault::Create(source)) => {
+                AgentVmHttpConfigError::FlakeInputCacheDirCreate { path, source }
+            }
+            (Self::FlakeInputCache, RootPreparationFault::Probe(source)) => {
                 AgentVmHttpConfigError::FlakeInputCacheDirProbe { path, source }
             }
         }
     }
+}
+
+/// Which step of preparing a root failed, before it is named in any particular
+/// config section's vocabulary. Exists so [`create_and_probe`] can be written
+/// once for roots that report through different error types.
+enum RootPreparationFault {
+    Create(std::io::Error),
+    Probe(std::io::Error),
+}
+
+/// Create `path` if absent, then prove this process can actually write into
+/// it, rather than discovering otherwise at request time.
+///
+/// `probe_prefix` distinguishes the probe file per root so two roots
+/// configured to the same directory cannot collide on `create_new`.
+fn create_and_probe(path: &Path, probe_prefix: &str) -> Result<(), RootPreparationFault> {
+    std::fs::create_dir_all(path).map_err(RootPreparationFault::Create)?;
+    let probe = path.join(format!(
+        "{}-{}-{}",
+        probe_prefix,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(b"probe")?;
+            file.sync_all()
+        })
+        .map_err(RootPreparationFault::Probe)?;
+    std::fs::remove_file(&probe).map_err(RootPreparationFault::Probe)?;
+    Ok(())
+}
+
+/// The pure half of validating the top-level `agent_run_log_root`: the same
+/// two text checks the `vm_http` roots get, in their own vocabulary.
+fn check_agent_run_log_root(path: PathBuf) -> Result<PathBuf, AgentRunLogRootError> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentRunLogRootError::Empty);
+    }
+    if !path.is_absolute() {
+        return Err(AgentRunLogRootError::Relative(path));
+    }
+    Ok(path)
+}
+
+/// The effectful half. Expects a path that has already passed
+/// [`check_agent_run_log_root`].
+fn prepare_agent_run_log_root(path: &Path) -> Result<(), AgentRunLogRootError> {
+    create_and_probe(path, ".writ-agent-run-log-probe").map_err(|fault| match fault {
+        RootPreparationFault::Create(source) => AgentRunLogRootError::Create {
+            path: path.to_path_buf(),
+            source,
+        },
+        RootPreparationFault::Probe(source) => AgentRunLogRootError::Probe {
+            path: path.to_path_buf(),
+            source,
+        },
+    })
 }
 
 /// The pure half of validating a writable root: does the *configured text*
@@ -1382,27 +1495,8 @@ fn prepare_writable_root(
     kind: WritableRoot,
     path: PathBuf,
 ) -> Result<PathBuf, AgentVmHttpConfigError> {
-    std::fs::create_dir_all(&path).map_err(|source| kind.create(path.clone(), source))?;
-    let probe = path.join(format!(
-        "{}-{}-{}",
-        kind.probe_prefix(),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .and_then(|mut file| {
-            use std::io::Write as _;
-            file.write_all(b"probe")?;
-            file.sync_all()
-        })
-        .map_err(|source| kind.probe(path.clone(), source))?;
-    std::fs::remove_file(&probe).map_err(|source| kind.probe(path.clone(), source))?;
+    create_and_probe(&path, kind.probe_prefix())
+        .map_err(|fault| kind.fault(path.clone(), fault))?;
     Ok(path)
 }
 
@@ -1693,6 +1787,20 @@ pub fn default_config_path() -> PathBuf {
 /// the audit DB's *parent directory* read-write; anything else in that directory
 /// would be exposed read-write inside the broker VM. See
 /// [`ensure_audit_dir_is_dedicated`].
+/// Default root for per-run agent stdout/stderr logs. A sibling of the audit
+/// DB's directory rather than a child of the agent-VM work root: the streams
+/// outlive the run that produced them and are pointed at by audit rows, so
+/// they belong with writ's durable state and not with a subsystem's scratch
+/// space.
+pub fn default_agent_run_log_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("writ/agent-runs")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/share/writ/agent-runs")
+    }
+}
+
 pub fn default_audit_db_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
         PathBuf::from(dir).join("writ/audit/audit.db")

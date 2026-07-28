@@ -143,6 +143,11 @@ const AGENT_VM_WORKSPACE_BOOTSTRAP_PREWARM_SAMPLE_LIMIT: usize = 5;
 pub struct AgentVmDaemonRuntimeConfig {
     lifecycle: AgentVmLifecycleRuntimeConfig,
     vm_http: VmHttpRuntimeConfig,
+    /// Where per-run stdout/stderr logs go. Configured at the top level of the
+    /// daemon config, not in `vm_http`, because the host-spawn `RunAgent` arm
+    /// writes here too; the agent-VM runtime holds a copy because the VM arm is
+    /// the other writer.
+    agent_run_log_root: PathBuf,
 }
 
 /// Host facts the broker-VM (`broker_placement = vm`) arm needs that are *not*
@@ -433,9 +438,14 @@ impl AgentVmDaemonRuntimeConfig {
     pub fn new(
         lifecycle: AgentVmLifecycleRuntimeConfig,
         vm_http: VmHttpRuntimeConfig,
+        agent_run_log_root: PathBuf,
     ) -> Result<Self, AgentVmDaemonRuntimeConfigError> {
         Self::check_bind_addr(vm_http.bind_addr())?;
-        Ok(Self { lifecycle, vm_http })
+        Ok(Self {
+            lifecycle,
+            vm_http,
+            agent_run_log_root,
+        })
     }
 
     /// The daemon-level invariant [`Self::new`] enforces, over the one field it
@@ -476,6 +486,10 @@ impl AgentVmDaemonRuntimeConfig {
 
     pub fn vm_http(&self) -> &VmHttpRuntimeConfig {
         &self.vm_http
+    }
+
+    pub fn agent_run_log_root(&self) -> &Path {
+        &self.agent_run_log_root
     }
 }
 
