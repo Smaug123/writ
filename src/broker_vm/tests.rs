@@ -659,6 +659,7 @@ fn host_config_json() -> String {
         "policy": { "default_ttl": 600, "writable_repos": [] },
         "secret_store": { "type": "keyring", "service": "writ" },
         "audit_db": "/Users/me/Library/writ/audit.db",
+        "agent_run_log_root": "/Users/me/Library/writ/agent-runs",
         "agent_vm": {
             "lifecycle": {
                 "ipv4_pool": "192.168.0.0/16",
@@ -686,7 +687,6 @@ fn host_config_json() -> String {
                 "nix_cache_max_nar_bytes": 67108864,
                 "nix_prewarm_cache_dir": "/Users/me/Library/writ/prewarm",
                 "flake_mirror_cache_dir": "/Users/me/Library/writ/mirror",
-                "agent_run_log_root": "/Users/me/Library/writ/agent-runs",
                 "git_push_staging_root": "/Users/me/Library/writ/git-push"
             }
         }
@@ -723,6 +723,10 @@ fn broker_config_rewrites_paths_pins_port_and_drops_host_features() {
         config.audit_db.as_deref(),
         Some(Path::new("/writ/audit/audit.db"))
     );
+    // The host's agent-run log root names a host directory that is not mounted
+    // into the guest, and the v1 broker serves no agent-run routes, so the key
+    // must not survive.
+    assert_eq!(config.agent_run_log_root, None);
 
     // The vm_http config is one the broker accepts (the strong oracle), the
     // port is pinned, and the host-only features are gone.
@@ -1225,6 +1229,7 @@ fn materialize_host_config_json() -> String {
         "policy": { "default_ttl": 600, "writable_repos": [] },
         "secret_store": { "type": "keyring", "service": "writ" },
         "audit_db": "/Users/me/Library/writ/audit.db",
+        "agent_run_log_root": "/Users/me/Library/writ/agent-runs",
         "agent_vm": {
             "lifecycle": {
                 "ipv4_pool": "192.168.0.0/16", "ipv6_pool": "fd83:b6f2:e57::/48",

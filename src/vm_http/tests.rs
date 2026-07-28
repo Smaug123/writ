@@ -368,7 +368,6 @@ async fn prepare_on_listener_uses_the_provided_bearer_and_bound_port() {
         BrokerPortRange::new(1024, 65535).unwrap(),
         git_clone_config_for_test(&temp, write_fake_git(temp.path())),
         nix_cache_config_for_test(),
-        temp.path().join("agent-run-logs"),
         temp.path().join("git-push-staging"),
         VmGitPushBodyLimits::new(
             ByteSize::from_bytes(65 * 1024 * 1024),
@@ -1058,7 +1057,6 @@ async fn prepare_vm_http_session_returns_in_range_broker_port_and_redacted_token
         range,
         git_clone_config_for_test(&temp, write_fake_git(temp.path())),
         nix_cache_config_for_test(),
-        temp.path().join("agent-runs"),
         temp.path().join("git-push-staging"),
         VmGitPushBodyLimits::new(
             ByteSize::from_bytes(65 * 1024 * 1024),
@@ -1091,7 +1089,6 @@ async fn running_runtime_serves_session_and_shuts_down() {
         BrokerPortRange::new(1024, 65535).unwrap(),
         git_clone_config_for_test(&temp, write_fake_git(temp.path())),
         nix_cache_config_for_test(),
-        temp.path().join("agent-runs"),
         temp.path().join("git-push-staging"),
         VmGitPushBodyLimits::new(
             ByteSize::from_bytes(65 * 1024 * 1024),

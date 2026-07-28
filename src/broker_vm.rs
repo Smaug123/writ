@@ -306,14 +306,19 @@ pub enum BrokerConfigError {
 /// here: like the mirror cache it is re-pointed (at [`BROKER_VM_PREWARM_DIR`],
 /// the read-only mount [`BrokerVmPlan::with_prewarm_cache_mount`] provides), so
 /// the in-VM broker serves the operator's pre-warmed closure exactly as the host
-/// broker does. `agent_run_log_root` / `git_push_staging_root` stay disabled: the
-/// v1 broker serves no agent-run or git-push routes.
+/// broker does. `git_push_staging_root` stays disabled: the v1 broker serves no
+/// git-push routes.
 const BROKER_DROPPED_VM_HTTP_KEYS: &[&str] = &[
     "flake_input_cache_dir",
     "flake_materialize_scratch_dir",
-    "agent_run_log_root",
     "git_push_staging_root",
 ];
+
+/// Top-level host paths that mean nothing inside the broker VM. `agent_run_log_root`
+/// names a host directory that is not mounted into the guest, and the v1 broker
+/// serves no agent-run routes — `prepare_broker` builds only the `vm_http` slice,
+/// so nothing in the guest reads or creates it.
+const BROKER_DROPPED_TOP_LEVEL_KEYS: &[&str] = &["agent_run_log_root"];
 
 /// Derive the broker VM's daemon config from the host daemon config: keep
 /// github_apps / policy / proxy settings, but rewrite the secret store, audit DB,
@@ -430,6 +435,12 @@ pub fn broker_config_json(
     }
     for key in BROKER_DROPPED_VM_HTTP_KEYS {
         vm_http.remove(*key);
+    }
+
+    // Re-borrow the top level: the `vm_http` borrow above is exclusive.
+    let obj = config.as_object_mut().ok_or(BrokerConfigError::NotObject)?;
+    for key in BROKER_DROPPED_TOP_LEVEL_KEYS {
+        obj.remove(*key);
     }
 
     serde_json::to_string_pretty(&config).map_err(BrokerConfigError::Serialize)

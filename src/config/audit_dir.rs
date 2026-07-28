@@ -283,6 +283,12 @@ pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotD
 /// `audit/` directory (see [`super::default_audit_db_path`]). Retained only so the
 /// daemon can detect an un-migrated legacy database and refuse to boot rather
 /// than silently fork audit history; it is not a supported configuration target.
+/// Resolves the environment **exactly** as [`super::default_audit_db_path`]
+/// does, empty-variable quirks included, and deliberately does not use
+/// `xdg_dir_or_home`. The two are a pair: this one says where the old database
+/// would be and that one says where the new one goes, so any divergence
+/// between them is a migration the guard fails to notice. If the empty-value
+/// handling changes, it changes for both at once.
 pub fn legacy_default_audit_db_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
         PathBuf::from(dir).join("writ/audit.db")
@@ -389,6 +395,30 @@ mod tests {
     use super::*;
     use crate::config::{default_audit_db_path, default_secret_store_path};
     use proptest::prelude::*;
+
+    /// The legacy and current audit-DB defaults must resolve the environment
+    /// identically: the guard compares "is there a database at the old place"
+    /// against "where does the new place resolve to", and if only one of them
+    /// normalises an exported-but-empty `XDG_DATA_HOME` the guard probes a
+    /// directory the old database was never in, finds nothing, and lets writd
+    /// start a fresh audit history.
+    ///
+    /// Both currently keep the raw `var_os` semantics. This test does not
+    /// assert *which* semantics; it asserts they are the same one, so a change
+    /// to either has to be a change to both.
+    #[test]
+    fn the_legacy_and_current_audit_defaults_share_a_base_directory() {
+        let legacy = legacy_default_audit_db_path();
+        let current = default_audit_db_path();
+        assert_eq!(
+            legacy.parent().map(Path::to_path_buf),
+            current
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+            "legacy {legacy:?} and current {current:?} resolved to different bases",
+        );
+    }
 
     #[test]
     fn audit_dir_with_only_db_and_sidecars_is_dedicated() {

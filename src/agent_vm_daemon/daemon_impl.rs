@@ -175,7 +175,7 @@ impl AgentVmDaemon {
                 })?;
                 let agent_runs = VmHttpAgentRunService::new(
                     Arc::clone(&state),
-                    self.config.vm_http.agent_run_log_root(),
+                    self.config.agent_run_log_root(),
                 );
                 agent_runs.insert_run_config(run_id, prompt.clone(), agent_model.clone());
                 let guest_command =

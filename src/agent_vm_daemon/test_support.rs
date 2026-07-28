@@ -568,7 +568,6 @@ fn daemon_config_inner(
                 BrokerPortRange::new(1024, 65535).unwrap(),
                 git_clone,
                 nix_cache,
-                dir.join("agent-runs"),
                 dir.join("git-push-staging"),
                 VmGitPushBodyLimits::new(
                     ByteSize::from_bytes(65 * 1024 * 1024),
@@ -578,6 +577,7 @@ fn daemon_config_inner(
                 .unwrap(),
             )
             .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir),
+            crate::config::AgentRunLogRoot::check(dir.join("agent-runs")).unwrap(),
         )
         .unwrap(),
         state_store,

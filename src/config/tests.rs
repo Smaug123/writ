@@ -7,6 +7,7 @@
 use super::*;
 use crate::core::AgentKind;
 use crate::github::GitHubAppRegistryConfigError;
+use proptest::prelude::*;
 
 const TEST_NIX_CACHE_PUBLIC_KEY: &str =
     "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
@@ -326,8 +327,7 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
                     "timeout_secs": 60,
                     "max_request_bytes": 2097152,
                     "max_response_bytes": 8388608
-                },
-                "agent_run_log_root": "/var/folders/writ/agent-runs"
+                }
             }
         }
     }"#,
@@ -335,14 +335,14 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
     .unwrap();
     json["agent_vm"]["vm_http"]["work_root"] =
         serde_json::Value::String(work_root.to_string_lossy().into_owned());
-    json["agent_vm"]["vm_http"]["agent_run_log_root"] =
-        serde_json::Value::String(agent_run_log_root.to_string_lossy().into_owned());
     json["agent_vm"]["vm_http"]["git_push_staging_root"] =
         serde_json::Value::String(git_push_staging_root.to_string_lossy().into_owned());
     let c: DaemonConfig = serde_json::from_value(json).unwrap();
     let agent_vm = c.agent_vm.unwrap();
 
-    let runtime = agent_vm.to_runtime_config().unwrap();
+    let runtime = agent_vm
+        .to_runtime_config(AgentRunLogRoot::check(agent_run_log_root.clone()).unwrap())
+        .unwrap();
 
     assert_eq!(runtime.vm_http().bind_addr(), Ipv4Addr::UNSPECIFIED);
     assert_eq!(runtime.vm_http().broker_port_range().min().get(), 18080);
@@ -391,7 +391,7 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
         claude_proxy.max_response_bytes(),
         ByteSize::from_bytes(8_388_608)
     );
-    assert_eq!(runtime.vm_http().agent_run_log_root(), agent_run_log_root);
+    assert_eq!(runtime.agent_run_log_root(), agent_run_log_root);
     assert_eq!(
         runtime.vm_http().git_push_staging_root(),
         git_push_staging_root
@@ -459,8 +459,7 @@ fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
                     "timeout_secs": 60,
                     "max_request_bytes": 2097152,
                     "max_response_bytes": 8388608
-                },
-                "agent_run_log_root": "/var/folders/writ/agent-runs"
+                }
             }
         }
     }"#,
@@ -468,12 +467,12 @@ fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
     .unwrap();
     json["agent_vm"]["vm_http"]["work_root"] =
         serde_json::Value::String(work_root.to_string_lossy().into_owned());
-    json["agent_vm"]["vm_http"]["agent_run_log_root"] =
-        serde_json::Value::String(agent_run_log_root.to_string_lossy().into_owned());
     let c: DaemonConfig = serde_json::from_value(json).unwrap();
     let agent_vm = c.agent_vm.unwrap();
 
-    let runtime = agent_vm.to_runtime_config().unwrap();
+    let runtime = agent_vm
+        .to_runtime_config(AgentRunLogRoot::check(agent_run_log_root.clone()).unwrap())
+        .unwrap();
     let claude_proxy = runtime.vm_http().claude_proxy().unwrap();
     assert_eq!(claude_proxy.auth_secret().as_str(), "anthropic-oauth-token");
     assert_eq!(claude_proxy.auth_kind(), VmHttpClaudeProxyAuthKind::OAuth);
@@ -513,6 +512,12 @@ fn unique_config_test_path(label: &str) -> PathBuf {
     ))
 }
 
+/// A checked log root in a unique temp location, for the tests that only need
+/// `to_runtime_config` to have *some* valid one.
+fn test_agent_run_log_root() -> AgentRunLogRoot {
+    AgentRunLogRoot::check(unique_config_test_path("agent-runs")).unwrap()
+}
+
 fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
     let work_root = unique_config_test_path("work-root");
     AgentVmHttpConfig {
@@ -542,7 +547,6 @@ fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
         flake_provision_timeout_secs: default_flake_provision_timeout_secs(),
         claude_proxy: None,
         openai_proxy: None,
-        agent_run_log_root: None,
         git_push_staging_root: None,
         git_push_max_body_bytes: default_git_push_max_body_bytes(),
         git_push_max_metadata_bytes: default_git_push_max_metadata_bytes(),
@@ -701,7 +705,7 @@ fn agent_vm_config_rejects_non_wildcard_vm_http_bind_address() {
     };
 
     assert!(matches!(
-        sole_error(c.to_runtime_config()),
+        sole_error(c.to_runtime_config(test_agent_run_log_root())),
         AgentVmDaemonConfigError::Runtime(
             AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(addr)
         ) if addr == Ipv4Addr::LOCALHOST
@@ -951,39 +955,295 @@ fn agent_vm_http_config_applies_defaults_for_omitted_fields() {
     assert_eq!(c.nix_cache_max_nar_bytes, ByteSize::mib(512));
     assert!(c.claude_proxy.is_none());
     assert!(c.openai_proxy.is_none());
-    assert!(c.agent_run_log_root.is_none());
     assert!(c.git_push_staging_root.is_none());
     assert!(c.flake_input_cache_dir.is_none());
     assert!(c.flake_mirror_cache_dir.is_none());
 }
 
+/// Whichever branch it takes, the default log root is an absolute path under
+/// writ's own data directory — never relative, and never under the agent-VM
+/// work root, which is a subsystem's scratch space.
 #[test]
-fn agent_vm_http_config_rejects_relative_agent_run_log_root() {
-    let mut c = valid_agent_vm_http_config();
-    c.agent_run_log_root = Some(PathBuf::from("agent-runs"));
+fn the_default_agent_run_log_root_is_absolute_and_writ_owned() {
+    let root = default_agent_run_log_root();
+    assert!(root.is_absolute(), "{root:?}");
+    assert!(root.ends_with("writ/agent-runs"), "{root:?}");
+}
 
+/// `default_agent_run_log_root` resolves through `xdg_dir_or_home`, and the
+/// property that matters is that the result is **absolute for every
+/// environment**: a relative default reaches a caller that requires an
+/// absolute path and refuses the daemon over a path the operator never wrote.
+///
+/// The interesting input is the exported-but-empty variable. `var_os` returns
+/// `Some("")` for it — indistinguishable from a real setting unless you look —
+/// and joining onto it silently produces a relative path. Writing this as a
+/// property rather than a case is what found the second instance: the `HOME`
+/// fallback had the same hole as the XDG variable, since `unwrap_or_else` does
+/// not fire on `Some("")`.
+///
+/// Driven against the pure `resolve_base_dir` rather than the env-reading
+/// wrapper, so it mutates nothing that other tests in this process can see.
+#[test]
+fn a_default_path_is_absolute_whatever_the_environment_says() {
+    proptest!(|(xdg in "[/a-z]{0,12}", home in "[/a-z]{0,12}")| {
+        let resolved = resolve_base_dir(
+            Some(xdg.clone().into()),
+            Some(home.clone().into()),
+            "writ/thing",
+            ".local/share/writ/thing",
+        );
+        // A *relative* non-empty value is the operator naming a relative
+        // directory: their own doing, and reported to them as such. Empty is
+        // what the helper exists to catch, at either level.
+        if xdg.is_empty() && (home.is_empty() || home.starts_with('/')) {
+            prop_assert!(
+                resolved.is_absolute(),
+                "XDG={:?} HOME={:?} produced the relative {:?}", xdg, home, resolved,
+            );
+        }
+        // Exported-but-empty must be indistinguishable from absent — that is
+        // the whole claim, and it holds for any pair of suffixes.
+        prop_assert_eq!(
+            resolve_base_dir(Some("".into()), Some("".into()), "writ/thing", ".local/thing"),
+            resolve_base_dir(None, None, "writ/thing", ".local/thing"),
+        );
+    });
+}
+
+/// The agent-run log root is a *top-level* key, so it is checked whether or
+/// not an `agent_vm` section exists — a daemon serving only host-spawn
+/// `RunAgent` still writes stream files under it.
+#[test]
+fn daemon_config_rejects_relative_agent_run_log_root() {
     assert!(matches!(
-        sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::RelativeAgentRunLogRoot(path)
+        sole_error(check_daemon_sections(None, None, Some(Path::new("agent-runs")))),
+        DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Relative(path))
             if path.as_os_str() == "agent-runs"
     ));
 }
 
 #[test]
-fn agent_vm_http_config_rejects_unwritable_agent_run_log_root() {
+fn daemon_config_rejects_unwritable_agent_run_log_root() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("not-a-directory");
     std::fs::write(&path, b"file").unwrap();
-    let mut c = valid_agent_vm_http_config();
-    c.agent_run_log_root = Some(path.clone());
 
     assert!(matches!(
-        sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::AgentRunLogRootCreate {
+        sole_error(check_daemon_sections(None, None, Some(&path))),
+        DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Create {
             path: failed,
             ..
-        } if failed == path
+        }) if failed == path
     ));
+}
+
+/// Checking creates the root, so an operator learns at boot that it is
+/// writable rather than at the first `RunAgent`.
+#[test]
+fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("named-explicitly");
+    assert!(!root.exists());
+
+    let checked = check_daemon_sections(None, None, Some(&root)).unwrap();
+
+    assert_eq!(checked.agent_run_log_root.as_path(), root);
+    assert!(root.is_dir(), "the root must exist after checking");
+    assert!(checked.agent_vm.is_none());
+}
+
+/// Preparing the root chmods it, and `set_permissions` follows symlinks — so a
+/// symlinked root would re-mode whatever it points at, which an attacker with
+/// write access to the link's parent gets to choose. Refuse instead, as the
+/// work-root validator does, and leave the target untouched.
+#[test]
+fn a_symlinked_agent_run_log_root_is_refused_rather_than_followed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("someone-elses-directory");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let link = temp.path().join("log-root-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = AgentRunLogRoot::check(link.clone())
+        .unwrap()
+        .prepare()
+        .unwrap_err();
+
+    assert!(
+        matches!(err, AgentRunLogRootError::Symlink { ref path } if *path == link),
+        "got {err:?}",
+    );
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "the symlink's target was re-moded to {mode:o}");
+}
+
+/// Preparing the log root and materialising the section's own directories are
+/// independent effects, so a bad log root must not defer a bad staging root to
+/// the operator's next attempt. This is the same contract
+/// `check_daemon_sections` holds; the convenience method must not be the
+/// weaker path.
+#[test]
+fn the_direct_runtime_conversion_reports_a_bad_log_root_and_a_bad_staging_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_root = temp.path().join("log-root-is-a-file");
+    std::fs::write(&log_root, b"file").unwrap();
+    let staging_root = temp.path().join("staging-root-is-a-file");
+    std::fs::write(&staging_root, b"file").unwrap();
+
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.work_root = temp.path().join("work-root");
+    vm_http.git_push_staging_root = Some(staging_root);
+    let config = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+
+    let errors = config
+        .to_runtime_config(AgentRunLogRoot::check(log_root).unwrap())
+        .unwrap_err();
+    let rendered = errors.to_string();
+    assert!(
+        rendered.contains("agent run log root"),
+        "expected the log root failure, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("git push staging root"),
+        "expected the staging root failure too, got: {rendered}"
+    );
+}
+
+/// `to_runtime_config` hands back a config that is meant to be *usable*, and
+/// `AgentRunLogRoot` only proves the path is well-formed. Before the hoist the
+/// log root was one of `vm_http`'s own and `materialize` created it, so a
+/// caller of this method got that for free; it must still.
+#[test]
+fn the_direct_runtime_conversion_prepares_and_rejects_a_bad_log_root() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let usable = temp.path().join("usable");
+    let config = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http: valid_agent_vm_http_config(),
+    };
+    config
+        .to_runtime_config(AgentRunLogRoot::check(usable.clone()).unwrap())
+        .expect("a usable log root must be accepted");
+    assert!(usable.is_dir(), "the log root was not created");
+
+    // Absolute, so `check` passes; a regular file, so only preparation can
+    // catch it.
+    let unusable = temp.path().join("log-root-is-a-file");
+    std::fs::write(&unusable, b"file").unwrap();
+    let config = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http: valid_agent_vm_http_config(),
+    };
+    assert!(matches!(
+        sole_error(config.to_runtime_config(AgentRunLogRoot::check(unusable.clone()).unwrap())),
+        AgentVmDaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Create {
+            path,
+            ..
+        }) if path == unusable
+    ));
+}
+
+/// The log root holds agent output that `agent_run_outcome` rows point at, so
+/// a group- or world-writable parent would let another local user rename or
+/// delete those artifacts. It is created owner-only, and an existing directory
+/// is tightened to match — which is what the runtime
+/// (`writ_agent_run`'s `ensure_private_dir`) would do to it anyway.
+#[test]
+fn the_agent_run_log_root_is_owner_only_however_it_arrived() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+
+    let fresh = temp.path().join("fresh");
+    AgentRunLogRoot::check(fresh.clone())
+        .unwrap()
+        .prepare()
+        .unwrap();
+    let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "freshly created root is {mode:o}");
+
+    let loose = temp.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+    AgentRunLogRoot::check(loose.clone())
+        .unwrap()
+        .prepare()
+        .unwrap();
+    let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "pre-existing root left at {mode:o}");
+}
+
+/// The natural way to keep the old layout after the hoist is to name
+/// `<vm_http.work_root>/agent-runs` explicitly. Preparing the log root then
+/// creates `work_root` itself — and `ensure_vm_http_work_root_private` refuses
+/// a work root with any group or world bit set, so creating it at the process
+/// umask would reject the boot *and* leave behind the directory that makes
+/// every retry fail the same way. Both roots must come out usable.
+#[test]
+fn a_log_root_nested_under_an_uncreated_work_root_leaves_both_usable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+    let work_root = temp.path().join("work-root");
+    let log_root = work_root.join("agent-runs");
+    assert!(!work_root.exists());
+
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.work_root = work_root.clone();
+    let agent_vm = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+
+    let checked = check_daemon_sections(Some(&agent_vm), None, Some(&log_root))
+        .expect("a log root beneath an uncreated work root must be accepted");
+
+    assert_eq!(checked.agent_run_log_root.as_path(), log_root);
+    assert!(log_root.is_dir());
+    let work_mode = std::fs::metadata(&work_root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        work_mode & 0o077,
+        0,
+        "work root created at {work_mode:o}; the next boot would refuse it",
+    );
+}
+
+/// Creating the log root and materialising the `agent_vm` section are
+/// independent effects: a broken log root must not hide a broken sibling root,
+/// which is the whole point of accumulating.
+#[test]
+fn a_broken_agent_run_log_root_does_not_hide_a_broken_push_staging_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_root = temp.path().join("log-root-is-a-file");
+    std::fs::write(&log_root, b"file").unwrap();
+    let staging_root = temp.path().join("staging-root-is-a-file");
+    std::fs::write(&staging_root, b"file").unwrap();
+
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.work_root = temp.path().join("work-root");
+    vm_http.git_push_staging_root = Some(staging_root.clone());
+    let agent_vm = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+
+    let Err(errors) = check_daemon_sections(Some(&agent_vm), None, Some(&log_root)) else {
+        panic!("expected the config to be rejected");
+    };
+    let rendered = errors.to_string();
+    assert!(
+        rendered.contains("agent run log root"),
+        "expected the log root failure, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("git push staging root"),
+        "expected the staging root failure too, got: {rendered}"
+    );
 }
 
 /// A typo on a top-level field (e.g. `agentVm` instead of `agent_vm`)
@@ -1664,7 +1924,6 @@ fn agent_vm_http_config_reports_every_independent_failure() {
     c.git_clone_base_url = "ssh://github.com".into();
     c.nix_cache_url = "not-a-url".into();
     c.nix_cache_trusted_public_keys = vec!["missing-the-colon".into()];
-    c.agent_run_log_root = Some(PathBuf::from("relative/log-root"));
     c.git_push_staging_root = Some(PathBuf::from("relative/staging"));
     c.git_push_max_body_bytes = ByteSize::from_bytes(0);
     c.flake_mirror_cache_dir = Some(PathBuf::from("relative/mirrors"));
@@ -1677,7 +1936,6 @@ fn agent_vm_http_config_reports_every_independent_failure() {
         "ssh",
         "not-a-url",
         "missing-the-colon",
-        "agent run log root",
         "git push staging root",
         "flake mirror cache dir",
         "nix pre-warm cache dir",
@@ -1693,7 +1951,7 @@ fn agent_vm_http_config_reports_every_independent_failure() {
             .any(|error| matches!(error, AgentVmHttpConfigError::GitPushBodyLimits(_))),
         "zero git push body limit not reported; got {found:#?}",
     );
-    assert_eq!(errors.len(), 9, "unexpected failure set: {found:#?}");
+    assert_eq!(errors.len(), 8, "unexpected failure set: {found:#?}");
 }
 
 /// The lifecycle and vm_http sections are independent, so a mistake in one
@@ -1708,7 +1966,9 @@ fn agent_vm_daemon_config_reports_lifecycle_and_vm_http_failures_together() {
     vm_http.git_push_max_body_bytes = ByteSize::from_bytes(0);
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(test_agent_run_log_root())
+        .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
         errors
@@ -1819,7 +2079,9 @@ fn a_bad_lifecycle_section_creates_no_vm_http_directories() {
     vm_http.work_root = work_root.clone();
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(test_agent_run_log_root())
+        .unwrap_err();
 
     assert!(
         errors
@@ -1846,13 +2108,14 @@ fn a_rejected_work_root_suppresses_every_root_probe() {
     let work_root = temp.path().join("loose-work-root");
     std::fs::create_dir(&work_root).unwrap();
     std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // An explicit log root elsewhere, which would fail its probe if attempted.
-    let log_root = temp.path().join("log-root-is-a-file");
-    std::fs::write(&log_root, b"not a directory").unwrap();
+    // An explicit staging root elsewhere, which would fail its probe if
+    // attempted.
+    let staging_root = temp.path().join("staging-root-is-a-file");
+    std::fs::write(&staging_root, b"not a directory").unwrap();
 
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
-    c.agent_run_log_root = Some(log_root.clone());
+    c.git_push_staging_root = Some(staging_root.clone());
 
     let errors = c.to_runtime_config().unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
@@ -1868,8 +2131,8 @@ fn a_rejected_work_root_suppresses_every_root_probe() {
         "expected only the work root failure: {found:#?}"
     );
     assert!(
-        log_root.is_file(),
-        "the explicit log root was mutated after the work root was rejected",
+        staging_root.is_file(),
+        "the explicit staging root was mutated after the work root was rejected",
     );
 }
 
@@ -1886,7 +2149,9 @@ fn a_non_wildcard_bind_addr_is_reported_with_its_siblings_and_creates_nothing() 
     vm_http.bind_addr = Ipv4Addr::new(127, 0, 0, 1);
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(test_agent_run_log_root())
+        .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
 
     assert!(
@@ -1924,7 +2189,7 @@ fn a_root_under_an_unpreparable_work_root_fails_rather_than_creating_it() {
 
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
-    c.agent_run_log_root = Some(work_root.join("logs"));
+    c.git_push_staging_root = Some(work_root.join("staging"));
 
     let errors = c.to_runtime_config().unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
@@ -1950,11 +2215,11 @@ fn a_rejected_work_root_creates_no_roots_beneath_it() {
     let work_root = temp.path().join("loose-work-root");
     std::fs::create_dir(&work_root).unwrap();
     std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let log_root = work_root.join("logs");
+    let staging_root = work_root.join("staging");
 
     let mut c = valid_agent_vm_http_config();
     c.work_root = work_root.clone();
-    c.agent_run_log_root = Some(log_root.clone());
+    c.git_push_staging_root = Some(staging_root.clone());
 
     let errors = c.to_runtime_config().unwrap_err();
     assert!(
@@ -1964,8 +2229,8 @@ fn a_rejected_work_root_creates_no_roots_beneath_it() {
         "work root failure missing: {errors}",
     );
     assert!(
-        !log_root.exists(),
-        "{log_root:?} was created inside a work root that had just been rejected",
+        !staging_root.exists(),
+        "{staging_root:?} was created inside a work root that had just been rejected",
     );
 }
 
@@ -1982,7 +2247,9 @@ fn a_non_wildcard_bind_addr_is_reported_alongside_an_unrelated_vm_http_fault() {
         lifecycle: valid_agent_vm_lifecycle_config(),
         vm_http,
     };
-    let errors = config.to_runtime_config().unwrap_err();
+    let errors = config
+        .to_runtime_config(test_agent_run_log_root())
+        .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
         errors.iter().any(|error| matches!(
@@ -2016,7 +2283,12 @@ fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
         bearer_path: None,
     };
 
-    let errors = check_daemon_sections(Some(&agent_vm), Some(&ui_http)).unwrap_err();
+    let errors = check_daemon_sections(
+        Some(&agent_vm),
+        Some(&ui_http),
+        Some(&unique_config_test_path("agent-runs")),
+    )
+    .unwrap_err();
     assert!(
         errors
             .iter()

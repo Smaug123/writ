@@ -143,6 +143,11 @@ const AGENT_VM_WORKSPACE_BOOTSTRAP_PREWARM_SAMPLE_LIMIT: usize = 5;
 pub struct AgentVmDaemonRuntimeConfig {
     lifecycle: AgentVmLifecycleRuntimeConfig,
     vm_http: VmHttpRuntimeConfig,
+    /// Where per-run stdout/stderr logs go. Configured at the top level of the
+    /// daemon config, not in `vm_http` (see
+    /// [`DaemonConfig::agent_run_log_root`](crate::config::DaemonConfig::agent_run_log_root));
+    /// the agent-VM runtime holds it because the VM arm is what writes there.
+    agent_run_log_root: crate::config::AgentRunLogRoot,
 }
 
 /// Host facts the broker-VM (`broker_placement = vm`) arm needs that are *not*
@@ -433,9 +438,14 @@ impl AgentVmDaemonRuntimeConfig {
     pub fn new(
         lifecycle: AgentVmLifecycleRuntimeConfig,
         vm_http: VmHttpRuntimeConfig,
+        agent_run_log_root: crate::config::AgentRunLogRoot,
     ) -> Result<Self, AgentVmDaemonRuntimeConfigError> {
         Self::check_bind_addr(vm_http.bind_addr())?;
-        Ok(Self { lifecycle, vm_http })
+        Ok(Self {
+            lifecycle,
+            vm_http,
+            agent_run_log_root,
+        })
     }
 
     /// The daemon-level invariant [`Self::new`] enforces, over the one field it
@@ -476,6 +486,10 @@ impl AgentVmDaemonRuntimeConfig {
 
     pub fn vm_http(&self) -> &VmHttpRuntimeConfig {
         &self.vm_http
+    }
+
+    pub fn agent_run_log_root(&self) -> &Path {
+        self.agent_run_log_root.as_path()
     }
 }
 
