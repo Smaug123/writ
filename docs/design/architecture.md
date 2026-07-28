@@ -954,9 +954,10 @@ run (metadata + detached SSHSIG + framed output), stores it as a git note, and
 downstream consumers (bailiff) verify it.
 
 **Lives in.** The `writ-agent-run` crate (the run contract + process-runner,
-re-exported as `writ::agent_run`), plus `agent_run_envelope.rs` (185: builds
-the signed envelope from an outcome row), `run_envelope.rs`, `run_verify.rs`
-and `SignedRunMetadata` in `protocol/views.rs`. `writ-agent-run`'s contract types are
+re-exported as `writ::agent_run`), plus `agent_run_envelope.rs` (builds the
+signed envelope from an outcome row), `run_envelope.rs`, `run_verify.rs`,
+`run_provenance.rs` (the pure log/note cross-check) and `SignedRunMetadata` in
+`protocol/views.rs`. `writ-agent-run`'s contract types are
 always compiled; its runner/hashing sit behind the crate's `vm-client` feature
 (and host-only `AgentPrompt::summary` behind `host`), so both the daemon and the
 guest share it. The `run_envelope`/`run_verify` host modules stay in `writ`.
@@ -965,6 +966,31 @@ guest share it. The `run_envelope`/`run_verify` host modules stay in `writ`.
 (`run_envelope.rs:111,68`); `SignedRunMetadata` with `canonical_bytes()`
 (`protocol/views.rs:178`); `AllowedSigners`/`verify_run_envelope`
 (`run_verify.rs:61,265`).
+
+**Two questions, two mechanisms.** `verify_run_envelope` answers "is this note
+internally consistent and signed by a key I trust" — both facts drawn from the
+note itself, so any holder can check it, and bailiff does. It cannot answer
+"did writ actually run this", because that evidence lives in the audit
+database and the stream files, which only the daemon has.
+`ClientMessage::VerifyAgentRun` is the second question:
+`run_provenance::cross_check` compares the note's metadata against the
+`agent_run` / `agent_run_outcome` rows (session, prompt hash, exit code,
+completion time, output digest) and returns a `RunProvenanceVerdict` — a DU, so
+"no such run" cannot be read as "nothing wrong found". Only metadata and
+signature cross the wire: `output_envelope_sha256` already binds the output,
+and writd re-derives that digest from its *own* stream files via §5.9's
+materialiser, which re-checks those files against the rows as it reads. So the
+request stays small however large the run's output was, and the output side of
+the comparison is writ checking its own files rather than agreeing with the
+caller's copy of them.
+
+This needs no change to the signed format — every compared field already exists
+on both sides. It is also not proof against a determined local attacker: writ
+is single-operator, so whoever can rewrite the database can reach the signing
+key. What it closes is *partial* divergence — a note altered without the log, a
+row altered without the note, a stream file replaced after the fact, or a bug
+in either writer — which is the space where a wrong answer is otherwise
+indistinguishable from a right one.
 
 **Guarantees & invariants.** The signature covers only
 `metadata.canonical_bytes()` (compact serde JSON, fixed field order,

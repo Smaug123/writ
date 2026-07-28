@@ -580,3 +580,109 @@ async fn run_agent_in_vm_after_start(
     )
     .await
 }
+
+/// Handle a [`ClientMessage::VerifyAgentRun`]: say whether writ's own audit
+/// log corroborates a signed note.
+///
+/// The order is load-bearing. The signature is checked first, and a note that
+/// fails it returns that verdict *alone*: unverified metadata is unattributed
+/// bytes, so comparing its fields against the log would produce findings that
+/// look like evidence about a run while being evidence about nothing.
+///
+/// Only then is the run looked up. The output side of the comparison is not
+/// taken from the caller at all — the caller sends no output bytes — but
+/// re-derived here by rebuilding the envelope from the stream files the
+/// outcome row names, through the same
+/// [`crate::agent_run_envelope`] path that signed it in the first place.
+/// That path re-checks those files against the row as it reads them, so a
+/// stream file altered since the run refuses here rather than quietly
+/// producing a digest that then "disagrees" with the note.
+pub(super) async fn verify_agent_run<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    signed_metadata: &crate::protocol::SignedRunMetadata,
+    signature: &crate::core::SshSignature,
+) -> ServerMessage {
+    let Some(signing_key) = state.signing_key.clone() else {
+        return run_agent_not_configured("signing_key");
+    };
+    let verdict = match check_signature_is_ours(&signing_key, signed_metadata, signature) {
+        Ok(()) => audited_verdict(state, signed_metadata, &signing_key).await,
+        Err(verdict) => Ok(verdict),
+    };
+    match verdict {
+        Ok(verdict) => ServerMessage::AgentRunProvenance { verdict },
+        Err(message) => ServerMessage::Error { message },
+    }
+}
+
+/// Refuse a note this daemon did not sign, distinguishing "not ours" from
+/// "ours but altered" — the first is the ordinary answer when a note is shown
+/// to the wrong writ, the second is tampering.
+fn check_signature_is_ours(
+    signing_key: &crate::signing::WritSigningKey,
+    signed_metadata: &crate::protocol::SignedRunMetadata,
+    signature: &crate::core::SshSignature,
+) -> Result<(), crate::run_provenance::RunProvenanceVerdict> {
+    use crate::run_provenance::RunProvenanceVerdict;
+
+    let ours = signing_key.fingerprint();
+    if signed_metadata.signing_key_fingerprint != ours {
+        return Err(RunProvenanceVerdict::NotOurs {
+            fingerprint: signed_metadata.signing_key_fingerprint.clone(),
+        });
+    }
+    signing_key
+        .verifying_key()
+        .verify(&signed_metadata.canonical_bytes(), signature)
+        .map_err(|_| RunProvenanceVerdict::SignatureInvalid)
+}
+
+/// The audit half: load the run's rows and compare them with the note.
+async fn audited_verdict<S: SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+    signed_metadata: &crate::protocol::SignedRunMetadata,
+    signing_key: &crate::signing::WritSigningKey,
+) -> Result<crate::run_provenance::RunProvenanceVerdict, String> {
+    use crate::run_provenance::{AuditedRun, RunProvenanceVerdict, cross_check};
+
+    let run_id = signed_metadata.run_id;
+    let request = state
+        .audit
+        .get_agent_run(run_id)
+        .map_err(|err| format!("VerifyAgentRun: read agent run {run_id}: {err}"))?;
+    let Some(request) = request else {
+        return Ok(RunProvenanceVerdict::UnknownRun { run_id });
+    };
+    let outcome = state
+        .audit
+        .get_agent_run_outcome(run_id)
+        .map_err(|err| format!("VerifyAgentRun: read agent run outcome {run_id}: {err}"))?;
+    let Some(outcome) = outcome else {
+        return Ok(RunProvenanceVerdict::OutcomePending { run_id });
+    };
+
+    // Rebuild the envelope from writ's own files to get the digest to compare
+    // against. `capabilities` and `prompt_sha256` are echoed from the note
+    // here because the materialiser needs them to build metadata it will not
+    // be asked for — only `output_envelope_sha256` is read back out, and that
+    // comes from the files.
+    let materialised = crate::agent_run_envelope::materialize_signed_run_envelope(
+        &outcome,
+        request.session_id,
+        signed_metadata.prompt_sha256.clone(),
+        signed_metadata.capabilities.clone(),
+        signing_key,
+    )
+    .await
+    .map_err(|err| format!("VerifyAgentRun: re-derive output envelope for {run_id}: {err}"))?;
+
+    let audited = AuditedRun {
+        request,
+        outcome,
+        output_envelope_sha256: materialised.envelope.metadata.output_envelope_sha256,
+    };
+    Ok(RunProvenanceVerdict::Checked {
+        run_id,
+        findings: cross_check(signed_metadata, &audited),
+    })
+}

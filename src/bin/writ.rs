@@ -224,6 +224,19 @@ enum AgentCmd {
         #[arg(long, value_parser = parse_correlation_id)]
         correlation_id: Option<CorrelationId>,
     },
+    /// Ask writ whether its audit log corroborates a signed run note.
+    ///
+    /// `writ agent verify` answers the question a signature cannot: not "is
+    /// this note internally consistent and signed by a key I trust" — a
+    /// verifier settles that on its own — but "did this daemon actually run
+    /// what the note describes". Only writd holds the audit database and the
+    /// stream files, so only writd can say.
+    Verify {
+        /// Path to a file holding the signed envelope bytes, as stored in a
+        /// note body. `-` reads from stdin.
+        #[arg(long)]
+        envelope: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -492,6 +505,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     correlation_id,
                 )?;
             }
+            AgentCmd::Verify { envelope } => {
+                verify_agent_run(&socket_path, &envelope)?;
+            }
         },
         Cmd::Promote { action } => match action {
             PromoteCmd::List { session_id } => {
@@ -677,6 +693,79 @@ fn start_agent_vm(
         }
         ServerMessage::Error { message } => Err(message.into()),
         other => Err(format!("unexpected response: {other:?}").into()),
+    }
+}
+
+/// Present a signed run note to writd and print what its audit log says.
+///
+/// Reads the *envelope* — the note body as stored — but sends only its
+/// metadata and signature: the output bytes stay here, because
+/// `output_envelope_sha256` already binds them and writd re-derives that
+/// digest from its own stream files. Comparing writd's copy against writd's
+/// row is the whole point; sending ours would only ask it to agree with us.
+///
+/// Exit status is the answer: zero when the log corroborates the note, one
+/// otherwise. A verdict that is anything other than a clean comparison —
+/// including "no such run" — is a reason not to trust the note, so it must
+/// not exit zero.
+fn verify_agent_run(
+    socket_path: &Path,
+    envelope_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use writ::run_provenance::RunProvenanceVerdict;
+
+    let bytes = if envelope_path == Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read(envelope_path)
+            .map_err(|e| format!("cannot read {}: {e}", envelope_path.display()))?
+    };
+    let envelope = writ::run_envelope::SignedRunEnvelope::from_bytes(&bytes).map_err(|e| {
+        format!(
+            "{} is not a signed run envelope: {e}",
+            envelope_path.display()
+        )
+    })?;
+
+    let msg = ClientMessage::VerifyAgentRun {
+        signed_metadata: envelope.metadata,
+        signature: envelope.signature,
+    };
+    let verdict = match call(socket_path, &msg)? {
+        ServerMessage::AgentRunProvenance { verdict } => verdict,
+        ServerMessage::Error { message } => return Err(message.into()),
+        other => return Err(format!("unexpected response: {other:?}").into()),
+    };
+
+    match &verdict {
+        RunProvenanceVerdict::NotOurs { fingerprint } => {
+            println!("not-ours fingerprint={fingerprint}");
+        }
+        RunProvenanceVerdict::SignatureInvalid => {
+            println!("signature-invalid");
+        }
+        RunProvenanceVerdict::UnknownRun { run_id } => {
+            println!("unknown-run run_id={run_id}");
+        }
+        RunProvenanceVerdict::OutcomePending { run_id } => {
+            println!("outcome-pending run_id={run_id}");
+        }
+        RunProvenanceVerdict::Checked { run_id, findings } if findings.is_empty() => {
+            println!("corroborated run_id={run_id}");
+        }
+        RunProvenanceVerdict::Checked { run_id, findings } => {
+            println!("mismatch run_id={run_id} findings={}", findings.len());
+            for finding in findings {
+                println!("  {finding:?}");
+            }
+        }
+    }
+    if verdict.is_corroborated() {
+        Ok(())
+    } else {
+        Err("writ's audit log does not corroborate this note".into())
     }
 }
 
