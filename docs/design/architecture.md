@@ -984,6 +984,15 @@ request stays small however large the run's output was, and the output side of
 the comparison is writ checking its own files rather than agreeing with the
 caller's copy of them.
 
+The two checks compose in one order only, and a caller that skips the first
+gets a true answer to the wrong question: only metadata and signature travel,
+so an envelope whose *body* was swapped after signing still asks writd about
+authentic metadata, and writd — re-deriving the digest from its own intact
+files — truthfully answers "corroborated" about a note that is not the one the
+caller holds. `run_verify::check_output_digest` is that first half, split out
+of `verify_run_envelope` because it is the one check that needs no keyring and
+the one whose absence is silent; `writ agent verify` runs it before the RPC.
+
 This needs no change to the signed format — every compared field already exists
 on both sides. It is also not proof against a determined local attacker: writ
 is single-operator, so whoever can rewrite the database can reach the signing
