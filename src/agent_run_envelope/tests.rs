@@ -208,7 +208,7 @@ async fn materialize_vm_envelope_caps_streams_at_max_run_agent_stream_bytes() {
     let cap = crate::server::MAX_RUN_AGENT_STREAM_BYTES;
     // Write cap + 1 KiB so the read overruns the cap on the very
     // last block, exercising the boundary clamp inside
-    // capture_stream_capped.
+    // `read_capped_and_hashed`.
     let stdout_bytes = vec![b'a'; cap + 1024];
     let outcome = outcome_for_streams(
         &tmp.path().join(run_id.to_string()),
@@ -363,12 +363,13 @@ async fn a_stream_file_rewritten_after_its_outcome_row_is_refused() {
     );
 }
 
-/// The same refusal when the file grew past the read cap.
+/// The same refusal when the file is longer than the read cap.
 ///
-/// Past the cap the recorded hash cannot be re-derived without reading the
-/// whole file, so this is the one case where the check is length-only: a row
-/// claiming fewer retained bytes than the cap cannot describe a file that
-/// still has bytes beyond it.
+/// The check must not weaken past the cap. `read_capped_and_hashed` drains to
+/// EOF regardless — it has to, to know the file ran over — so every byte is
+/// read either way and the whole-file digest costs only the hashing. A
+/// tamperer who keeps the length above the cap must not thereby buy a signature
+/// over bytes the row contradicts.
 #[tokio::test]
 async fn a_stream_file_that_grew_past_the_read_cap_is_refused() {
     use crate::core::Sha256Hex;
@@ -399,7 +400,53 @@ async fn a_stream_file_that_grew_past_the_read_cap_is_refused() {
     .expect_err("a file longer than its row claims must not be signed");
     let message = err.to_string();
     assert!(
-        message.contains("stdout") && message.contains("grew"),
-        "the error must name the stream that grew, got: {message}",
+        message.contains("stdout") && message.contains("no longer matches"),
+        "the error must name the stream that changed, got: {message}",
+    );
+}
+
+/// An over-cap file replaced with *different* bytes of the same over-cap
+/// length is still refused.
+///
+/// This is the case a length-only check past the cap would wave through: both
+/// the row and the file agree the stream ran past 4 MiB, but the first 4 MiB —
+/// the bytes that get signed — are not the audited ones. Only the whole-file
+/// digest catches it.
+#[tokio::test]
+async fn an_over_cap_stream_file_swapped_for_different_bytes_is_refused() {
+    use crate::core::Sha256Hex;
+    use crate::signing::WritSigningKey;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signing_key = WritSigningKey::from_openssh_pem(TEST_SIGNING_PEM).unwrap();
+    let run_id = AgentRunId::new();
+    let cap = crate::server::MAX_RUN_AGENT_STREAM_BYTES;
+    let audited = vec![b'a'; cap + 1024];
+    let outcome = outcome_for_streams(
+        &tmp.path().join(run_id.to_string()),
+        run_id,
+        0,
+        &audited,
+        b"",
+    );
+    // Same length, still past the cap, different bytes — including in the
+    // prefix that would be signed.
+    let swapped = vec![b'b'; cap + 1024];
+    fs::write(&outcome.outcome.stdout.path, &swapped).unwrap();
+
+    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let err = materialize_signed_run_envelope(
+        &outcome,
+        SessionId::new(),
+        prompt_sha256,
+        vec![],
+        &signing_key,
+    )
+    .await
+    .expect_err("an over-cap file whose contents changed must not be signed");
+    let message = err.to_string();
+    assert!(
+        message.contains("stdout") && message.contains("no longer matches"),
+        "the error must name the stream that changed, got: {message}",
     );
 }

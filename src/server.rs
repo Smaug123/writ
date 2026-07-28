@@ -429,46 +429,6 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
 /// a prefix rather than the whole stream.
 pub(crate) const MAX_RUN_AGENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
 
-/// Read `reader` to EOF, retaining at most `cap` bytes. After the cap
-/// is hit, further bytes are drained and discarded so the child does
-/// not block writing to a full pipe. The returned `truncated_at` is
-/// `Some(cap)` iff any bytes were dropped — `None` means the entire
-/// stream fit. The cap is byte-aligned to whatever the underlying read
-/// returned; we do not bisect a single read across the boundary.
-pub(crate) async fn capture_stream_capped<R>(
-    mut reader: R,
-    cap: usize,
-) -> std::io::Result<(Vec<u8>, Option<u64>)>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut tmp = vec![0u8; 16 * 1024];
-    let mut truncated_at: Option<u64> = None;
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok((buf, truncated_at));
-        }
-        if truncated_at.is_some() {
-            // Past the cap: drain to keep the child unblocked.
-            continue;
-        }
-        let room = cap.saturating_sub(buf.len());
-        if room == 0 {
-            // We previously filled exactly to the cap. Receiving more
-            // bytes proves the stream extended past it.
-            truncated_at = Some(cap as u64);
-        } else if n <= room {
-            buf.extend_from_slice(&tmp[..n]);
-        } else {
-            buf.extend_from_slice(&tmp[..room]);
-            truncated_at = Some(cap as u64);
-        }
-    }
-}
-
 fn missing_agent_kind_for_registry_response() -> ServerMessage {
     ServerMessage::Error {
         message: "agent kind is required; open the session with --agent claude or --agent codex"

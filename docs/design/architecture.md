@@ -977,10 +977,14 @@ behind by the agent whose output it is — so the bytes are checked against the
 row before they are signed, and a mismatch refuses rather than vouches. The
 recorded hash is writ's own: computed by the host arm's capture, or re-derived
 by the broker from the guest's upload before writing it (§5.6 checks the
-guest's claim against the bytes at that point). Below the read cap the check is
-length *and* hash; at or past it the recorded hash covers retained bytes the
-read deliberately did not finish, so only the row's agreement that the file
-runs past the cap is checkable.
+guest's claim against the bytes at that point). The check is total — length and
+hash of the *whole* file, not of the prefix that gets signed — because reading
+to EOF is unavoidable anyway (it is the only way to know the file ran past the
+envelope cap), so the whole-file digest costs hashing and no extra IO. Checking
+only the prefix would let a tamperer who keeps the length above the cap buy a
+signature over bytes the row contradicts. Both crates hash a stream through one
+`writ_agent_run::Sha256Stream`, so the capture's digest and this re-read's are
+comparable by construction.
 
 ### 5.10 Clients & UI
 

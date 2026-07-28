@@ -260,6 +260,39 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex_lower(digest.as_ref())
 }
 
+/// SHA-256 over bytes that arrive a chunk at a time, yielding the same
+/// lowercase hex [`sha256_hex`] does.
+///
+/// Streams too big to hold are hashed in more than one place — the run capture
+/// measures a pipe as it writes it to disk, and the host re-measures that file
+/// when building the envelope — and those digests get compared to each other.
+/// One implementation is what makes the comparison meaningful, so this exists
+/// rather than a `ring::digest::Context` at each site.
+#[cfg(any(feature = "host", feature = "vm-client"))]
+pub struct Sha256Stream(ring::digest::Context);
+
+#[cfg(any(feature = "host", feature = "vm-client"))]
+impl Sha256Stream {
+    pub fn new() -> Self {
+        Self(ring::digest::Context::new(&ring::digest::SHA256))
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finish_hex(self) -> String {
+        hex_lower(self.0.finish().as_ref())
+    }
+}
+
+#[cfg(any(feature = "host", feature = "vm-client"))]
+impl Default for Sha256Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(any(feature = "host", feature = "vm-client"))]
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -677,8 +710,8 @@ mod process_runner {
         let mut total = 0u64;
         let mut captured = 0u64;
         let mut buffer = [0u8; 8192];
-        let mut hash_context = ring::digest::Context::new(&ring::digest::SHA256);
-        let mut retained_hash_context = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut full_hash = super::Sha256Stream::new();
+        let mut retained_hash = super::Sha256Stream::new();
         loop {
             let read =
                 reader
@@ -691,7 +724,7 @@ mod process_runner {
                 break;
             }
             let chunk = &buffer[..read];
-            hash_context.update(chunk);
+            full_hash.update(chunk);
             total = total.saturating_add(read as u64);
             if captured < max_capture_bytes {
                 let remaining = (max_capture_bytes - captured) as usize;
@@ -702,7 +735,7 @@ mod process_runner {
                         path: path.clone(),
                         source,
                     })?;
-                retained_hash_context.update(kept);
+                retained_hash.update(kept);
                 captured += to_write as u64;
             }
         }
@@ -714,9 +747,9 @@ mod process_runner {
         Ok(AgentRunStreamCapture {
             path,
             retained_byte_len: captured,
-            retained_sha256_hex: super::hex_lower(retained_hash_context.finish().as_ref()),
+            retained_sha256_hex: retained_hash.finish_hex(),
             full_byte_len: total,
-            full_sha256_hex: super::hex_lower(hash_context.finish().as_ref()),
+            full_sha256_hex: full_hash.finish_hex(),
         })
     }
 

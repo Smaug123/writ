@@ -14,8 +14,8 @@
 //! dispatch wires it between the outcome row and the notes-repo write step.
 //!
 //! Reading the files back opens a window in which they can change, so the
-//! bytes are checked against the row before they are signed — see
-//! `check_matches_summary` for what that covers and what it cannot.
+//! whole of each file is hashed and checked against the row before any of it
+//! is signed — see `check_matches_summary`.
 
 use std::path::PathBuf;
 
@@ -50,17 +50,6 @@ pub enum MaterializeRunEnvelopeError {
         recorded_sha256: String,
         found_byte_len: u64,
         found_sha256: String,
-    },
-    #[error(
-        "{stream} log file {} grew past the {cap}-byte read cap, but the outcome \
-         row describing it records only {recorded_byte_len} retained bytes",
-        path.display()
-    )]
-    StreamGrewPastCap {
-        stream: &'static str,
-        path: PathBuf,
-        recorded_byte_len: u64,
-        cap: usize,
     },
     #[error("sign canonical metadata: {0}")]
     Sign(#[source] crate::signing::WritSigningKeyError),
@@ -191,28 +180,88 @@ pub async fn materialize_signed_run_envelope(
     })
 }
 
+/// One stream file, read back for the envelope.
+///
+/// `retained` is what gets signed; the `file_*` pair describes the whole file
+/// and is what the outcome row is checked against. They differ exactly when
+/// the file ran past the read cap — and the row describes the file, so the
+/// check has to be against the file, not against the prefix.
+struct StreamReadback {
+    /// The bytes the envelope will carry: the file, or its first `cap` bytes.
+    retained: Vec<u8>,
+    /// `Some(cap)` iff the file ran past the cap, so `retained` is a prefix.
+    capped_at: Option<u64>,
+    /// Length of the whole file, capped or not.
+    file_byte_len: u64,
+    /// SHA-256 of the whole file, directly comparable with the outcome row's
+    /// `sha256_hex` (which also describes the file).
+    file_sha256_hex: String,
+}
+
 async fn read_stream_capped_from_disk(
     stream: &'static str,
     summary: &crate::agent_run::AgentRunStreamSummary,
     cap: usize,
 ) -> Result<(Vec<u8>, Option<u64>), MaterializeRunEnvelopeError> {
     let path = summary.path.as_path();
-    let file = tokio::fs::File::open(path).await.map_err(|source| {
-        MaterializeRunEnvelopeError::StreamRead {
-            stream,
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    let (bytes, truncated_at) = crate::server::capture_stream_capped(file, cap)
+    let read_error = |source| MaterializeRunEnvelopeError::StreamRead {
+        stream,
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = tokio::fs::File::open(path).await.map_err(read_error)?;
+    let readback = read_capped_and_hashed(file, cap)
         .await
-        .map_err(|source| MaterializeRunEnvelopeError::StreamRead {
-            stream,
-            path: path.to_path_buf(),
-            source,
-        })?;
-    check_matches_summary(stream, summary, &bytes, truncated_at, cap)?;
-    Ok((bytes, truncated_at))
+        .map_err(read_error)?;
+    check_matches_summary(stream, summary, &readback)?;
+    Ok((readback.retained, readback.capped_at))
+}
+
+/// Read `reader` to EOF, retaining at most `cap` bytes and hashing every byte
+/// that goes past.
+///
+/// Reading to EOF is not optional: it is the only way to know whether the
+/// stream ran past `cap` at all. Since those bytes are read regardless, the
+/// whole-file digest costs hashing and no extra IO — which is what lets the
+/// outcome-row check stay total instead of weakening above the cap. Memory
+/// stays bounded at `cap` either way: past it, bytes are hashed and dropped.
+///
+/// The cap is byte-aligned to whatever the underlying read returned; a single
+/// read is not bisected across the boundary.
+async fn read_capped_and_hashed<R>(mut reader: R, cap: usize) -> std::io::Result<StreamReadback>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut retained: Vec<u8> = Vec::new();
+    let mut tmp = vec![0u8; 16 * 1024];
+    let mut capped_at: Option<u64> = None;
+    let mut file_byte_len: u64 = 0;
+    let mut digest = crate::agent_run::Sha256Stream::new();
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(StreamReadback {
+                retained,
+                capped_at,
+                file_byte_len,
+                file_sha256_hex: digest.finish_hex(),
+            });
+        }
+        let chunk = &tmp[..n];
+        digest.update(chunk);
+        file_byte_len = file_byte_len.saturating_add(n as u64);
+        let room = cap.saturating_sub(retained.len());
+        if room == 0 {
+            // Already filled exactly to the cap; more bytes prove it overran.
+            capped_at = Some(cap as u64);
+        } else if n <= room {
+            retained.extend_from_slice(chunk);
+        } else {
+            retained.extend_from_slice(&chunk[..room]);
+            capped_at = Some(cap as u64);
+        }
+    }
 }
 
 /// Refuse to sign bytes the outcome row contradicts.
@@ -230,36 +279,19 @@ async fn read_stream_capped_from_disk(
 /// So: verify, and fail rather than vouch. The truthful row stays; only the
 /// envelope is withheld.
 ///
-/// **What is checked depends on whether the whole file was read.** Below the
-/// cap, `bytes` *is* the file, so length and hash are both re-derived. At or
-/// past the cap the recorded hash covers retained bytes this read deliberately
-/// did not finish, so it cannot be re-derived without reading the rest — up to
-/// whatever the writer was allowed to retain. What remains checkable there is
-/// that the row agrees the file runs past the cap at all: a row recording
-/// fewer retained bytes than the cap cannot describe a file that still has
-/// bytes beyond it.
+/// The check is **total** — length and hash, whether or not the file ran past
+/// the read cap. Both sides describe the same thing: the row's `byte_len` and
+/// `sha256_hex` are of the file, and [`StreamReadback`]'s `file_*` pair is of
+/// the file as found. Comparing the row against the *retained prefix* instead
+/// would let a tamperer who keeps the length above the cap buy a signature
+/// over bytes the row contradicts.
 fn check_matches_summary(
     stream: &'static str,
     summary: &crate::agent_run::AgentRunStreamSummary,
-    bytes: &[u8],
-    truncated_at: Option<u64>,
-    cap: usize,
+    readback: &StreamReadback,
 ) -> Result<(), MaterializeRunEnvelopeError> {
-    if truncated_at.is_some() {
-        return if summary.byte_len > cap as u64 {
-            Ok(())
-        } else {
-            Err(MaterializeRunEnvelopeError::StreamGrewPastCap {
-                stream,
-                path: summary.path.clone(),
-                recorded_byte_len: summary.byte_len,
-                cap,
-            })
-        };
-    }
-    let found_byte_len = bytes.len() as u64;
-    let found_sha256 = crate::agent_run::sha256_hex(bytes);
-    if found_byte_len == summary.byte_len && found_sha256 == summary.sha256_hex {
+    if readback.file_byte_len == summary.byte_len && readback.file_sha256_hex == summary.sha256_hex
+    {
         return Ok(());
     }
     Err(MaterializeRunEnvelopeError::StreamChanged {
@@ -267,8 +299,8 @@ fn check_matches_summary(
         path: summary.path.clone(),
         recorded_byte_len: summary.byte_len,
         recorded_sha256: summary.sha256_hex.clone(),
-        found_byte_len,
-        found_sha256,
+        found_byte_len: readback.file_byte_len,
+        found_sha256: readback.file_sha256_hex.clone(),
     })
 }
 
