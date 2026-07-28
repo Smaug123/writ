@@ -62,16 +62,13 @@ fn run_agent_not_configured(component: &str) -> ServerMessage {
 /// variant is denied by `policy::*`) is deferred to a follow-up slice —
 /// see the plan doc.
 ///
-/// `purpose` is still not recorded: the `agent_run` table has no column
-/// for it and `correlation_id` cannot stand in (its charset rejects
-/// bailiff's `review:plan-abc`), so recording it needs a schema
-/// migration of its own.
+/// `purpose` is recorded verbatim on the `agent_run` row by both arms.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
     prompt: AgentPrompt,
     capabilities: Vec<crate::core::CapabilitySet>,
-    purpose: String,
+    purpose: crate::agent_run::RunPurpose,
     output_ref: NotesRef,
     request_session_id: Option<SessionId>,
     workspace: Option<crate::vm_git::AgentVmWorkspaceBootstrap>,
@@ -79,11 +76,6 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     agent_model: Option<String>,
     agent_vm: Option<&Arc<crate::agent_vm_daemon::AgentVmDaemon>>,
 ) -> ServerMessage {
-    // `purpose` is part of the wire contract and lands on the audit row once
-    // the column exists. Holding the name in scope (not discarding via `_`)
-    // keeps the pending plumbing self-evident.
-    let _purpose = purpose;
-
     // VM1 invariant: a `WorkspaceWrite` capability is only meaningful
     // when the request also carries a workspace bootstrap, because the
     // host-spawn path has no cwd for the agent to mutate. Reject the
@@ -108,6 +100,7 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
                 agent_vm,
                 prompt,
                 capabilities,
+                purpose,
                 output_ref,
                 request_session_id,
                 ws,
@@ -208,6 +201,7 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
             agent_kind: spawn_agent_kind,
             prompt: prompt_summary,
             correlation_id: None,
+            purpose: Some(purpose),
         }) {
         Ok(recorded) => recorded,
         Err(err) => {
@@ -418,6 +412,7 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
     agent_vm: Option<&Arc<crate::agent_vm_daemon::AgentVmDaemon>>,
     prompt: AgentPrompt,
     capabilities: Vec<crate::core::CapabilitySet>,
+    purpose: crate::agent_run::RunPurpose,
     output_ref: NotesRef,
     request_session_id: Option<SessionId>,
     workspace: crate::vm_git::AgentVmWorkspaceBootstrap,
@@ -470,7 +465,13 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
             agent_model,
             workspace,
             prompt,
-            None,
+            // The VM arm carries no correlation id: `RunAgent` has no such
+            // field. The two tags come from different RPCs, which is what
+            // `AgentRunTags` makes explicit at each call site.
+            crate::agent_vm_daemon::AgentRunTags {
+                correlation_id: None,
+                purpose: Some(purpose),
+            },
         )
         .await
     {

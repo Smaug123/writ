@@ -335,7 +335,14 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                         agent_model,
                         workspace,
                         prompt,
-                        correlation_id,
+                        // `StartAgentRun` has no `purpose` field, and is not
+                        // getting one speculatively: a run started this way is
+                        // permanently `purpose: None` on the audit row, which is
+                        // the truth about what the caller supplied.
+                        crate::agent_vm_daemon::AgentRunTags {
+                            correlation_id,
+                            purpose: None,
+                        },
                     )
                     .await
                 {

@@ -24,6 +24,14 @@ pub const VM_AGENT_RUN_OUTCOME_PATH_SUFFIX: &str = "outcome";
 pub const MIN_CORRELATION_ID_BYTES: usize = 1;
 pub const MAX_CORRELATION_ID_BYTES: usize = 64;
 
+/// Inclusive bounds on a [`RunPurpose`]. The lower bound rejects the
+/// empty string for the same reason as [`MIN_CORRELATION_ID_BYTES`]:
+/// the audit column is nullable, and `NULL` must mean exactly one
+/// thing. The upper bound keeps a purpose to one terminal line and
+/// bounds what a caller can deposit in an append-only log.
+pub const MIN_RUN_PURPOSE_BYTES: usize = 1;
+pub const MAX_RUN_PURPOSE_BYTES: usize = 128;
+
 #[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AgentRunId(Uuid);
@@ -380,6 +388,128 @@ impl Serialize for CorrelationId {
 }
 
 impl<'de> Deserialize<'de> for CorrelationId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Self::try_new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+// --- RunPurpose -------------------------------------------------------
+
+/// Caller-supplied opaque tag saying what a run was *for*, recorded
+/// verbatim on the `agent_run` audit row. Writ never interprets the
+/// contents: the upstream orchestrator decides what a purpose means
+/// and matches on it by equality (bailiff writes `"plan-submit"`,
+/// `"review:plan-abc"`, and whatever an operator passes to
+/// `--purpose`).
+///
+/// Invariants:
+/// - [`MIN_RUN_PURPOSE_BYTES`]..=[`MAX_RUN_PURPOSE_BYTES`] bytes
+/// - every byte is printable ASCII, `0x20..=0x7e`
+/// - no leading or trailing space
+///
+/// The value is stored verbatim and never normalised — [`as_str`] returns
+/// the caller's bytes unchanged, because an audit row that silently
+/// differs from what the caller sent is not a record of what happened.
+///
+/// [`as_str`]: Self::as_str
+///
+/// # Why printable ASCII, when a purpose is prose
+///
+/// A purpose is a join key an orchestrator reconciles on, and it lands
+/// in an append-only log that can never be corrected. The hazard is
+/// therefore two purposes that are unequal as keys but identical on
+/// screen. Printable ASCII excludes, *by construction* rather than by
+/// blocklist, every invisible and control character that could produce
+/// one: NUL, CR/LF, ESC, the C1 range, zero-width spaces, and bidi
+/// overrides. An allow-Unicode class cannot get there — it would need a
+/// blocklist of format characters, which is wrong by default the moment
+/// Unicode gains a member, and it would still admit the confusables
+/// (Cyrillic `а` is an ordinary lowercase letter) that motivate it.
+///
+/// The cost is that a purpose must be written in Latin script. That is a
+/// loud parse-time rejection rather than a silent corruption, and the
+/// class is trivially widened later — every value valid today stays
+/// valid — whereas a log full of Unicode purposes could not be narrowed.
+///
+/// What this does *not* promise: that two purposes cannot render
+/// *similarly*. `l`/`1`/`I`, `O`/`0`, and runs of interior spaces all
+/// survive, deliberately — a quoted render distinguishes them, and they
+/// are a lesser hazard than a character with no glyph at all.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct RunPurpose(String);
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RunPurposeError {
+    #[error("purpose must not be empty")]
+    Empty,
+    #[error(
+        "purpose must be at most {max} bytes; got {got}",
+        max = MAX_RUN_PURPOSE_BYTES,
+    )]
+    TooLong { got: usize },
+    #[error("purpose byte at offset {at} is {byte:#04x}; expected printable ASCII (0x20..=0x7e)")]
+    ForbiddenByte { at: usize, byte: u8 },
+    #[error("purpose must not start or end with a space")]
+    SurroundingSpace,
+}
+
+impl RunPurpose {
+    pub fn try_new(raw: impl Into<String>) -> Result<Self, RunPurposeError> {
+        let raw = raw.into();
+        let len = raw.len();
+        if len < MIN_RUN_PURPOSE_BYTES {
+            return Err(RunPurposeError::Empty);
+        }
+        if len > MAX_RUN_PURPOSE_BYTES {
+            return Err(RunPurposeError::TooLong { got: len });
+        }
+        for (at, byte) in raw.bytes().enumerate() {
+            if !(0x20..=0x7e).contains(&byte) {
+                return Err(RunPurposeError::ForbiddenByte { at, byte });
+            }
+        }
+        // Checked after the byte scan, so the class violation is reported
+        // in preference to the shape one: a purpose containing a newline
+        // should be told about the newline. Space is the only whitespace
+        // the class admits, which is what makes this test exhaustive.
+        if raw.starts_with(' ') || raw.ends_with(' ') {
+            return Err(RunPurposeError::SurroundingSpace);
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RunPurpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for RunPurpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RunPurpose({:?})", self.0)
+    }
+}
+
+impl FromStr for RunPurpose {
+    type Err = RunPurposeError;
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::try_new(raw)
+    }
+}
+
+impl Serialize for RunPurpose {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RunPurpose {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(d)?;
         Self::try_new(raw).map_err(serde::de::Error::custom)
@@ -1104,6 +1234,173 @@ mod tests {
             assert!(
                 matches!(err, CorrelationIdError::InvalidByte { .. }),
                 "expected InvalidByte for {bad:?}, got {err:?}",
+            );
+        }
+    }
+
+    /// The documented invariant, restated independently of
+    /// [`RunPurpose::try_new`]. This is the oracle the property below
+    /// compares against: two expressions of one rule, so a change to
+    /// either that is not a change to both shows up as a counterexample
+    /// rather than as a test that was quietly updated to agree.
+    fn reference_accepts_run_purpose(raw: &str) -> bool {
+        (MIN_RUN_PURPOSE_BYTES..=MAX_RUN_PURPOSE_BYTES).contains(&raw.len())
+            && raw.bytes().all(|b| (0x20..=0x7e).contains(&b))
+            && !raw.starts_with(' ')
+            && !raw.ends_with(' ')
+    }
+
+    /// Strings drawn to straddle the boundary: valid-shaped ASCII, ASCII
+    /// with a space at either end, anything at all (control bytes,
+    /// non-ASCII), and lengths either side of the cap. A uniform
+    /// `any::<String>()` would almost never produce an *accepted* value,
+    /// so the property would pass while only ever testing rejection.
+    ///
+    /// The `edge` arm exists because uniform generation is hopeless at
+    /// hitting a *specific* byte: widening the accepted range by one to
+    /// admit `0x7f` was caught only by the example test until this arm
+    /// was added, because nothing else here produces a lone DEL. Search
+    /// the boundary deliberately rather than hoping to stumble onto it.
+    fn run_purpose_candidate() -> impl Strategy<Value = String> {
+        let edge = (
+            proptest::sample::select(vec![
+                '\u{1f}', ' ', '!', '~', '\u{7f}', '\u{80}', '\u{a0}', '\u{200b}',
+            ]),
+            "[A-Za-z]{0,8}",
+            "[A-Za-z]{0,8}",
+        )
+            .prop_map(|(edge, before, after)| format!("{before}{edge}{after}"));
+        prop_oneof![
+            "[ -~]{0,140}",
+            "[A-Za-z0-9:._/#-]{0,40}",
+            " {0,2}[ -~]{0,20} {0,2}",
+            any::<String>(),
+            "[\\PC]{0,40}",
+            edge,
+            Just(String::new()),
+            Just("a".repeat(MAX_RUN_PURPOSE_BYTES)),
+            Just("a".repeat(MAX_RUN_PURPOSE_BYTES + 1)),
+        ]
+    }
+
+    proptest! {
+        /// `try_new` accepts exactly the documented class — no more, no
+        /// less. Stated against a reference predicate rather than as a
+        /// list of examples, because the failure that matters is a rule
+        /// that is subtly wider than documented (an off-by-one on the
+        /// cap, a byte range that lets 0x7f through), which no example
+        /// anyone thinks to write will catch.
+        #[test]
+        fn run_purpose_accepts_exactly_the_documented_class(raw in run_purpose_candidate()) {
+            prop_assert_eq!(
+                RunPurpose::try_new(raw.clone()).is_ok(),
+                reference_accepts_run_purpose(&raw),
+                "disagreement on {:?}", raw,
+            );
+        }
+
+        /// An accepted purpose is stored and re-emitted byte-for-byte.
+        /// The audit row is a record of what the caller sent; a type that
+        /// trimmed, normalised, or case-folded would make the log
+        /// disagree with the request that produced it.
+        #[test]
+        fn an_accepted_purpose_round_trips_verbatim(raw in run_purpose_candidate()) {
+            prop_assume!(reference_accepts_run_purpose(&raw));
+            let purpose = RunPurpose::try_new(raw.clone()).expect("reference says it parses");
+            prop_assert_eq!(purpose.as_str(), raw.as_str());
+            prop_assert_eq!(purpose.to_string(), raw.clone());
+
+            // Serde is the wire boundary, so it must be the same parser:
+            // a purpose that arrives as JSON must be exactly as
+            // constrained as one built in process, or the wire is a way
+            // in for values the type forbids.
+            let json = serde_json::to_string(&purpose).expect("a string serialises");
+            prop_assert_eq!(&json, &serde_json::to_string(&raw).expect("a string serialises"));
+            let back: RunPurpose = serde_json::from_str(&json).expect("its own output parses");
+            prop_assert_eq!(back, purpose);
+        }
+
+        /// Nothing reaches `RunPurpose` through serde that `try_new`
+        /// would refuse. Without this, the newtype documents an invariant
+        /// the deserialiser does not enforce, and the wire becomes the
+        /// back door.
+        #[test]
+        fn deserialising_accepts_exactly_what_try_new_accepts(raw in run_purpose_candidate()) {
+            let json = serde_json::to_string(&raw).expect("a string serialises");
+            let parsed = serde_json::from_str::<RunPurpose>(&json);
+            prop_assert_eq!(
+                parsed.is_ok(),
+                RunPurpose::try_new(raw.clone()).is_ok(),
+                "serde and try_new disagree on {:?}", raw,
+            );
+        }
+    }
+
+    /// The values callers actually send parse, and each rejection names
+    /// its own reason. The property above pins the *set*; this pins that
+    /// the errors are useful, and that the real vocabulary is inside it.
+    #[test]
+    fn run_purpose_accepts_real_tags_and_names_each_rejection() {
+        for ok in [
+            "plan-submit",
+            "plan-review",
+            "plan-implement",
+            "review:plan-abc",
+            "plan-stage:abc123",
+            // An operator's free text: spaces and punctuation are the
+            // reason the class is not `CorrelationId`'s.
+            "review of plan #3",
+            "~",
+            &"a".repeat(MAX_RUN_PURPOSE_BYTES),
+        ] {
+            let parsed = RunPurpose::try_new(ok)
+                .unwrap_or_else(|e| panic!("expected {ok:?} to parse, got {e}"));
+            assert_eq!(parsed.as_str(), ok);
+        }
+
+        assert_eq!(RunPurpose::try_new(""), Err(RunPurposeError::Empty));
+        assert_eq!(
+            RunPurpose::try_new("a".repeat(MAX_RUN_PURPOSE_BYTES + 1)),
+            Err(RunPurposeError::TooLong {
+                got: MAX_RUN_PURPOSE_BYTES + 1
+            }),
+        );
+        assert_eq!(
+            RunPurpose::try_new(" leading"),
+            Err(RunPurposeError::SurroundingSpace),
+        );
+        assert_eq!(
+            RunPurpose::try_new("trailing "),
+            Err(RunPurposeError::SurroundingSpace),
+        );
+        // A lone space is both empty-ish and surrounded; it must not slip
+        // through as a purpose that renders as nothing.
+        assert_eq!(
+            RunPurpose::try_new(" "),
+            Err(RunPurposeError::SurroundingSpace),
+        );
+
+        // The characters the class exists to exclude: each would be
+        // invisible or line-breaking in a log, a terminal, or a listing.
+        for (bad, at, byte) in [
+            ("nul\0byte", 3, 0u8),
+            ("two\nlines", 3, b'\n'),
+            ("carriage\rreturn", 8, b'\r'),
+            ("tab\tseparated", 3, b'\t'),
+            ("esc\x1b[31m", 3, 0x1b),
+            ("del\x7f", 3, 0x7f),
+            // Cyrillic 'а' — a homoglyph of ASCII 'a', and the reason an
+            // allow-Unicode class could not deliver the property.
+            ("plan-\u{0430}", 5, 0xd0),
+            // Zero-width space: two purposes, one rendering.
+            ("plan\u{200b}review", 4, 0xe2),
+            // Right-to-left override.
+            ("plan\u{202e}review", 4, 0xe2),
+        ] {
+            assert_eq!(
+                RunPurpose::try_new(bad),
+                Err(RunPurposeError::ForbiddenByte { at, byte }),
+                "expected {bad:?} to be rejected at offset {at}",
             );
         }
     }

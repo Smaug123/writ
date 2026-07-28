@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, watch};
 
-use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
+use crate::agent_run::{AgentPrompt, AgentRunId};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmNames, AgentVmResources,
     AgentVmSessionManagerError, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError,
@@ -220,6 +220,20 @@ pub struct AgentRunStarted {
     session_id: SessionId,
     run_id: AgentRunId,
     broker_url: String,
+}
+
+/// The opaque caller-supplied tags recorded on an `agent_run` row.
+///
+/// Bundled rather than passed as two positional `Option`s because they
+/// are the same *kind* of thing — strings writ stores and never
+/// interprets — and because the two RPCs that start a run supply
+/// different subsets of them: `RunAgent` always has a purpose and never
+/// a correlation id, `StartAgentRun` the reverse. A struct makes each
+/// call site say which it is giving and which it is not.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentRunTags {
+    pub correlation_id: Option<crate::agent_run::CorrelationId>,
+    pub purpose: Option<crate::agent_run::RunPurpose>,
 }
 
 #[derive(Debug, thiserror::Error)]

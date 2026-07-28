@@ -161,7 +161,7 @@ fn run_agent_roundtrips() {
                 repo: sample_repo(),
             },
         ],
-        purpose: "plan-stage".into(),
+        purpose: "plan-stage".parse().unwrap(),
         output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
         session_id: Some(fixed_session_id()),
         workspace: None,
@@ -184,7 +184,7 @@ fn run_agent_pins_field_names_and_accepts_empty_capabilities() {
     let msg = ClientMessage::RunAgent {
         prompt: AgentPrompt::new("p"),
         capabilities: vec![],
-        purpose: "reviewer".into(),
+        purpose: "reviewer".parse().unwrap(),
         output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
         session_id: None,
         workspace: None,
@@ -219,7 +219,7 @@ fn run_agent_session_id_is_named_session_id_on_the_wire() {
     let msg = ClientMessage::RunAgent {
         prompt: AgentPrompt::new("p"),
         capabilities: vec![],
-        purpose: "plan-submit".into(),
+        purpose: "plan-submit".parse().unwrap(),
         output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
         session_id: Some(session_id),
         workspace: None,
@@ -267,7 +267,7 @@ fn run_agent_roundtrips_with_workspace_field() {
         capabilities: vec![CapabilitySet::WorkspaceWrite {
             repo: sample_repo(),
         }],
-        purpose: "implement-stage".into(),
+        purpose: "implement-stage".parse().unwrap(),
         output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
         session_id: Some(fixed_session_id()),
         workspace: Some(AgentVmWorkspaceBootstrap {
@@ -319,7 +319,7 @@ fn run_agent_roundtrips_with_agent_kind_and_model() {
         capabilities: vec![CapabilitySet::WorkspaceWrite {
             repo: sample_repo(),
         }],
-        purpose: "implement-stage".into(),
+        purpose: "implement-stage".parse().unwrap(),
         output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
         session_id: None,
         workspace: Some(AgentVmWorkspaceBootstrap {
@@ -1509,7 +1509,7 @@ fn sample_client_message(index: usize) -> ClientMessage {
             capabilities: vec![CapabilitySet::WorkspaceRead {
                 repo: sample_repo(),
             }],
-            purpose: "plan-stage".into(),
+            purpose: "plan-stage".parse().unwrap(),
             output_ref: NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap(),
             session_id: Some(fixed_session_id()),
             workspace: None,

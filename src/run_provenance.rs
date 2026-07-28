@@ -150,6 +150,12 @@ impl RunProvenanceVerdict {
 /// against, and inventing agreement from silence would be worse than the gap.
 /// The fingerprint is checked where it can be — the shell verifies the
 /// signature against the daemon's own key before this is reached.
+///
+/// `purpose` is the same gap from the other side: the row has it, the signed
+/// metadata does not. A caller's tag is not evidence about a run, and a
+/// "finding" derived from one side alone would be a disagreement with silence.
+/// The comparison is invariant under it, which the tests assert rather than
+/// leave to be inferred from its absence here.
 pub fn cross_check(signed: &SignedRunMetadata, audited: &AuditedRun) -> Vec<RunProvenanceFinding> {
     let mut findings = Vec::new();
     if signed.session_id != audited.request.session_id {

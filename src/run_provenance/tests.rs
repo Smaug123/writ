@@ -57,6 +57,11 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
         any::<i32>(),
         0i64..4_000_000_000_000,
         0u64..1_000_000,
+        proptest::option::of(proptest::sample::select(vec![
+            "plan-submit",
+            "review:plan-abc",
+            "review of plan #3",
+        ])),
     )
         .prop_map(
             |(
@@ -67,6 +72,7 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
                 exit_code,
                 completed_ms,
                 prompt_bytes,
+                purpose,
             )| {
                 let run_id = AgentRunId::new();
                 let session_id = SessionId::new();
@@ -88,6 +94,8 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
                         redacted_preview: "<redacted>".to_string(),
                     },
                     correlation_id: None,
+                    purpose: purpose
+                        .map(|p| crate::agent_run::RunPurpose::try_new(p).expect("a valid tag")),
                 };
                 let outcome = AgentRunOutcomeAuditRecord {
                     completed_at,
@@ -231,6 +239,37 @@ proptest! {
             findings,
         };
         prop_assert!(!verdict.is_corroborated());
+    }
+
+    /// `cross_check` is invariant under the audit row's `purpose`.
+    ///
+    /// Deliberate, not an oversight: the signed metadata has no purpose
+    /// field, so there is nothing on the note to compare the column
+    /// against, and a "finding" derived from one side alone would be a
+    /// disagreement with silence. Asserted rather than left implicit
+    /// because the next person to read `cross_check` will see a column
+    /// it ignores and have to work out whether that was intended.
+    ///
+    /// If the signed format ever grows a purpose, this property is what
+    /// fails, and the fix is to compare it — not to delete this.
+    #[test]
+    fn the_comparison_ignores_the_audit_rows_purpose(
+        (signed, audited) in matching_pair(),
+        other in proptest::option::of(proptest::sample::select(vec![
+            "plan-implement",
+            "something else entirely",
+        ])),
+    ) {
+        let baseline = cross_check(&signed, &audited);
+        let repurposed = AuditedRun {
+            request: AgentRunAuditRecord {
+                purpose: other
+                    .map(|p| crate::agent_run::RunPurpose::try_new(p).expect("a valid tag")),
+                ..audited.request.clone()
+            },
+            ..audited.clone()
+        };
+        prop_assert_eq!(cross_check(&signed, &repurposed), baseline);
     }
 
     /// Findings come out in a fixed order, so two reports over the same

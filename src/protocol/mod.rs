@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId};
+use crate::agent_run::{AgentPrompt, AgentRunId, CorrelationId, RunPurpose};
 use crate::core::{
     AgentKind, CapabilityRequest, CapabilitySet, NotesRef, RequestId, SessionId, SshSignature,
     UnixMillis,
@@ -262,11 +262,16 @@ pub enum ClientMessage {
         /// `policy::*` oracle check at request time. Stored as a
         /// canonical collection on the audit row.
         capabilities: Vec<CapabilitySet>,
-        /// Caller-supplied opaque tag recorded verbatim in audit.
-        /// Writ never interprets the contents; bailiff uses it to
-        /// reconcile the writ-side run with its own workflow vocabulary
-        /// (e.g. `"plan-stage"`, `"review:plan-abc"`).
-        purpose: String,
+        /// Caller-supplied opaque tag recorded verbatim on the
+        /// `agent_run` audit row. Writ never interprets the contents for
+        /// policy; bailiff uses it to reconcile the writ-side run with
+        /// its own workflow vocabulary (e.g. `"plan-stage"`,
+        /// `"review:plan-abc"`).
+        ///
+        /// Writ does *parse* it, as a bounded printable-ASCII tag — see
+        /// [`RunPurpose`] for why an audit column that can never be
+        /// corrected does not accept arbitrary bytes.
+        purpose: RunPurpose,
         /// Notes ref in the caller's Git repo where writ should
         /// attach the signed output note once the run completes.
         output_ref: NotesRef,

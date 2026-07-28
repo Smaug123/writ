@@ -14,7 +14,7 @@ use super::validation::{
 use super::{AuditError, AuditLog};
 use writ_agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
-    CorrelationId,
+    CorrelationId, RunPurpose,
 };
 use writ_core::core::{AgentKind, SessionId, UnixMillis};
 
@@ -39,6 +39,15 @@ pub struct AgentRunAuditRecord {
     /// were not tagged at request time. The orchestrator decides the
     /// semantics; the broker treats it as a join key.
     pub correlation_id: Option<CorrelationId>,
+    /// Opaque caller-supplied tag saying what the run was *for*, as
+    /// supplied on `RunAgent`.
+    ///
+    /// `None` has two truthful readings, and neither is "the caller
+    /// declined to say": the run predates migration 8, or it was
+    /// started through `StartAgentRun`, which carries a correlation id
+    /// but has no purpose field. Rows written by `RunAgent` always
+    /// carry `Some`, because the wire type is non-optional.
+    pub purpose: Option<RunPurpose>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,8 +85,9 @@ fn insert_agent_run_request_row(
              prompt_bytes,
              prompt_sha256,
              prompt_redacted_preview,
-             correlation_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             correlation_id,
+             purpose
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             r.run_id.as_uuid().to_string(),
             r.session_id.as_uuid().to_string(),
@@ -87,6 +97,7 @@ fn insert_agent_run_request_row(
             &r.prompt.sha256_hex,
             &r.prompt.redacted_preview,
             r.correlation_id.as_ref().map(CorrelationId::as_str),
+            r.purpose.as_ref().map(RunPurpose::as_str),
         ],
     )?;
     Ok(())
@@ -312,7 +323,8 @@ impl AuditLog {
             let row = c
                 .query_row(
                     "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
-                            prompt_sha256, prompt_redacted_preview, correlation_id
+                            prompt_sha256, prompt_redacted_preview, correlation_id,
+                            purpose
                      FROM agent_run
                      WHERE run_id = ?1",
                     params![run_id.as_uuid().to_string()],
@@ -425,7 +437,8 @@ impl AuditLog {
             let row = c
                 .query_row(
                     "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
-                            prompt_sha256, prompt_redacted_preview, correlation_id
+                            prompt_sha256, prompt_redacted_preview, correlation_id,
+                            purpose
                      FROM agent_run
                      WHERE session_id = ?1
                      ORDER BY requested_at DESC
@@ -464,6 +477,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
     let prompt_sha256: String = row.get(5)?;
     let prompt_redacted_preview: String = row.get(6)?;
     let correlation_id_raw: Option<String> = row.get(7)?;
+    let purpose_raw: Option<String> = row.get(8)?;
 
     let parse = || -> Result<AgentRunAuditRecord, AuditError> {
         let run_id = uuid::Uuid::parse_str(&run_id_str)
@@ -482,6 +496,10 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
             .map(CorrelationId::try_new)
             .transpose()
             .map_err(|_| AuditError::Invariant("agent run row: correlation_id is invalid"))?;
+        let purpose = purpose_raw
+            .map(RunPurpose::try_new)
+            .transpose()
+            .map_err(|_| AuditError::Invariant("agent run row: purpose is invalid"))?;
         Ok(AgentRunAuditRecord {
             run_id: AgentRunId::from_uuid(run_id),
             session_id: SessionId::from_uuid(session_id),
@@ -493,6 +511,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
                 redacted_preview: prompt_redacted_preview,
             },
             correlation_id,
+            purpose,
         })
     };
     Ok(parse())
@@ -614,11 +633,12 @@ mod tests {
         String,
         String,
         Option<String>,
+        Option<String>,
     )> {
         log.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes, \
-                 prompt_sha256, prompt_redacted_preview, correlation_id \
+                 prompt_sha256, prompt_redacted_preview, correlation_id, purpose \
                  FROM agent_run ORDER BY rowid",
             )?;
             let rows = stmt
@@ -632,6 +652,7 @@ mod tests {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -755,6 +776,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: prompt.summary(),
             correlation_id: None,
+            purpose: None,
         };
 
         log.record_agent_run(&record).unwrap();
@@ -810,6 +832,7 @@ mod tests {
             agent_kind: AgentKind::Codex,
             prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
+            purpose: None,
         };
 
         let err = log.record_agent_run(&record).unwrap_err();
@@ -873,6 +896,7 @@ mod tests {
                     redacted_preview: "<redacted>".to_string(),
                 },
                 correlation_id: None,
+                purpose: None,
             })
             .unwrap_err();
 
@@ -930,6 +954,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
+            purpose: None,
         };
 
         log.record_agent_run(&record).unwrap();
@@ -952,6 +977,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
+            purpose: None,
         })
         .unwrap();
         let entry = log.get_agent_run(run_id).unwrap().unwrap();
@@ -1015,6 +1041,127 @@ mod tests {
         assert!(msg_len.contains("CHECK"), "got: {msg_len}");
     }
 
+    /// A purpose round-trips verbatim, including the characters that
+    /// forced it to be its own column rather than a second
+    /// `correlation_id`: the colon in bailiff's `review:plan-abc`, and
+    /// the spaces in an operator's free text.
+    #[test]
+    fn agent_run_roundtrips_with_purpose() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        for raw in ["plan-submit", "review:plan-abc", "review of plan #3"] {
+            let run_id = AgentRunId::new();
+            let purpose = RunPurpose::try_new(raw).unwrap();
+            log.record_agent_run(&AgentRunAuditRecord {
+                run_id,
+                session_id: s.session_id,
+                requested_at: UnixMillis::from_millis(1_700_000_100),
+                agent_kind: AgentKind::Claude,
+                prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
+                purpose: Some(purpose.clone()),
+            })
+            .unwrap();
+
+            let entry = log.get_agent_run(run_id).unwrap().unwrap();
+            assert_eq!(entry.purpose, Some(purpose));
+            assert_eq!(
+                entry.purpose.as_ref().map(RunPurpose::as_str),
+                Some(raw),
+                "the audit row must store the caller's bytes unchanged",
+            );
+        }
+    }
+
+    /// A pre-migration-8 row (NULL purpose) reads back as `None` rather
+    /// than as a parse error. The same shape a `StartAgentRun`-launched
+    /// run has permanently, since that RPC has no purpose to give.
+    #[test]
+    fn agent_run_purpose_null_surfaces_as_none() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let run_id = AgentRunId::new();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id,
+            session_id: s.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
+            correlation_id: None,
+            purpose: None,
+        })
+        .unwrap();
+        assert!(
+            log.get_agent_run(run_id)
+                .unwrap()
+                .unwrap()
+                .purpose
+                .is_none()
+        );
+    }
+
+    /// The CHECK constraint is an exact mirror of `RunPurpose::try_new`,
+    /// so a code path that bypassed the type could still not land a
+    /// value the reader would later refuse to parse. Driven through a
+    /// raw INSERT so it is unambiguous which layer rejects.
+    ///
+    /// The NUL case is the one worth spelling out: SQLite's `length()`
+    /// and `GLOB` both stop at the first NUL, so the byte-length clause
+    /// (`length(cast(purpose AS BLOB)) = length(purpose)`) is the only
+    /// thing standing between the column and an embedded NUL.
+    #[test]
+    fn agent_run_purpose_check_constraint_mirrors_the_parser() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+
+        let insert_raw = |value: &str| -> Result<(), AuditError> {
+            log.with_conn_mut(|c| {
+                c.execute(
+                    "INSERT INTO agent_run (
+                         run_id, session_id, requested_at, agent_kind,
+                         prompt_bytes, prompt_sha256, prompt_redacted_preview,
+                         correlation_id, purpose
+                     ) VALUES (?1, ?2, ?3, 'claude', 1, ?4, '<redacted>', NULL, ?5)",
+                    params![
+                        AgentRunId::new().as_uuid().to_string(),
+                        s.session_id.as_uuid().to_string(),
+                        1_700_000_100i64,
+                        writ_agent_run::sha256_hex(b"x"),
+                        value,
+                    ],
+                )
+                .map(|_| ())
+                .map_err(AuditError::from)
+            })
+        };
+
+        for bad in [
+            "",                   // empty
+            &"a".repeat(129),     // one over the cap
+            "two\nlines",         // control character
+            "tab\tseparated",     // control character
+            "del\x7f",            // DEL is not printable
+            "plan-\u{0430}",      // non-ASCII homoglyph
+            "plan\u{200b}review", // zero-width space
+            " leading",           // surrounding space
+            "trailing ",          // surrounding space
+            "nul\0byte",          // NUL: length() and GLOB are blind to it
+        ] {
+            let err = insert_raw(bad).expect_err(&format!("expected the CHECK to reject {bad:?}"));
+            assert!(err.to_string().contains("CHECK"), "for {bad:?} got: {err}");
+        }
+
+        // ...and the values the parser accepts are accepted here too, so
+        // the mirror is not merely strict in one direction.
+        for ok in ["plan-submit", "review:plan-abc", "review of plan #3", "~"] {
+            insert_raw(ok).unwrap_or_else(|e| panic!("expected {ok:?} to be accepted, got {e}"));
+        }
+    }
+
     /// `correlation_id_for_session` returns:
     ///   - `Some(id)` when the session's run was tagged,
     ///   - `None` when the run is untagged, and
@@ -1050,6 +1197,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: None,
+            purpose: None,
         })
         .unwrap();
         assert!(
@@ -1072,6 +1220,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
             correlation_id: Some(correlation.clone()),
+            purpose: None,
         })
         .unwrap();
         assert_eq!(
@@ -1105,6 +1254,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("plan this").summary(),
             correlation_id: None,
+            purpose: None,
         })
         .unwrap();
         let later_run_id = AgentRunId::new();
@@ -1115,6 +1265,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("review the plan").summary(),
             correlation_id: None,
+            purpose: None,
         })
         .unwrap();
 
@@ -1157,6 +1308,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("p").summary(),
             correlation_id: None,
+            purpose: None,
         })
         .unwrap();
         log.record_agent_run(&AgentRunAuditRecord {
@@ -1166,6 +1318,7 @@ mod tests {
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("p").summary(),
             correlation_id: None,
+            purpose: None,
         })
         .unwrap();
         assert_eq!(
@@ -1189,6 +1342,9 @@ mod tests {
             agent_is_claude in any::<bool>(),
             prompt_bytes in 0u64..=1_000_000,
             has_correlation in any::<bool>(),
+            purpose in proptest::option::of(
+                proptest::sample::select(vec!["plan-submit", "review:plan-abc", "a b #3"])
+            ),
             status_succeeded in any::<bool>(),
             exit_code in any::<i32>(),
             stdout_bytes in 0u64..=(i64::MAX as u64),
@@ -1219,6 +1375,7 @@ mod tests {
                 },
                 correlation_id: has_correlation
                     .then(|| CorrelationId::try_new("feat-42_xyz").unwrap()),
+                purpose: purpose.map(|p| RunPurpose::try_new(p).unwrap()),
             };
             // The outcome's key is nested (`outcome.run_id`); it must match the
             // request's `run_id` for `complete` to bind the pair.

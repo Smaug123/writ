@@ -133,7 +133,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     // --- Client request (bailiff side) --------------------------
     let prompt_text = "noop\n";
     let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
-    let purpose = "plan-submit".to_string();
+    let purpose: writ::agent_run::RunPurpose = "plan-submit".parse().unwrap();
     let client = WritClient::new(&socket_path);
     // The host-spawn arm records the run against the caller's session, which
     // is what `run_stage_under_owned_session` opens in the real stage runners.
@@ -186,7 +186,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
                 allowed_signers: allowed.clone(),
             },
             &writ_notes_ref_clone,
-            purpose.clone(),
+            purpose.to_string(),
             &completed_clone,
         )
     })
@@ -289,7 +289,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
     // --- Client request (bailiff side) --------------------------
     let prompt_text = "reviewer-prompt + plan body\n";
     let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
-    let purpose = "plan-review".to_string();
+    let purpose: writ::agent_run::RunPurpose = "plan-review".parse().unwrap();
     let client = WritClient::new(&socket_path);
     // The host-spawn arm records the run against the caller's session, which
     // is what `run_stage_under_owned_session` opens in the real stage runners.
@@ -341,7 +341,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
                 allowed_signers: allowed.clone(),
             },
             &writ_notes_ref_clone,
-            purpose.clone(),
+            purpose.to_string(),
             &completed_clone,
         )
     })
@@ -442,7 +442,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
     // --- Client request (bailiff side) --------------------------
     let prompt_text = "implementer-prompt + plan body\n";
     let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
-    let purpose = "plan-implement".to_string();
+    let purpose: writ::agent_run::RunPurpose = "plan-implement".parse().unwrap();
     let client = WritClient::new(&socket_path);
     // The host-spawn arm records the run against the caller's session, which
     // is what `run_stage_under_owned_session` opens in the real stage runners.
@@ -495,7 +495,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
                 allowed_signers: allowed.clone(),
             },
             &writ_notes_ref_clone,
-            purpose.clone(),
+            purpose.to_string(),
             &completed_clone,
         )
     })
