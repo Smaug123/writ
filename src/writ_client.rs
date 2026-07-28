@@ -1065,6 +1065,7 @@ mod end_to_end_tests {
             run_agent_spawn: Some(RunAgentSpawnConfig {
                 command: cat,
                 args: Vec::new(),
+                agent_kind: crate::core::AgentKind::Claude,
                 log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
                     .unwrap(),
             }),
@@ -1240,6 +1241,7 @@ mod end_to_end_tests {
             run_agent_spawn: Some(RunAgentSpawnConfig {
                 command: cat,
                 args: Vec::new(),
+                agent_kind: crate::core::AgentKind::Claude,
                 log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
                     .unwrap(),
             }),

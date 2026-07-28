@@ -78,6 +78,10 @@ mod run_agent;
 pub struct RunAgentSpawnConfig {
     pub command: std::path::PathBuf,
     pub args: Vec<String>,
+    /// Which agent `command` is, as declared by the operator who configured
+    /// it. Recorded on every host-spawned run's `agent_run` row, and the
+    /// value a caller's session kind must agree with.
+    pub agent_kind: crate::core::AgentKind,
     pub log_root: crate::config::AgentRunLogRoot,
 }
 

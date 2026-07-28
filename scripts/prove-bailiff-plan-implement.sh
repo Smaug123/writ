@@ -652,6 +652,7 @@ config = {
         "notes_repo_path": notes_repo_path,
         "signing_key_secret": "writ-signing-key",
         "spawn_command": submit_agent,
+        "spawn_agent_kind": "claude",
         "spawn_args": [],
     },
     "agent_vm": {

@@ -443,6 +443,17 @@ reconciliation appends an outcome for an orphaned carrier) and `agent_run` (the
 VM arm mints the request row at run launch, and the outcome arrives later over
 the guest's HTTP surface — see the outcome-only shape in §5.6).
 
+The host arm records the agent kind its `run_agent.spawn_agent_kind` config
+declares, not the one the caller's session declares, and refuses a session that
+disagrees. The arm spawns exactly one binary and the operator who chose it is
+the only party who knows what it is; a caller's kind is a guess about a
+daemon-side configuration it cannot see (bailiff's `--agent` defaults to
+`claude` regardless). Neither value is checkable against the binary, but only
+one is written by someone in a position to know — and the refusal matters
+because the session's kind is not inert: it routes credential mints to a GitHub
+App, so a mismatch would mint as one agent and execute as another. The VM arm
+has no such gap: there the kind *builds* the guest command.
+
 `agent_run` is the one table used in *both* guard shapes, because its two arms
 genuinely differ. The VM arm spans two processes and two lifecycle events, so
 it is outcome-only: launch writes the row, the outcome endpoint `resume_effect`s

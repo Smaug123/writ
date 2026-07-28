@@ -153,23 +153,38 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
             };
         }
     };
-    // Agent identity for the row comes from the session, which is where the
-    // caller fixed it at `OpenSession`; the host arm has no per-run identity
-    // of its own. The request's `agent_kind` is therefore redundant here —
-    // but a *contradictory* one would have the row say Claude while the
-    // caller believes it asked for Codex, so refuse rather than silently
-    // prefer one.
+    // Agent identity for the row is the *configured* one: this arm spawns one
+    // binary, and the operator who chose it is the only party who knows what
+    // it is. The session's kind and the request's are both declarations by a
+    // caller that cannot see the daemon's configuration, so neither can stand
+    // in — taking the row's value from the session would let writd record
+    // "Codex ran" while spawning Claude, and bailiff's `--agent` defaults to
+    // claude whether or not that is what writd spawns.
+    //
+    // They must still *agree*, because the session's kind is not inert: it
+    // routes credential mints to a GitHub App. A session claiming an identity
+    // the daemon cannot run is a caller working from a false picture, so
+    // refuse it here rather than let it mint as one agent and run as another.
     let Some(session_agent_kind) = session.agent_kind else {
         return missing_agent_kind_for_registry_response();
     };
+    let spawn_agent_kind = spawn_config.agent_kind;
+    if session_agent_kind != spawn_agent_kind {
+        return ServerMessage::Error {
+            message: format!(
+                "RunAgent: session {session_id} was opened for {session_agent_kind}, \
+                 but this daemon's host-spawn agent is {spawn_agent_kind}; \
+                 open the session with the agent writd is configured to run",
+            ),
+        };
+    }
     if let Some(requested) = agent_kind
-        && requested != session_agent_kind
+        && requested != spawn_agent_kind
     {
         return ServerMessage::Error {
             message: format!(
-                "RunAgent: agent_kind {requested} contradicts session {session_id}, \
-                 which was opened for {session_agent_kind}; \
-                 host-spawn runs take their agent identity from the session",
+                "RunAgent: agent_kind {requested} is not this daemon's host-spawn \
+                 agent ({spawn_agent_kind})",
             ),
         };
     }
@@ -190,7 +205,7 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
             run_id,
             session_id,
             requested_at: UnixMillis::now(),
-            agent_kind: session_agent_kind,
+            agent_kind: spawn_agent_kind,
             prompt: prompt_summary,
             correlation_id: None,
         }) {

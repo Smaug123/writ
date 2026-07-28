@@ -112,6 +112,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
         run_agent_spawn: Some(RunAgentSpawnConfig {
             command: cat,
             args: Vec::new(),
+            agent_kind: writ::core::AgentKind::Claude,
             log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
         }),
         promote_runtime: None,
@@ -267,6 +268,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
         run_agent_spawn: Some(RunAgentSpawnConfig {
             command: cat,
             args: Vec::new(),
+            agent_kind: writ::core::AgentKind::Claude,
             log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
         }),
         promote_runtime: None,
@@ -419,6 +421,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
         run_agent_spawn: Some(RunAgentSpawnConfig {
             command: cat,
             args: Vec::new(),
+            agent_kind: writ::core::AgentKind::Claude,
             log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
         }),
         promote_runtime: None,

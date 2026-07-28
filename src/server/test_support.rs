@@ -213,6 +213,7 @@ pub(super) fn make_run_agent_state(
     inner.run_agent_spawn = Some(RunAgentSpawnConfig {
         command,
         args,
+        agent_kind: AgentKind::Claude,
         log_root: AgentRunLogRoot::check(log_root.clone())
             .expect("a tempdir-rooted log path is absolute"),
     });

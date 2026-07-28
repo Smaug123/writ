@@ -246,6 +246,22 @@ pub struct RunAgentDaemonConfig {
     /// Absolute path to the child binary writd spawns for every
     /// `RunAgent` call. Required when the section is present.
     pub spawn_command: PathBuf,
+    /// Which agent [`Self::spawn_command`] is. Required, and required
+    /// *here*, because this is where the operator who chose the binary can
+    /// say what it is — the only party who knows.
+    ///
+    /// It lands on every host-spawned run's `agent_run` row, and a caller
+    /// whose session declares a different kind is refused. Taking the row's
+    /// value from the session instead would let writd record "Codex ran"
+    /// while spawning Claude, since the session's kind is a *caller's*
+    /// declaration about a daemon-side configuration it cannot see. Neither
+    /// value is machine-checkable against the binary, but only one of them is
+    /// written by someone in a position to know.
+    ///
+    /// One kind for the whole daemon, matching the single `spawn_command`;
+    /// per-kind dispatch is the slice-C work noted on
+    /// [`crate::server::RunAgentSpawnConfig`].
+    pub spawn_agent_kind: crate::core::AgentKind,
     /// Extra args passed to [`Self::spawn_command`] before the prompt
     /// arrives on the child's stdin.
     #[serde(default)]
@@ -319,6 +335,7 @@ impl RunAgentDaemonConfig {
             spawn: RunAgentSpawnConfig {
                 command: self.spawn_command.clone(),
                 args: self.spawn_args.clone(),
+                agent_kind: self.spawn_agent_kind,
                 log_root: agent_run_log_root,
             },
         })

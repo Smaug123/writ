@@ -392,7 +392,7 @@ mod process_runner {
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::thread;
 
     use writ_core::process_spawn;
@@ -514,6 +514,11 @@ mod process_runner {
         Wait(std::io::Error),
         #[error("agent {stream} stream capture thread failed: {panic}")]
         StreamThread { stream: &'static str, panic: String },
+        #[error("cannot start the agent {stream} stream capture thread: {source}")]
+        StreamThreadSpawn {
+            stream: &'static str,
+            source: std::io::Error,
+        },
         #[error("cannot capture agent stream {path}: {source}")]
         StreamCapture {
             path: PathBuf,
@@ -596,7 +601,7 @@ mod process_runner {
         let stdout_path = run_dir.join("stdout.log");
         let stderr_path = run_dir.join("stderr.log");
 
-        let mut child = {
+        let child = {
             let mut command = Command::new(&plan.program);
             command
                 .args(&plan.args)
@@ -613,34 +618,37 @@ mod process_runner {
             process_spawn::spawn(&mut command).map_err(AgentProcessRunError::Spawn)?
         };
 
+        // From here on every failure must leave no agent behind: see
+        // `ChildGuard`.
+        let mut child = ChildGuard(Some(child));
+
         let stdout = child
+            .as_mut()
             .stdout
             .take()
             .expect("stdout was configured as piped before spawn");
         let stderr = child
+            .as_mut()
             .stderr
             .take()
             .expect("stderr was configured as piped before spawn");
         let max_stdout = plan.max_stream_capture_bytes;
         let max_stderr = plan.max_stream_capture_bytes;
-        let stdout_thread = thread::spawn({
-            let stdout_path = stdout_path.clone();
-            move || capture_stream(stdout, stdout_path, max_stdout)
-        });
-        let stderr_thread = thread::spawn({
-            let stderr_path = stderr_path.clone();
-            move || capture_stream(stderr, stderr_path, max_stderr)
-        });
+        let stdout_thread =
+            spawn_capture_thread("stdout", stdout, stdout_path.clone(), max_stdout)?;
+        let stderr_thread =
+            spawn_capture_thread("stderr", stderr, stderr_path.clone(), max_stderr)?;
 
         write_prompt_to_stdin(
             child
+                .as_mut()
                 .stdin
                 .take()
                 .expect("stdin was configured as piped before spawn"),
             prompt,
         )?;
 
-        let status = child.wait().map_err(AgentProcessRunError::Wait)?;
+        let status = child.wait()?;
         let stdout = join_capture_thread("stdout", stdout_thread)??;
         let stderr = join_capture_thread("stderr", stderr_thread)??;
         let exit_code = exit_code(status);
@@ -655,6 +663,85 @@ mod process_runner {
             stdout,
             stderr,
         })
+    }
+
+    /// Owns the spawned agent from the moment it exists until the run ends,
+    /// killing and reaping it on any path that does not wait for it.
+    ///
+    /// `std::process::Child` does neither of those on drop — by design, but it
+    /// means an early return anywhere after the spawn leaves the agent running
+    /// with nobody waiting for it. That is worse than a leak here: the run's
+    /// audit session is about to close, so the process would outlive the
+    /// authority that permitted it, still holding the broker token it was
+    /// started with, and still writing to the stream files an outcome row will
+    /// never describe.
+    ///
+    /// A guard rather than a `kill` at each `?`: the invariant is "this
+    /// function does not return while the agent runs", and only something that
+    /// owns the child can enforce that against paths nobody wrote by hand —
+    /// including a panic in between.
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn as_mut(&mut self) -> &mut Child {
+            self.0
+                .as_mut()
+                .expect("the child is taken only by `wait`, which consumes the guard")
+        }
+
+        /// Wait for the agent to exit, disarming the guard.
+        ///
+        /// Takes `self` because after this the child is reaped: a second wait
+        /// would be an error, and the guard has nothing left to protect. If the
+        /// wait itself fails the child goes back under the guard's drop, which
+        /// kills it — a wait that failed tells us nothing about whether the
+        /// agent is still running.
+        fn wait(mut self) -> Result<std::process::ExitStatus, AgentProcessRunError> {
+            match self.as_mut().wait() {
+                Ok(status) => {
+                    self.0 = None;
+                    Ok(status)
+                }
+                Err(err) => Err(AgentProcessRunError::Wait(err)),
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            // Both results are deliberately ignored: this runs on a path that
+            // is already failing, and an agent that exited on its own between
+            // the failure and here makes `kill` fail with no consequence.
+            // Reaping after the kill is what keeps the zombie from outliving
+            // the daemon.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Start one capture thread, failing rather than panicking when the OS
+    /// cannot give us a thread.
+    ///
+    /// `thread::spawn` panics on failure, which under thread exhaustion would
+    /// unwind past the running agent. The guard would still reap it — that is
+    /// what the guard is for — but a daemon that reports "cannot start a
+    /// capture thread" is far easier to act on than one whose handler panicked.
+    fn spawn_capture_thread<R: Read + Send + 'static>(
+        stream: &'static str,
+        reader: R,
+        path: PathBuf,
+        max_capture_bytes: u64,
+    ) -> Result<
+        thread::JoinHandle<Result<AgentRunStreamCapture, AgentProcessRunError>>,
+        AgentProcessRunError,
+    > {
+        thread::Builder::new()
+            .name(format!("writ-agent-{stream}"))
+            .spawn(move || capture_stream(reader, path, max_capture_bytes))
+            .map_err(|source| AgentProcessRunError::StreamThreadSpawn { stream, source })
     }
 
     /// Feed the prompt to the child on stdin, tolerating a broken pipe.
@@ -862,6 +949,73 @@ mod process_runner {
             return message.clone();
         }
         "<non-string panic payload>".to_string()
+    }
+
+    #[cfg(all(test, unix))]
+    mod child_guard_tests {
+        use super::ChildGuard;
+        use std::process::{Command, Stdio};
+
+        /// Whether a pid names a live process. `kill -0` signals nothing; it only
+        /// asks whether the process could be signalled, which is exactly the
+        /// question. A reaped child answers no.
+        fn is_running(pid: u32) -> bool {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill(1) is available")
+                .success()
+        }
+
+        /// Dropping the guard without waiting kills and reaps the agent.
+        ///
+        /// This is the whole point of the guard: every `?` after the spawn in
+        /// `run_agent_process` — a prompt that could not be written, a capture
+        /// thread the OS refused — returns through here, and a `std::process::Child`
+        /// dropped on its own would leave the agent running with nobody waiting for
+        /// it, outliving the audit session that authorised it.
+        ///
+        /// A 300-second sleep so the assertion cannot pass by the child simply
+        /// having finished.
+        #[test]
+        fn dropping_the_guard_kills_and_reaps_the_agent() {
+            let child = Command::new("sleep")
+                .arg("300")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("sleep(1) is available");
+            let pid = child.id();
+            let guard = ChildGuard(Some(child));
+            assert!(
+                is_running(pid),
+                "the agent should be running before the drop"
+            );
+
+            drop(guard);
+
+            assert!(
+                !is_running(pid),
+                "pid {pid} outlived its guard: a failing run must not leave an agent behind",
+            );
+        }
+
+        /// Waiting through the guard disarms it, so the drop does not then try to
+        /// kill and reap a pid the OS is free to have reassigned.
+        #[test]
+        fn waiting_through_the_guard_disarms_it() {
+            let child = Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("true(1) is available");
+            let status = ChildGuard(Some(child)).wait().expect("wait must succeed");
+            assert!(status.success());
+        }
     }
 }
 

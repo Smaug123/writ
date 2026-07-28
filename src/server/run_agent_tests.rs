@@ -839,6 +839,112 @@ async fn run_agent_refuses_a_host_spawn_whose_session_never_named_an_agent() {
     assert!(!fixture.log_root.exists());
 }
 
+/// A session opened for a different agent than the daemon actually spawns is
+/// refused, before anything runs or is recorded.
+///
+/// The `agent_run` row records the *configured* kind, because the operator who
+/// chose `spawn_command` is the only party who knows what that binary is. But
+/// the session's kind is not inert — it routes credential mints to a GitHub
+/// App — so a session claiming an identity this daemon cannot run would mint
+/// as one agent and execute as another. bailiff's `--agent` defaults to
+/// `claude` whatever writd is configured with, so this is reachable without
+/// anyone doing something strange.
+#[tokio::test]
+async fn run_agent_refuses_a_session_opened_for_a_different_agent_than_it_spawns() {
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    // The fixture's registry knows Claude, so open a Codex session directly:
+    // the disagreement under test is with the *spawn* config, not the registry.
+    let mut fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = Arc::get_mut(&mut fixture.state).expect("fresh Arc has no other handles");
+    state
+        .run_agent_spawn
+        .as_mut()
+        .expect("the fixture configures a spawn")
+        .agent_kind = AgentKind::Codex;
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "kind-mismatch".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let ServerMessage::Error { message } = resp else {
+        panic!("expected ServerMessage::Error, got {resp:?}");
+    };
+    assert!(
+        message.contains("claude") && message.contains("codex"),
+        "the refusal must name both kinds so the operator can see which to change, got: {message}",
+    );
+    assert!(
+        state
+            .audit
+            .agent_run_for_session(session_id)
+            .unwrap()
+            .is_none(),
+        "refused before recording a run",
+    );
+    assert!(!fixture.log_root.exists(), "refused before spawning");
+}
+
+/// The audit row records the kind the *daemon* is configured to spawn, not
+/// the one the caller declared — they are required to agree, so this pins
+/// which side is the source of truth.
+#[tokio::test]
+async fn the_audit_row_records_the_configured_agent_kind() {
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    let mut fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = Arc::get_mut(&mut fixture.state).expect("fresh Arc has no other handles");
+    state
+        .run_agent_spawn
+        .as_mut()
+        .expect("the fixture configures a spawn")
+        .agent_kind = AgentKind::Codex;
+    let state = &fixture.state;
+    let session_id = open_session_with_agent_kind(state, Some(AgentKind::Codex)).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "configured-kind".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let run_id = match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata, ..
+        } => signed_metadata.run_id,
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+    assert_eq!(
+        state
+            .audit
+            .get_agent_run(run_id)
+            .unwrap()
+            .unwrap()
+            .agent_kind,
+        AgentKind::Codex,
+    );
+}
+
 /// An agent that exits non-zero still *ran*, so its outcome row is
 /// `Failed` with the exit code — not a missing row. The plan is explicit
 /// that writ signs the partial and the audit row records the non-zero exit.
