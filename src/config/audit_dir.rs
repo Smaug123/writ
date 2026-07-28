@@ -284,12 +284,11 @@ pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotD
 /// daemon can detect an un-migrated legacy database and refuse to boot rather
 /// than silently fork audit history; it is not a supported configuration target.
 pub fn legacy_default_audit_db_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/audit.db")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/audit.db")
-    }
+    super::xdg_dir_or_home(
+        "XDG_DATA_HOME",
+        "writ/audit.db",
+        ".local/share/writ/audit.db",
+    )
 }
 
 /// An install that relied on the *default* audit DB path, upgraded across the

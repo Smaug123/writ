@@ -200,12 +200,11 @@ impl UiHttpConfig {
 /// the runtime-secret material that consumers need to talk to the
 /// daemon.
 pub fn default_ui_http_bearer_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("writ/ui-bearer")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/run/writ/ui-bearer")
-    }
+    xdg_dir_or_home(
+        "XDG_RUNTIME_DIR",
+        "writ/ui-bearer",
+        ".local/run/writ/ui-bearer",
+    )
 }
 
 /// Configuration for the `RunAgent` dispatch path. Absent from
@@ -359,12 +358,7 @@ pub enum RunAgentBootError {
 /// against writd's `config` module, so the convention is duplicated.
 /// If you move the path, move it on both sides at once.
 pub fn default_notes_repo_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/repo")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/repo")
-    }
+    xdg_dir_or_home("XDG_DATA_HOME", "writ/repo", ".local/share/writ/repo")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1750,18 +1744,11 @@ fn default_nix_cache_max_nar_bytes() -> ByteSize {
 /// alongside `agent-vm-sessions`, falling back to `~/.local/state/writ/` when
 /// XDG is unset — matching [`default_agent_vm_state_dir`].
 pub fn default_vm_http_work_root() -> PathBuf {
-    // Treat an empty `XDG_STATE_HOME` as unset (matches
-    // `default_agent_vm_state_dir`). Without this filter, an environment that
-    // exports `XDG_STATE_HOME=` would yield the relative path `writ/vm-work`
-    // and the absolute-path check downstream would refuse the daemon config —
-    // even though the `HOME` fallback would have worked.
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|dir| !dir.as_os_str().is_empty())
-    {
-        PathBuf::from(dir).join("writ/vm-work")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/state/writ/vm-work")
-    }
+    xdg_dir_or_home(
+        "XDG_STATE_HOME",
+        "writ/vm-work",
+        ".local/state/writ/vm-work",
+    )
 }
 
 fn parse_ipv4_cidr_config(
@@ -1826,25 +1813,57 @@ fn default_secret_store_config() -> SecretStoreConfig {
     }
 }
 
+/// Resolve an XDG base directory, treating an **empty** value as unset.
+///
+/// `var_os` cannot distinguish `XDG_DATA_HOME=` from a real setting, and an
+/// exported-but-empty XDG variable is a real thing to find in a container or a
+/// stripped-down CI environment. Joining onto it yields a *relative* path,
+/// which for a value that is later required to be absolute means the daemon
+/// refuses to start — with a message about a path the operator never wrote.
+/// Every default below routes through here so that mistake has one home rather
+/// than one per default.
+fn xdg_dir_or_home(xdg_var: &str, xdg_suffix: &str, home_suffix: &str) -> PathBuf {
+    resolve_base_dir(
+        std::env::var_os(xdg_var),
+        std::env::var_os("HOME"),
+        xdg_suffix,
+        home_suffix,
+    )
+}
+
+/// The pure half of [`xdg_dir_or_home`], so the property that matters — the
+/// result is absolute for *every* pair of environment values — can be tested
+/// without mutating process-global state.
+///
+/// Both variables get the empty filter, not just the XDG one: an exported-but-
+/// empty `HOME` is the same trap one level down, and `unwrap_or_else` does not
+/// fire on `Some("")`.
+fn resolve_base_dir(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    xdg_suffix: &str,
+    home_suffix: &str,
+) -> PathBuf {
+    let non_empty = |dir: Option<std::ffi::OsString>| dir.filter(|d| !d.as_os_str().is_empty());
+    match non_empty(xdg) {
+        Some(dir) => PathBuf::from(dir).join(xdg_suffix),
+        None => PathBuf::from(non_empty(home).unwrap_or_else(|| "/tmp".into())).join(home_suffix),
+    }
+}
+
 /// Default base directory for the file secret store. Matches the
 /// `$XDG_DATA_HOME/writ/` location called out in `docs/design/broker.md`.
 pub fn default_secret_store_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/secrets")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/secrets")
-    }
+    xdg_dir_or_home("XDG_DATA_HOME", "writ/secrets", ".local/share/writ/secrets")
 }
 
 /// Default location for the daemon config file.
 pub fn default_config_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(dir).join("writ/config.json")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".config/writ/config.json")
-    }
+    xdg_dir_or_home(
+        "XDG_CONFIG_HOME",
+        "writ/config.json",
+        ".config/writ/config.json",
+    )
 }
 
 /// Default location for the SQLite audit database. The DB lives in a dedicated
@@ -1858,21 +1877,19 @@ pub fn default_config_path() -> PathBuf {
 /// they belong with writ's durable state and not with a subsystem's scratch
 /// space.
 pub fn default_agent_run_log_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/agent-runs")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/agent-runs")
-    }
+    xdg_dir_or_home(
+        "XDG_DATA_HOME",
+        "writ/agent-runs",
+        ".local/share/writ/agent-runs",
+    )
 }
 
 pub fn default_audit_db_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/audit/audit.db")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/audit/audit.db")
-    }
+    xdg_dir_or_home(
+        "XDG_DATA_HOME",
+        "writ/audit/audit.db",
+        ".local/share/writ/audit/audit.db",
+    )
 }
 
 #[cfg(test)]

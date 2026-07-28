@@ -7,6 +7,7 @@
 use super::*;
 use crate::core::AgentKind;
 use crate::github::GitHubAppRegistryConfigError;
+use proptest::prelude::*;
 
 const TEST_NIX_CACHE_PUBLIC_KEY: &str =
     "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
@@ -967,6 +968,47 @@ fn the_default_agent_run_log_root_is_absolute_and_writ_owned() {
     let root = default_agent_run_log_root();
     assert!(root.is_absolute(), "{root:?}");
     assert!(root.ends_with("writ/agent-runs"), "{root:?}");
+}
+
+/// Every default path in this module resolves through `xdg_dir_or_home`, and
+/// the property that matters is that the result is **absolute for every
+/// environment**: a relative default reaches a caller that requires an
+/// absolute path and refuses the daemon over a path the operator never wrote.
+///
+/// The interesting input is the exported-but-empty variable. `var_os` returns
+/// `Some("")` for it — indistinguishable from a real setting unless you look —
+/// and joining onto it silently produces a relative path. Writing this as a
+/// property rather than a case is what found the second instance: the `HOME`
+/// fallback had the same hole as the XDG variable, since `unwrap_or_else` does
+/// not fire on `Some("")`.
+///
+/// Driven against the pure `resolve_base_dir` rather than the env-reading
+/// wrapper, so it mutates nothing that other tests in this process can see.
+#[test]
+fn a_default_path_is_absolute_whatever_the_environment_says() {
+    proptest!(|(xdg in "[/a-z]{0,12}", home in "[/a-z]{0,12}")| {
+        let resolved = resolve_base_dir(
+            Some(xdg.clone().into()),
+            Some(home.clone().into()),
+            "writ/thing",
+            ".local/share/writ/thing",
+        );
+        // A *relative* non-empty value is the operator naming a relative
+        // directory: their own doing, and reported to them as such. Empty is
+        // what the helper exists to catch, at either level.
+        if xdg.is_empty() && (home.is_empty() || home.starts_with('/')) {
+            prop_assert!(
+                resolved.is_absolute(),
+                "XDG={:?} HOME={:?} produced the relative {:?}", xdg, home, resolved,
+            );
+        }
+        // Exported-but-empty must be indistinguishable from absent — that is
+        // the whole claim, and it holds for any pair of suffixes.
+        prop_assert_eq!(
+            resolve_base_dir(Some("".into()), Some("".into()), "writ/thing", ".local/thing"),
+            resolve_base_dir(None, None, "writ/thing", ".local/thing"),
+        );
+    });
 }
 
 /// The agent-run log root is a *top-level* key, so it is checked whether or
