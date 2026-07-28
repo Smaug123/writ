@@ -636,7 +636,7 @@ pub enum AgentVmHttpConfigError {
 #[derive(Debug)]
 pub struct CheckedDaemonSections {
     pub agent_vm: Option<AgentVmDaemonRuntimeConfig>,
-    pub agent_run_log_root: PathBuf,
+    pub agent_run_log_root: AgentRunLogRoot,
 }
 
 /// Validate every daemon section that can be checked before writd takes an
@@ -659,7 +659,7 @@ pub fn check_daemon_sections(
     let mut errors = Accumulator::new();
     let agent_vm = errors.record_many(agent_vm.map(AgentVmDaemonConfig::check).transpose());
     let ui_http = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
-    let agent_run_log_root = errors.record_from(check_agent_run_log_root(
+    let agent_run_log_root = errors.record_from(AgentRunLogRoot::check(
         agent_run_log_root
             .map(Path::to_path_buf)
             .unwrap_or_else(default_agent_run_log_root),
@@ -671,11 +671,14 @@ pub fn check_daemon_sections(
     // Creating the log root and materialising the agent-VM plan are
     // independent effects, so both run and both report: an unwritable log root
     // must not hide an unwritable push-staging root, and vice versa.
-    // `materialize` is handed the *checked* path rather than waiting on the
-    // prepared one, which is the same path — preparation proves it writable,
-    // it does not rewrite it.
+    // `materialize` is handed the *checked* root rather than waiting on the
+    // prepared one, which is the same path — preparation creates and proves it
+    // writable, it does not rewrite it. Either order is safe: the log root is
+    // created owner-only, so if it happens to sit under a not-yet-existing
+    // `vm_http.work_root` it leaves that parent at 0700, which is exactly what
+    // `ensure_vm_http_work_root_private` demands.
     let mut errors = Accumulator::new();
-    let prepared = errors.record_from(prepare_agent_run_log_root(&agent_run_log_root));
+    let prepared = errors.record_from(agent_run_log_root.prepare());
     let agent_vm = errors.record_many(
         agent_vm
             .map(|plan| plan.materialize(agent_run_log_root.clone()))
@@ -703,11 +706,96 @@ pub enum DaemonConfigError {
     AgentRunLogRoot(#[from] AgentRunLogRootError),
 }
 
+/// An `agent_run_log_root` that has passed its text checks: non-empty and
+/// absolute.
+///
+/// Parse-don't-validate for the one config value that is threaded *through*
+/// the section validators rather than parsed by one of them. Without it,
+/// [`AgentVmDaemonConfig::to_runtime_config`] would take a bare `PathBuf` and
+/// a caller could hand it a relative path, producing an apparently-valid
+/// runtime config whose first agent-run outcome fails at upload time.
+///
+/// Being checked is *not* being prepared: [`Self::prepare`] is the separate
+/// effectful step, the same split `check_writable_root` /
+/// `prepare_writable_root` give the `vm_http` roots, so that a config can be
+/// rejected on its text without anything having been created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunLogRoot(PathBuf);
+
+impl AgentRunLogRoot {
+    /// The pure half: the same two text checks the `vm_http` roots get, in
+    /// this key's own vocabulary.
+    pub fn check(path: PathBuf) -> Result<Self, AgentRunLogRootError> {
+        if path.as_os_str().is_empty() {
+            return Err(AgentRunLogRootError::Empty);
+        }
+        if !path.is_absolute() {
+            return Err(AgentRunLogRootError::Relative(path));
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+
+    /// The effectful half: create the directory **owner-only** if absent, then
+    /// prove the daemon can write into it.
+    ///
+    /// Owner-only is not decoration. Per-run subdirectories hold agent output
+    /// that `agent_run_outcome` rows point at, and a group- or world-writable
+    /// parent lets another local user rename or delete them, silently
+    /// invalidating what the audit log claims is on disk. The runtime already
+    /// insists on this — `writ_agent_run`'s `ensure_private_dir` chmods the
+    /// root to 0700 before each run — so creating it any other way here would
+    /// only mean the mode changed out from under the operator later.
+    ///
+    /// The mode applies to every component this creates, which is what makes
+    /// the *nested* case safe: an operator who keeps the old
+    /// `<vm_http.work_root>/agent-runs` layout has this create `work_root`
+    /// itself, and `ensure_vm_http_work_root_private` refuses a work root with
+    /// any group or world bit set. At 0700 it accepts, so the two roots can be
+    /// prepared in either order.
+    pub fn prepare(&self) -> Result<(), AgentRunLogRootError> {
+        create_private_dir_all(&self.0).map_err(|source| AgentRunLogRootError::Create {
+            path: self.0.clone(),
+            source,
+        })?;
+        probe_writable(&self.0, ".writ-agent-run-log-probe").map_err(|source| {
+            AgentRunLogRootError::Probe {
+                path: self.0.clone(),
+                source,
+            }
+        })
+    }
+}
+
+/// Create `path` and any missing parents with mode 0700, and pin the mode of
+/// `path` itself even when it already existed.
+///
+/// `DirBuilderExt::mode` is masked by the process umask, and says nothing
+/// about a directory that was already there, so the explicit `set_permissions`
+/// is what actually makes the postcondition hold. Only the leaf is pinned: an
+/// existing parent belongs to whoever made it, and tightening it here would be
+/// mutating a directory this config never named.
+fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Faults in the top-level `agent_run_log_root` key.
 ///
-/// Its own type, not an `agent_vm` one: the root is where *both* `RunAgent`
-/// arms put an agent's stdout and stderr, so a daemon that serves only
-/// host-spawn runs still has one and can still get it wrong.
+/// Its own type, not an `agent_vm` one: the root is a top-level key, so a
+/// daemon with no `agent_vm` section at all still has one and can still get it
+/// wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentRunLogRootError {
     #[error("agent run log root path must not be empty")]
@@ -757,7 +845,7 @@ impl AgentVmDaemonConfig {
     /// section creates nothing until those siblings have been checked too.
     pub fn to_runtime_config(
         &self,
-        agent_run_log_root: PathBuf,
+        agent_run_log_root: AgentRunLogRoot,
     ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
         self.check()?.materialize(agent_run_log_root)
     }
@@ -805,7 +893,7 @@ impl AgentVmDaemonPlan {
     /// runtime carries it because the VM arm is one of its two writers.
     pub fn materialize(
         self,
-        agent_run_log_root: PathBuf,
+        agent_run_log_root: AgentRunLogRoot,
     ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
         let vm_http = self.vm_http.materialize().map_err(Errors::map_into)?;
         AgentVmDaemonRuntimeConfig::new(self.lifecycle, vm_http, agent_run_log_root)
@@ -1408,20 +1496,20 @@ impl WritableRoot {
 }
 
 /// Which step of preparing a root failed, before it is named in any particular
-/// config section's vocabulary. Exists so [`create_and_probe`] can be written
-/// once for roots that report through different error types.
+/// config section's vocabulary. Exists so the shared preparation steps can be
+/// written once for roots that report through different error types.
 enum RootPreparationFault {
     Create(std::io::Error),
     Probe(std::io::Error),
 }
 
-/// Create `path` if absent, then prove this process can actually write into
-/// it, rather than discovering otherwise at request time.
+/// Prove this process can actually write into `path`, rather than discovering
+/// otherwise at request time. The directory must already exist — creation is
+/// the caller's, because the roots differ in what permissions they demand.
 ///
 /// `probe_prefix` distinguishes the probe file per root so two roots
 /// configured to the same directory cannot collide on `create_new`.
-fn create_and_probe(path: &Path, probe_prefix: &str) -> Result<(), RootPreparationFault> {
-    std::fs::create_dir_all(path).map_err(RootPreparationFault::Create)?;
+fn probe_writable(path: &Path, probe_prefix: &str) -> Result<(), std::io::Error> {
     let probe = path.join(format!(
         "{}-{}-{}",
         probe_prefix,
@@ -1439,37 +1527,8 @@ fn create_and_probe(path: &Path, probe_prefix: &str) -> Result<(), RootPreparati
             use std::io::Write as _;
             file.write_all(b"probe")?;
             file.sync_all()
-        })
-        .map_err(RootPreparationFault::Probe)?;
-    std::fs::remove_file(&probe).map_err(RootPreparationFault::Probe)?;
-    Ok(())
-}
-
-/// The pure half of validating the top-level `agent_run_log_root`: the same
-/// two text checks the `vm_http` roots get, in their own vocabulary.
-fn check_agent_run_log_root(path: PathBuf) -> Result<PathBuf, AgentRunLogRootError> {
-    if path.as_os_str().is_empty() {
-        return Err(AgentRunLogRootError::Empty);
-    }
-    if !path.is_absolute() {
-        return Err(AgentRunLogRootError::Relative(path));
-    }
-    Ok(path)
-}
-
-/// The effectful half. Expects a path that has already passed
-/// [`check_agent_run_log_root`].
-fn prepare_agent_run_log_root(path: &Path) -> Result<(), AgentRunLogRootError> {
-    create_and_probe(path, ".writ-agent-run-log-probe").map_err(|fault| match fault {
-        RootPreparationFault::Create(source) => AgentRunLogRootError::Create {
-            path: path.to_path_buf(),
-            source,
-        },
-        RootPreparationFault::Probe(source) => AgentRunLogRootError::Probe {
-            path: path.to_path_buf(),
-            source,
-        },
-    })
+        })?;
+    std::fs::remove_file(&probe)
 }
 
 /// The pure half of validating a writable root: does the *configured text*
@@ -1499,8 +1558,10 @@ fn prepare_writable_root(
     kind: WritableRoot,
     path: PathBuf,
 ) -> Result<PathBuf, AgentVmHttpConfigError> {
-    create_and_probe(&path, kind.probe_prefix())
-        .map_err(|fault| kind.fault(path.clone(), fault))?;
+    std::fs::create_dir_all(&path)
+        .map_err(|source| kind.fault(path.clone(), RootPreparationFault::Create(source)))?;
+    probe_writable(&path, kind.probe_prefix())
+        .map_err(|source| kind.fault(path.clone(), RootPreparationFault::Probe(source)))?;
     Ok(path)
 }
 

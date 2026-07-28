@@ -340,7 +340,7 @@ fn parses_agent_vm_config_and_converts_to_runtime_config() {
     let agent_vm = c.agent_vm.unwrap();
 
     let runtime = agent_vm
-        .to_runtime_config(agent_run_log_root.clone())
+        .to_runtime_config(AgentRunLogRoot::check(agent_run_log_root.clone()).unwrap())
         .unwrap();
 
     assert_eq!(runtime.vm_http().bind_addr(), Ipv4Addr::UNSPECIFIED);
@@ -470,7 +470,7 @@ fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
     let agent_vm = c.agent_vm.unwrap();
 
     let runtime = agent_vm
-        .to_runtime_config(agent_run_log_root.clone())
+        .to_runtime_config(AgentRunLogRoot::check(agent_run_log_root.clone()).unwrap())
         .unwrap();
     let claude_proxy = runtime.vm_http().claude_proxy().unwrap();
     assert_eq!(claude_proxy.auth_secret().as_str(), "anthropic-oauth-token");
@@ -509,6 +509,12 @@ fn unique_config_test_path(label: &str) -> PathBuf {
         "writ-config-{label}-{}-{nanos}",
         std::process::id()
     ))
+}
+
+/// A checked log root in a unique temp location, for the tests that only need
+/// `to_runtime_config` to have *some* valid one.
+fn test_agent_run_log_root() -> AgentRunLogRoot {
+    AgentRunLogRoot::check(unique_config_test_path("agent-runs")).unwrap()
 }
 
 fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
@@ -698,7 +704,7 @@ fn agent_vm_config_rejects_non_wildcard_vm_http_bind_address() {
     };
 
     assert!(matches!(
-        sole_error(c.to_runtime_config(unique_config_test_path("agent-runs"))),
+        sole_error(c.to_runtime_config(test_agent_run_log_root())),
         AgentVmDaemonConfigError::Runtime(
             AgentVmDaemonRuntimeConfigError::NonWildcardVmHttpBindAddr(addr)
         ) if addr == Ipv4Addr::LOCALHOST
@@ -1000,9 +1006,72 @@ fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
 
     let checked = check_daemon_sections(None, None, Some(&root)).unwrap();
 
-    assert_eq!(checked.agent_run_log_root, root);
+    assert_eq!(checked.agent_run_log_root.as_path(), root);
     assert!(root.is_dir(), "the root must exist after checking");
     assert!(checked.agent_vm.is_none());
+}
+
+/// The log root holds agent output that `agent_run_outcome` rows point at, so
+/// a group- or world-writable parent would let another local user rename or
+/// delete those artifacts. It is created owner-only, and an existing directory
+/// is tightened to match — which is what the runtime
+/// (`writ_agent_run`'s `ensure_private_dir`) would do to it anyway.
+#[test]
+fn the_agent_run_log_root_is_owner_only_however_it_arrived() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+
+    let fresh = temp.path().join("fresh");
+    AgentRunLogRoot::check(fresh.clone())
+        .unwrap()
+        .prepare()
+        .unwrap();
+    let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "freshly created root is {mode:o}");
+
+    let loose = temp.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+    AgentRunLogRoot::check(loose.clone())
+        .unwrap()
+        .prepare()
+        .unwrap();
+    let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "pre-existing root left at {mode:o}");
+}
+
+/// The natural way to keep the old layout after the hoist is to name
+/// `<vm_http.work_root>/agent-runs` explicitly. Preparing the log root then
+/// creates `work_root` itself — and `ensure_vm_http_work_root_private` refuses
+/// a work root with any group or world bit set, so creating it at the process
+/// umask would reject the boot *and* leave behind the directory that makes
+/// every retry fail the same way. Both roots must come out usable.
+#[test]
+fn a_log_root_nested_under_an_uncreated_work_root_leaves_both_usable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = tempfile::tempdir().unwrap();
+    let work_root = temp.path().join("work-root");
+    let log_root = work_root.join("agent-runs");
+    assert!(!work_root.exists());
+
+    let mut vm_http = valid_agent_vm_http_config();
+    vm_http.work_root = work_root.clone();
+    let agent_vm = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http,
+    };
+
+    let checked = check_daemon_sections(Some(&agent_vm), None, Some(&log_root))
+        .expect("a log root beneath an uncreated work root must be accepted");
+
+    assert_eq!(checked.agent_run_log_root.as_path(), log_root);
+    assert!(log_root.is_dir());
+    let work_mode = std::fs::metadata(&work_root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        work_mode & 0o077,
+        0,
+        "work root created at {work_mode:o}; the next boot would refuse it",
+    );
 }
 
 /// Creating the log root and materialising the `agent_vm` section are
@@ -1759,7 +1828,7 @@ fn agent_vm_daemon_config_reports_lifecycle_and_vm_http_failures_together() {
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
     let errors = config
-        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .to_runtime_config(test_agent_run_log_root())
         .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
@@ -1872,7 +1941,7 @@ fn a_bad_lifecycle_section_creates_no_vm_http_directories() {
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
     let errors = config
-        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .to_runtime_config(test_agent_run_log_root())
         .unwrap_err();
 
     assert!(
@@ -1942,7 +2011,7 @@ fn a_non_wildcard_bind_addr_is_reported_with_its_siblings_and_creates_nothing() 
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
     let errors = config
-        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .to_runtime_config(test_agent_run_log_root())
         .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
 
@@ -2040,7 +2109,7 @@ fn a_non_wildcard_bind_addr_is_reported_alongside_an_unrelated_vm_http_fault() {
         vm_http,
     };
     let errors = config
-        .to_runtime_config(unique_config_test_path("agent-runs"))
+        .to_runtime_config(test_agent_run_log_root())
         .unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(

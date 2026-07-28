@@ -325,7 +325,14 @@ alongside everything else rather than after all of that succeeds.
 subsystem section can own it: `StartAgentRun` reaches the VM `RunAgent` arm
 with no `run_agent` section configured, and a host-spawn-only daemon has no
 `agent_vm` section. It defaults to `$XDG_DATA_HOME/writ/agent-runs` and is
-created and probed at boot. Today the VM arm is its only writer (per-run
+created **owner-only** and probed at boot, via the `AgentRunLogRoot`
+check/prepare pair — the same text-then-effect split the `vm_http` roots use,
+as a type so that a raw relative path cannot reach
+`AgentVmDaemonConfig::to_runtime_config`. 0700 is what makes the two effectful
+steps order-independent: a log root named beneath a not-yet-existing
+`vm_http.work_root` creates that parent at 0700, which is exactly what
+`ensure_vm_http_work_root_private` demands, and it matches what the runtime
+(`writ_agent_run`'s `ensure_private_dir`) enforces before every run. Today the VM arm is its only writer (per-run
 `<root>/<run-id>/stdout.log` and `stderr.log`, pointed at by
 `agent_run_outcome` rows); the host-spawn arm keeps its child's output in
 memory and records no audit rows at all — closing that gap is what the key is

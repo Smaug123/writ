@@ -577,7 +577,7 @@ fn daemon_config_inner(
                 .unwrap(),
             )
             .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir),
-            dir.join("agent-runs"),
+            crate::config::AgentRunLogRoot::check(dir.join("agent-runs")).unwrap(),
         )
         .unwrap(),
         state_store,

@@ -236,7 +236,7 @@ async fn run_host_daemon(
     // to know which directory this boot resolved, whether they configured it
     // or took the default.
     tracing::info!(
-        agent_run_log_root = %checked.agent_run_log_root.display(),
+        agent_run_log_root = %checked.agent_run_log_root.as_path().display(),
         "agent run logs directory",
     );
 

@@ -147,7 +147,7 @@ pub struct AgentVmDaemonRuntimeConfig {
     /// daemon config, not in `vm_http` (see
     /// [`DaemonConfig::agent_run_log_root`](crate::config::DaemonConfig::agent_run_log_root));
     /// the agent-VM runtime holds it because the VM arm is what writes there.
-    agent_run_log_root: PathBuf,
+    agent_run_log_root: crate::config::AgentRunLogRoot,
 }
 
 /// Host facts the broker-VM (`broker_placement = vm`) arm needs that are *not*
@@ -438,7 +438,7 @@ impl AgentVmDaemonRuntimeConfig {
     pub fn new(
         lifecycle: AgentVmLifecycleRuntimeConfig,
         vm_http: VmHttpRuntimeConfig,
-        agent_run_log_root: PathBuf,
+        agent_run_log_root: crate::config::AgentRunLogRoot,
     ) -> Result<Self, AgentVmDaemonRuntimeConfigError> {
         Self::check_bind_addr(vm_http.bind_addr())?;
         Ok(Self {
@@ -489,7 +489,7 @@ impl AgentVmDaemonRuntimeConfig {
     }
 
     pub fn agent_run_log_root(&self) -> &Path {
-        &self.agent_run_log_root
+        self.agent_run_log_root.as_path()
     }
 }
 
