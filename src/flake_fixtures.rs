@@ -73,27 +73,65 @@ pub(crate) fn git_failure(args: &[&str], cwd: &Path, out: &std::process::Output)
     )
 }
 
-pub(crate) fn git(program: &Path, args: &[&str], cwd: &Path) {
-    let out = apply_clean_git_config(&mut std::process::Command::new(program))
+/// `-c` flags that stop git spawning a *detached background process* over
+/// the fixture repository.
+///
+/// This is not tidiness. `git commit` runs
+/// `git maintenance run --auto --quiet --detach`, which keeps writing to
+/// `objects/` after `git commit` has exited and returned to the caller.
+/// A fixture that commits and then immediately clones is therefore
+/// racing a writer it never asked for, and lost that race in CI:
+///
+/// ```text
+/// fatal: failed to copy file to '…/mirror.git/objects/pack/
+///        .tmp-23252-pack-ca4771….idx': No such file or directory
+/// ```
+///
+/// `clone_local` copies the source object store by walking it, so it
+/// enumerated `objects/pack/`, saw maintenance's transient
+/// `.tmp-<pid>-pack-*` file, and by the time it opened that file
+/// maintenance had renamed it away. (git reports the errno against the
+/// *destination* path, which is why the message reads as though the
+/// destination directory were missing.) The pid in the name belongs to
+/// neither the test nor its clone: it is the detached child.
+///
+/// So the fix is to remove the second writer rather than to retry around
+/// it. Verified directly: with `maintenance.auto=false`, `GIT_TRACE`
+/// shows zero `maintenance run --auto` spawns where an unconfigured
+/// commit shows three. `gc.auto=0` covers the older direct-gc path.
+///
+/// Deliberately *not* added to `apply_clean_git_config`: that recipe is
+/// production code's, and whether writd wants background maintenance
+/// suppressed on the repositories it manages is a real operational
+/// decision (repacking has to happen sometime) rather than a test-harness
+/// one. Tracked separately.
+const NO_AUTO_MAINTENANCE: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
+/// A fixture `git` command: the hardened config recipe, plus no detached
+/// background maintenance.
+fn fixture_git_command(program: &Path, args: &[&str], cwd: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    apply_clean_git_config(&mut command)
+        .args(NO_AUTO_MAINTENANCE)
         .args(args)
         .current_dir(cwd)
+        .stdin(Stdio::null());
+    command
+}
+
+pub(crate) fn git(program: &Path, args: &[&str], cwd: &Path) {
+    let out = fixture_git_command(program, args, cwd)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@e")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@e")
-        .stdin(Stdio::null())
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
 }
 
-fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
-    let out = apply_clean_git_config(&mut std::process::Command::new(program))
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+pub(crate) fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
+    let out = fixture_git_command(program, args, cwd).output().unwrap();
     assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
@@ -186,6 +224,61 @@ pub(crate) fn fake_nix_failing(root: &Path, code: u8) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture commit spawns no detached background maintenance.
+    ///
+    /// This is the flake's cause, pinned. `git commit` normally runs
+    /// `git maintenance run --auto --quiet --detach`, which outlives the
+    /// commit and keeps writing to `objects/`; the very next fixture step
+    /// clones that repository, and `clone_local` walks the object store
+    /// while it is being written. In CI that walk reached maintenance's
+    /// transient `.tmp-<pid>-pack-*.idx` after it had been renamed away,
+    /// and died with ENOENT.
+    ///
+    /// Asserted through `GIT_TRACE`, because what has to be proved is a
+    /// *negative about process spawning* — that nothing was launched.
+    /// The absence of a background writer cannot be observed by
+    /// inspecting the repository afterwards: not losing the race is
+    /// exactly what already happened almost every time.
+    #[test]
+    fn a_fixture_commit_leaves_no_background_writer_behind() {
+        let Some(git_program) = tool_on_path("git") else {
+            eprintln!("skipping: git must be on PATH");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&git_program, &["init", "-q", "-b", "main"], &repo);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(&git_program, &["add", "."], &repo);
+
+        let out = fixture_git_command(&git_program, &["commit", "-qm", "m"], &repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .env("GIT_TRACE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            git_failure(&["commit"], &repo, &out),
+        );
+
+        // GIT_TRACE goes to stderr. An unconfigured commit shows several
+        // `maintenance run --auto` lines here.
+        let trace = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !trace.contains("maintenance run --auto"),
+            "fixture commit spawned background maintenance:\n{trace}",
+        );
+        assert!(
+            !trace.contains("gc --auto"),
+            "fixture commit spawned background gc:\n{trace}",
+        );
+    }
 
     /// A failing fixture `git` reports git's own explanation.
     ///

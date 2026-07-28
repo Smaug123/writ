@@ -157,10 +157,8 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Stdio;
 
     use super::*;
-    use writ_core::git_env::apply_clean_git_config;
 
     fn git_on_path() -> PathBuf {
         let path = std::env::var_os("PATH").expect("PATH must be set for git tests");
@@ -173,31 +171,12 @@ mod tests {
         panic!("git must be on PATH for flake_materialize tests");
     }
 
-    use crate::flake_fixtures::git_failure;
-
     fn git(program: &Path, args: &[&str], cwd: &Path) {
-        let out = apply_clean_git_config(&mut std::process::Command::new(program))
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@e")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@e")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
+        crate::flake_fixtures::git(program, args, cwd)
     }
 
     fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
-        let out = apply_clean_git_config(&mut std::process::Command::new(program))
-            .args(args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
+        crate::flake_fixtures::git_stdout(program, args, cwd)
     }
 
     /// Build a bare mirror of a repo carrying a flake at a known commit, and
