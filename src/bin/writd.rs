@@ -231,10 +231,10 @@ async fn run_host_daemon(
     )
     .map_err(|errors| errors.to_string())?;
     let agent_vm = checked.agent_vm;
-    // Both `RunAgent` arms write per-run stdout/stderr here, and the absolute
-    // paths land on `agent_run_outcome` rows — so the operator needs to know
-    // which directory this boot resolved, whether they configured it or took
-    // the default.
+    // The VM `RunAgent` arm writes per-run stdout/stderr here, and the
+    // absolute paths land on `agent_run_outcome` rows — so the operator needs
+    // to know which directory this boot resolved, whether they configured it
+    // or took the default.
     tracing::info!(
         agent_run_log_root = %checked.agent_run_log_root.display(),
         "agent run logs directory",

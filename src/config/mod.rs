@@ -122,12 +122,17 @@ pub struct DaemonConfig {
     /// holding that run's captured `stdout.log` and `stderr.log`. Defaults to
     /// [`default_agent_run_log_root`].
     ///
-    /// Top-level rather than under `agent_vm`, because *both* `RunAgent`
-    /// dispatch arms write here: the VM arm materialises the streams the guest
-    /// uploads, and the host-spawn arm captures its child's directly. Neither
-    /// section can own the key — `ClientMessage::StartAgentRun` reaches the VM
-    /// arm with no `run_agent` section configured at all, and a daemon that
-    /// serves only host-spawn runs has no `agent_vm` section.
+    /// **Today's writer is the VM `RunAgent` arm only**: it materialises the
+    /// streams the guest uploads into `<root>/<run-id>/`. The host-spawn arm
+    /// keeps its child's output in memory and writes no files, so a host-only
+    /// daemon creates this root and leaves it empty. That arm records no audit
+    /// rows either; giving it the pair is the follow-up this key is
+    /// preparation for, and needs on-disk paths to point the rows at.
+    ///
+    /// It is top-level rather than under `agent_vm` because neither section
+    /// can own it: `ClientMessage::StartAgentRun` reaches the VM arm with no
+    /// `run_agent` section configured at all, and a daemon that serves only
+    /// host-spawn runs has no `agent_vm` section.
     ///
     /// The paths recorded on `agent_run_outcome` rows are absolute, so moving
     /// this root leaves already-recorded runs resolvable where they were
@@ -626,8 +631,8 @@ pub enum AgentVmHttpConfigError {
 }
 
 /// What [`check_daemon_sections`] resolved: the optional agent-VM runtime
-/// config, and the agent-run log root — which is not optional, because both
-/// `RunAgent` dispatch arms write stream files under it.
+/// config, and the agent-run log root — which is not optional, because it is
+/// resolved from a default when the operator names none.
 #[derive(Debug)]
 pub struct CheckedDaemonSections {
     pub agent_vm: Option<AgentVmDaemonRuntimeConfig>,
@@ -644,9 +649,8 @@ pub struct CheckedDaemonSections {
 ///
 /// `agent_run_log_root` is [`DaemonConfig::agent_run_log_root`] verbatim;
 /// `None` resolves to [`default_agent_run_log_root`]. It is checked and
-/// created unconditionally, because it is not a subsystem's directory: a
-/// daemon with neither an `agent_vm` nor a `run_agent` section still refuses
-/// `RunAgent` at dispatch, and one with either of them writes here.
+/// created unconditionally, because it is not a subsystem's directory — see
+/// that field for which arm writes there today.
 pub fn check_daemon_sections(
     agent_vm: Option<&AgentVmDaemonConfig>,
     ui_http: Option<&UiHttpConfig>,

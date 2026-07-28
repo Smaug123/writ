@@ -616,6 +616,7 @@ config = {
     "secret_store": {"type": "file", "path": secrets_dir},
     "socket_path": socket_path,
     "audit_db": audit_db,
+    "agent_run_log_root": agent_run_log_root,
     "agent_vm": {
         "lifecycle": {
             "ipv4_pool": ipv4_pool,
@@ -654,7 +655,6 @@ config = {
                 "max_request_bytes": 2097152,
                 "max_response_bytes": 8388608,
             },
-            "agent_run_log_root": agent_run_log_root,
         },
     },
 }

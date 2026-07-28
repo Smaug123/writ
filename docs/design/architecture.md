@@ -241,7 +241,7 @@ operator CLI verbs).
 `deny_unknown_fields` since outbound); `Decision`/`AuthorizedMint`
 (`policy.rs:97,52`); config root `DaemonConfig` (`config/mod.rs`,
 `deny_unknown_fields`): `github_apps`, `policy`, `agent_vm?`, `secret_store`,
-`socket_path?`, `audit_db?`, `ui_http?`, `run_agent?`.
+`socket_path?`, `audit_db?`, `ui_http?`, `run_agent?`, `agent_run_log_root?`.
 
 **Entry points.** Accept loop `serve_broker_with_agent_vm` (`server.rs:843`,
 task-per-connection) → `handle_connection` (`server.rs:662`) →
@@ -280,12 +280,20 @@ config plus the directories that still need creating; `VmHttpPlan::materialize`
 carries that out. This is the interpreter pattern applied to config, and it *composes*:
 `AgentVmDaemonConfig::check` holds a `VmHttpPlan` inside an
 `AgentVmDaemonPlan`, and `check_daemon_sections` holds that while it validates
-`ui_http`, so nothing is created until every section — plus the daemon-level
-bind invariant, via `AgentVmDaemonRuntimeConfig::check_bind_addr`, which takes
-the bare address so it cannot hide behind an unrelated fault — has been checked.
-A fault anywhere therefore leaves no debris. That matters most for `work_root`, where a directory created at the process umask
-(0755) would make `validate_existing_work_root` refuse that path on every later
-boot too.
+`ui_http` and the shape of `agent_run_log_root`, so nothing is created until
+every section — plus the daemon-level bind invariant, via
+`AgentVmDaemonRuntimeConfig::check_bind_addr`, which takes the bare address so
+it cannot hide behind an unrelated fault — has been checked. **No config
+rejected on its text leaves debris.** That matters most for `work_root`, where
+a directory created at the process umask (0755) would make
+`validate_existing_work_root` refuse that path on every later boot too.
+
+Once the text is known good, the two effectful steps — creating
+`agent_run_log_root` and materialising the `agent_vm` plan — are independent, so
+both run and both report into one accumulator: an unwritable log root must not
+hide an unwritable `git_push_staging_root`. This is the one place where a
+rejected config *can* leave a directory behind, and only one whose own creation
+succeeded.
 
 Inside `materialize` the work root is prepared first, and **every** root waits on
 it, including one the operator named explicitly. Whether a named root is really a
@@ -308,10 +316,20 @@ reports only the first. The section-level tiering that cost a restart per
 mistake is gone; per-field accumulation inside those constructors would mean
 reworking them across `vm_http`, `writ-core`, and the lifecycle module.
 
-`writd` calls `check_daemon_sections`, which validates `agent_vm` and `ui_http`
-together, up front, before the socket bind, the signing key, and the reconcile
-passes — so a bad `ui_http.bind` is reported alongside everything else rather
-than after all of that succeeds.
+`writd` calls `check_daemon_sections`, which validates `agent_vm`, `ui_http`,
+and `agent_run_log_root` together, up front, before the socket bind, the
+signing key, and the reconcile passes — so a bad `ui_http.bind` is reported
+alongside everything else rather than after all of that succeeds.
+
+`agent_run_log_root` is top-level rather than a `vm_http` key because neither
+subsystem section can own it: `StartAgentRun` reaches the VM `RunAgent` arm
+with no `run_agent` section configured, and a host-spawn-only daemon has no
+`agent_vm` section. It defaults to `$XDG_DATA_HOME/writ/agent-runs` and is
+created and probed at boot. Today the VM arm is its only writer (per-run
+`<root>/<run-id>/stdout.log` and `stderr.log`, pointed at by
+`agent_run_outcome` rows); the host-spawn arm keeps its child's output in
+memory and records no audit rows at all — closing that gap is what the key is
+in place for.
 
 **Neighbours.** Calls audit, credential minting, the git pipeline
 (staged-push), and the VM sandbox (`AgentVmDaemon`). Called by the `writ` CLI

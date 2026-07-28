@@ -220,9 +220,10 @@ Before that block does anything useful you need four things on disk:
 `git_push_staging_root` is optional; if omitted it defaults to a
 subdirectory of `work_root`.
 
-`agent_run_log_root` is a **top-level** key, not part of `agent_vm` — both
-ways of running an agent write per-run `stdout.log` / `stderr.log` beneath it,
-so neither section owns it:
+`agent_run_log_root` is a **top-level** key, not part of `agent_vm`. A run
+inside a VM writes its `stdout.log` / `stderr.log` beneath it (a host-spawned
+run keeps its output in memory today), and neither config section can own it:
+a daemon serving only host-spawned runs has no `agent_vm` block at all.
 
 ```json
 "agent_run_log_root": "/abs/path/to/writ/agent-run-logs"

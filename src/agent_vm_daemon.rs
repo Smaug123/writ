@@ -144,9 +144,9 @@ pub struct AgentVmDaemonRuntimeConfig {
     lifecycle: AgentVmLifecycleRuntimeConfig,
     vm_http: VmHttpRuntimeConfig,
     /// Where per-run stdout/stderr logs go. Configured at the top level of the
-    /// daemon config, not in `vm_http`, because the host-spawn `RunAgent` arm
-    /// writes here too; the agent-VM runtime holds a copy because the VM arm is
-    /// the other writer.
+    /// daemon config, not in `vm_http` (see
+    /// [`DaemonConfig::agent_run_log_root`](crate::config::DaemonConfig::agent_run_log_root));
+    /// the agent-VM runtime holds it because the VM arm is what writes there.
     agent_run_log_root: PathBuf,
 }
 
