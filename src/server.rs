@@ -38,10 +38,9 @@ use crate::notes_repo::NotesRepo;
 use crate::openai_chatgpt_auth::ChatgptOauthAuthority;
 use crate::policy::{self, Decision, PolicyConfig};
 use crate::protocol::{
-    ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage, SignedRunMetadata,
-    StagedPushAuditView, StagedPushDetail, StagedPushSummary,
+    ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage, StagedPushAuditView,
+    StagedPushDetail, StagedPushSummary,
 };
-use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::secret::SecretStore;
 use crate::signing::WritSigningKey;
 use crate::vm_git_bundle::GitSecretValue;
@@ -56,12 +55,21 @@ mod staged_push;
 mod run_agent;
 
 /// Boot-time description of the child process that produces an agent
-/// run's stdout. Pure data — dispatch reads `command` and `args`,
-/// hands them to `tokio::process::Command`, writes the prompt bytes
-/// to the child's stdin, and captures stdout. The shell — *which*
-/// binary writ launches — is set at boot; the wire `RunAgent` request
-/// does not choose it, so a `RunAgent` caller cannot smuggle in an
-/// arbitrary command.
+/// run's streams, and where those streams are kept. Pure data —
+/// dispatch reads `command` and `args`, hands them to
+/// [`crate::agent_run::AgentProcessPlan`], writes the prompt bytes to
+/// the child's stdin, and captures both streams under `log_root`. The
+/// shell — *which* binary writ launches — is set at boot; the wire
+/// `RunAgent` request does not choose it, so a `RunAgent` caller cannot
+/// smuggle in an arbitrary command.
+///
+/// `log_root` is not optional, because the host-spawn arm cannot run
+/// without one: every run records an `agent_run_outcome` row naming the
+/// files its streams landed in, so a spawn config with nowhere to put
+/// them describes a run that could start but never be audited. The
+/// daemon-wide root is [`crate::config::DaemonConfig::agent_run_log_root`],
+/// checked once at boot and handed to both `RunAgent` arms; this field
+/// is the host arm's copy of that same validated value.
 ///
 /// Slice B accepts a single fixed command for the whole daemon; the
 /// agent-kind selection that bailiff will eventually drive arrives in
@@ -70,6 +78,7 @@ mod run_agent;
 pub struct RunAgentSpawnConfig {
     pub command: std::path::PathBuf,
     pub args: Vec<String>,
+    pub log_root: crate::config::AgentRunLogRoot,
 }
 
 /// Shared state for the broker. Wrapped in `Arc` so connections spawned

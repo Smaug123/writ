@@ -1,15 +1,17 @@
-//! Example/edge-case tests for [`super::materialize_vm_signed_envelope`].
+//! Example/edge-case tests for [`super::materialize_signed_run_envelope`].
 use super::*;
+use crate::agent_run::AgentRunId;
+use crate::core::UnixMillis;
 use std::fs;
 use std::path::Path;
 
 /// Build an `AgentRunOutcomeAuditRecord` pointing at on-disk stdout
 /// and stderr files containing the supplied bytes. The sha256 and
-/// byte_len fields on the audit record describe whatever bytes the
-/// VM-side reader retained (here: identical to file contents, since
-/// the test fixture never exceeds the VM-side 1 GiB cap). The
-/// materializer does not consult these fields — it hashes the file
-/// contents from disk — so the values matter only for plausibility.
+/// byte_len fields on the audit record describe whatever bytes the run's
+/// capture retained (here: identical to file contents, since the test
+/// fixture never exceeds any cap). The materializer does not consult those
+/// two fields — it hashes the file contents from disk — so their values
+/// matter only for plausibility. It *does* consult `truncated`.
 fn outcome_for_streams(
     run_dir: &Path,
     run_id: AgentRunId,
@@ -92,7 +94,7 @@ async fn materialize_vm_envelope_packs_streams_and_signs_metadata() {
         },
     }];
 
-    let materialized = materialize_vm_signed_envelope(
+    let materialized = materialize_signed_run_envelope(
         &outcome,
         session_id,
         prompt_sha256.clone(),
@@ -174,7 +176,7 @@ async fn materialize_vm_envelope_propagates_nonzero_exit_code() {
     );
 
     let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
-    let materialized = materialize_vm_signed_envelope(
+    let materialized = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
         prompt_sha256,
@@ -216,7 +218,7 @@ async fn materialize_vm_envelope_caps_streams_at_max_run_agent_stream_bytes() {
     );
 
     let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
-    let materialized = materialize_vm_signed_envelope(
+    let materialized = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
         prompt_sha256,
@@ -288,7 +290,7 @@ async fn materialize_vm_envelope_preserves_guest_truncation_flag() {
     };
 
     let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
-    let materialized = materialize_vm_signed_envelope(
+    let materialized = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
         prompt_sha256,

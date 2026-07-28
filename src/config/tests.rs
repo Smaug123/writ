@@ -1885,8 +1885,9 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
         spawn_args: vec![],
     };
     let store = InMem::default();
+    let log_root = AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap();
 
-    let first = cfg.materialize(&store).unwrap();
+    let first = cfg.materialize(&store, log_root.clone()).unwrap();
     assert!(
         first.signing.was_generated(),
         "first boot generates the key"
@@ -1895,7 +1896,7 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
     assert!(first.notes_repo.path().exists());
     assert_eq!(first.spawn.command, PathBuf::from("/bin/cat"));
 
-    let second = cfg.materialize(&store).unwrap();
+    let second = cfg.materialize(&store, log_root.clone()).unwrap();
     assert!(
         !second.signing.was_generated(),
         "second boot loads the existing key"

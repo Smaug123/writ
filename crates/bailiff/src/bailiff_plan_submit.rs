@@ -454,6 +454,8 @@ mod end_to_end_tests {
             run_agent_spawn: Some(RunAgentSpawnConfig {
                 command: cat,
                 args: Vec::new(),
+                log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
+                    .unwrap(),
             }),
             promote_runtime: None,
             git_data_http: std::sync::OnceLock::new(),

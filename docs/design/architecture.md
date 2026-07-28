@@ -225,10 +225,11 @@ sessions, runs each capability request through the pure policy chokepoint, mints
 a short-lived token, and audits every step. It also hosts staged-push
 approve/reject/reconcile and agent-run/agent-VM orchestration.
 
-**Lives in.** `server.rs` (881 lines: transport, dispatch, connection handling)
+**Lives in.** `server.rs` (922 lines: transport, dispatch, connection handling)
 plus `server/staged_push.rs` (1772: the list/show/reject/approve/reconcile
-approval handlers) and `server/run_agent.rs` (569: the `RunAgent` handler and
-its VM-dispatch path); `server/` also holds the test submodules. `protocol/`
+approval handlers) and `server/run_agent.rs` (543: both `RunAgent` arms — host
+spawn and VM dispatch — and the signing/notes tail they share);
+`server/` also holds the test submodules. `protocol/`
 (`mod.rs` 534 for the `ClientMessage`/`ServerMessage` DUs + `views.rs` 246 for
 the payload types they carry + `tests.rs` for the wire tests),
 `broker_session.rs`, `broker_protocol.rs`, `policy.rs`,
@@ -337,11 +338,11 @@ default is the one path here that treats an exported-but-empty `XDG_DATA_HOME`
 as unset (`xdg_dir_or_home`); the neighbouring defaults have the same hole but
 name durable state, so normalising them is a migration — moving where
 `default_audit_db_path` resolves moves `legacy_default_audit_db_path` with it
-and the migration guard would stop finding the old DB. Today the VM arm is its only writer (per-run
-`<root>/<run-id>/stdout.log` and `stderr.log`, pointed at by
-`agent_run_outcome` rows); the host-spawn arm keeps its child's output in
-memory and records no audit rows at all — closing that gap is what the key is
-in place for.
+and the migration guard would stop finding the old DB. Both `RunAgent` arms
+write here: per-run `<root>/<run-id>/stdout.log` and `stderr.log`, pointed at
+by `agent_run_outcome` rows. The host arm reaches it through
+`RunAgentSpawnConfig.log_root`, which is non-optional — a spawn config with
+nowhere to put streams describes a run that could start but never be audited.
 
 **Neighbours.** Calls audit, credential minting, the git pipeline
 (staged-push), and the VM sandbox (`AgentVmDaemon`). Called by the `writ` CLI
@@ -439,7 +440,22 @@ Nix-cache, flake-provision — the unguarded half-pair writers are now `#[cfg(te
 so **the guard is the only way production code can write those tables**. The two
 that keep public unpaired writers do so for stated reasons: `git_push` (boot
 reconciliation appends an outcome for an orphaned carrier) and `agent_run` (the
-request row is minted at run launch, the outcome arrives later).
+VM arm mints the request row at run launch, and the outcome arrives later over
+the guest's HTTP surface — see the outcome-only shape in §5.6).
+
+`agent_run` is the one table used in *both* guard shapes, because its two arms
+genuinely differ. The VM arm spans two processes and two lifecycle events, so
+it is outcome-only: launch writes the row, the outcome endpoint `resume_effect`s
+it. The host-spawn arm performs the whole run inside one handler, so it is
+ordinary two-phase — `begin_effect` before the child starts, `complete` with
+the capture's outcome, `abandon` when the run cannot report one truthfully (an
+unspawnable command, a stream that could not be captured). Both leave an
+unpaired row in that last case, which is what an unfinished run looks like;
+neither fabricates a terminal status, because the outcome row is keyed on the
+run id and a fabricated row would consume the run's only outcome slot forever.
+This is also why `EFFECT_AUDIT_PAIRS` excludes `agent_run`: an unpaired row
+there is indistinguishable from a run still in flight, so the generic boot scan
+would false-positive on every live run.
 
 **The approve-attempt state machine.** `approve_attempt.rs` owns the vocabulary
 and the transition relation of the operator-approve lifecycle, which the DAO
@@ -927,8 +943,9 @@ run (metadata + detached SSHSIG + framed output), stores it as a git note, and
 downstream consumers (bailiff) verify it.
 
 **Lives in.** The `writ-agent-run` crate (the run contract + process-runner,
-re-exported as `writ::agent_run`), plus `run_envelope.rs`, `run_verify.rs` and
-`SignedRunMetadata` in `protocol/views.rs`. `writ-agent-run`'s contract types are
+re-exported as `writ::agent_run`), plus `agent_run_envelope.rs` (185: builds
+the signed envelope from an outcome row), `run_envelope.rs`, `run_verify.rs`
+and `SignedRunMetadata` in `protocol/views.rs`. `writ-agent-run`'s contract types are
 always compiled; its runner/hashing sit behind the crate's `vm-client` feature
 (and host-only `AgentPrompt::summary` behind `host`), so both the daemon and the
 guest share it. The `run_envelope`/`run_verify` host modules stay in `writ`.
@@ -947,7 +964,12 @@ namespace — so tampered output → `OutputDigestMismatch`, unknown key →
 `UnknownSigner`, tampered metadata → `SignatureInvalid`.
 
 **Neighbours.** Repo/object types come from `writ-vm-git`; envelopes are minted
-on the VM-sandbox run path and verified by bailiff via a notes-ref fetch.
+by `agent_run_envelope::materialize_signed_run_envelope` — which **both**
+`RunAgent` arms call, so a host-spawned and a VM-sandboxed run produce
+envelopes that mean the same thing — and verified by bailiff via a notes-ref
+fetch. Its inputs are the `agent_run_outcome` row and the stream files that
+row names, never an in-memory capture, so the signed bytes describe what
+survived the run.
 
 ### 5.10 Clients & UI
 
@@ -1011,10 +1033,15 @@ unreachable arm.
 **Session ownership is a type-level distinction.** `run_under_owned_session`
 (submit, review) opens the session, binds `RunAgent` to it, cross-checks the id
 the broker stamped into the signed metadata, and closes it on every exit path
-after the open. `run_under_broker_session` (implement) does none of that: writd's
-VM dispatch arm mints its own audit session and closes it before `RunAgent`
-returns. Two functions rather than one function over a flag, so the close-session
-path is not *reachable* from the VM-dispatched stage. Callers are routed by the
+after the open. The broker requires this: its host-spawn arm refuses a
+`RunAgent` with no `session_id`, because the run's `agent_run` row keys onto a
+`session` row and there is no honest id to record without one (it used to mint
+an unopened `SessionId` and stamp it into the signed envelope, which claimed a
+session no verifier could resolve). `run_under_broker_session` (implement) does
+none of that: writd's VM dispatch arm mints its own audit session and closes it
+before `RunAgent` returns — and correspondingly *refuses* a caller-supplied
+`session_id`. Two functions rather than one function over a flag, so the
+close-session path is not *reachable* from the VM-dispatched stage. Callers are routed by the
 data they hold — only implement has an `AgentVmWorkspaceBootstrap`, which is the
 same field writd's dispatch keys on.
 

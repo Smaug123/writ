@@ -158,6 +158,73 @@ pub(super) fn make_agent_registry_state_for_agents(
     })
 }
 
+/// A `BrokerState` with the whole `RunAgent` triple wired up, ready for a
+/// host-spawn dispatch: a fresh bare notes repo, the shared Ed25519 signing
+/// fixture, and a [`RunAgentSpawnConfig`] for `command`/`args` whose stream
+/// logs land under a temp root.
+///
+/// Built by [`make_run_agent_state`]. The `TempDir` is a field rather than a
+/// second return value so a test cannot drop the notes repo and log root out
+/// from under the state it is still dispatching against.
+pub(super) struct RunAgentFixture {
+    pub(super) state: Arc<BrokerState<InMemStore>>,
+    /// A clone of the key `state` signs with, so a test can verify a
+    /// signature and check the fingerprint from the caller's side.
+    pub(super) signing_key: crate::signing::WritSigningKey,
+    /// Where the host arm writes `<run-id>/{stdout,stderr}.log`.
+    pub(super) log_root: PathBuf,
+    _tmp: tempfile::TempDir,
+}
+
+impl RunAgentFixture {
+    /// The `<log_root>/<run_id>/` directory a run's streams land in.
+    pub(super) fn run_dir(&self, run_id: crate::agent_run::AgentRunId) -> PathBuf {
+        self.log_root.join(run_id.to_string())
+    }
+}
+
+/// Build a [`RunAgentFixture`] spawning `command` with `args`.
+///
+/// Every host-spawn `RunAgent` test needs the same five pieces (notes repo,
+/// signing key, spawn command, stream log root, and the registry
+/// `make_state` supplies); assembling them here keeps each test's body about
+/// the behaviour it pins rather than about `BrokerState`'s field list.
+pub(super) fn make_run_agent_state(
+    server: &MockServer,
+    command: std::path::PathBuf,
+    args: Vec<String>,
+) -> RunAgentFixture {
+    use crate::config::AgentRunLogRoot;
+    use crate::signing::WritSigningKey;
+    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
+    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+    // Deliberately *not* pre-created: the host arm creates its own run
+    // directories under this root, so a test that finds streams here has also
+    // shown the arm does that creation itself.
+    let log_root = tmp.path().join("agent-runs");
+
+    let mut state = make_state(server, vec![], "o");
+    let inner = Arc::get_mut(&mut state).expect("fresh Arc has no other handles");
+    inner.notes_repo = Some(Arc::new(notes_repo));
+    inner.signing_key = Some(signing_key.clone());
+    inner.run_agent_spawn = Some(RunAgentSpawnConfig {
+        command,
+        args,
+        log_root: AgentRunLogRoot::check(log_root.clone())
+            .expect("a tempdir-rooted log path is absolute"),
+    });
+
+    RunAgentFixture {
+        state,
+        signing_key,
+        log_root,
+        _tmp: tmp,
+    }
+}
+
 pub(super) fn repo(owner: &str, name: &str) -> RepoRef {
     RepoRef {
         owner: owner.into(),

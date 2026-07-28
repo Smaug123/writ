@@ -288,9 +288,16 @@ impl RunAgentDaemonConfig {
     /// and persists a fresh Ed25519 keypair; every subsequent boot
     /// returns the same key. The returned [`EnsureOutcome`] lets the
     /// caller log "generated new key" once at INFO/WARN level.
+    ///
+    /// `agent_run_log_root` is a parameter rather than a field of this
+    /// section because the root is daemon-wide: the VM `RunAgent` arm
+    /// needs the same directory and reaches writd without a `run_agent`
+    /// section at all. It arrives already checked and prepared (see
+    /// [`check_daemon_sections`]), so this method only stores it.
     pub fn materialize(
         &self,
         store: &dyn SecretStore,
+        agent_run_log_root: AgentRunLogRoot,
     ) -> Result<RunAgentBootState, RunAgentBootError> {
         let notes_repo_path = self.notes_repo_path_or_default();
         let notes_repo = NotesRepo::init_or_open(&notes_repo_path).map_err(|source| {
@@ -312,6 +319,7 @@ impl RunAgentDaemonConfig {
             spawn: RunAgentSpawnConfig {
                 command: self.spawn_command.clone(),
                 args: self.spawn_args.clone(),
+                log_root: agent_run_log_root,
             },
         })
     }
