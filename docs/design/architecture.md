@@ -971,6 +971,17 @@ fetch. Its inputs are the `agent_run_outcome` row and the stream files that
 row names, never an in-memory capture, so the signed bytes describe what
 survived the run.
 
+Re-reading those files opens a window in which they can change — anything
+running as the daemon's user can rewrite one, including a detached helper left
+behind by the agent whose output it is — so the bytes are checked against the
+row before they are signed, and a mismatch refuses rather than vouches. The
+recorded hash is writ's own: computed by the host arm's capture, or re-derived
+by the broker from the guest's upload before writing it (§5.6 checks the
+guest's claim against the bytes at that point). Below the read cap the check is
+length *and* hash; at or past it the recorded hash covers retained bytes the
+read deliberately did not finish, so only the row's agreement that the file
+runs past the cap is checkable.
+
 ### 5.10 Clients & UI
 
 **Purpose.** The non-daemon surfaces:

@@ -12,6 +12,10 @@
 //! describe what actually survived the run, and the two arms cannot drift
 //! into signing subtly different things. `crate::server`'s `run_agent`
 //! dispatch wires it between the outcome row and the notes-repo write step.
+//!
+//! Reading the files back opens a window in which they can change, so the
+//! bytes are checked against the row before they are signed — see
+//! `check_matches_summary` for what that covers and what it cannot.
 
 use std::path::PathBuf;
 
@@ -33,6 +37,30 @@ pub enum MaterializeRunEnvelopeError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error(
+        "{stream} log file {} no longer matches the outcome row describing it \
+         (row: {recorded_byte_len} bytes, {recorded_sha256}; file: {found_byte_len} bytes, {found_sha256})",
+        path.display()
+    )]
+    StreamChanged {
+        stream: &'static str,
+        path: PathBuf,
+        recorded_byte_len: u64,
+        recorded_sha256: String,
+        found_byte_len: u64,
+        found_sha256: String,
+    },
+    #[error(
+        "{stream} log file {} grew past the {cap}-byte read cap, but the outcome \
+         row describing it records only {recorded_byte_len} retained bytes",
+        path.display()
+    )]
+    StreamGrewPastCap {
+        stream: &'static str,
+        path: PathBuf,
+        recorded_byte_len: u64,
+        cap: usize,
     },
     #[error("sign canonical metadata: {0}")]
     Sign(#[source] crate::signing::WritSigningKeyError),
@@ -63,14 +91,17 @@ pub struct MaterializedRunEnvelope {
 /// host-spawn arm. Either way it is the session the `agent_run` row's
 /// foreign key points at, which is what a verifier should follow.
 ///
-/// Streams are read off the on-disk paths the outcome row points at
-/// and re-capped at `MAX_RUN_AGENT_STREAM_BYTES` (4 MiB). On the host
-/// arm the capture cap is that same 4 MiB, so the file *is* what the
-/// envelope carries. On the VM arm the guest-side audit policy permits
-/// up to 1 GiB per stream, so the file on disk may be substantially
-/// larger than the envelope can carry; the `_truncated_at` marker on
-/// `OutputEnvelope` records the per-call cap so verifiers tell
-/// prefix-from-whole either way.
+/// Streams are read off the on-disk paths the outcome row points at and
+/// re-capped at `MAX_RUN_AGENT_STREAM_BYTES` (4 MiB), which bounds this
+/// call's memory footprint whatever is on disk. In practice neither arm
+/// reaches that cap on the read: the host arm captures at the same 4 MiB, so
+/// the file *is* what the envelope carries, and the VM arm's file is what the
+/// broker wrote from the guest's upload, bounded by the outcome route's 4-MiB
+/// body limit (and usually far below it, by the guest's own 1-MiB capture
+/// cap). The re-cap stays because neither of those bounds is this module's to
+/// enforce. What tells a verifier prefix-from-whole is the `_truncated_at`
+/// marker on `OutputEnvelope`, which reflects the *capture's* truncation as
+/// well as this read's.
 ///
 /// This helper is pure-with-IO: no network, no audit writes, no notes
 /// repo. Each dispatch arm wires it between the outcome row and the
@@ -87,13 +118,13 @@ pub async fn materialize_signed_run_envelope(
 
     let (stdout_bytes, stdout_host_truncated_at) = read_stream_capped_from_disk(
         "stdout",
-        &outcome.outcome.stdout.path,
+        &outcome.outcome.stdout,
         crate::server::MAX_RUN_AGENT_STREAM_BYTES,
     )
     .await?;
     let (stderr_bytes, stderr_host_truncated_at) = read_stream_capped_from_disk(
         "stderr",
-        &outcome.outcome.stderr.path,
+        &outcome.outcome.stderr,
         crate::server::MAX_RUN_AGENT_STREAM_BYTES,
     )
     .await?;
@@ -162,9 +193,10 @@ pub async fn materialize_signed_run_envelope(
 
 async fn read_stream_capped_from_disk(
     stream: &'static str,
-    path: &std::path::Path,
+    summary: &crate::agent_run::AgentRunStreamSummary,
     cap: usize,
 ) -> Result<(Vec<u8>, Option<u64>), MaterializeRunEnvelopeError> {
+    let path = summary.path.as_path();
     let file = tokio::fs::File::open(path).await.map_err(|source| {
         MaterializeRunEnvelopeError::StreamRead {
             stream,
@@ -172,13 +204,72 @@ async fn read_stream_capped_from_disk(
             source,
         }
     })?;
-    crate::server::capture_stream_capped(file, cap)
+    let (bytes, truncated_at) = crate::server::capture_stream_capped(file, cap)
         .await
         .map_err(|source| MaterializeRunEnvelopeError::StreamRead {
             stream,
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+    check_matches_summary(stream, summary, &bytes, truncated_at, cap)?;
+    Ok((bytes, truncated_at))
+}
+
+/// Refuse to sign bytes the outcome row contradicts.
+///
+/// The row committed a length and a hash of the bytes *writ itself held* when
+/// it wrote this file — computed by the host arm's capture, or re-derived by
+/// the broker from the guest's upload before writing (the guest's own claim is
+/// checked against the bytes at that point, so neither arm's recorded hash is
+/// an unverified assertion). Between then and now, anything running as the
+/// daemon's user can rewrite the file, including a detached helper left behind
+/// by the very agent whose output this is. Signing whatever is on disk would
+/// hand out a valid signature over bytes the audit log contradicts, and both
+/// would look authoritative to whoever read them next.
+///
+/// So: verify, and fail rather than vouch. The truthful row stays; only the
+/// envelope is withheld.
+///
+/// **What is checked depends on whether the whole file was read.** Below the
+/// cap, `bytes` *is* the file, so length and hash are both re-derived. At or
+/// past the cap the recorded hash covers retained bytes this read deliberately
+/// did not finish, so it cannot be re-derived without reading the rest — up to
+/// whatever the writer was allowed to retain. What remains checkable there is
+/// that the row agrees the file runs past the cap at all: a row recording
+/// fewer retained bytes than the cap cannot describe a file that still has
+/// bytes beyond it.
+fn check_matches_summary(
+    stream: &'static str,
+    summary: &crate::agent_run::AgentRunStreamSummary,
+    bytes: &[u8],
+    truncated_at: Option<u64>,
+    cap: usize,
+) -> Result<(), MaterializeRunEnvelopeError> {
+    if truncated_at.is_some() {
+        return if summary.byte_len > cap as u64 {
+            Ok(())
+        } else {
+            Err(MaterializeRunEnvelopeError::StreamGrewPastCap {
+                stream,
+                path: summary.path.clone(),
+                recorded_byte_len: summary.byte_len,
+                cap,
+            })
+        };
+    }
+    let found_byte_len = bytes.len() as u64;
+    let found_sha256 = crate::agent_run::sha256_hex(bytes);
+    if found_byte_len == summary.byte_len && found_sha256 == summary.sha256_hex {
+        return Ok(());
+    }
+    Err(MaterializeRunEnvelopeError::StreamChanged {
+        stream,
+        path: summary.path.clone(),
+        recorded_byte_len: summary.byte_len,
+        recorded_sha256: summary.sha256_hex.clone(),
+        found_byte_len,
+        found_sha256,
+    })
 }
 
 #[cfg(test)]
