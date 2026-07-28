@@ -677,9 +677,19 @@ mod process_runner {
     /// never describe.
     ///
     /// A guard rather than a `kill` at each `?`: the invariant is "this
-    /// function does not return while the agent runs", and only something that
-    /// owns the child can enforce that against paths nobody wrote by hand —
-    /// including a panic in between.
+    /// function does not return while the process it spawned runs", and only
+    /// something that owns the child can enforce that against paths nobody
+    /// wrote by hand — including a panic in between.
+    ///
+    /// **Its reach is that one process.** `kill(2)` signals a pid, so an agent
+    /// that had already forked — or a `spawn_command` that is a wrapper script
+    /// around the real binary — leaves descendants this does not touch. That
+    /// gap is not specific to the failure path: descendants outlive a
+    /// *successful* run too, since a normal wait sweeps nothing either.
+    /// Closing it means running each agent in its own process group and
+    /// signalling the group, which is a decision about what a finished run
+    /// guarantees rather than a detail of this guard — see the agent-run
+    /// lifecycle work.
     struct ChildGuard(Option<Child>);
 
     impl ChildGuard {

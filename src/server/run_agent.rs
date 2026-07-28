@@ -264,8 +264,11 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     .await;
     let capture = match captured {
         Ok(Ok(capture)) => capture,
-        // The run did not reach a terminal status we can describe, so there is
-        // no truthful outcome to record: fabricating one would consume the run
+        // The agent itself is already killed and reaped by the runner's guard;
+        // any process it forked is not, here or on the success path (see
+        // `ChildGuard`). The run did not reach a terminal status we can
+        // describe, so there is no truthful outcome to record: fabricating one
+        // would consume the run
         // id's only outcome slot with a lie. Leave the request row unpaired,
         // which is what an unfinished run looks like. Note that the generic
         // boot scan does *not* range over `agent_run` (an unpaired row there
