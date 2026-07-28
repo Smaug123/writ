@@ -200,11 +200,12 @@ impl UiHttpConfig {
 /// the runtime-secret material that consumers need to talk to the
 /// daemon.
 pub fn default_ui_http_bearer_path() -> PathBuf {
-    xdg_dir_or_home(
-        "XDG_RUNTIME_DIR",
-        "writ/ui-bearer",
-        ".local/run/writ/ui-bearer",
-    )
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        PathBuf::from(dir).join("writ/ui-bearer")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/run/writ/ui-bearer")
+    }
 }
 
 /// Configuration for the `RunAgent` dispatch path. Absent from
@@ -358,7 +359,12 @@ pub enum RunAgentBootError {
 /// against writd's `config` module, so the convention is duplicated.
 /// If you move the path, move it on both sides at once.
 pub fn default_notes_repo_path() -> PathBuf {
-    xdg_dir_or_home("XDG_DATA_HOME", "writ/repo", ".local/share/writ/repo")
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("writ/repo")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/share/writ/repo")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -822,6 +828,11 @@ pub enum AgentVmDaemonConfigError {
     LifecycleRuntime(#[from] AgentVmLifecycleRuntimeConfigError),
     #[error(transparent)]
     Runtime(#[from] AgentVmDaemonRuntimeConfigError),
+    /// The top-level `agent_run_log_root` is not an `agent_vm` key, but
+    /// [`AgentVmDaemonConfig::to_runtime_config`] prepares it, so its faults
+    /// have to be expressible in that method's report.
+    #[error(transparent)]
+    AgentRunLogRoot(#[from] AgentRunLogRootError),
     #[error("agent VM config field {field} has invalid CIDR {value:?}: {message}")]
     InvalidCidr {
         field: &'static str,
@@ -834,14 +845,29 @@ impl AgentVmDaemonConfig {
     /// Validate both subsections and build the runtime config.
     ///
     /// Equivalent to [`Self::check`] followed by
-    /// [`AgentVmDaemonPlan::materialize`]; a caller that also validates
-    /// *sibling* config sections should use those two directly, so that this
-    /// section creates nothing until those siblings have been checked too.
+    /// [`AgentVmDaemonPlan::materialize`], **plus** preparing
+    /// `agent_run_log_root`; a caller that also validates *sibling* config
+    /// sections should use those directly (as [`check_daemon_sections`] does),
+    /// so that this section creates nothing until those siblings have been
+    /// checked too.
+    ///
+    /// The log root is prepared here because a runtime config handed back from
+    /// this method is meant to be usable, and `AgentRunLogRoot` proves only
+    /// that the *path* is well-formed. Before the root moved to the top level
+    /// it was one of `vm_http`'s own, so `materialize` created it; dropping
+    /// that would leave a caller with a config whose first outcome upload
+    /// fails on a directory that was never there. It accumulates alongside the
+    /// section's own faults rather than gating them, for the same reason the
+    /// two effects are independent in `check_daemon_sections`.
     pub fn to_runtime_config(
         &self,
         agent_run_log_root: AgentRunLogRoot,
     ) -> Result<AgentVmDaemonRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
-        self.check()?.materialize(agent_run_log_root)
+        let mut errors = Accumulator::new();
+        let plan = errors.record_many(self.check());
+        let prepared = errors.record_from(agent_run_log_root.prepare());
+        let (plan, ()) = errors.unpack(all_recorded!(plan, prepared))?;
+        plan.materialize(agent_run_log_root)
     }
 
     /// Run every check that touches nothing across both subsections, and
@@ -1744,11 +1770,18 @@ fn default_nix_cache_max_nar_bytes() -> ByteSize {
 /// alongside `agent-vm-sessions`, falling back to `~/.local/state/writ/` when
 /// XDG is unset — matching [`default_agent_vm_state_dir`].
 pub fn default_vm_http_work_root() -> PathBuf {
-    xdg_dir_or_home(
-        "XDG_STATE_HOME",
-        "writ/vm-work",
-        ".local/state/writ/vm-work",
-    )
+    // Treat an empty `XDG_STATE_HOME` as unset (matches
+    // `default_agent_vm_state_dir`). Without this filter, an environment that
+    // exports `XDG_STATE_HOME=` would yield the relative path `writ/vm-work`
+    // and the absolute-path check downstream would refuse the daemon config —
+    // even though the `HOME` fallback would have worked.
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|dir| !dir.as_os_str().is_empty())
+    {
+        PathBuf::from(dir).join("writ/vm-work")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/state/writ/vm-work")
+    }
 }
 
 fn parse_ipv4_cidr_config(
@@ -1818,10 +1851,16 @@ fn default_secret_store_config() -> SecretStoreConfig {
 /// `var_os` cannot distinguish `XDG_DATA_HOME=` from a real setting, and an
 /// exported-but-empty XDG variable is a real thing to find in a container or a
 /// stripped-down CI environment. Joining onto it yields a *relative* path,
-/// which for a value that is later required to be absolute means the daemon
-/// refuses to start — with a message about a path the operator never wrote.
-/// Every default below routes through here so that mistake has one home rather
-/// than one per default.
+/// which for a value later required to be absolute means the daemon refuses to
+/// start — over a path the operator never wrote.
+///
+/// Used only by [`default_agent_run_log_root`], deliberately. The neighbouring
+/// defaults have the same hole, but several of them name **durable** state:
+/// normalising where `default_audit_db_path` resolves would move an existing
+/// audit DB out from under the migration guard (which resolves the same way)
+/// and silently start a fresh history. Changing those is a migration, not a
+/// tidy-up — see the follow-up. The log-root default is new here and has no
+/// prior installation to strand.
 fn xdg_dir_or_home(xdg_var: &str, xdg_suffix: &str, home_suffix: &str) -> PathBuf {
     resolve_base_dir(
         std::env::var_os(xdg_var),
@@ -1854,16 +1893,22 @@ fn resolve_base_dir(
 /// Default base directory for the file secret store. Matches the
 /// `$XDG_DATA_HOME/writ/` location called out in `docs/design/broker.md`.
 pub fn default_secret_store_path() -> PathBuf {
-    xdg_dir_or_home("XDG_DATA_HOME", "writ/secrets", ".local/share/writ/secrets")
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("writ/secrets")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/share/writ/secrets")
+    }
 }
 
 /// Default location for the daemon config file.
 pub fn default_config_path() -> PathBuf {
-    xdg_dir_or_home(
-        "XDG_CONFIG_HOME",
-        "writ/config.json",
-        ".config/writ/config.json",
-    )
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(dir).join("writ/config.json")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".config/writ/config.json")
+    }
 }
 
 /// Default location for the SQLite audit database. The DB lives in a dedicated
@@ -1885,11 +1930,12 @@ pub fn default_agent_run_log_root() -> PathBuf {
 }
 
 pub fn default_audit_db_path() -> PathBuf {
-    xdg_dir_or_home(
-        "XDG_DATA_HOME",
-        "writ/audit/audit.db",
-        ".local/share/writ/audit/audit.db",
-    )
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("writ/audit/audit.db")
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+        PathBuf::from(home).join(".local/share/writ/audit/audit.db")
+    }
 }
 
 #[cfg(test)]

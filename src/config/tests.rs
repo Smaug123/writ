@@ -970,8 +970,8 @@ fn the_default_agent_run_log_root_is_absolute_and_writ_owned() {
     assert!(root.ends_with("writ/agent-runs"), "{root:?}");
 }
 
-/// Every default path in this module resolves through `xdg_dir_or_home`, and
-/// the property that matters is that the result is **absolute for every
+/// `default_agent_run_log_root` resolves through `xdg_dir_or_home`, and the
+/// property that matters is that the result is **absolute for every
 /// environment**: a relative default reaches a caller that requires an
 /// absolute path and refuses the daemon over a path the operator never wrote.
 ///
@@ -1051,6 +1051,41 @@ fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
     assert_eq!(checked.agent_run_log_root.as_path(), root);
     assert!(root.is_dir(), "the root must exist after checking");
     assert!(checked.agent_vm.is_none());
+}
+
+/// `to_runtime_config` hands back a config that is meant to be *usable*, and
+/// `AgentRunLogRoot` only proves the path is well-formed. Before the hoist the
+/// log root was one of `vm_http`'s own and `materialize` created it, so a
+/// caller of this method got that for free; it must still.
+#[test]
+fn the_direct_runtime_conversion_prepares_and_rejects_a_bad_log_root() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let usable = temp.path().join("usable");
+    let config = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http: valid_agent_vm_http_config(),
+    };
+    config
+        .to_runtime_config(AgentRunLogRoot::check(usable.clone()).unwrap())
+        .expect("a usable log root must be accepted");
+    assert!(usable.is_dir(), "the log root was not created");
+
+    // Absolute, so `check` passes; a regular file, so only preparation can
+    // catch it.
+    let unusable = temp.path().join("log-root-is-a-file");
+    std::fs::write(&unusable, b"file").unwrap();
+    let config = AgentVmDaemonConfig {
+        lifecycle: valid_agent_vm_lifecycle_config(),
+        vm_http: valid_agent_vm_http_config(),
+    };
+    assert!(matches!(
+        sole_error(config.to_runtime_config(AgentRunLogRoot::check(unusable.clone()).unwrap())),
+        AgentVmDaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Create {
+            path,
+            ..
+        }) if path == unusable
+    ));
 }
 
 /// The log root holds agent output that `agent_run_outcome` rows point at, so

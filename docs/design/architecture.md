@@ -332,7 +332,12 @@ as a type so that a raw relative path cannot reach
 steps order-independent: a log root named beneath a not-yet-existing
 `vm_http.work_root` creates that parent at 0700, which is exactly what
 `ensure_vm_http_work_root_private` demands, and it matches what the runtime
-(`writ_agent_run`'s `ensure_private_dir`) enforces before every run. Today the VM arm is its only writer (per-run
+(`writ_agent_run`'s `ensure_private_dir`) enforces before every run. Its
+default is the one path here that treats an exported-but-empty `XDG_DATA_HOME`
+as unset (`xdg_dir_or_home`); the neighbouring defaults have the same hole but
+name durable state, so normalising them is a migration — moving where
+`default_audit_db_path` resolves moves `legacy_default_audit_db_path` with it
+and the migration guard would stop finding the old DB. Today the VM arm is its only writer (per-run
 `<root>/<run-id>/stdout.log` and `stderr.log`, pointed at by
 `agent_run_outcome` rows); the host-spawn arm keeps its child's output in
 memory and records no audit rows at all — closing that gap is what the key is
