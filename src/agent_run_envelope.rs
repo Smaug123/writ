@@ -1,0 +1,390 @@
+//! Build the signed-run envelope for a finished `RunAgent` from its
+//! `agent_run_outcome` row plus the request-side facts.
+//!
+//! [`materialize_signed_run_envelope`] is pure-with-IO: it reads the recorded
+//! stream files off disk, re-caps them, and signs the canonical metadata. No
+//! network, no audit writes, no notes repo.
+//!
+//! **Both `RunAgent` arms come through here**, which is the point: the
+//! envelope a verifier receives must mean the same thing whether the agent
+//! ran on the host or inside a guest VM. Its inputs are the audit row and the
+//! files that row names — never an in-memory capture — so the signed bytes
+//! describe what actually survived the run, and the two arms cannot drift
+//! into signing subtly different things. `crate::server`'s `run_agent`
+//! dispatch wires it between the outcome row and the notes-repo write step.
+//!
+//! Reading the files back opens a window in which they can change, so the
+//! whole of each file is hashed and checked against the row before any of it
+//! is signed — see `check_matches_summary`.
+
+use std::path::PathBuf;
+
+use crate::core::SessionId;
+
+/// Errors returned by [`materialize_signed_run_envelope`].
+///
+/// `StreamRead` carries the failing stream and on-disk path verbatim
+/// so the operator-facing message names the file whoever ran the agent
+/// wrote (the most likely cause of a read failure is a filesystem that
+/// ran out, in which case the path identifies the culprit directory).
+/// `Sign` propagates the signing-key failure from
+/// [`crate::signing::WritSigningKey::sign`].
+#[derive(Debug, thiserror::Error)]
+pub enum MaterializeRunEnvelopeError {
+    #[error("read {stream} log file {}: {source}", path.display())]
+    StreamRead {
+        stream: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "{stream} log file {} no longer matches the outcome row describing it \
+         (row: {recorded_byte_len} bytes, {recorded_sha256}; file: {found_byte_len} bytes, {found_sha256})",
+        path.display()
+    )]
+    StreamChanged {
+        stream: &'static str,
+        path: PathBuf,
+        recorded_byte_len: u64,
+        recorded_sha256: String,
+        found_byte_len: u64,
+        found_sha256: String,
+    },
+    #[error(
+        "{stream} log file {} is not a regular file; refusing to read it",
+        path.display()
+    )]
+    StreamNotRegularFile { stream: &'static str, path: PathBuf },
+    #[error("sign canonical metadata: {0}")]
+    Sign(#[source] crate::signing::WritSigningKeyError),
+}
+
+/// A materialised signed-run envelope plus its canonical bytes.
+///
+/// The envelope is what `ServerMessage::RunAgentCompleted` will return
+/// (the dispatch arm pulls `metadata` and `signature` off it); the
+/// bytes are what the notes-repo write step hands to
+/// `notes_repo.write_note`. Returning both avoids re-serialising the
+/// envelope a second time on the hot path.
+#[derive(Debug)]
+pub struct MaterializedRunEnvelope {
+    pub envelope: crate::run_envelope::SignedRunEnvelope,
+    pub envelope_bytes: Vec<u8>,
+}
+
+/// Build the signed-run envelope for a finished `RunAgent` from its
+/// outcome row plus the request-side facts (session id, prompt hash,
+/// capabilities, signing key).
+///
+/// The metadata's `run_id`, `exit_code`, and `completed_at` come from
+/// the outcome row — whoever ran the agent is the source of truth for
+/// "what happened", and the row is what they recorded. `session_id` is
+/// the session the run is *audited* under: the VM-minted one on the VM
+/// arm (opened by `start_agent_run_session`), the caller's on the
+/// host-spawn arm. Either way it is the session the `agent_run` row's
+/// foreign key points at, which is what a verifier should follow.
+///
+/// Streams are read off the on-disk paths the outcome row points at and
+/// re-capped at `MAX_RUN_AGENT_STREAM_BYTES` (4 MiB), which bounds this
+/// call's memory footprint whatever is on disk. In practice neither arm
+/// reaches that cap on the read: the host arm captures at the same 4 MiB, so
+/// the file *is* what the envelope carries, and the VM arm's file is what the
+/// broker wrote from the guest's upload, bounded by the outcome route's 4-MiB
+/// body limit (and usually far below it, by the guest's own 1-MiB capture
+/// cap). The re-cap stays because neither of those bounds is this module's to
+/// enforce. What tells a verifier prefix-from-whole is the `_truncated_at`
+/// marker on `OutputEnvelope`, which reflects the *capture's* truncation as
+/// well as this read's.
+///
+/// This helper is pure-with-IO: no network, no audit writes, no notes
+/// repo. Each dispatch arm wires it between the outcome row and the
+/// notes-repo write step.
+pub async fn materialize_signed_run_envelope(
+    outcome: &crate::audit::AgentRunOutcomeAuditRecord,
+    session_id: SessionId,
+    prompt_sha256: crate::core::Sha256Hex,
+    capabilities: Vec<crate::core::CapabilitySet>,
+    signing_key: &crate::signing::WritSigningKey,
+) -> Result<MaterializedRunEnvelope, MaterializeRunEnvelopeError> {
+    use crate::protocol::SignedRunMetadata;
+    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+
+    let (stdout_bytes, stdout_host_truncated_at) = read_stream_capped_from_disk(
+        "stdout",
+        &outcome.outcome.stdout,
+        crate::server::MAX_RUN_AGENT_STREAM_BYTES,
+    )
+    .await?;
+    let (stderr_bytes, stderr_host_truncated_at) = read_stream_capped_from_disk(
+        "stderr",
+        &outcome.outcome.stderr,
+        crate::server::MAX_RUN_AGENT_STREAM_BYTES,
+    )
+    .await?;
+    // Two truncation layers stack: the *capture* cap decided what landed on
+    // disk in the first place (1 MiB per stream by default inside a guest,
+    // per `DEFAULT_AGENT_RUN_STREAM_CAPTURE_BYTES`; 4 MiB on the host arm),
+    // and the envelope cap (`MAX_RUN_AGENT_STREAM_BYTES`, 4 MiB) re-bounds
+    // what we read back off disk. The file is at most the retained prefix, so
+    // whenever the capture already truncated, the file *is* that prefix and
+    // the read-back cap does not fire — `host_truncated_at` is `None` even
+    // though the stream was longer. Without consulting
+    // `outcome.outcome.<stream>.truncated` the envelope would then be signed
+    // as if the prefix were the whole stream and a verifier would see no
+    // marker: certain on the host arm (where the two caps are equal, so the
+    // read-back cap *never* fires) and common on the VM arm. Fall back to the
+    // recorded flag when the read-back cap didn't trigger; `byte_len` is the
+    // retained prefix length when truncated, which is the correct cap point.
+    let stdout_truncated_at = stdout_host_truncated_at.or(outcome
+        .outcome
+        .stdout
+        .truncated
+        .then_some(outcome.outcome.stdout.byte_len));
+    let stderr_truncated_at = stderr_host_truncated_at.or(outcome
+        .outcome
+        .stderr
+        .truncated
+        .then_some(outcome.outcome.stderr.byte_len));
+
+    let output_envelope = OutputEnvelope {
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        stdout_truncated_at,
+        stderr_truncated_at,
+    };
+    let output_envelope_bytes = output_envelope.to_bytes();
+    let output_envelope_sha256_str = crate::agent_run::sha256_hex(&output_envelope_bytes);
+    let output_envelope_sha256 = crate::core::Sha256Hex::try_new(output_envelope_sha256_str)
+        .expect("sha256_hex returns canonical 64-lowercase-hex output");
+
+    let metadata = SignedRunMetadata {
+        run_id: outcome.outcome.run_id,
+        session_id,
+        prompt_sha256,
+        output_envelope_sha256,
+        capabilities,
+        exit_code: outcome.outcome.exit_code,
+        completed_at: outcome.completed_at,
+        signing_key_fingerprint: signing_key.fingerprint(),
+    };
+    let canonical = metadata.canonical_bytes();
+    let signature = signing_key
+        .sign(&canonical)
+        .map_err(MaterializeRunEnvelopeError::Sign)?;
+
+    let envelope = SignedRunEnvelope {
+        metadata,
+        signature,
+        output: output_envelope_bytes,
+    };
+    let envelope_bytes = envelope.to_bytes();
+    Ok(MaterializedRunEnvelope {
+        envelope,
+        envelope_bytes,
+    })
+}
+
+enum OpenRegularFileError {
+    Io(std::io::Error),
+    NotRegular,
+}
+
+/// Open a stream file for re-reading, refusing anything that is not a plain
+/// file sitting exactly where the row said.
+///
+/// The row records a path, and a path is not a file: between the write and
+/// this read, whatever is at that path can be replaced. A host-spawned agent
+/// runs as writd's own user — that arm has no sandbox, which is what the VM
+/// arm exists to provide — so it can find its run directory, unlink
+/// `stdout.log`, and leave a FIFO in its place. Then the *open* blocks until
+/// someone writes, and a read blocks with no EOF and no bytes, so neither the
+/// length bound nor the digest check ever gets a chance to fire: the run hangs,
+/// holding its blocking-pool thread, and the workflow waiting on it hangs too.
+///
+/// `O_NONBLOCK` so the open cannot wait on a writer, `O_NOFOLLOW` so a symlink
+/// at the final component cannot redirect the read elsewhere, and then the
+/// decisive check: `fstat` the descriptor we actually opened and require a
+/// regular file. Checking the *descriptor* rather than the path is what makes
+/// it a check rather than a race. Both flags are inert on the regular file
+/// this is supposed to be.
+///
+/// This does not make a same-uid agent harmless — one that wanted to could
+/// read the secret store directly. It makes the failure a refusal naming the
+/// file instead of a hang.
+async fn open_regular_file(
+    path: &std::path::Path,
+) -> Result<tokio::fs::File, OpenRegularFileError> {
+    // `custom_flags` here is tokio's own inherent method, not the std
+    // extension trait.
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .await
+        .map_err(OpenRegularFileError::Io)?;
+    let metadata = file.metadata().await.map_err(OpenRegularFileError::Io)?;
+    if !metadata.is_file() {
+        return Err(OpenRegularFileError::NotRegular);
+    }
+    Ok(file)
+}
+
+/// One stream file, read back for the envelope.
+///
+/// `retained` is what gets signed; the `file_*` pair describes the whole file
+/// and is what the outcome row is checked against. They differ exactly when
+/// the file ran past the read cap — and the row describes the file, so the
+/// check has to be against the file, not against the prefix.
+struct StreamReadback {
+    /// The bytes the envelope will carry: the file, or its first `cap` bytes.
+    retained: Vec<u8>,
+    /// `Some(cap)` iff the file ran past the cap, so `retained` is a prefix.
+    capped_at: Option<u64>,
+    /// Length of the whole file, capped or not.
+    file_byte_len: u64,
+    /// SHA-256 of the whole file, directly comparable with the outcome row's
+    /// `sha256_hex` (which also describes the file).
+    file_sha256_hex: String,
+}
+
+async fn read_stream_capped_from_disk(
+    stream: &'static str,
+    summary: &crate::agent_run::AgentRunStreamSummary,
+    cap: usize,
+) -> Result<(Vec<u8>, Option<u64>), MaterializeRunEnvelopeError> {
+    let path = summary.path.as_path();
+    let read_error = |source| MaterializeRunEnvelopeError::StreamRead {
+        stream,
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = open_regular_file(path).await.map_err(|err| match err {
+        OpenRegularFileError::Io(source) => read_error(source),
+        OpenRegularFileError::NotRegular => MaterializeRunEnvelopeError::StreamNotRegularFile {
+            stream,
+            path: path.to_path_buf(),
+        },
+    })?;
+    let readback = read_capped_and_hashed(file, cap, summary.byte_len)
+        .await
+        .map_err(read_error)?;
+    check_matches_summary(stream, summary, &readback)?;
+    Ok((readback.retained, readback.capped_at))
+}
+
+/// Read `reader`, retaining at most `cap` bytes and hashing every byte that
+/// goes past, and stopping once more than `expected_byte_len` have arrived.
+///
+/// Reading past `cap` is not optional: it is the only way to know whether the
+/// stream ran over at all. Since those bytes are read regardless, the
+/// whole-file digest costs hashing and no extra IO — which is what lets the
+/// outcome-row check stay total instead of weakening above the cap. Memory
+/// stays bounded at `cap` either way: past it, bytes are hashed and dropped.
+///
+/// `expected_byte_len` is what the outcome row says the file is, and it bounds
+/// the read in *time* the way `cap` bounds it in memory. A file that keeps
+/// growing has no EOF — a host-spawned agent can leave a detached helper
+/// appending to its own stream file — and draining to EOF would let that agent
+/// decide how long writ reads and hashes for it, pinning the run's
+/// blocking-pool thread. One byte past the recorded length is all the evidence
+/// a mismatch needs, and a mismatch is refused, so there is nothing further to
+/// learn by reading on.
+///
+/// The cap is byte-aligned to whatever the underlying read returned; a single
+/// read is not bisected across the boundary.
+async fn read_capped_and_hashed<R>(
+    mut reader: R,
+    cap: usize,
+    expected_byte_len: u64,
+) -> std::io::Result<StreamReadback>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut retained: Vec<u8> = Vec::new();
+    let mut tmp = vec![0u8; 16 * 1024];
+    let mut capped_at: Option<u64> = None;
+    let mut file_byte_len: u64 = 0;
+    let mut digest = crate::agent_run::Sha256Stream::new();
+    loop {
+        let n = reader.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(StreamReadback {
+                retained,
+                capped_at,
+                file_byte_len,
+                file_sha256_hex: digest.finish_hex(),
+            });
+        }
+        let chunk = &tmp[..n];
+        digest.update(chunk);
+        file_byte_len = file_byte_len.saturating_add(n as u64);
+        let room = cap.saturating_sub(retained.len());
+        let outgrew_its_row = file_byte_len > expected_byte_len;
+        if room == 0 {
+            // Already filled exactly to the cap; more bytes prove it overran.
+            capped_at = Some(cap as u64);
+        } else if n <= room {
+            retained.extend_from_slice(chunk);
+        } else {
+            retained.extend_from_slice(&chunk[..room]);
+            capped_at = Some(cap as u64);
+        }
+        if outgrew_its_row {
+            // The file is already longer than the row claims, so the check
+            // refuses whatever else is in it. Returning a digest of a prefix is
+            // safe precisely because it cannot be mistaken for a match: the
+            // length disagrees on its own.
+            return Ok(StreamReadback {
+                retained,
+                capped_at,
+                file_byte_len,
+                file_sha256_hex: digest.finish_hex(),
+            });
+        }
+    }
+}
+
+/// Refuse to sign bytes the outcome row contradicts.
+///
+/// The row committed a length and a hash of the bytes *writ itself held* when
+/// it wrote this file — computed by the host arm's capture, or re-derived by
+/// the broker from the guest's upload before writing (the guest's own claim is
+/// checked against the bytes at that point, so neither arm's recorded hash is
+/// an unverified assertion). Between then and now, anything running as the
+/// daemon's user can rewrite the file, including a detached helper left behind
+/// by the very agent whose output this is. Signing whatever is on disk would
+/// hand out a valid signature over bytes the audit log contradicts, and both
+/// would look authoritative to whoever read them next.
+///
+/// So: verify, and fail rather than vouch. The truthful row stays; only the
+/// envelope is withheld.
+///
+/// The check is **total** — length and hash, whether or not the file ran past
+/// the read cap. Both sides describe the same thing: the row's `byte_len` and
+/// `sha256_hex` are of the file, and [`StreamReadback`]'s `file_*` pair is of
+/// the file as found. Comparing the row against the *retained prefix* instead
+/// would let a tamperer who keeps the length above the cap buy a signature
+/// over bytes the row contradicts.
+fn check_matches_summary(
+    stream: &'static str,
+    summary: &crate::agent_run::AgentRunStreamSummary,
+    readback: &StreamReadback,
+) -> Result<(), MaterializeRunEnvelopeError> {
+    if readback.file_byte_len == summary.byte_len && readback.file_sha256_hex == summary.sha256_hex
+    {
+        return Ok(());
+    }
+    Err(MaterializeRunEnvelopeError::StreamChanged {
+        stream,
+        path: summary.path.clone(),
+        recorded_byte_len: summary.byte_len,
+        recorded_sha256: summary.sha256_hex.clone(),
+        found_byte_len: readback.file_byte_len,
+        found_sha256: readback.file_sha256_hex.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests;

@@ -231,10 +231,10 @@ async fn run_host_daemon(
     )
     .map_err(|errors| errors.to_string())?;
     let agent_vm = checked.agent_vm;
-    // The VM `RunAgent` arm writes per-run stdout/stderr here, and the
-    // absolute paths land on `agent_run_outcome` rows — so the operator needs
-    // to know which directory this boot resolved, whether they configured it
-    // or took the default.
+    // Both `RunAgent` arms write per-run stdout/stderr here, and the absolute
+    // paths land on `agent_run_outcome` rows — so the operator needs to know
+    // which directory this boot resolved, whether they configured it or took
+    // the default.
     tracing::info!(
         agent_run_log_root = %checked.agent_run_log_root.as_path().display(),
         "agent run logs directory",
@@ -381,7 +381,7 @@ async fn run_host_daemon(
     let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
         Some(cfg) => {
             let boot = cfg
-                .materialize(&*store)
+                .materialize(&*store, checked.agent_run_log_root.clone())
                 .map_err(|e| format!("cannot materialize RunAgent state from config: {e}"))?;
             let fingerprint = boot.signing.signing_key().fingerprint();
             if boot.signing.was_generated() {

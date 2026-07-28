@@ -1065,6 +1065,9 @@ mod end_to_end_tests {
             run_agent_spawn: Some(RunAgentSpawnConfig {
                 command: cat,
                 args: Vec::new(),
+                agent_kind: crate::core::AgentKind::Claude,
+                log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
+                    .unwrap(),
             }),
             promote_runtime: None,
             git_data_http: std::sync::OnceLock::new(),
@@ -1095,6 +1098,13 @@ mod end_to_end_tests {
         let prompt_text = "noop\n";
         let output_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
         let client = WritClient::new(&socket_path);
+        // The host-spawn arm records the run against the caller's session, so
+        // the client opens one first — the same thing bailiff's stage runner
+        // does before every host-spawn stage.
+        let session_id = client
+            .open_session(None, Some(AgentKind::Claude), None)
+            .await
+            .expect("open session");
         let completed = tokio::time::timeout(
             Duration::from_secs(15),
             client.run_agent(RunAgentRequest {
@@ -1107,7 +1117,7 @@ mod end_to_end_tests {
                 }],
                 purpose: "round-trip-test".into(),
                 output_ref: output_ref.clone(),
-                session_id: None,
+                session_id: Some(session_id),
                 workspace: None,
                 agent_kind: None,
                 agent_model: None,
@@ -1231,6 +1241,9 @@ mod end_to_end_tests {
             run_agent_spawn: Some(RunAgentSpawnConfig {
                 command: cat,
                 args: Vec::new(),
+                agent_kind: crate::core::AgentKind::Claude,
+                log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
+                    .unwrap(),
             }),
             promote_runtime: None,
             git_data_http: std::sync::OnceLock::new(),
@@ -1257,6 +1270,10 @@ mod end_to_end_tests {
         let prompt = AgentPrompt::new(&big);
         let output_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
         let client = WritClient::new(&socket_path);
+        let session_id = client
+            .open_session(None, Some(AgentKind::Claude), None)
+            .await
+            .expect("open session");
         let completed = tokio::time::timeout(
             Duration::from_secs(30),
             client.run_agent(RunAgentRequest {
@@ -1269,7 +1286,7 @@ mod end_to_end_tests {
                 }],
                 purpose: "large-prompt".into(),
                 output_ref,
-                session_id: None,
+                session_id: Some(session_id),
                 workspace: None,
                 agent_kind: None,
                 agent_model: None,

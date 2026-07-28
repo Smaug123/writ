@@ -7,6 +7,8 @@
 
 pub use writ_agent_run as agent_run;
 #[cfg(feature = "host")]
+pub mod agent_run_envelope;
+#[cfg(feature = "host")]
 pub mod agent_vm_daemon;
 #[cfg(feature = "host")]
 pub mod agent_vm_firewall;

@@ -1,14 +1,18 @@
-//! Run-agent orchestration: the `RunAgent` request handler and its
-//! VM-dispatch path.
+//! Run-agent orchestration: the `RunAgent` request handler and its two
+//! dispatch arms.
 //!
-//! [`run_agent`] is dispatched from [`super::dispatch_message_with_agent_vm`];
-//! it spawns the configured child (or opens a per-run agent VM), captures
-//! output through [`super::capture_stream_capped`], signs the resulting
-//! envelope, and stores it in writ's own bare repo. Transport and the
-//! staged-push subsystem live in the parent [`super`] module. Tests drive
-//! this through `dispatch_message` rather than calling in directly.
-//! Extracted from `server.rs` to keep the dispatcher readable; behaviour is
-//! unchanged.
+//! [`run_agent`] is dispatched from [`super::dispatch_message_with_agent_vm`].
+//! It either spawns the configured child here on the host (via
+//! [`crate::agent_run::run_agent_process`]) or opens a per-run agent VM and
+//! waits for the guest's outcome. The arms differ in *who runs the agent* and
+//! *who owns the audit session*, and in nothing else: both record an
+//! `(agent_run, agent_run_outcome)` pair, and both finish through
+//! [`sign_and_store_run`], so the signed note a verifier fetches means the
+//! same thing either way.
+//!
+//! Transport and the staged-push subsystem live in the parent [`super`]
+//! module. Tests drive this through `dispatch_message` rather than calling in
+//! directly.
 
 use super::*;
 
@@ -39,10 +43,13 @@ fn run_agent_not_configured(component: &str) -> ServerMessage {
 
 /// Handle a [`ClientMessage::RunAgent`] request end-to-end.
 ///
-/// Spawn the configured child with the prompt on stdin, capture stdout
-/// to completion, sign the resulting [`SignedRunMetadata`], wrap
-/// everything in a [`SignedRunEnvelope`], and store the envelope in
-/// writ's own bare repo under `output_ref` keyed on the fresh run id.
+/// Record the run in the audit log, spawn the configured child with the
+/// prompt on stdin, capture both streams to files under the configured
+/// log root, record the outcome, sign the resulting
+/// [`SignedRunMetadata`](crate::protocol::SignedRunMetadata), wrap
+/// everything in a [`SignedRunEnvelope`](crate::run_envelope::SignedRunEnvelope),
+/// and store the envelope in writ's own bare repo under `output_ref`
+/// keyed on the run id.
 /// The on-the-wire `output_ref` is a ref name inside writ's repo
 /// (bailiff fetches `refs/notes/writ/v1/*` over Git remote, per the
 /// cross-daemon ownership decision pinned in
@@ -52,8 +59,13 @@ fn run_agent_not_configured(component: &str) -> ServerMessage {
 /// `capabilities` is recorded verbatim into the signed metadata so a
 /// verifier sees the full set the run was authorised under.
 /// Capability-set policy enforcement (refusing to spawn if a granted
-/// variant is denied by `policy::*`) is deferred to a follow-up slice
-/// alongside the audit row — see the plan doc.
+/// variant is denied by `policy::*`) is deferred to a follow-up slice —
+/// see the plan doc.
+///
+/// `purpose` is still not recorded: the `agent_run` table has no column
+/// for it and `correlation_id` cannot stand in (its charset rejects
+/// bailiff's `review:plan-abc`), so recording it needs a schema
+/// migration of its own.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     state: &Arc<BrokerState<S>>,
@@ -67,9 +79,9 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     agent_model: Option<String>,
     agent_vm: Option<&Arc<crate::agent_vm_daemon::AgentVmDaemon>>,
 ) -> ServerMessage {
-    // `purpose` is part of the wire contract and will land on the
-    // audit row in the follow-up slice. Holding the name in scope (not
-    // discarding via `_`) keeps the future plumbing self-evident.
+    // `purpose` is part of the wire contract and lands on the audit row once
+    // the column exists. Holding the name in scope (not discarding via `_`)
+    // keeps the pending plumbing self-evident.
     let _purpose = purpose;
 
     // VM1 invariant: a `WorkspaceWrite` capability is only meaningful
@@ -117,200 +129,239 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         return run_agent_not_configured("run_agent_spawn");
     };
 
-    // Bind the run to the caller's audit session when supplied: the
-    // signed metadata stamps the same id, so a verifier can correlate
-    // the envelope back to a session row. Reject unknown / already-
-    // closed sessions before we spawn — running an agent against a
-    // session that doesn't exist (or has ended) would silently produce
-    // a signed envelope claiming an unreachable session.
-    let resolved_session_id = match request_session_id {
-        Some(claimed) => match state.audit.get_session(claimed) {
-            Ok(Some(session)) if session.closed_at.is_none() => claimed,
-            Ok(Some(_)) => {
-                return ServerMessage::ClosedSession {
-                    session_id: claimed,
-                };
-            }
-            Ok(None) => {
-                return ServerMessage::UnknownSession {
-                    session_id: claimed,
-                };
-            }
-            Err(err) => {
-                return ServerMessage::Error {
-                    message: format!("RunAgent: read session {claimed}: {err}"),
-                };
-            }
-        },
-        None => SessionId::new(),
+    // The host-spawn arm requires an open audit session, because the run it
+    // is about to perform must be recorded and an `agent_run` row's
+    // `session_id` is a foreign key onto `session`. It used to accept `None`
+    // and mint a `SessionId` that was never opened, stamping it into the
+    // signed envelope — an envelope claiming a session no verifier could
+    // resolve. Reject unknown / already-closed sessions before we spawn, for
+    // the same reason.
+    let Some(session_id) = request_session_id else {
+        return ServerMessage::Error {
+            message: "RunAgent: host-spawn dispatch requires session_id; \
+                      open a session first so the run can be recorded against it"
+                .into(),
+        };
     };
-
-    let mut command = tokio::process::Command::new(&spawn_config.command);
-    command
-        .args(&spawn_config.args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = match crate::process_spawn::spawn_async(&mut command).await {
-        Ok(c) => c,
+    let session = match state.audit.get_session(session_id) {
+        Ok(Some(session)) if session.closed_at.is_none() => session,
+        Ok(Some(_)) => return ServerMessage::ClosedSession { session_id },
+        Ok(None) => return ServerMessage::UnknownSession { session_id },
         Err(err) => {
             return ServerMessage::Error {
+                message: format!("RunAgent: read session {session_id}: {err}"),
+            };
+        }
+    };
+    // Agent identity for the row is the *configured* one: this arm spawns one
+    // binary, and the operator who chose it is the only party who knows what
+    // it is. The session's kind and the request's are both declarations by a
+    // caller that cannot see the daemon's configuration, so neither can stand
+    // in — taking the row's value from the session would let writd record
+    // "Codex ran" while spawning Claude, and bailiff's `--agent` defaults to
+    // claude whether or not that is what writd spawns.
+    //
+    // They must still *agree*, because the session's kind is not inert: it
+    // routes credential mints to a GitHub App. A session claiming an identity
+    // the daemon cannot run is a caller working from a false picture, so
+    // refuse it here rather than let it mint as one agent and run as another.
+    let Some(session_agent_kind) = session.agent_kind else {
+        return missing_agent_kind_for_registry_response();
+    };
+    let spawn_agent_kind = spawn_config.agent_kind;
+    if session_agent_kind != spawn_agent_kind {
+        return ServerMessage::Error {
+            message: format!(
+                "RunAgent: session {session_id} was opened for {session_agent_kind}, \
+                 but this daemon's host-spawn agent is {spawn_agent_kind}; \
+                 open the session with the agent writd is configured to run",
+            ),
+        };
+    }
+    if let Some(requested) = agent_kind
+        && requested != spawn_agent_kind
+    {
+        return ServerMessage::Error {
+            message: format!(
+                "RunAgent: agent_kind {requested} is not this daemon's host-spawn \
+                 agent ({spawn_agent_kind})",
+            ),
+        };
+    }
+
+    let run_id = AgentRunId::new();
+    let prompt_summary = prompt.summary();
+    let prompt_sha256 = Sha256Hex::try_new(prompt_summary.sha256_hex.clone())
+        .expect("AgentPrompt::summary hashes via sha256_hex");
+
+    // Two-phase, request row first: the row commits before the child starts,
+    // so a run interrupted by a crash is visible as an unpaired request rather
+    // than as nothing at all. The VM arm records its row at launch for the
+    // same reason. Every path below either `complete`s the guard with a
+    // truthful outcome or `abandon`s it.
+    let recorded = match state
+        .audit
+        .begin_effect::<crate::audit::AgentRunAuditTable>(&crate::audit::AgentRunAuditRecord {
+            run_id,
+            session_id,
+            requested_at: UnixMillis::now(),
+            agent_kind: spawn_agent_kind,
+            prompt: prompt_summary,
+            correlation_id: None,
+        }) {
+        Ok(recorded) => recorded,
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: record agent run: {err}"),
+            };
+        }
+    };
+
+    let plan = match crate::agent_run::AgentProcessPlan::new(
+        run_id,
+        spawn_config.command.clone(),
+        spawn_config.args.iter().map(std::ffi::OsString::from),
+    ) {
+        // The capture cap matches the envelope cap so the file on disk is
+        // exactly what the envelope carries — see
+        // `crate::agent_run_envelope`'s note on the two stacking caps.
+        Ok(plan) => plan.with_max_stream_capture_bytes(MAX_RUN_AGENT_STREAM_BYTES as u64),
+        Err(err) => {
+            recorded.abandon();
+            return ServerMessage::Error {
                 message: format!(
-                    "RunAgent: spawn {:?} failed: {err}",
+                    "RunAgent: agent command {}: {err}",
                     spawn_config.command.display()
                 ),
             };
         }
     };
 
-    // Feed the prompt to the child on a background task so the
-    // reader tasks below aren't deadlocked when the child reads more
-    // than the pipe buffer holds. Drop the writer half on EOF so the
-    // child sees stdin close.
-    let mut stdin = child
-        .stdin
-        .take()
-        .expect("child stdin was requested via Stdio::piped");
-    let prompt_bytes = prompt.as_bytes().to_vec();
-    let prompt_sha256_str = sha256_hex(&prompt_bytes);
-    let writer = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let res = stdin.write_all(&prompt_bytes).await;
-        // Explicit shutdown so the child sees EOF on stdin even if the
-        // tokio runtime decides to delay the drop.
-        let _ = stdin.shutdown().await;
-        res
-    });
-
-    // Read stdout and stderr concurrently on their own tasks: a child
-    // that fills either pipe buffer would otherwise block on write,
-    // and `child.wait()` would never return. Each reader caps its
-    // retained buffer at MAX_RUN_AGENT_STREAM_BYTES and drains past
-    // that — bounding writd's memory footprint per call.
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .expect("child stdout was requested via Stdio::piped");
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .expect("child stderr was requested via Stdio::piped");
-    let stdout_task = tokio::spawn(async move {
-        capture_stream_capped(stdout_pipe, MAX_RUN_AGENT_STREAM_BYTES).await
-    });
-    let stderr_task = tokio::spawn(async move {
-        capture_stream_capped(stderr_pipe, MAX_RUN_AGENT_STREAM_BYTES).await
-    });
-
-    let status = match child.wait().await {
-        Ok(s) => s,
-        Err(err) => {
-            // The reader/writer tasks are still alive; await them so
-            // the captured buffers don't outlive the borrow. Their
-            // results are uninteresting once wait failed.
-            let _ = writer.await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            return ServerMessage::Error {
-                message: format!("RunAgent: wait for child failed: {err}"),
-            };
-        }
-    };
-    // The writer task may have failed (broken pipe is normal when a
-    // child exits without reading the whole prompt — e.g. `head -c 0`).
-    // Drain it so the task doesn't leak; treat any error as informational.
-    let _ = writer.await;
-
-    let (stdout_bytes, stdout_truncated_at) = match stdout_task.await {
-        Ok(Ok(v)) => v,
+    // `run_agent_process` is blocking (it spawns, writes the prompt, and joins
+    // two capture threads), so it goes to the blocking pool rather than
+    // stalling this reactor thread for the length of an agent run.
+    //
+    // **What one in-flight host run costs**, since agent runs are long and
+    // this arm has no timeout of its own (`RUN_AGENT_VM_TIMEOUT` bounds only
+    // the VM arm): one thread from tokio's blocking pool — 512 by default,
+    // shared with every other `spawn_blocking` in the daemon, including the
+    // notes write below — plus the two OS threads the helper uses for the
+    // captures, plus the child, all for the run's full duration. So N
+    // concurrent host runs hold N of those 512 and 2N OS threads, and a hung
+    // agent holds its share until the daemon restarts.
+    //
+    // Nothing bounds N. That is not new — nothing bounded concurrent
+    // `RunAgent` calls on either arm before this either, and the previous
+    // async spawn held tokio tasks instead — but the resource is now a capped
+    // shared pool rather than the scheduler, so the ceiling is closer.
+    // Bounding it properly needs a concurrency policy for agent runs (a limit,
+    // a queue discipline, and a wire answer for "too many in flight") that
+    // covers both arms; tracked separately rather than guessed at here.
+    let log_root = spawn_config.log_root.as_path().to_path_buf();
+    let captured = tokio::task::spawn_blocking(move || {
+        crate::agent_run::run_agent_process(&plan, &prompt, &log_root)
+    })
+    .await;
+    let capture = match captured {
+        Ok(Ok(capture)) => capture,
+        // The agent itself is already killed and reaped by the runner's guard;
+        // any process it forked is not, here or on the success path (see
+        // `ChildGuard`). The run did not reach a terminal status we can
+        // describe, so there is no truthful outcome to record: fabricating one
+        // would consume the run
+        // id's only outcome slot with a lie. Leave the request row unpaired,
+        // which is what an unfinished run looks like. Note that the generic
+        // boot scan does *not* range over `agent_run` (an unpaired row there
+        // is indistinguishable from a run still in flight, so it would
+        // false-positive on every live run) — resolving these belongs to the
+        // agent-run lifecycle.
         Ok(Err(err)) => {
+            recorded.abandon();
             return ServerMessage::Error {
-                message: format!("RunAgent: read stdout: {err}"),
+                message: format!(
+                    "RunAgent: run agent {}: {err}",
+                    spawn_config.command.display()
+                ),
             };
         }
         Err(err) => {
+            recorded.abandon();
             return ServerMessage::Error {
-                message: format!("RunAgent: stdout reader task failed: {err}"),
-            };
-        }
-    };
-    let (stderr_bytes, stderr_truncated_at) = match stderr_task.await {
-        Ok(Ok(v)) => v,
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: format!("RunAgent: read stderr: {err}"),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("RunAgent: stderr reader task failed: {err}"),
+                message: format!("RunAgent: agent run task failed: {err}"),
             };
         }
     };
 
-    // Signal termination: surface as a typed negative so the audit
-    // row (when it lands) records "killed by signal" distinguishably
-    // from an explicit non-zero exit. -1 is the placeholder pending
-    // the audit-row slice that will refine this.
-    let exit_code = status.code().unwrap_or(-1);
-
-    let output_envelope = OutputEnvelope {
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
-        stdout_truncated_at,
-        stderr_truncated_at,
-    };
-    // The hash binds the canonical envelope bytes — not raw stdout —
-    // so a verifier that re-encodes the envelope from its parsed form
-    // can re-derive `output_envelope_sha256` deterministically.
-    let output_envelope_bytes = output_envelope.to_bytes();
-    let output_envelope_sha256_str = sha256_hex(&output_envelope_bytes);
-
-    let prompt_sha256 = Sha256Hex::try_new(prompt_sha256_str)
-        .expect("sha256_hex returns canonical 64-lowercase-hex output");
-    let output_envelope_sha256 = Sha256Hex::try_new(output_envelope_sha256_str)
-        .expect("sha256_hex returns canonical 64-lowercase-hex output");
-
-    let metadata = SignedRunMetadata {
-        run_id: AgentRunId::new(),
-        // Resolved above: caller-supplied id when bound to an audit
-        // session, freshly-minted otherwise. A verifier sees the same
-        // id the caller asked for, so an envelope's session_id can be
-        // cross-referenced with writ's audit log.
-        session_id: resolved_session_id,
-        prompt_sha256,
-        output_envelope_sha256,
-        capabilities,
-        exit_code,
+    let outcome = crate::audit::AgentRunOutcomeAuditRecord {
         completed_at: UnixMillis::now(),
-        signing_key_fingerprint: signing_key.fingerprint(),
+        outcome: capture.to_outcome(),
     };
+    // Record the outcome before signing: the row is writ's record of what
+    // happened, the note is an artefact derived from it. A note signed
+    // against an outcome the log never accepted would be the one ordering
+    // that leaves the two disagreeing.
+    if let Err(err) = recorded.complete(&outcome) {
+        return ServerMessage::Error {
+            message: format!("RunAgent: record agent run outcome: {err}"),
+        };
+    }
 
-    let canonical = metadata.canonical_bytes();
-    let signature = match signing_key.sign(&canonical) {
-        Ok(s) => s,
+    sign_and_store_run(
+        &notes_repo,
+        &signing_key,
+        &outcome,
+        session_id,
+        prompt_sha256,
+        capabilities,
+        output_ref,
+    )
+    .await
+}
+
+/// Sign a finished run's envelope and store it in writ's notes repo, the tail
+/// both `RunAgent` arms share once their outcome row is recorded.
+///
+/// Shared so the two arms cannot drift: an envelope's meaning must not depend
+/// on whether the agent ran on the host or in a guest, and the note layout a
+/// verifier fetches is part of that. Returns the wire response directly —
+/// either `RunAgentCompleted` or the `Error` describing which step failed.
+async fn sign_and_store_run(
+    notes_repo: &Arc<crate::notes_repo::NotesRepo>,
+    signing_key: &crate::signing::WritSigningKey,
+    outcome: &crate::audit::AgentRunOutcomeAuditRecord,
+    session_id: SessionId,
+    prompt_sha256: Sha256Hex,
+    capabilities: Vec<crate::core::CapabilitySet>,
+    output_ref: NotesRef,
+) -> ServerMessage {
+    let materialised = match crate::agent_run_envelope::materialize_signed_run_envelope(
+        outcome,
+        session_id,
+        prompt_sha256,
+        capabilities,
+        signing_key,
+    )
+    .await
+    {
+        Ok(materialised) => materialised,
         Err(err) => {
             return ServerMessage::Error {
-                message: format!("RunAgent: sign canonical metadata: {err}"),
+                message: format!("RunAgent: materialise signed envelope: {err}"),
             };
         }
     };
 
-    let envelope = SignedRunEnvelope {
-        metadata: metadata.clone(),
-        signature: signature.clone(),
-        output: output_envelope_bytes,
-    };
-    let envelope_bytes = envelope.to_bytes();
     // Seed the note's target OID with the run id bytes so each run gets
     // a distinct attachment object. The seed carries no payload — the
     // signed envelope itself lives in the note body, per the slice-B
     // durability decision (envelope in body, not a separate blob).
-    let run_id_seed = metadata.run_id.to_string().into_bytes();
+    let run_id_seed = outcome.outcome.run_id.to_string().into_bytes();
+    let envelope_bytes = materialised.envelope_bytes;
+    let metadata = materialised.envelope.metadata;
+    let signature = materialised.envelope.signature;
 
     let write_result = {
-        let notes_repo = Arc::clone(&notes_repo);
-        let output_ref = output_ref.clone();
+        let notes_repo = Arc::clone(notes_repo);
         tokio::task::spawn_blocking(move || {
             notes_repo.write_note(&output_ref, &run_id_seed, &envelope_bytes)
         })
@@ -518,52 +569,14 @@ async fn run_agent_in_vm_after_start(
         }
     };
 
-    let materialised = match crate::agent_vm_daemon::materialize_vm_signed_envelope(
+    sign_and_store_run(
+        notes_repo,
+        signing_key,
         &outcome,
         session_id,
         prompt_sha256,
         capabilities,
-        signing_key,
+        output_ref,
     )
     .await
-    {
-        Ok(m) => m,
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("RunAgent: materialise signed envelope: {err}"),
-            };
-        }
-    };
-
-    let run_id_seed = run_id.to_string().into_bytes();
-    let envelope_bytes = materialised.envelope_bytes;
-    let metadata = materialised.envelope.metadata;
-    let signature = materialised.envelope.signature;
-
-    let write_result = {
-        let notes_repo = Arc::clone(notes_repo);
-        tokio::task::spawn_blocking(move || {
-            notes_repo.write_note(&output_ref, &run_id_seed, &envelope_bytes)
-        })
-        .await
-    };
-    let output_oid = match write_result {
-        Ok(Ok(oid)) => oid,
-        Ok(Err(err)) => {
-            return ServerMessage::Error {
-                message: format!("RunAgent: write signed-run note: {err}"),
-            };
-        }
-        Err(err) => {
-            return ServerMessage::Error {
-                message: format!("RunAgent: notes-write task failed: {err}"),
-            };
-        }
-    };
-
-    ServerMessage::RunAgentCompleted {
-        output_oid,
-        signed_metadata: metadata,
-        signature,
-    }
 }

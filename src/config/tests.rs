@@ -1757,8 +1757,8 @@ fn parses_config_without_run_agent_section() {
     assert!(c.run_agent.is_none());
 }
 
-/// `run_agent` minimal shape: only `spawn_command` is required;
-/// `notes_repo_path`, `signing_key_secret`, and `spawn_args`
+/// `run_agent` minimal shape: `spawn_command` and `spawn_agent_kind` are
+/// required; `notes_repo_path`, `signing_key_secret`, and `spawn_args`
 /// default. The accessors return the documented defaults.
 #[test]
 fn parses_run_agent_section_with_defaults() {
@@ -1772,11 +1772,12 @@ fn parses_run_agent_section_with_defaults() {
             }
         },
         "policy": { "default_ttl": 600, "writable_repos": [] },
-        "run_agent": { "spawn_command": "/usr/bin/claude" }
+        "run_agent": { "spawn_command": "/usr/bin/claude", "spawn_agent_kind": "claude" }
     }"#;
     let c: DaemonConfig = serde_json::from_str(json).unwrap();
     let cfg = c.run_agent.expect("run_agent parsed");
     assert_eq!(cfg.spawn_command, PathBuf::from("/usr/bin/claude"));
+    assert_eq!(cfg.spawn_agent_kind, crate::core::AgentKind::Claude);
     assert!(cfg.spawn_args.is_empty());
     assert!(cfg.notes_repo_path.is_none());
     assert!(cfg.signing_key_secret.is_none());
@@ -1803,7 +1804,8 @@ fn parses_run_agent_section_with_all_fields() {
         },
         "policy": { "default_ttl": 600, "writable_repos": [] },
         "run_agent": {
-            "spawn_command": "/opt/agents/claude",
+            "spawn_command": "/opt/agents/codex",
+            "spawn_agent_kind": "codex",
             "spawn_args": ["--headless", "--no-color"],
             "notes_repo_path": "/var/lib/writ/notes",
             "signing_key_secret": "custom-signing"
@@ -1811,7 +1813,8 @@ fn parses_run_agent_section_with_all_fields() {
     }"#;
     let c: DaemonConfig = serde_json::from_str(json).unwrap();
     let cfg = c.run_agent.expect("run_agent parsed");
-    assert_eq!(cfg.spawn_command, PathBuf::from("/opt/agents/claude"));
+    assert_eq!(cfg.spawn_command, PathBuf::from("/opt/agents/codex"));
+    assert_eq!(cfg.spawn_agent_kind, crate::core::AgentKind::Codex);
     assert_eq!(cfg.spawn_args, vec!["--headless", "--no-color"]);
     assert_eq!(
         cfg.notes_repo_path_or_default(),
@@ -1840,6 +1843,7 @@ fn run_agent_section_rejects_unknown_fields() {
         "policy": { "default_ttl": 600, "writable_repos": [] },
         "run_agent": {
             "spawn_command": "/bin/true",
+            "spawn_agent_kind": "claude",
             "spwan_args": []
         }
     }"#;
@@ -1882,11 +1886,13 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
         notes_repo_path: Some(tmp.path().join("notes-repo")),
         signing_key_secret: Some(SecretKey::new("writ-signing-key").unwrap()),
         spawn_command: PathBuf::from("/bin/cat"),
+        spawn_agent_kind: crate::core::AgentKind::Claude,
         spawn_args: vec![],
     };
     let store = InMem::default();
+    let log_root = AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap();
 
-    let first = cfg.materialize(&store).unwrap();
+    let first = cfg.materialize(&store, log_root.clone()).unwrap();
     assert!(
         first.signing.was_generated(),
         "first boot generates the key"
@@ -1895,7 +1901,7 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
     assert!(first.notes_repo.path().exists());
     assert_eq!(first.spawn.command, PathBuf::from("/bin/cat"));
 
-    let second = cfg.materialize(&store).unwrap();
+    let second = cfg.materialize(&store, log_root.clone()).unwrap();
     assert!(
         !second.signing.was_generated(),
         "second boot loads the existing key"
@@ -2298,5 +2304,34 @@ fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
     assert!(
         !work_root.exists(),
         "agent_vm work root {work_root:?} was created despite ui_http being invalid",
+    );
+}
+
+/// `spawn_agent_kind` is required, not defaulted.
+///
+/// Defaulting it would mean a config that never mentions an agent still
+/// stamps one onto every host-spawned run's audit row — a value nobody
+/// asserted, indistinguishable in the row from one an operator chose. The
+/// point of the field is that a person who knows what `spawn_command` is says
+/// so, and there is no honest default for that.
+#[test]
+fn the_run_agent_section_requires_an_agent_kind() {
+    let json = r#"{
+        "github_apps": {
+            "claude": {
+                "app_id": 1,
+                "installation_id": 2,
+                "installation_owner": "o",
+                "private_key_secret": "pk"
+            }
+        },
+        "policy": { "default_ttl": 600, "writable_repos": [] },
+        "run_agent": { "spawn_command": "/usr/bin/claude" }
+    }"#;
+    let err = serde_json::from_str::<DaemonConfig>(json)
+        .expect_err("a run_agent section without spawn_agent_kind must not parse");
+    assert!(
+        err.to_string().contains("spawn_agent_kind"),
+        "the parse error must name the missing field, got: {err}",
     );
 }

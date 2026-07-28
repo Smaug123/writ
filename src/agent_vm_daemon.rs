@@ -58,11 +58,6 @@ use guest_command::{
     build_agent_run_guest_command, workspace_bootstrap_audit_record, wrap_guest_command,
 };
 
-mod materialize;
-pub use materialize::{
-    MaterializeVmEnvelopeError, MaterializedVmRunEnvelope, materialize_vm_signed_envelope,
-};
-
 mod run_outcome;
 pub use run_outcome::{WaitForAgentRunOutcomeError, wait_for_agent_run_outcome};
 
@@ -1265,8 +1260,6 @@ fn close_audit_session_best_effort<S: SecretStore + Send + Sync>(
 mod guest_command_tests;
 #[cfg(test)]
 mod lifecycle_tests;
-#[cfg(test)]
-mod materialize_tests;
 #[cfg(test)]
 mod run_outcome_tests;
 #[cfg(test)]

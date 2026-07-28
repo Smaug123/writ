@@ -246,6 +246,22 @@ pub struct RunAgentDaemonConfig {
     /// Absolute path to the child binary writd spawns for every
     /// `RunAgent` call. Required when the section is present.
     pub spawn_command: PathBuf,
+    /// Which agent [`Self::spawn_command`] is. Required, and required
+    /// *here*, because this is where the operator who chose the binary can
+    /// say what it is — the only party who knows.
+    ///
+    /// It lands on every host-spawned run's `agent_run` row, and a caller
+    /// whose session declares a different kind is refused. Taking the row's
+    /// value from the session instead would let writd record "Codex ran"
+    /// while spawning Claude, since the session's kind is a *caller's*
+    /// declaration about a daemon-side configuration it cannot see. Neither
+    /// value is machine-checkable against the binary, but only one of them is
+    /// written by someone in a position to know.
+    ///
+    /// One kind for the whole daemon, matching the single `spawn_command`;
+    /// per-kind dispatch is the slice-C work noted on
+    /// [`crate::server::RunAgentSpawnConfig`].
+    pub spawn_agent_kind: crate::core::AgentKind,
     /// Extra args passed to [`Self::spawn_command`] before the prompt
     /// arrives on the child's stdin.
     #[serde(default)]
@@ -288,9 +304,16 @@ impl RunAgentDaemonConfig {
     /// and persists a fresh Ed25519 keypair; every subsequent boot
     /// returns the same key. The returned [`EnsureOutcome`] lets the
     /// caller log "generated new key" once at INFO/WARN level.
+    ///
+    /// `agent_run_log_root` is a parameter rather than a field of this
+    /// section because the root is daemon-wide: the VM `RunAgent` arm
+    /// needs the same directory and reaches writd without a `run_agent`
+    /// section at all. It arrives already checked and prepared (see
+    /// [`check_daemon_sections`]), so this method only stores it.
     pub fn materialize(
         &self,
         store: &dyn SecretStore,
+        agent_run_log_root: AgentRunLogRoot,
     ) -> Result<RunAgentBootState, RunAgentBootError> {
         let notes_repo_path = self.notes_repo_path_or_default();
         let notes_repo = NotesRepo::init_or_open(&notes_repo_path).map_err(|source| {
@@ -312,6 +335,8 @@ impl RunAgentDaemonConfig {
             spawn: RunAgentSpawnConfig {
                 command: self.spawn_command.clone(),
                 args: self.spawn_args.clone(),
+                agent_kind: self.spawn_agent_kind,
+                log_root: agent_run_log_root,
             },
         })
     }

@@ -112,6 +112,8 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
         run_agent_spawn: Some(RunAgentSpawnConfig {
             command: cat,
             args: Vec::new(),
+            agent_kind: writ::core::AgentKind::Claude,
+            log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
         }),
         promote_runtime: None,
         git_data_http: std::sync::OnceLock::new(),
@@ -133,6 +135,12 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
     let purpose = "plan-submit".to_string();
     let client = WritClient::new(&socket_path);
+    // The host-spawn arm records the run against the caller's session, which
+    // is what `run_stage_under_owned_session` opens in the real stage runners.
+    let session_id = client
+        .open_session(None, Some(AgentKind::Claude), None)
+        .await
+        .expect("open session");
     let completed = tokio::time::timeout(
         Duration::from_secs(15),
         client.run_agent(RunAgentRequest {
@@ -145,7 +153,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
             }],
             purpose: purpose.clone(),
             output_ref: writ_notes_ref.clone(),
-            session_id: None,
+            session_id: Some(session_id),
             workspace: None,
             agent_kind: None,
             agent_model: None,
@@ -260,6 +268,8 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
         run_agent_spawn: Some(RunAgentSpawnConfig {
             command: cat,
             args: Vec::new(),
+            agent_kind: writ::core::AgentKind::Claude,
+            log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
         }),
         promote_runtime: None,
         git_data_http: std::sync::OnceLock::new(),
@@ -281,6 +291,12 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
     let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
     let purpose = "plan-review".to_string();
     let client = WritClient::new(&socket_path);
+    // The host-spawn arm records the run against the caller's session, which
+    // is what `run_stage_under_owned_session` opens in the real stage runners.
+    let session_id = client
+        .open_session(None, Some(AgentKind::Claude), None)
+        .await
+        .expect("open session");
     let completed = tokio::time::timeout(
         Duration::from_secs(15),
         client.run_agent(RunAgentRequest {
@@ -293,7 +309,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
             }],
             purpose: purpose.clone(),
             output_ref: writ_notes_ref.clone(),
-            session_id: None,
+            session_id: Some(session_id),
             workspace: None,
             agent_kind: None,
             agent_model: None,
@@ -405,6 +421,8 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
         run_agent_spawn: Some(RunAgentSpawnConfig {
             command: cat,
             args: Vec::new(),
+            agent_kind: writ::core::AgentKind::Claude,
+            log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
         }),
         promote_runtime: None,
         git_data_http: std::sync::OnceLock::new(),
@@ -426,6 +444,12 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
     let writ_notes_ref = NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
     let purpose = "plan-implement".to_string();
     let client = WritClient::new(&socket_path);
+    // The host-spawn arm records the run against the caller's session, which
+    // is what `run_stage_under_owned_session` opens in the real stage runners.
+    let session_id = client
+        .open_session(None, Some(AgentKind::Claude), None)
+        .await
+        .expect("open session");
     let completed = tokio::time::timeout(
         Duration::from_secs(15),
         client.run_agent(RunAgentRequest {
@@ -438,7 +462,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
             }],
             purpose: purpose.clone(),
             output_ref: writ_notes_ref.clone(),
-            session_id: None,
+            session_id: Some(session_id),
             workspace: None,
             agent_kind: None,
             agent_model: None,

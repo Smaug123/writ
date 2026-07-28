@@ -150,16 +150,6 @@ async fn run_agent_with_workspace_reports_unconfigured_vm_runtime() {
 #[tokio::test]
 async fn run_agent_round_trip_signs_and_writes_note() {
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-    use crate::signing::WritSigningKey;
-
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_path = tmp.path().join("writ-repo");
-    let notes_repo = NotesRepo::init_or_open(&repo_path).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-    let verifying_key = signing_key.verifying_key();
-    let fingerprint = signing_key.fingerprint();
 
     // `cat` is the canonical "noop" agent: it copies stdin to
     // stdout, so the captured stdout is byte-equal to the prompt
@@ -172,29 +162,11 @@ async fn run_agent_round_trip_signs_and_writes_note() {
     // helper so the registry shape stays in lockstep with other
     // dispatch tests; the wiremock server is harmless overhead.
     let server = MockServer::start().await;
-    let base = make_state(&server, vec![], "o");
-    // Tear the Arc apart so we can extend the state with the
-    // run-agent triple. `Arc::try_unwrap` succeeds because nothing
-    // else holds the Arc yet.
-    let base =
-        Arc::try_unwrap(base).unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
-    let state = Arc::new(BrokerState {
-        audit: base.audit,
-        minter: base.minter,
-        secrets: base.secrets,
-        policy: base.policy,
-        staging_store: base.staging_store,
-        notes_repo: Some(Arc::new(notes_repo)),
-        signing_key: Some(signing_key),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: cat,
-            args: Vec::new(),
-        }),
-        promote_runtime: base.promote_runtime,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: base.mirror_pins,
-        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
-    });
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
+    let verifying_key = fixture.signing_key.verifying_key();
+    let fingerprint = fixture.signing_key.fingerprint();
+    let session_id = open_session(state).await;
 
     let prompt_text = "hello world from cat\n";
     let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
@@ -209,12 +181,12 @@ async fn run_agent_round_trip_signs_and_writes_note() {
             }],
             purpose: "round-trip-test".into(),
             output_ref: output_ref.clone(),
-            session_id: None,
+            session_id: Some(session_id),
             workspace: None,
             agent_kind: None,
             agent_model: None,
         },
-        &state,
+        state,
     )
     .await;
 
@@ -282,35 +254,12 @@ async fn run_agent_round_trip_signs_and_writes_note() {
 #[tokio::test]
 async fn run_agent_signs_non_zero_exit() {
     use crate::run_envelope::OutputEnvelope;
-    use crate::signing::WritSigningKey;
 
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
     let false_bin = find_in_path("false").expect("false must be on PATH for the test");
-
     let server = MockServer::start().await;
-    let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
-        .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
-    let state = Arc::new(BrokerState {
-        audit: base.audit,
-        minter: base.minter,
-        secrets: base.secrets,
-        policy: base.policy,
-        staging_store: base.staging_store,
-        notes_repo: Some(Arc::new(notes_repo)),
-        signing_key: Some(signing_key),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: false_bin,
-            args: Vec::new(),
-        }),
-        promote_runtime: base.promote_runtime,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: base.mirror_pins,
-        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
-    });
+    let fixture = make_run_agent_state(&server, false_bin, Vec::new());
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
 
     let resp = dispatch_message(
         ClientMessage::RunAgent {
@@ -318,12 +267,12 @@ async fn run_agent_signs_non_zero_exit() {
             capabilities: Vec::new(),
             purpose: "non-zero-exit".into(),
             output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
-            session_id: None,
+            session_id: Some(session_id),
             workspace: None,
             agent_kind: None,
             agent_model: None,
         },
-        &state,
+        state,
     )
     .await;
 
@@ -359,35 +308,16 @@ async fn run_agent_signs_non_zero_exit() {
 #[tokio::test]
 async fn run_agent_captures_stderr_in_envelope() {
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-    use crate::signing::WritSigningKey;
 
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
     let sh = find_in_path_any(&["sh", "bash"]);
-
     let server = MockServer::start().await;
-    let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
-        .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
-    let state = Arc::new(BrokerState {
-        audit: base.audit,
-        minter: base.minter,
-        secrets: base.secrets,
-        policy: base.policy,
-        staging_store: base.staging_store,
-        notes_repo: Some(Arc::new(notes_repo)),
-        signing_key: Some(signing_key),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: sh,
-            args: vec!["-c".into(), "printf out; printf err 1>&2; exit 0".into()],
-        }),
-        promote_runtime: base.promote_runtime,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: base.mirror_pins,
-        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
-    });
+    let fixture = make_run_agent_state(
+        &server,
+        sh,
+        vec!["-c".into(), "printf out; printf err 1>&2; exit 0".into()],
+    );
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
 
     let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
     let resp = dispatch_message(
@@ -396,12 +326,12 @@ async fn run_agent_captures_stderr_in_envelope() {
             capabilities: Vec::new(),
             purpose: "stderr-capture".into(),
             output_ref: output_ref.clone(),
-            session_id: None,
+            session_id: Some(session_id),
             workspace: None,
             agent_kind: None,
             agent_model: None,
         },
-        &state,
+        state,
     )
     .await;
 
@@ -447,44 +377,25 @@ async fn run_agent_captures_stderr_in_envelope() {
 #[tokio::test]
 async fn run_agent_caps_stream_capture_records_truncation() {
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-    use crate::signing::WritSigningKey;
 
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
     let sh = find_in_path_any(&["sh", "bash"]);
-
     let server = MockServer::start().await;
-    let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
-        .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
-    let state = Arc::new(BrokerState {
-        audit: base.audit,
-        minter: base.minter,
-        secrets: base.secrets,
-        policy: base.policy,
-        staging_store: base.staging_store,
-        notes_repo: Some(Arc::new(notes_repo)),
-        signing_key: Some(signing_key),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: sh,
-            // Emit MAX_RUN_AGENT_STREAM_BYTES + 1 KiB of stdout so
-            // the cap path runs without depending on shell-builtin
-            // performance for many megabytes of output. dd with a
-            // 1 MiB block size and (cap_mib + 1 / 1024) reps would
-            // be tidier, but `head -c` from /dev/zero is portable
-            // across BSD and GNU userland.
-            args: vec![
-                "-c".into(),
-                format!("head -c {} /dev/zero", MAX_RUN_AGENT_STREAM_BYTES + 1024),
-            ],
-        }),
-        promote_runtime: base.promote_runtime,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: base.mirror_pins,
-        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
-    });
+    let fixture = make_run_agent_state(
+        &server,
+        sh,
+        // Emit MAX_RUN_AGENT_STREAM_BYTES + 1 KiB of stdout so
+        // the cap path runs without depending on shell-builtin
+        // performance for many megabytes of output. dd with a
+        // 1 MiB block size and (cap_mib + 1 / 1024) reps would
+        // be tidier, but `head -c` from /dev/zero is portable
+        // across BSD and GNU userland.
+        vec![
+            "-c".into(),
+            format!("head -c {} /dev/zero", MAX_RUN_AGENT_STREAM_BYTES + 1024),
+        ],
+    );
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
 
     let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
     let resp = dispatch_message(
@@ -493,17 +404,21 @@ async fn run_agent_caps_stream_capture_records_truncation() {
             capabilities: Vec::new(),
             purpose: "truncation".into(),
             output_ref: output_ref.clone(),
-            session_id: None,
+            session_id: Some(session_id),
             workspace: None,
             agent_kind: None,
             agent_model: None,
         },
-        &state,
+        state,
     )
     .await;
 
-    let output_oid = match resp {
-        ServerMessage::RunAgentCompleted { output_oid, .. } => output_oid,
+    let (output_oid, run_id) = match resp {
+        ServerMessage::RunAgentCompleted {
+            output_oid,
+            signed_metadata,
+            ..
+        } => (output_oid, signed_metadata.run_id),
         other => panic!("expected RunAgentCompleted, got {other:?}"),
     };
 
@@ -525,6 +440,29 @@ async fn run_agent_caps_stream_capture_records_truncation() {
     );
     assert!(output_envelope.stderr.is_empty());
     assert_eq!(output_envelope.stderr_truncated_at, None);
+
+    // The audit row must tell the same story as the envelope: an operator
+    // who opens `stdout_path` sees exactly the retained prefix, and
+    // `truncated` warns them it is a prefix. `byte_len` describes the file,
+    // not the stream the child produced — that number is deliberately not
+    // recorded (see `AgentRunStreamSummary`).
+    let outcome = state
+        .audit
+        .get_agent_run_outcome(run_id)
+        .unwrap()
+        .expect("a completed host-spawn run has an outcome row");
+    assert!(outcome.outcome.stdout.truncated);
+    assert_eq!(
+        outcome.outcome.stdout.byte_len,
+        MAX_RUN_AGENT_STREAM_BYTES as u64,
+    );
+    assert_eq!(
+        std::fs::metadata(&outcome.outcome.stdout.path)
+            .unwrap()
+            .len(),
+        MAX_RUN_AGENT_STREAM_BYTES as u64,
+    );
+    assert!(!outcome.outcome.stderr.truncated);
 }
 
 /// When `RunAgent` carries a `session_id` bound to an open audit
@@ -536,34 +474,11 @@ async fn run_agent_caps_stream_capture_records_truncation() {
 #[tokio::test]
 async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
     use crate::core::SessionRecord;
-    use crate::signing::WritSigningKey;
 
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
     let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
     let server = MockServer::start().await;
-    let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
-        .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
-    let state = Arc::new(BrokerState {
-        audit: base.audit,
-        minter: base.minter,
-        secrets: base.secrets,
-        policy: base.policy,
-        staging_store: base.staging_store,
-        notes_repo: Some(Arc::new(notes_repo)),
-        signing_key: Some(signing_key),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: cat,
-            args: Vec::new(),
-        }),
-        promote_runtime: base.promote_runtime,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: base.mirror_pins,
-        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
-    });
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
 
     let session_id = SessionId::new();
     state
@@ -589,7 +504,7 @@ async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
             agent_kind: None,
             agent_model: None,
         },
-        &state,
+        state,
     )
     .await;
     let signed_metadata = match resp {
@@ -610,34 +525,10 @@ async fn run_agent_stamps_caller_supplied_session_id_into_signed_metadata() {
 /// would be worse than a clear refusal.
 #[tokio::test]
 async fn run_agent_rejects_unknown_session_id() {
-    use crate::signing::WritSigningKey;
-
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
     let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
     let server = MockServer::start().await;
-    let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
-        .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
-    let state = Arc::new(BrokerState {
-        audit: base.audit,
-        minter: base.minter,
-        secrets: base.secrets,
-        policy: base.policy,
-        staging_store: base.staging_store,
-        notes_repo: Some(Arc::new(notes_repo)),
-        signing_key: Some(signing_key),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: cat,
-            args: Vec::new(),
-        }),
-        promote_runtime: base.promote_runtime,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: base.mirror_pins,
-        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
-    });
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
 
     let bogus = SessionId::new();
     let resp = dispatch_message(
@@ -651,7 +542,7 @@ async fn run_agent_rejects_unknown_session_id() {
             agent_kind: None,
             agent_model: None,
         },
-        &state,
+        state,
     )
     .await;
     match resp {
@@ -667,34 +558,11 @@ async fn run_agent_rejects_unknown_session_id() {
 #[tokio::test]
 async fn run_agent_rejects_closed_session_id() {
     use crate::core::SessionRecord;
-    use crate::signing::WritSigningKey;
 
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-
-    let tmp = tempfile::tempdir().unwrap();
-    let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
     let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
     let server = MockServer::start().await;
-    let base = Arc::try_unwrap(make_state(&server, vec![], "o"))
-        .unwrap_or_else(|_| panic!("make_state Arc must be uniquely held"));
-    let state = Arc::new(BrokerState {
-        audit: base.audit,
-        minter: base.minter,
-        secrets: base.secrets,
-        policy: base.policy,
-        staging_store: base.staging_store,
-        notes_repo: Some(Arc::new(notes_repo)),
-        signing_key: Some(signing_key),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: cat,
-            args: Vec::new(),
-        }),
-        promote_runtime: base.promote_runtime,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: base.mirror_pins,
-        chatgpt_oauth_authority: base.chatgpt_oauth_authority,
-    });
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
 
     let session_id = SessionId::new();
     state
@@ -724,13 +592,605 @@ async fn run_agent_rejects_closed_session_id() {
             agent_kind: None,
             agent_model: None,
         },
-        &state,
+        state,
     )
     .await;
     match resp {
         ServerMessage::ClosedSession { session_id: seen } => assert_eq!(seen, session_id),
         other => panic!("expected ClosedSession, got {other:?}"),
     }
+}
+
+/// A host-spawned run records the same `(agent_run, agent_run_outcome)`
+/// pair the VM arm records, naming the files its streams landed in.
+///
+/// Before this, the host arm wrote *no* audit rows at all: bailiff's submit
+/// and review stages ran real agents that left no trace in the log writ
+/// claims is complete by construction ("because the only way to act is to
+/// obtain a grant, the SQLite log *is* the history"). The row is what makes
+/// the run visible; the stream paths are what make its output retrievable
+/// once the wire response is gone.
+#[tokio::test]
+async fn a_host_spawned_run_records_an_audit_pair_naming_its_streams() {
+    let sh = find_in_path_any(&["sh", "bash"]);
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(
+        &server,
+        sh,
+        vec!["-c".into(), "printf out; printf err 1>&2".into()],
+    );
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let prompt_text = "audited prompt";
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new(prompt_text),
+            capabilities: Vec::new(),
+            purpose: "audit-pair".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let signed_metadata = match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata, ..
+        } => signed_metadata,
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+    let run_id = signed_metadata.run_id;
+
+    let request = state
+        .audit
+        .get_agent_run(run_id)
+        .unwrap()
+        .expect("a host-spawn run records its request row");
+    assert_eq!(request.session_id, session_id);
+    // Identity comes from the session row, which is where the caller fixed it
+    // at `OpenSession` — the host arm has no per-run agent identity to read.
+    assert_eq!(request.agent_kind, AgentKind::Claude);
+    assert_eq!(
+        request.prompt.sha256_hex,
+        crate::agent_run::sha256_hex(prompt_text.as_bytes()),
+    );
+    assert_eq!(request.prompt.byte_len, prompt_text.len() as u64);
+
+    let outcome = state
+        .audit
+        .get_agent_run_outcome(run_id)
+        .unwrap()
+        .expect("a completed host-spawn run records its outcome row");
+    assert_eq!(outcome.outcome.run_id, run_id);
+    assert_eq!(
+        outcome.outcome.status,
+        crate::agent_run::AgentRunTerminalStatus::Succeeded,
+    );
+    assert_eq!(outcome.outcome.exit_code, 0);
+
+    // The paths on the row are absolute and hold what the child wrote, so an
+    // operator reading the log can open them without knowing writd's config.
+    let run_dir = fixture.run_dir(run_id);
+    assert_eq!(outcome.outcome.stdout.path, run_dir.join("stdout.log"));
+    assert_eq!(outcome.outcome.stderr.path, run_dir.join("stderr.log"));
+    assert_eq!(std::fs::read(&outcome.outcome.stdout.path).unwrap(), b"out");
+    assert_eq!(std::fs::read(&outcome.outcome.stderr.path).unwrap(), b"err");
+    assert!(!outcome.outcome.stdout.truncated);
+    assert_eq!(outcome.outcome.stdout.byte_len, 3);
+    assert_eq!(
+        outcome.outcome.stdout.sha256_hex,
+        crate::agent_run::sha256_hex(b"out"),
+    );
+}
+
+/// The run id in the signed envelope is the run id in the audit log.
+///
+/// This is the provenance join a verifier needs: given a signed note from
+/// bailiff's repo, `signed_metadata.run_id` must find the `agent_run` row
+/// that authorised it. The host arm used to mint its envelope run id
+/// independently of any audit row (there was none), so the id in a note
+/// pointed at nothing.
+#[tokio::test]
+async fn the_signed_envelope_and_the_audit_row_name_the_same_run() {
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "provenance".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let signed_metadata = match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata, ..
+        } => signed_metadata,
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+
+    let audited = state
+        .audit
+        .agent_run_for_session(session_id)
+        .unwrap()
+        .expect("the session has exactly one run");
+    assert_eq!(
+        audited.run_id, signed_metadata.run_id,
+        "the envelope's run id must be the audited run id, not a second minting",
+    );
+    assert_eq!(audited.session_id, signed_metadata.session_id);
+}
+
+/// A host-spawn `RunAgent` with no `session_id` is refused.
+///
+/// It used to be accepted, and the broker minted a fresh `SessionId` that it
+/// stamped into the signed envelope *without opening a session row*. The
+/// envelope then claimed a session no verifier could ever resolve, and the
+/// run could not be audited at all: an `agent_run` row's `session_id` is a
+/// foreign key onto `session`. Refusing is the honest answer — bailiff
+/// already opens a session for every host-spawn stage.
+#[tokio::test]
+async fn run_agent_refuses_a_host_spawn_with_no_session() {
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "sessionless".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: None,
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let ServerMessage::Error { message } = resp else {
+        panic!("expected ServerMessage::Error, got {resp:?}");
+    };
+    assert!(
+        message.contains("session_id"),
+        "the refusal must name the missing field, got: {message}",
+    );
+    // Refused before the child ran, so nothing was created on disk. There is
+    // no session to look for a run row under — which is the point.
+    assert!(!fixture.log_root.exists());
+}
+
+/// A session with no agent kind cannot host a run, because
+/// `agent_run.agent_kind` is the row's record of *what* ran and the host arm
+/// has nowhere else to read it from. Refuse with the same guidance the
+/// registry path gives, rather than inventing an identity for the log.
+///
+/// The session is written straight through the audit API because
+/// `OpenSession` already refuses a kindless session over the wire — so this
+/// row is the shape only a *pre-existing* database can hold (the column is
+/// nullable). That is exactly why the branch has to exist: the type permits
+/// the row, so the handler must have an answer for it.
+#[tokio::test]
+async fn run_agent_refuses_a_host_spawn_whose_session_never_named_an_agent() {
+    use crate::core::SessionRecord;
+
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = &fixture.state;
+    let session_id = SessionId::new();
+    state
+        .audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: None,
+            agent_model: None,
+            opened_at: UnixMillis::now(),
+            closed_at: None,
+        })
+        .expect("open a kindless session directly");
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "no-agent-kind".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let ServerMessage::Error { message } = resp else {
+        panic!("expected ServerMessage::Error, got {resp:?}");
+    };
+    assert!(
+        message.contains("agent kind") && message.contains("--agent"),
+        "the refusal must tell the operator how to fix it, got: {message}",
+    );
+    assert!(
+        state
+            .audit
+            .agent_run_for_session(session_id)
+            .unwrap()
+            .is_none(),
+        "refused before recording anything against the session",
+    );
+    assert!(!fixture.log_root.exists());
+}
+
+/// A session opened for a different agent than the daemon actually spawns is
+/// refused, before anything runs or is recorded.
+///
+/// The `agent_run` row records the *configured* kind, because the operator who
+/// chose `spawn_command` is the only party who knows what that binary is. But
+/// the session's kind is not inert — it routes credential mints to a GitHub
+/// App — so a session claiming an identity this daemon cannot run would mint
+/// as one agent and execute as another. bailiff's `--agent` defaults to
+/// `claude` whatever writd is configured with, so this is reachable without
+/// anyone doing something strange.
+#[tokio::test]
+async fn run_agent_refuses_a_session_opened_for_a_different_agent_than_it_spawns() {
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    // The fixture's registry knows Claude, so open a Codex session directly:
+    // the disagreement under test is with the *spawn* config, not the registry.
+    let mut fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = Arc::get_mut(&mut fixture.state).expect("fresh Arc has no other handles");
+    state
+        .run_agent_spawn
+        .as_mut()
+        .expect("the fixture configures a spawn")
+        .agent_kind = AgentKind::Codex;
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "kind-mismatch".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let ServerMessage::Error { message } = resp else {
+        panic!("expected ServerMessage::Error, got {resp:?}");
+    };
+    assert!(
+        message.contains("claude") && message.contains("codex"),
+        "the refusal must name both kinds so the operator can see which to change, got: {message}",
+    );
+    assert!(
+        state
+            .audit
+            .agent_run_for_session(session_id)
+            .unwrap()
+            .is_none(),
+        "refused before recording a run",
+    );
+    assert!(!fixture.log_root.exists(), "refused before spawning");
+}
+
+/// The audit row records the kind the *daemon* is configured to spawn, not
+/// the one the caller declared — they are required to agree, so this pins
+/// which side is the source of truth.
+#[tokio::test]
+async fn the_audit_row_records_the_configured_agent_kind() {
+    let cat = find_in_path("cat").expect("cat must be on PATH");
+    let server = MockServer::start().await;
+    let mut fixture = make_run_agent_state(&server, cat, Vec::new());
+    let state = Arc::get_mut(&mut fixture.state).expect("fresh Arc has no other handles");
+    state
+        .run_agent_spawn
+        .as_mut()
+        .expect("the fixture configures a spawn")
+        .agent_kind = AgentKind::Codex;
+    let state = &fixture.state;
+    let session_id = open_session_with_agent_kind(state, Some(AgentKind::Codex)).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "configured-kind".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let run_id = match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata, ..
+        } => signed_metadata.run_id,
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+    assert_eq!(
+        state
+            .audit
+            .get_agent_run(run_id)
+            .unwrap()
+            .unwrap()
+            .agent_kind,
+        AgentKind::Codex,
+    );
+}
+
+/// An agent that exits non-zero still *ran*, so its outcome row is
+/// `Failed` with the exit code — not a missing row. The plan is explicit
+/// that writ signs the partial and the audit row records the non-zero exit.
+#[tokio::test]
+async fn a_failed_host_spawn_records_a_failed_outcome() {
+    let false_bin = find_in_path("false").expect("false must be on PATH");
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(&server, false_bin, Vec::new());
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("ignored"),
+            capabilities: Vec::new(),
+            purpose: "failed-run".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let run_id = match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata, ..
+        } => signed_metadata.run_id,
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+
+    let outcome = state
+        .audit
+        .get_agent_run_outcome(run_id)
+        .unwrap()
+        .expect("a run that exited non-zero still has an outcome");
+    assert_eq!(
+        outcome.outcome.status,
+        crate::agent_run::AgentRunTerminalStatus::Failed,
+    );
+    assert_eq!(outcome.outcome.exit_code, 1);
+}
+
+/// A run whose child could never start leaves its `agent_run` row
+/// deliberately unpaired rather than inventing an outcome for it.
+///
+/// Writing a row saying "did not run" would fabricate a terminal status the
+/// run never had, and worse, the outcome row's primary key is the run id, so
+/// a fabricated row consumes the run's only outcome slot forever. An unpaired
+/// request row is exactly what "a run was requested and we cannot say how it
+/// went" looks like.
+///
+/// Note what is *not* asserted: `scan_unpaired_effect_rows` does not range
+/// over `agent_run`, deliberately — an unpaired row there is
+/// indistinguishable from a run still in flight, so the boot scan would
+/// false-positive on every live run (see `EFFECT_AUDIT_PAIRS`). Resolving
+/// these belongs to the agent-run lifecycle, not to the generic backstop.
+#[tokio::test]
+async fn a_host_spawn_that_cannot_start_leaves_its_run_row_for_reconciliation() {
+    let server = MockServer::start().await;
+    let missing = std::path::PathBuf::from("/nonexistent/bin/definitely-not-an-agent");
+    let fixture = make_run_agent_state(&server, missing, Vec::new());
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("hi"),
+            capabilities: Vec::new(),
+            purpose: "unspawnable".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let ServerMessage::Error { message } = resp else {
+        panic!("expected ServerMessage::Error, got {resp:?}");
+    };
+    assert!(
+        message.contains("definitely-not-an-agent"),
+        "the error must name the command the operator configured, got: {message}",
+    );
+
+    let audited = state
+        .audit
+        .agent_run_for_session(session_id)
+        .unwrap()
+        .expect("the attempt is recorded even though it never ran");
+    assert!(
+        state
+            .audit
+            .get_agent_run_outcome(audited.run_id)
+            .unwrap()
+            .is_none(),
+        "a run that never started must not be given a fabricated outcome",
+    );
+    // The request row is a faithful record of the attempt: the prompt it was
+    // asked to run, under the session that asked.
+    assert_eq!(audited.session_id, session_id);
+    assert_eq!(
+        audited.prompt.sha256_hex,
+        crate::agent_run::sha256_hex(b"hi"),
+    );
+}
+
+/// The audit row, the signed envelope, and the bytes on disk tell one story,
+/// whatever the agent wrote.
+///
+/// Three independently-computed descriptions of the same run meet here: the
+/// capture hashes each stream as it streams past, the file is what actually
+/// landed, and the envelope is re-read off that file before signing. A
+/// swapped stdout/stderr path, a summary hashing the wrong buffer, or an
+/// envelope built from a stale in-memory copy all agree with themselves and
+/// only disagree with each other — so the property is the cross-check, and
+/// per-stream example tests could not replace it.
+///
+/// Sampled rather than swept: each case spawns a real child, so the case
+/// count is deliberately small (same reasoning as the double-crash property).
+#[test]
+fn the_audit_row_and_the_envelope_agree_with_the_bytes_on_disk() {
+    use proptest::test_runner::{Config, TestRunner};
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let server = rt.block_on(MockServer::start());
+    let sh = find_in_path_any(&["sh", "bash"]);
+
+    let mut config = Config::with_cases(12);
+    config.source_file = Some(file!());
+    // Same reasoning as `double_crash_sampled_pairs_recover_to_one_approved_publish`:
+    // the case body drives async work on the shared runtime above, so forking
+    // it into a fresh process would run something else entirely.
+    config.fork = false;
+    config.timeout = 0;
+    // The alphabet excludes `'` and `\` so each stream's text can be embedded
+    // in a single-quoted `sh -c` argument without escaping — the child's job
+    // here is to emit exact bytes, not to exercise a shell quoter.
+    let text = || proptest::string::string_regex("[a-zA-Z0-9 ]{0,64}").unwrap();
+    TestRunner::new(config)
+        .run(&(text(), text(), 0i32..=7), |(out, err, exit_code)| {
+            rt.block_on(one_agreement_case(&server, &sh, &out, &err, exit_code))
+        })
+        .unwrap_or_else(|err| panic!("audit/envelope/disk agreement property failed: {err}"));
+}
+
+async fn one_agreement_case(
+    server: &MockServer,
+    sh: &std::path::Path,
+    out: &str,
+    err: &str,
+    exit_code: i32,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+    use proptest::prop_assert_eq;
+
+    let fixture = make_run_agent_state(
+        server,
+        sh.to_path_buf(),
+        vec![
+            "-c".into(),
+            format!("printf '%s' '{out}'; printf '%s' '{err}' 1>&2; exit {exit_code}"),
+        ],
+    );
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+    let output_ref = crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap();
+
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("prompt"),
+            capabilities: Vec::new(),
+            purpose: "agreement".into(),
+            output_ref: output_ref.clone(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let (output_oid, signed_metadata) = match resp {
+        ServerMessage::RunAgentCompleted {
+            output_oid,
+            signed_metadata,
+            ..
+        } => (output_oid, signed_metadata),
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+
+    let outcome = state
+        .audit
+        .get_agent_run_outcome(signed_metadata.run_id)
+        .unwrap()
+        .expect("a completed run has an outcome row");
+    prop_assert_eq!(outcome.outcome.exit_code, exit_code);
+    prop_assert_eq!(
+        &outcome.outcome.status,
+        &if exit_code == 0 {
+            crate::agent_run::AgentRunTerminalStatus::Succeeded
+        } else {
+            crate::agent_run::AgentRunTerminalStatus::Failed
+        }
+    );
+
+    let notes_repo_handle = state.notes_repo.as_ref().unwrap().clone();
+    let body =
+        tokio::task::spawn_blocking(move || notes_repo_handle.read_note(&output_ref, &output_oid))
+            .await
+            .unwrap()
+            .unwrap();
+    let envelope = SignedRunEnvelope::from_bytes(&body).unwrap();
+    let output_envelope = OutputEnvelope::from_bytes(&envelope.output).unwrap();
+
+    for (name, summary, expected, in_envelope) in [
+        (
+            "stdout",
+            &outcome.outcome.stdout,
+            out,
+            &output_envelope.stdout,
+        ),
+        (
+            "stderr",
+            &outcome.outcome.stderr,
+            err,
+            &output_envelope.stderr,
+        ),
+    ] {
+        let on_disk = std::fs::read(&summary.path)
+            .unwrap_or_else(|e| panic!("{name} log {} unreadable: {e}", summary.path.display()));
+        prop_assert_eq!(&on_disk, &expected.as_bytes(), "{} on disk", name);
+        prop_assert_eq!(summary.byte_len, on_disk.len() as u64, "{} byte_len", name);
+        prop_assert_eq!(
+            &summary.sha256_hex,
+            &crate::agent_run::sha256_hex(&on_disk),
+            "{} sha256",
+            name
+        );
+        prop_assert_eq!(!summary.truncated, true, "{} was not capped", name);
+        prop_assert_eq!(in_envelope, &on_disk, "{} in the envelope", name);
+    }
+    Ok(())
 }
 
 #[tokio::test]

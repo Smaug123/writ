@@ -38,10 +38,9 @@ use crate::notes_repo::NotesRepo;
 use crate::openai_chatgpt_auth::ChatgptOauthAuthority;
 use crate::policy::{self, Decision, PolicyConfig};
 use crate::protocol::{
-    ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage, SignedRunMetadata,
-    StagedPushAuditView, StagedPushDetail, StagedPushSummary,
+    ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage, StagedPushAuditView,
+    StagedPushDetail, StagedPushSummary,
 };
-use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use crate::secret::SecretStore;
 use crate::signing::WritSigningKey;
 use crate::vm_git_bundle::GitSecretValue;
@@ -56,12 +55,21 @@ mod staged_push;
 mod run_agent;
 
 /// Boot-time description of the child process that produces an agent
-/// run's stdout. Pure data — dispatch reads `command` and `args`,
-/// hands them to `tokio::process::Command`, writes the prompt bytes
-/// to the child's stdin, and captures stdout. The shell — *which*
-/// binary writ launches — is set at boot; the wire `RunAgent` request
-/// does not choose it, so a `RunAgent` caller cannot smuggle in an
-/// arbitrary command.
+/// run's streams, and where those streams are kept. Pure data —
+/// dispatch reads `command` and `args`, hands them to
+/// [`crate::agent_run::AgentProcessPlan`], writes the prompt bytes to
+/// the child's stdin, and captures both streams under `log_root`. The
+/// shell — *which* binary writ launches — is set at boot; the wire
+/// `RunAgent` request does not choose it, so a `RunAgent` caller cannot
+/// smuggle in an arbitrary command.
+///
+/// `log_root` is not optional, because the host-spawn arm cannot run
+/// without one: every run records an `agent_run_outcome` row naming the
+/// files its streams landed in, so a spawn config with nowhere to put
+/// them describes a run that could start but never be audited. The
+/// daemon-wide root is [`crate::config::DaemonConfig::agent_run_log_root`],
+/// checked once at boot and handed to both `RunAgent` arms; this field
+/// is the host arm's copy of that same validated value.
 ///
 /// Slice B accepts a single fixed command for the whole daemon; the
 /// agent-kind selection that bailiff will eventually drive arrives in
@@ -70,6 +78,11 @@ mod run_agent;
 pub struct RunAgentSpawnConfig {
     pub command: std::path::PathBuf,
     pub args: Vec<String>,
+    /// Which agent `command` is, as declared by the operator who configured
+    /// it. Recorded on every host-spawned run's `agent_run` row, and the
+    /// value a caller's session kind must agree with.
+    pub agent_kind: crate::core::AgentKind,
+    pub log_root: crate::config::AgentRunLogRoot,
 }
 
 /// Shared state for the broker. Wrapped in `Arc` so connections spawned
@@ -419,46 +432,6 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
 /// `OutputEnvelope` records the cap so verifiers know the capture is
 /// a prefix rather than the whole stream.
 pub(crate) const MAX_RUN_AGENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
-
-/// Read `reader` to EOF, retaining at most `cap` bytes. After the cap
-/// is hit, further bytes are drained and discarded so the child does
-/// not block writing to a full pipe. The returned `truncated_at` is
-/// `Some(cap)` iff any bytes were dropped — `None` means the entire
-/// stream fit. The cap is byte-aligned to whatever the underlying read
-/// returned; we do not bisect a single read across the boundary.
-pub(crate) async fn capture_stream_capped<R>(
-    mut reader: R,
-    cap: usize,
-) -> std::io::Result<(Vec<u8>, Option<u64>)>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut tmp = vec![0u8; 16 * 1024];
-    let mut truncated_at: Option<u64> = None;
-    loop {
-        let n = reader.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok((buf, truncated_at));
-        }
-        if truncated_at.is_some() {
-            // Past the cap: drain to keep the child unblocked.
-            continue;
-        }
-        let room = cap.saturating_sub(buf.len());
-        if room == 0 {
-            // We previously filled exactly to the cap. Receiving more
-            // bytes proves the stream extended past it.
-            truncated_at = Some(cap as u64);
-        } else if n <= room {
-            buf.extend_from_slice(&tmp[..n]);
-        } else {
-            buf.extend_from_slice(&tmp[..room]);
-            truncated_at = Some(cap as u64);
-        }
-    }
-}
 
 fn missing_agent_kind_for_registry_response() -> ServerMessage {
     ServerMessage::Error {
