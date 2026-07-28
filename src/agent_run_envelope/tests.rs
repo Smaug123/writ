@@ -490,3 +490,58 @@ async fn the_stream_read_stops_once_the_file_outgrows_its_row() {
         readback.file_byte_len,
     );
 }
+
+/// A stream path that no longer names a regular file is refused, not read.
+///
+/// The host-spawn arm runs the agent as writd's own user, so it can find its
+/// run directory and replace `stdout.log` with a FIFO before exiting. Opening
+/// that FIFO blocks until someone writes, and reading it blocks with no EOF —
+/// so neither the recorded length nor the recorded digest ever gets a chance
+/// to catch anything, and the run hangs holding its thread. Refusing at open
+/// is what turns that into an error naming the file.
+///
+/// Under a timeout, because the regression this pins is a hang.
+#[tokio::test]
+async fn a_stream_path_that_is_not_a_regular_file_is_refused() {
+    use crate::core::Sha256Hex;
+    use crate::signing::WritSigningKey;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signing_key = WritSigningKey::from_openssh_pem(TEST_SIGNING_PEM).unwrap();
+    let run_id = AgentRunId::new();
+    let outcome = outcome_for_streams(
+        &tmp.path().join(run_id.to_string()),
+        run_id,
+        0,
+        b"the bytes the row describes",
+        b"",
+    );
+    // Swap the file for a FIFO, exactly as a departing agent could.
+    let stdout_path = &outcome.outcome.stdout.path;
+    fs::remove_file(stdout_path).unwrap();
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(stdout_path)
+        .status()
+        .expect("mkfifo(1) is available");
+    assert!(mkfifo.success(), "could not create the FIFO under test");
+
+    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        materialize_signed_run_envelope(
+            &outcome,
+            SessionId::new(),
+            prompt_sha256,
+            vec![],
+            &signing_key,
+        ),
+    )
+    .await
+    .expect("a FIFO in place of a log file must not hang the run")
+    .expect_err("a FIFO in place of a log file must not be signed");
+    let message = err.to_string();
+    assert!(
+        message.contains("stdout") && message.contains("not a regular file"),
+        "the error must say what it refused and why, got: {message}",
+    );
+}

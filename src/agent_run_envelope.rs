@@ -51,6 +51,11 @@ pub enum MaterializeRunEnvelopeError {
         found_byte_len: u64,
         found_sha256: String,
     },
+    #[error(
+        "{stream} log file {} is not a regular file; refusing to read it",
+        path.display()
+    )]
+    StreamNotRegularFile { stream: &'static str, path: PathBuf },
     #[error("sign canonical metadata: {0}")]
     Sign(#[source] crate::signing::WritSigningKeyError),
 }
@@ -180,6 +185,51 @@ pub async fn materialize_signed_run_envelope(
     })
 }
 
+enum OpenRegularFileError {
+    Io(std::io::Error),
+    NotRegular,
+}
+
+/// Open a stream file for re-reading, refusing anything that is not a plain
+/// file sitting exactly where the row said.
+///
+/// The row records a path, and a path is not a file: between the write and
+/// this read, whatever is at that path can be replaced. A host-spawned agent
+/// runs as writd's own user — that arm has no sandbox, which is what the VM
+/// arm exists to provide — so it can find its run directory, unlink
+/// `stdout.log`, and leave a FIFO in its place. Then the *open* blocks until
+/// someone writes, and a read blocks with no EOF and no bytes, so neither the
+/// length bound nor the digest check ever gets a chance to fire: the run hangs,
+/// holding its blocking-pool thread, and the workflow waiting on it hangs too.
+///
+/// `O_NONBLOCK` so the open cannot wait on a writer, `O_NOFOLLOW` so a symlink
+/// at the final component cannot redirect the read elsewhere, and then the
+/// decisive check: `fstat` the descriptor we actually opened and require a
+/// regular file. Checking the *descriptor* rather than the path is what makes
+/// it a check rather than a race. Both flags are inert on the regular file
+/// this is supposed to be.
+///
+/// This does not make a same-uid agent harmless — one that wanted to could
+/// read the secret store directly. It makes the failure a refusal naming the
+/// file instead of a hang.
+async fn open_regular_file(
+    path: &std::path::Path,
+) -> Result<tokio::fs::File, OpenRegularFileError> {
+    // `custom_flags` here is tokio's own inherent method, not the std
+    // extension trait.
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .await
+        .map_err(OpenRegularFileError::Io)?;
+    let metadata = file.metadata().await.map_err(OpenRegularFileError::Io)?;
+    if !metadata.is_file() {
+        return Err(OpenRegularFileError::NotRegular);
+    }
+    Ok(file)
+}
+
 /// One stream file, read back for the envelope.
 ///
 /// `retained` is what gets signed; the `file_*` pair describes the whole file
@@ -209,7 +259,13 @@ async fn read_stream_capped_from_disk(
         path: path.to_path_buf(),
         source,
     };
-    let file = tokio::fs::File::open(path).await.map_err(read_error)?;
+    let file = open_regular_file(path).await.map_err(|err| match err {
+        OpenRegularFileError::Io(source) => read_error(source),
+        OpenRegularFileError::NotRegular => MaterializeRunEnvelopeError::StreamNotRegularFile {
+            stream,
+            path: path.to_path_buf(),
+        },
+    })?;
     let readback = read_capped_and_hashed(file, cap, summary.byte_len)
         .await
         .map_err(read_error)?;

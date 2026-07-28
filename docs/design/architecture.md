@@ -996,7 +996,11 @@ read stops one byte past the length the row records: a file that keeps growing
 has no EOF, and a host-spawned agent that leaves a helper appending to its own
 stream file would otherwise choose how long writ reads and hashes for it. The
 row's length bounds the read in time the way the envelope cap bounds it in
-memory. Checking
+memory. The file is also opened `O_NONBLOCK|O_NOFOLLOW` and `fstat`ed for
+"regular file" before any of it is read — a path is not a file, and the
+host-spawn arm's agent runs as writd's own user, so it can leave a FIFO where
+its log used to be; opening one blocks before any check could run. Checking the
+descriptor rather than the path is what makes that a check rather than a race. Checking
 only the prefix would let a tamperer who keeps the length above the cap buy a
 signature over bytes the row contradicts. Both crates hash a stream through one
 `writ_agent_run::Sha256Stream`, so the capture's digest and this re-read's are
