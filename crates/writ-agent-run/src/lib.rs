@@ -691,19 +691,24 @@ mod process_runner {
 
         /// Wait for the agent to exit, disarming the guard.
         ///
-        /// Takes `self` because after this the child is reaped: a second wait
-        /// would be an error, and the guard has nothing left to protect. If the
-        /// wait itself fails the child goes back under the guard's drop, which
-        /// kills it — a wait that failed tells us nothing about whether the
-        /// agent is still running.
+        /// Disarms *before* waiting, so the guard is disarmed however the wait
+        /// turns out. That is deliberate, and the failure case is why: on Unix
+        /// a `wait` that fails means `ECHILD` — the child was already reaped by
+        /// someone else (`SIGCHLD` ignored, `SA_NOCLDWAIT`, an outer reaper) —
+        /// and a reaped pid is free for the OS to reassign. Killing it then is
+        /// not cleanup, it is signalling whatever process now holds that
+        /// number. `process_spawn::wait_collecting` reached the same
+        /// conclusion for the same reason.
+        ///
+        /// So the guard protects exactly the paths that never got as far as
+        /// waiting; taking the child out here means there is no armed-on-error
+        /// path to get wrong.
         fn wait(mut self) -> Result<std::process::ExitStatus, AgentProcessRunError> {
-            match self.as_mut().wait() {
-                Ok(status) => {
-                    self.0 = None;
-                    Ok(status)
-                }
-                Err(err) => Err(AgentProcessRunError::Wait(err)),
-            }
+            let mut child = self
+                .0
+                .take()
+                .expect("the child is taken only here, and this consumes the guard");
+            child.wait().map_err(AgentProcessRunError::Wait)
         }
     }
 
@@ -1003,8 +1008,11 @@ mod process_runner {
             );
         }
 
-        /// Waiting through the guard disarms it, so the drop does not then try to
-        /// kill and reap a pid the OS is free to have reassigned.
+        /// Waiting through the guard disarms it, so the drop does not then try
+        /// to kill and reap a pid the OS is free to have reassigned. The
+        /// disarm happens before the wait, so it holds on the `ECHILD` path
+        /// too — which is the one that matters, since there the pid is
+        /// *already* free.
         #[test]
         fn waiting_through_the_guard_disarms_it() {
             let child = Command::new("true")
