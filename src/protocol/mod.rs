@@ -235,6 +235,24 @@ pub enum ClientMessage {
     /// and signing path; the response variant
     /// (`ServerMessage::RunAgentCompleted`) arrives alongside its
     /// first consumer (the bailiff binary skeleton) in slice A2.
+    /// Ask writ whether its audit log corroborates a signed run note.
+    ///
+    /// `verify_run_envelope` proves a note is internally consistent and
+    /// signed by a trusted key — both facts drawn from the note itself. It
+    /// cannot say whether writ ever ran the thing the note describes, because
+    /// only the daemon holds the audit database and the stream files. This
+    /// asks it.
+    ///
+    /// Only the metadata and its signature cross the wire, never the output
+    /// bytes: `metadata.output_envelope_sha256` already binds them, and writd
+    /// re-derives that digest from the stream files its own outcome row names.
+    /// So the request stays a few hundred bytes however large the run's output
+    /// was, and the output side of the comparison is writ checking its own
+    /// files rather than trusting the caller's copy of them.
+    VerifyAgentRun {
+        signed_metadata: SignedRunMetadata,
+        signature: SshSignature,
+    },
     RunAgent {
         /// Prompt delivered verbatim to the spawned agent's stdin.
         /// Writ forwards the bytes but does not store, persist, or
@@ -424,6 +442,15 @@ pub enum ServerMessage {
         signed_metadata: SignedRunMetadata,
         signature: SshSignature,
     },
+    /// Answer to [`ClientMessage::VerifyAgentRun`]: what writ's own audit log
+    /// says about a signed note presented to it.
+    ///
+    /// One variant for every shape of answer, so a caller matches
+    /// exhaustively rather than reading a bag of optional fields — and so
+    /// "no such run" cannot be mistaken for "nothing wrong found".
+    AgentRunProvenance {
+        verdict: crate::run_provenance::RunProvenanceVerdict,
+    },
     /// An internal failure (mint error, audit write failure, agent VM
     /// runtime not configured, …). The agent should surface `message` to
     /// the user and not retry automatically. Outcomes a client may want
@@ -523,6 +550,10 @@ impl std::fmt::Debug for ServerMessage {
                 .field("output_oid", output_oid)
                 .field("signed_metadata", signed_metadata)
                 .field("signature", signature)
+                .finish(),
+            Self::AgentRunProvenance { verdict } => f
+                .debug_struct("AgentRunProvenance")
+                .field("verdict", verdict)
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }

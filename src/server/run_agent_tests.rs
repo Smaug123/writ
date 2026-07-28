@@ -2,7 +2,8 @@
 
 use super::test_support::*;
 use super::*;
-use crate::core::{AgentKind, RepoRef};
+use crate::core::{AgentKind, RepoRef, SshSignature};
+use crate::protocol::SignedRunMetadata;
 use wiremock::MockServer;
 
 /// Dispatch refuses `RunAgent` when any of the three configuration
@@ -1236,5 +1237,189 @@ async fn agent_vm_messages_fail_when_runtime_is_not_configured() {
         ServerMessage::Error {
             message: "agent VM runtime is not configured".into()
         }
+    );
+}
+
+/// Run a real host-spawn `RunAgent` and return the note it produced plus the
+/// fixture that produced it, so a provenance test starts from a genuine run
+/// rather than a hand-built one.
+async fn run_one_agent(args: Vec<String>) -> (RunAgentFixture, SignedRunMetadata, SshSignature) {
+    let sh = find_in_path_any(&["sh", "bash"]);
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(&server, sh, args);
+    let session_id = open_session(&fixture.state).await;
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("provenance prompt"),
+            capabilities: Vec::new(),
+            purpose: "provenance".into(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        &fixture.state,
+    )
+    .await;
+    match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata,
+            signature,
+            ..
+        } => (fixture, signed_metadata, signature),
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    }
+}
+
+async fn verify(
+    fixture: &RunAgentFixture,
+    signed_metadata: &SignedRunMetadata,
+    signature: &SshSignature,
+) -> crate::run_provenance::RunProvenanceVerdict {
+    let resp = dispatch_message(
+        ClientMessage::VerifyAgentRun {
+            signed_metadata: signed_metadata.clone(),
+            signature: signature.clone(),
+        },
+        &fixture.state,
+    )
+    .await;
+    match resp {
+        ServerMessage::AgentRunProvenance { verdict } => verdict,
+        other => panic!("expected AgentRunProvenance, got {other:?}"),
+    }
+}
+
+/// The note writ just produced is corroborated by writ's own log.
+///
+/// End-to-end rather than against a hand-built pair: this is the only test
+/// that can catch the two halves being *individually* right and jointly
+/// wrong — a signer and a row-writer that disagree about, say, which
+/// timestamp `completed_at` means would each pass their own tests.
+#[tokio::test]
+async fn a_note_writ_just_signed_is_corroborated_by_its_own_log() {
+    let (fixture, signed_metadata, signature) =
+        run_one_agent(vec!["-c".into(), "printf out; printf err 1>&2".into()]).await;
+
+    let verdict = verify(&fixture, &signed_metadata, &signature).await;
+    assert!(
+        verdict.is_corroborated(),
+        "writ must corroborate the note it just signed, got {verdict:?}",
+    );
+}
+
+/// Altering the note after signing is caught as a bad signature, not as a
+/// field mismatch.
+///
+/// The distinction is the point: once the bytes no longer verify, the fields
+/// are unattributed, so reporting "the exit code disagrees" would dress an
+/// unverified claim up as evidence about a run.
+#[tokio::test]
+async fn a_note_altered_after_signing_is_rejected_before_any_field_is_compared() {
+    let (fixture, signed_metadata, signature) =
+        run_one_agent(vec!["-c".into(), "true".into()]).await;
+
+    let mut tampered = signed_metadata.clone();
+    tampered.exit_code = 42;
+    let verdict = verify(&fixture, &tampered, &signature).await;
+    assert_eq!(
+        verdict,
+        crate::run_provenance::RunProvenanceVerdict::SignatureInvalid
+    );
+}
+
+/// A note signed by some other writ is not ours to vouch for, and says so
+/// distinctly from tampering.
+#[tokio::test]
+async fn a_note_from_another_daemon_is_reported_as_not_ours() {
+    let (fixture, signed_metadata, signature) =
+        run_one_agent(vec!["-c".into(), "true".into()]).await;
+
+    // Re-sign the same metadata with a different key, so the note is
+    // internally valid — just not this daemon's.
+    const OTHER_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing_other.key");
+    let other = crate::signing::WritSigningKey::from_openssh_pem(OTHER_PEM).unwrap();
+    let mut foreign = signed_metadata.clone();
+    foreign.signing_key_fingerprint = other.fingerprint();
+    let foreign_signature = other.sign(&foreign.canonical_bytes()).unwrap();
+
+    let verdict = verify(&fixture, &foreign, &foreign_signature).await;
+    match verdict {
+        crate::run_provenance::RunProvenanceVerdict::NotOurs { fingerprint } => {
+            assert_eq!(fingerprint, other.fingerprint());
+        }
+        other => panic!("expected NotOurs, got {other:?}"),
+    }
+    // The signature was valid for its own key; the point is that writ refuses
+    // to speak for a key it does not hold, not that it found a forgery.
+    drop(signature);
+}
+
+/// A genuine note whose run the log has never heard of is `UnknownRun` — not
+/// a clean bill of health.
+#[tokio::test]
+async fn a_note_for_a_run_the_log_never_recorded_is_unknown_not_corroborated() {
+    let (fixture, signed_metadata, _) = run_one_agent(vec!["-c".into(), "true".into()]).await;
+
+    // Re-sign a note for a run id that was never recorded, so the signature
+    // is genuine and only the log is missing it.
+    let signing_key = fixture.signing_key.clone();
+    let mut orphan = signed_metadata.clone();
+    orphan.run_id = crate::agent_run::AgentRunId::new();
+    let orphan_signature = signing_key.sign(&orphan.canonical_bytes()).unwrap();
+
+    let verdict = verify(&fixture, &orphan, &orphan_signature).await;
+    match verdict {
+        crate::run_provenance::RunProvenanceVerdict::UnknownRun { run_id } => {
+            assert_eq!(run_id, orphan.run_id);
+        }
+        other => panic!("expected UnknownRun, got {other:?}"),
+    }
+    assert!(
+        !verify(&fixture, &orphan, &orphan_signature)
+            .await
+            .is_corroborated()
+    );
+}
+
+/// A stream file rewritten after the run is caught when the note is checked,
+/// because the output digest is re-derived from the file rather than taken
+/// from the note.
+#[tokio::test]
+async fn a_stream_file_rewritten_after_the_run_fails_the_provenance_check() {
+    let (fixture, signed_metadata, signature) =
+        run_one_agent(vec!["-c".into(), "printf original".into()]).await;
+    // Corroborated before the tamper, so the failure below is the tamper.
+    assert!(
+        verify(&fixture, &signed_metadata, &signature)
+            .await
+            .is_corroborated()
+    );
+
+    let outcome = fixture
+        .state
+        .audit
+        .get_agent_run_outcome(signed_metadata.run_id)
+        .unwrap()
+        .expect("the run recorded an outcome");
+    std::fs::write(&outcome.outcome.stdout.path, b"replaced").unwrap();
+
+    let resp = dispatch_message(
+        ClientMessage::VerifyAgentRun {
+            signed_metadata: signed_metadata.clone(),
+            signature,
+        },
+        &fixture.state,
+    )
+    .await;
+    // The re-derivation refuses outright: the file disagrees with its own
+    // outcome row, so there is no honest digest to compare against the note.
+    let ServerMessage::Error { message } = resp else {
+        panic!("expected an Error refusing to re-derive, got {resp:?}");
+    };
+    assert!(
+        message.contains("no longer matches"),
+        "the error must name the tampered file, got: {message}",
     );
 }

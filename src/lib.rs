@@ -91,6 +91,8 @@ pub mod protocol;
 #[cfg(feature = "host")]
 pub mod run_envelope;
 #[cfg(feature = "host")]
+pub mod run_provenance;
+#[cfg(feature = "host")]
 pub mod run_verify;
 #[cfg(feature = "host")]
 pub mod secret;

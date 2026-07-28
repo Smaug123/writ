@@ -224,6 +224,19 @@ enum AgentCmd {
         #[arg(long, value_parser = parse_correlation_id)]
         correlation_id: Option<CorrelationId>,
     },
+    /// Ask writ whether its audit log corroborates a signed run note.
+    ///
+    /// `writ agent verify` answers the question a signature cannot: not "is
+    /// this note internally consistent and signed by a key I trust" — a
+    /// verifier settles that on its own — but "did this daemon actually run
+    /// what the note describes". Only writd holds the audit database and the
+    /// stream files, so only writd can say.
+    Verify {
+        /// Path to a file holding the signed envelope bytes, as stored in a
+        /// note body. `-` reads from stdin.
+        #[arg(long)]
+        envelope: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -492,6 +505,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     correlation_id,
                 )?;
             }
+            AgentCmd::Verify { envelope } => {
+                verify_agent_run(&socket_path, &envelope)?;
+            }
         },
         Cmd::Promote { action } => match action {
             PromoteCmd::List { session_id } => {
@@ -677,6 +693,95 @@ fn start_agent_vm(
         }
         ServerMessage::Error { message } => Err(message.into()),
         other => Err(format!("unexpected response: {other:?}").into()),
+    }
+}
+
+/// Parse an envelope and build the provenance request for it, refusing one
+/// whose own body does not match what it was signed over.
+///
+/// The local check is not redundant with the daemon's answer — it is the half
+/// the daemon *cannot* give. Only the metadata and signature travel, so if the
+/// output bytes in the file were swapped after signing, writd re-derives the
+/// digest from its own intact files, finds everything agrees, and truthfully
+/// answers a question about a note that is not the one on disk. The operator
+/// reads "corroborated" about a file whose body is now someone else's.
+///
+/// So the two checks compose in one order only: establish that this envelope
+/// is the envelope it claims to be, then ask whether writ's history backs it.
+///
+/// Split out from the IO for testability: this is the whole decision, over
+/// bytes.
+fn verification_request(bytes: &[u8]) -> Result<ClientMessage, String> {
+    let envelope = writ::run_envelope::SignedRunEnvelope::from_bytes(bytes)
+        .map_err(|e| format!("not a signed run envelope: {e}"))?;
+    writ::run_verify::check_output_digest(&envelope).map_err(|e| e.to_string())?;
+    Ok(ClientMessage::VerifyAgentRun {
+        signed_metadata: envelope.metadata,
+        signature: envelope.signature,
+    })
+}
+
+/// Present a signed run note to writd and print what its audit log says.
+///
+/// Reads the *envelope* — the note body as stored — but sends only its
+/// metadata and signature: the output bytes stay here, because
+/// `output_envelope_sha256` already binds them and writd re-derives that
+/// digest from its own stream files. Comparing writd's copy against writd's
+/// row is the whole point; sending ours would only ask it to agree with us.
+///
+/// Exit status is the answer: zero when the log corroborates the note, one
+/// otherwise. A verdict that is anything other than a clean comparison —
+/// including "no such run" — is a reason not to trust the note, so it must
+/// not exit zero.
+fn verify_agent_run(
+    socket_path: &Path,
+    envelope_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use writ::run_provenance::RunProvenanceVerdict;
+
+    let bytes = if envelope_path == Path::new("-") {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read(envelope_path)
+            .map_err(|e| format!("cannot read {}: {e}", envelope_path.display()))?
+    };
+    let msg =
+        verification_request(&bytes).map_err(|e| format!("{}: {e}", envelope_path.display()))?;
+    let verdict = match call(socket_path, &msg)? {
+        ServerMessage::AgentRunProvenance { verdict } => verdict,
+        ServerMessage::Error { message } => return Err(message.into()),
+        other => return Err(format!("unexpected response: {other:?}").into()),
+    };
+
+    match &verdict {
+        RunProvenanceVerdict::NotOurs { fingerprint } => {
+            println!("not-ours fingerprint={fingerprint}");
+        }
+        RunProvenanceVerdict::SignatureInvalid => {
+            println!("signature-invalid");
+        }
+        RunProvenanceVerdict::UnknownRun { run_id } => {
+            println!("unknown-run run_id={run_id}");
+        }
+        RunProvenanceVerdict::OutcomePending { run_id } => {
+            println!("outcome-pending run_id={run_id}");
+        }
+        RunProvenanceVerdict::Checked { run_id, findings } if findings.is_empty() => {
+            println!("corroborated run_id={run_id}");
+        }
+        RunProvenanceVerdict::Checked { run_id, findings } => {
+            println!("mismatch run_id={run_id} findings={}", findings.len());
+            for finding in findings {
+                println!("  {finding:?}");
+            }
+        }
+    }
+    if verdict.is_corroborated() {
+        Ok(())
+    } else {
+        Err("writ's audit log does not corroborate this note".into())
     }
 }
 
@@ -1767,6 +1872,78 @@ mod tests {
         assert!(
             err.to_string().contains("--guest-system"),
             "unexpected clap error: {err}",
+        );
+    }
+
+    /// An envelope whose output bytes were swapped after signing is refused
+    /// locally, before writd is asked anything.
+    ///
+    /// This is the failure that looks most like success. The metadata is
+    /// untouched and its signature still verifies, so the daemon — which
+    /// receives only those two things and re-derives the output digest from
+    /// its own intact files — would truthfully answer "corroborated" about a
+    /// note that is not the one on disk, and `writ agent verify` would print
+    /// it and exit zero over a file whose body is now someone else's.
+    #[test]
+    fn an_envelope_whose_output_was_swapped_is_refused_before_the_daemon_is_asked() {
+        use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+
+        const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+        let signing_key = writ::signing::WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
+        let output = OutputEnvelope {
+            stdout: b"what the agent wrote".to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated_at: None,
+            stderr_truncated_at: None,
+        }
+        .to_bytes();
+        let metadata = writ::protocol::SignedRunMetadata {
+            run_id: writ::agent_run::AgentRunId::new(),
+            session_id: SessionId::new(),
+            prompt_sha256: writ::core::Sha256Hex::try_new(writ::agent_run::sha256_hex(b"prompt"))
+                .unwrap(),
+            output_envelope_sha256: writ::core::Sha256Hex::try_new(writ::agent_run::sha256_hex(
+                &output,
+            ))
+            .unwrap(),
+            capabilities: Vec::new(),
+            exit_code: 0,
+            completed_at: writ::core::UnixMillis::from_millis(1_700_000_000),
+            signing_key_fingerprint: signing_key.fingerprint(),
+        };
+        let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
+
+        // Untampered: accepted, and the request carries exactly the signed
+        // metadata.
+        let honest = SignedRunEnvelope {
+            metadata: metadata.clone(),
+            signature: signature.clone(),
+            output,
+        };
+        match verification_request(&honest.to_bytes()).expect("an honest envelope is accepted") {
+            ClientMessage::VerifyAgentRun {
+                signed_metadata, ..
+            } => assert_eq!(signed_metadata, metadata),
+            other => panic!("expected VerifyAgentRun, got {other:?}"),
+        }
+
+        // Body swapped, metadata and signature untouched.
+        let swapped = SignedRunEnvelope {
+            metadata,
+            signature,
+            output: OutputEnvelope {
+                stdout: b"what someone else wrote".to_vec(),
+                stderr: Vec::new(),
+                stdout_truncated_at: None,
+                stderr_truncated_at: None,
+            }
+            .to_bytes(),
+        };
+        let err = verification_request(&swapped.to_bytes())
+            .expect_err("a swapped body must not reach the daemon as a question about the note");
+        assert!(
+            err.contains("output digest mismatch"),
+            "the refusal must name what is wrong, got: {err}",
         );
     }
 }

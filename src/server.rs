@@ -419,6 +419,10 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             )
             .await
         }
+        ClientMessage::VerifyAgentRun {
+            signed_metadata,
+            signature,
+        } => run_agent::verify_agent_run(state, &signed_metadata, &signature).await,
     }
 }
 

@@ -1531,3 +1531,90 @@ fn sample_client_message(index: usize) -> ClientMessage {
         other => unreachable!("variant index out of range: {other}"),
     }
 }
+
+/// `VerifyAgentRun` carries only the metadata and its signature — never the
+/// output bytes.
+///
+/// Pinned because the whole reason the request is cheap is that
+/// `output_envelope_sha256` already binds the output and writd re-derives that
+/// digest from its own files. A future field carrying output bytes would make
+/// the request unbounded *and* move the output side of the comparison to the
+/// caller's copy, which is the copy under suspicion.
+#[test]
+fn verify_agent_run_pins_wire_shape_and_carries_no_output() {
+    let msg = ClientMessage::VerifyAgentRun {
+        signed_metadata: sample_signed_run_metadata(),
+        signature: sample_ssh_signature(),
+    };
+    let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+    assert_eq!(value["type"], "verify_agent_run");
+    let object = value.as_object().expect("the request is a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["signature", "signed_metadata", "type"],
+        "wire: {value}"
+    );
+
+    let back: ClientMessage = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+    assert_eq!(back, msg);
+}
+
+/// Every provenance verdict round-trips, and each keeps its own tag.
+///
+/// The tags are what a caller matches on, and the variants exist precisely so
+/// that "no such run" cannot be read as "nothing wrong found" — collapsing two
+/// of them onto one tag would restore exactly that ambiguity.
+#[test]
+fn every_provenance_verdict_roundtrips_under_a_distinct_tag() {
+    use crate::run_provenance::{RunProvenanceFinding, RunProvenanceVerdict};
+
+    let run_id = crate::agent_run::AgentRunId::new();
+    let verdicts = vec![
+        RunProvenanceVerdict::NotOurs {
+            fingerprint: sample_signed_run_metadata().signing_key_fingerprint,
+        },
+        RunProvenanceVerdict::SignatureInvalid,
+        RunProvenanceVerdict::UnknownRun { run_id },
+        RunProvenanceVerdict::OutcomePending { run_id },
+        RunProvenanceVerdict::Checked {
+            run_id,
+            findings: Vec::new(),
+        },
+        RunProvenanceVerdict::Checked {
+            run_id,
+            findings: vec![RunProvenanceFinding::ExitCodeMismatch {
+                signed: 0,
+                audited: 1,
+            }],
+        },
+    ];
+
+    let mut tags = std::collections::BTreeSet::new();
+    for verdict in verdicts {
+        let msg = ServerMessage::AgentRunProvenance {
+            verdict: verdict.clone(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value["type"], "agent_run_provenance");
+        tags.insert(value["verdict"]["verdict"].as_str().unwrap().to_string());
+
+        let back: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(back, msg);
+    }
+    assert_eq!(
+        tags,
+        [
+            "checked",
+            "not_ours",
+            "outcome_pending",
+            "signature_invalid",
+            "unknown_run"
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<std::collections::BTreeSet<_>>(),
+    );
+}

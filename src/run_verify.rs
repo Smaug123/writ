@@ -254,6 +254,33 @@ pub enum VerifyError {
     SignatureInvalid(#[from] signing::VerifyError),
 }
 
+/// Check that an envelope's output bytes are the ones its metadata commits to.
+///
+/// The first of [`verify_run_envelope`]'s three checks, exposed on its own
+/// because it is the one check a caller can want *without* a keyring — and the
+/// one whose absence is silent. The signature covers the metadata, and the
+/// metadata covers the output only through this digest, so an envelope whose
+/// body was swapped after signing still has a perfectly valid signature over
+/// perfectly authentic metadata. Nothing about the note announces the swap
+/// except recomputing this.
+///
+/// That makes it the check to run before asking anyone *else* about a note:
+/// a question answered from the metadata alone — "does writ's audit log
+/// corroborate this?" — is answered correctly and means nothing, because the
+/// bytes the asker actually holds were never part of the question.
+pub fn check_output_digest(envelope: &SignedRunEnvelope) -> Result<(), VerifyError> {
+    let actual_hex = sha256_hex(&envelope.output);
+    let actual = Sha256Hex::try_new(actual_hex)
+        .expect("sha256_hex returns canonical 64-lowercase-hex output");
+    if actual.as_str() != envelope.metadata.output_envelope_sha256.as_str() {
+        return Err(VerifyError::OutputDigestMismatch {
+            expected: envelope.metadata.output_envelope_sha256.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
 /// Verify a `SignedRunEnvelope` end-to-end.
 ///
 /// Runs the three checks documented at the module level in the order
@@ -266,15 +293,7 @@ pub fn verify_run_envelope(
     envelope: &SignedRunEnvelope,
     allowed: &AllowedSigners,
 ) -> Result<(), VerifyError> {
-    let actual_hex = sha256_hex(&envelope.output);
-    let actual = Sha256Hex::try_new(actual_hex)
-        .expect("sha256_hex returns canonical 64-lowercase-hex output");
-    if actual.as_str() != envelope.metadata.output_envelope_sha256.as_str() {
-        return Err(VerifyError::OutputDigestMismatch {
-            expected: envelope.metadata.output_envelope_sha256.clone(),
-            actual,
-        });
-    }
+    check_output_digest(envelope)?;
 
     let fingerprint = &envelope.metadata.signing_key_fingerprint;
     let Some(key) = allowed.lookup(fingerprint) else {
