@@ -859,10 +859,10 @@ impl AgentRunLogRoot {
     ///
     /// The claim stops at this directory. A hostile local user who can write
     /// an *ancestor* of the root can still replace the entry, and nothing here
-    /// prevents that — but such a user can equally reach the secret store, the
-    /// notes repo, and the audit DB, none of which validate their ancestor
-    /// chains either. Path trust for writ's durable directories is one
-    /// question to answer uniformly, not per-root.
+    /// prevents that — but such a user is not in writ's threat model, which
+    /// runs between the single trusted host operator and the untrusted guest
+    /// (`docs/design/architecture.md` §1). The mode is hygiene, not a boundary;
+    /// don't extend it into an ancestor-chain or ownership check.
     ///
     /// The mode applies to every component this creates, which is what makes
     /// the *nested* case safe: an operator who keeps the old

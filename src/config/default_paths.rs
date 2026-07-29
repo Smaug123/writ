@@ -90,9 +90,18 @@
 //! Resolving a path is not trusting it. Nothing here checks that the resolved
 //! directory is owned by the right uid — and the mode-only checks that guard
 //! the secret store, the socket parent, and the bearer file are all bypassable
-//! by a macOS ACL, which `st_mode` does not reflect. That is a separate
-//! question about *every* writ host directory however it was arrived at, and
-//! it is deliberately not answered here.
+//! by a macOS ACL, which `st_mode` does not reflect.
+//!
+//! That is deliberate rather than pending. A hostile local user is not in
+//! writ's threat model: the boundary runs between the single trusted host
+//! operator and the untrusted guest, so a uid that can already write writ's
+//! directories is on the trusted side of it. See `docs/design/architecture.md`
+//! §1, which is the canonical statement.
+//!
+//! What this module *does* owe the guest boundary is that no path here is
+//! derived from anything the guest supplies: every entry is a compile-time
+//! constant joined onto an environment variable read from the host operator's
+//! own environment.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

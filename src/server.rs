@@ -782,6 +782,12 @@ async fn bind_socket(socket_path: &Path) -> io::Result<UnixListener> {
 /// credential socket. A stale socket file is removed only after
 /// confirming nothing is listening on it; if a live daemon is already
 /// serving the path this function returns `ErrorKind::AddrInUse`.
+///
+/// That mode check is defence-in-depth, not writ's trust boundary: a
+/// hostile local uid is out of the threat model (see §1 of
+/// `docs/design/architecture.md`). Keep it — it is what makes "if you
+/// can open the socket, you are trusted" true rather than merely
+/// assumed — but don't grow it into an ownership or ancestor check.
 pub async fn run<S: SecretStore + Send + Sync + 'static>(
     socket_path: &Path,
     state: Arc<BrokerState<S>>,

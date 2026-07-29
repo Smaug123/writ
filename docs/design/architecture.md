@@ -46,6 +46,35 @@ SQLite audit log. Two invariants give the system its shape:
 
 Everything below is a consequence of holding those two invariants at once.
 
+**What is *not* in the threat model: another local user on the same machine.**
+writ is single-operator. Its trust boundary runs between the host user account
+that runs `writd` — trusted, since it owns the config, the signing key and the
+audit database outright — and the agent inside the VM, which is not. Containing
+the agent is the whole point; containing a hostile uid on the same host is not a
+goal writ pursues.
+
+This is a decision rather than an oversight, and it settles a question that had
+been reopened per-directory more than once. Nothing validates the ancestor chain
+of writ's durable directories, and the mode checks guarding the secret store,
+the socket parent and the bearer file test `mode & 0o077 == 0` without ever
+consulting `st_uid` — which a macOS ACL (`chmod +a`) sidesteps entirely, since
+`st_mode` cannot express one. Under this threat model those are **known and
+accepted**, not latent bugs. Do not file them again per-root.
+
+The guards stay where they already exist. They cost a few lines each, they keep
+`writd` from silently becoming multi-user-exposed should the single-operator
+assumption ever stop holding, and "if you can open the socket, you are trusted"
+is only a safe thing to say while the socket is unreachable by anyone else. They
+are hygiene and defence-in-depth — not a boundary, and not to be extended into
+one. Ownership checks, ancestor-chain walks and `openat`-anchored descriptors
+are all out of scope.
+
+None of this relaxes the guest boundary. A host path component derived from
+guest-controlled data is still a bug, governed by invariant 2 — which is why
+`MirrorCacheKey`'s slug is a SHA-256 digest rather than a repository name, and
+why `AgentRunId` is a `Uuid` the host minted rather than a string the guest
+chose.
+
 ## 2. Workspace crates
 
 | Crate | Role | Depends on |
@@ -109,7 +138,9 @@ These hold across subsystems and are the reason to trust the whole:
   constructor, so it cannot be forged outside the policy engine.
 - **Transport auth = filesystem permissions.** The Unix socket's parent dir is
   forced/checked to `0700` and refuses group/world bits (`server.rs:823`). If
-  you can open the socket, you are trusted.
+  you can open the socket, you are trusted — which is a safe thing to say
+  because writ is single-operator (§1). There is no peer-credential check, and
+  under that threat model there does not need to be one.
 - **Two-phase, append-only audit.** The request row commits *before* any
   network mint; the outcome row (grant or mint-failure) follows. A minted token
   whose grant fails to record is never delivered (`server.rs:533`). A DB at a
