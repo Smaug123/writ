@@ -107,6 +107,20 @@ fn only_git_env_defines_the_hardened_git_recipe() {
             "GIT_CONFIG_SYSTEM",
             "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS",
+            // The numbered channel is part of the recipe now — it is how the
+            // clean recipe imposes `maintenance.auto=false` / `gc.auto=0`. A
+            // second definition of it is worse than a second copy of a denial:
+            // whoever writes it must also get `GIT_CONFIG_COUNT` right, and a
+            // count that disagrees with the pairs either drops a setting
+            // silently or brings an inherited slot into range.
+            "GIT_CONFIG_KEY_",
+            "GIT_CONFIG_VALUE_",
+            // And the settings themselves, in either spelling, so a caller
+            // cannot re-impose them per-command with `-c`. That is where they
+            // started life (the flake fixtures), and it is how they would drift
+            // back out of the shared recipe.
+            "maintenance.auto",
+            "gc.auto",
             // Quoted, so this matches only the standalone `GIT_CONFIG` name and
             // not the five suffixed ones above (every one of which starts with
             // it). The comment above used to claim this was covered when it was

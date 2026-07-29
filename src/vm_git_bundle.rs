@@ -985,7 +985,7 @@ mod tests {
 set -eu
 log={log}
 cwd=$(pwd)
-printf '%s|%s|%s|%s|%s|%s|%s\n' "$cwd" "${{GIT_CONFIG_NOSYSTEM-unset}}" "${{GIT_CONFIG_GLOBAL-unset}}" "${{GIT_CONFIG_COUNT-unset}}" "${{WRIT_GITHUB_TOKEN-unset}}" "${{HOME-unset}}" "${{PATH+set}}" >> "$log"
+printf '%s|%s|%s|%s|%s|%s|%s|%s=%s\n' "$cwd" "${{GIT_CONFIG_NOSYSTEM-unset}}" "${{GIT_CONFIG_GLOBAL-unset}}" "${{GIT_CONFIG_COUNT-unset}}" "${{WRIT_GITHUB_TOKEN-unset}}" "${{HOME-unset}}" "${{PATH+set}}" "${{GIT_CONFIG_KEY_0-unset}}" "${{GIT_CONFIG_VALUE_0-unset}}" >> "$log"
 if [ "$1" = "-c" ]; then
     [ "$2" = "credential.helper=" ]
     [ "$3" = "-c" ]
@@ -1580,8 +1580,17 @@ exit 42
         for command in commands.all() {
             assert_eq!(env_value(command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
             assert_eq!(env_value(command, "GIT_CONFIG_GLOBAL"), Some("/dev/null"));
-            assert_eq!(env_value(command, "GIT_CONFIG_COUNT"), Some("0"));
+            assert_eq!(env_value(command, "GIT_CONFIG_COUNT"), Some("2"));
             assert_eq!(env_value(command, "HOME"), Some("/dev/null"));
+            // The mirror clone and the bundle build must not leave a detached
+            // `git maintenance` behind: `clone_local` walks the source
+            // `objects/pack/`, which is exactly what raced such a process in
+            // CI.
+            assert_eq!(
+                env_value(command, "GIT_CONFIG_KEY_0"),
+                Some("maintenance.auto")
+            );
+            assert_eq!(env_value(command, "GIT_CONFIG_VALUE_0"), Some("false"));
         }
 
         for command in commands.all() {
@@ -1626,11 +1635,18 @@ exit 42
         // The shebang shell may synthesize PATH even though the executor
         // cleared the parent environment; cwd, HOME, Git config, and token
         // scope are the load-bearing assertions here.
+        //
+        // The trailing field is the strongest evidence available anywhere that
+        // the auto-maintenance suppression *arrives*: unlike the static
+        // assertions on `CleanGitInvocation`, this is what a really-spawned
+        // child really saw. `clone --mirror` walks the source `objects/pack/`,
+        // which is exactly what raced a detached `git maintenance` in CI, so
+        // this executor is the one that most needs it.
         assert_eq!(
             lines,
             vec![
-                "/|1|/dev/null|0|super-secret-token|/dev/null|set",
-                "/|1|/dev/null|0|unset|/dev/null|set",
+                "/|1|/dev/null|2|super-secret-token|/dev/null|set|maintenance.auto=false",
+                "/|1|/dev/null|2|unset|/dev/null|set|maintenance.auto=false",
             ]
         );
     }

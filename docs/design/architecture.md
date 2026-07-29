@@ -232,12 +232,36 @@ the complete config-source denial set (`GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_COUNT=0`, **and**
 `GIT_CONFIG_PARAMETERS=` — the last is a separate channel git parses
 independently of the count, so it needs its own entry), `CLEAN_GIT_CONFIG_ENV` is
-that plus `HOME=/dev/null`, and a test asserts the second is exactly the first
-plus `HOME` so the two cannot drift apart. A caller needing a real `HOME` (nix
-fetching a flake input) takes the denial set and supplies its own — never a
-subset. One test runs real `git` under the recipe with injections on every
-channel and asserts none lands, because the shape of the constant cannot tell you
-whether git honours it.
+that plus `HOME=/dev/null` plus `GIT_IMPOSED_CONFIG`, and tests assert the three
+cannot drift apart. A caller needing a real `HOME` (nix fetching a flake input)
+takes the denial set and supplies its own — never a subset. One test runs real
+`git` under the recipe with injections on every channel and asserts none lands,
+because the shape of the constant cannot tell you whether git honours it.
+
+`GIT_IMPOSED_CONFIG` is the one part of the recipe that *asserts* configuration
+rather than denying it: `maintenance.auto=false` and `gc.auto=0`, so no
+`git maintenance run --auto --quiet --detach` outlives the command that spawned
+it and keeps writing to `objects/`. writd reasons about the contents of the
+repositories it owns — object graphs, ancestry, which refs exist — and a detached
+process rewriting the store underneath that reasoning is the nonlocal effect this
+codebase rejects. It also actually happened: a fixture that committed and then
+cloned raced maintenance's transient `.tmp-<pid>-pack-*.idx` and got ENOENT.
+`git fetch` is the live blast radius (the notes repo and the push staging store
+both fetch; `notes add`, `hash-object -w` and `bundle unbundle` spawn nothing),
+measured on git 2.54 rather than inferred.
+
+Two consequences worth knowing. First, `CLEAN_GIT_CONFIG_ENV` is delivered
+through the numbered `GIT_CONFIG_KEY_<n>` channel, so its `GIT_CONFIG_COUNT` is
+the pair count and not `0`; that denies inherited pairs just as completely,
+provided the recipe fills every slot below the count, which is what
+`the_imposed_config_fills_exactly_the_slots_the_count_declares` pins. Second, the
+denial set deliberately does *not* impose this: its callers are nix (operating on
+caches writ does not own) and the guest's git inside the VM (whose filesystem
+dies with the VM). Nor can the env channel reach a `receive-pack` — `git push`
+strips `GIT_CONFIG_COUNT` for a local-transport child — but nothing in writd
+pushes into a repository it owns. Suppression does not remove writ's ability to
+compact: the `*.auto` knobs gate only the uninvited run, and an explicit
+`git gc` still packs. *When* writ compacts deliberately is still open.
 
 **Invariants.** Make-illegal-states-unrepresentable: `Metadata` requests carry a
 one-variant `MetadataAccess::Read`; private constructors (`AgentNetwork::new`,

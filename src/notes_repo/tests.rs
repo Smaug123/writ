@@ -452,11 +452,17 @@ fn write_note_handles_binary_body() {
 // process env. The properties they pin down:
 //
 // * The clean-recipe env (`HOME=/dev/null`,
-//   `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
-//   `GIT_CONFIG_COUNT=0`) is unconditionally set on the child —
-//   so a host-wide `GIT_CONFIG_GLOBAL` pointing at a poisoned
-//   file, `init.defaultObjectFormat = sha256` in `~/.gitconfig`,
+//   `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and
+//   a `GIT_CONFIG_COUNT` bounding the recipe's own numbered
+//   pairs) is unconditionally set on the child — so a host-wide
+//   `GIT_CONFIG_GLOBAL` pointing at a poisoned file,
+//   `init.defaultObjectFormat = sha256` in `~/.gitconfig`,
 //   `safe.bareRepository = explicit`, etc. cannot reach git.
+// * Those numbered pairs impose `maintenance.auto=false` /
+//   `gc.auto=0`, so the notes repo has no detached second
+//   writer. That matters here specifically: `write_note` fetches
+//   from a peer repo, and `git fetch` is the command that spawns
+//   `git maintenance run --auto --quiet --detach`.
 // * `PATH` flows from the supplied `InheritedEnv`, not from a
 //   hidden `std::env::var_os` call — so production passes the
 //   captured parent env explicitly and tests can substitute.
@@ -507,6 +513,27 @@ fn prepare_git_command_pins_clean_recipe_and_inherits_only_path() {
     );
     assert_eq!(
         envs.get(OsStr::new("GIT_CONFIG_COUNT")),
+        Some(&Some(OsString::from("2"))),
+        "the count must bound the recipe's own numbered pairs, so an inherited \
+         GIT_CONFIG_KEY_<n> is either overwritten or out of range"
+    );
+    // Asserted by value, not merely present: a notes repo rewritten by a
+    // detached `git maintenance` while writd is reading its object graph is
+    // the failure this suppresses.
+    assert_eq!(
+        envs.get(OsStr::new("GIT_CONFIG_KEY_0")),
+        Some(&Some(OsString::from("maintenance.auto")))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("GIT_CONFIG_VALUE_0")),
+        Some(&Some(OsString::from("false")))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("GIT_CONFIG_KEY_1")),
+        Some(&Some(OsString::from("gc.auto")))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("GIT_CONFIG_VALUE_1")),
         Some(&Some(OsString::from("0")))
     );
 }
