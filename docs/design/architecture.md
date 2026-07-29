@@ -1157,7 +1157,12 @@ capture's digest and this re-read's are comparable by construction.
   parsers, operator identity, workspace bootstrap, record output).
 - **`ui_http/`** — a read-only loopback JSON API, single-bearer-token gated,
   GET-only, joining broker/audit state for a UI/TUI/MCP/curl. Routes
-  `/v1/health`, `/v1/agent-vms`, `/v1/agent-vms/<id>`.
+  `/v1/health`, `/v1/agent-vms`, `/v1/agent-vms/<id>`,
+  `/v1/agent-runs/<run_id>`. The run resource is keyed by run id rather
+  than nested under the session, because a run outlives its VM: the audit
+  rows survive `close_agent_vm_session`, so nesting would shrink the
+  reachable set as sessions end. Follow `current_run_id` from a VM row to
+  reach it.
 - **`crates/writ-vm-git/`** — the shared host↔guest wire-types crate.
 
 **Guarantees & invariants.** The guest client is an ergonomic wrapper, **not an
@@ -1168,7 +1173,12 @@ request server-side. The `writ-vm-client` crate depends only on `writ-core`,
 crate graph, not a feature flag, is what keeps the guest surface host-dep-free.
 The UI is read-only over audit: GET-only, 405 on writes. Wire boundaries
 parse-don't-validate (bearer-token byte check, broker-URL rejects
-query/fragment/non-http).
+query/fragment/non-http). Every UI response is a *projection* of audit rows
+with nothing recomputed — `/v1/agent-runs/<id>` reports the `sha256_hex` the
+outcome row recorded and does not re-hash the stream files, because
+corroborating a recorded digest against bytes on disk is §5.9's job and a
+read endpoint that silently did both would make a verification result look
+like a field.
 
 **Neighbours.** `vm_client` → §5.6; `writ_client` → the daemon; `ui_http` →
 audit; `writ-vm-git` shared with the git pipeline and run provenance.

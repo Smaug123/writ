@@ -11,6 +11,7 @@
 //!
 //! See `docs/plans/2026-05-12-ui-data-api.md` for the design.
 
+mod agent_runs;
 mod agent_vms;
 
 use std::net::SocketAddr;
@@ -370,6 +371,8 @@ pub(crate) enum UiHttpErrorTag {
     NotFound,
     MalformedSessionId,
     UnknownSession,
+    MalformedRunId,
+    UnknownRun,
     Internal,
 }
 
@@ -382,6 +385,8 @@ impl UiHttpErrorTag {
             Self::NotFound => "not_found",
             Self::MalformedSessionId => "malformed_session_id",
             Self::UnknownSession => "unknown_session",
+            Self::MalformedRunId => "malformed_run_id",
+            Self::UnknownRun => "unknown_run",
             Self::Internal => "internal",
         }
     }
@@ -390,17 +395,35 @@ impl UiHttpErrorTag {
         match self {
             Self::MissingBearer | Self::InvalidBearer => 401,
             Self::MethodNotAllowed => 405,
-            Self::NotFound | Self::MalformedSessionId | Self::UnknownSession => 404,
+            Self::NotFound
+            | Self::MalformedSessionId
+            | Self::UnknownSession
+            | Self::MalformedRunId
+            | Self::UnknownRun => 404,
             Self::Internal => 503,
         }
     }
 }
 
+/// The identifier an error is *about*, when it is about one.
+///
+/// A DU rather than one `Option<String>` per id kind on [`ErrorBody`]:
+/// an error names at most one subject, and which kind is determined by
+/// the tag. Parallel optionals would make `malformed_session_id`
+/// carrying a `run_id` representable, and the wire shape is the same
+/// either way — `untagged` emits just the variant's own field.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum ErrorSubject {
+    Session { session_id: String },
+    Run { run_id: String },
+}
+
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
+    #[serde(flatten)]
+    subject: Option<ErrorSubject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -425,7 +448,11 @@ impl UiHttpResponse {
     }
 
     pub(crate) fn error_with_session_id(tag: UiHttpErrorTag, session_id: String) -> Self {
-        Self::error_with(tag, Some(session_id), None, None)
+        Self::error_with(tag, Some(ErrorSubject::Session { session_id }), None, None)
+    }
+
+    pub(crate) fn error_with_run_id(tag: UiHttpErrorTag, run_id: String) -> Self {
+        Self::error_with(tag, Some(ErrorSubject::Run { run_id }), None, None)
     }
 
     pub(crate) fn error_method_not_allowed(allowed: Vec<&'static str>) -> Self {
@@ -438,13 +465,13 @@ impl UiHttpResponse {
 
     fn error_with(
         tag: UiHttpErrorTag,
-        session_id: Option<String>,
+        subject: Option<ErrorSubject>,
         allowed: Option<Vec<&'static str>>,
         message: Option<String>,
     ) -> Self {
         let body = ErrorBody {
             error: tag.as_str(),
-            session_id,
+            subject,
             allowed,
             message,
         };
@@ -574,6 +601,21 @@ async fn route(service: &UiHttpService, method: &str, path: &str) -> UiHttpRespo
             return UiHttpResponse::error(UiHttpErrorTag::NotFound);
         }
         return agent_vms::detail(service, suffix).await;
+    }
+
+    // The run resource `/v1/agent-vms` has always pointed at via
+    // `current_run_id`. Keyed by run id rather than nested under the
+    // session, because a run outlives its VM: the audit rows survive
+    // `close_agent_vm_session`, and nesting would make the reachable
+    // set shrink as sessions end.
+    if let Some(suffix) = path.strip_prefix("/v1/agent-runs/") {
+        if method != "GET" {
+            return UiHttpResponse::error_method_not_allowed(vec!["GET"]);
+        }
+        if suffix.is_empty() || suffix.contains('/') {
+            return UiHttpResponse::error(UiHttpErrorTag::NotFound);
+        }
+        return agent_runs::detail(service, suffix);
     }
 
     UiHttpResponse::error(UiHttpErrorTag::NotFound)
@@ -733,6 +775,26 @@ mod tests {
         assert!(
             body.contains("\"error\":\"unknown_session\""),
             "body: {body}"
+        );
+        // The id is half the value of the error — an operator pasting a
+        // session id wants to see the one the daemon actually looked up.
+        // Asserted because `ErrorSubject` is `flatten`ed into the body,
+        // so a wrong serde attribute relocates or drops the key rather
+        // than failing to compile.
+        //
+        // Parsed rather than substring-matched: `body.contains(...)`
+        // also matches the *nested* `{"subject":{"session_id":...}}`
+        // that dropping `flatten` produces, so it passes on exactly the
+        // regression it was written to catch.
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            parsed.get("session_id").and_then(serde_json::Value::as_str),
+            Some(id.to_string().as_str()),
+            "body: {body}"
+        );
+        assert!(
+            parsed.get("run_id").is_none(),
+            "a session error must not carry a run id: {body}"
         );
     }
 
