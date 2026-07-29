@@ -358,8 +358,8 @@ impl AuditLog {
     /// Most-recent `agent_run.run_id` for a session, by `requested_at`.
     /// `None` if no run row exists. Used by the UI HTTP join to give
     /// the operator a stable handle to follow from a VM into a run
-    /// view; the run itself is exposed through its own resource and
-    /// not inlined here.
+    /// view; the run itself is exposed through `/v1/agent-runs/<id>`
+    /// and not inlined here.
     pub fn latest_agent_run_id_for_session(
         &self,
         session_id: SessionId,
