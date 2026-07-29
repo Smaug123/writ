@@ -12,11 +12,56 @@ use super::validation::{
     validate_agent_run_stream_path_text, validate_sha256_hex, validate_stream_summary,
 };
 use super::{AuditError, AuditLog};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use writ_agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
     CorrelationId, RunPurpose,
 };
-use writ_core::core::{AgentKind, SessionId, UnixMillis};
+use writ_core::core::{AgentKind, SessionId, SessionRecord, UnixMillis};
+
+/// What "the session's most recent run" means, as a SQL `ORDER BY`
+/// fragment, in the one place every reader of that notion shares.
+///
+/// `requested_at` alone is **not** a total order: it is millisecond
+/// granularity, so two runs requested in the same millisecond tie, and
+/// which one SQLite returns is unspecified. `run_id` breaks the tie. It
+/// carries no meaning and is not intended to — it is a UUID, so the
+/// tiebreak is arbitrary but *stable*, which is the whole requirement.
+/// Determinism is bought here, not a claim about which run is newer.
+///
+/// **This is defensive, not a fix for an observed bug.** Reverting to
+/// `requested_at DESC` alone does not currently make the per-session
+/// lookups and the batched [`AuditLog::sessions_with_latest_run`]
+/// disagree: today both forms happen to walk ties in the same order,
+/// and the property test still passes — that was checked rather than
+/// assumed. What the tiebreak removes is the *dependence* on that
+/// coincidence. `ORDER BY … LIMIT 1` and `ROW_NUMBER() OVER (…)` are
+/// separately planned, and tie order is a property of the plan, so
+/// adding an index on `requested_at`, upgrading the bundled SQLite, or
+/// growing the table past a plan-shape threshold could change one and
+/// not the other. Under a total order none of that is observable.
+const LATEST_RUN_ORDER: &str = "requested_at DESC, run_id DESC";
+
+/// How many session ids go into one `IN (...)` clause.
+///
+/// SQLite's compiled-in host-parameter limit is 32766 in the bundled
+/// build and was 999 in older ones; 256 stays far below both without
+/// making the query count interesting. It is a chunking bound, not a
+/// cap on what callers may ask for: [`AuditLog::sessions_with_latest_run`]
+/// accepts any number of ids and issues as many chunks as it needs.
+const SESSION_LOOKUP_CHUNK: usize = 256;
+
+/// What the UI's per-VM join needs to know about one session.
+///
+/// Both fields are `Option` and they are independently absent: a
+/// session may have no audit row at all (the daemon knows about a VM
+/// the log has not seen), and a session with a row may have no run.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionRunSummary {
+    pub session: Option<SessionRecord>,
+    pub latest_run_id: Option<AgentRunId>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmWorkspaceBootstrapAuditRecord {
@@ -355,11 +400,13 @@ impl AuditLog {
         })
     }
 
-    /// Most-recent `agent_run.run_id` for a session, by `requested_at`.
-    /// `None` if no run row exists. Used by the UI HTTP join to give
-    /// the operator a stable handle to follow from a VM into a run
-    /// view; the run itself is exposed through `/v1/agent-runs/<id>`
-    /// and not inlined here.
+    /// Most-recent `agent_run.run_id` for a session — by `requested_at`
+    /// descending, with `run_id` as a tiebreak so the answer does not
+    /// depend on SQLite's unspecified tie order (see the
+    /// `LATEST_RUN_ORDER` constant). `None` if no run row exists. Used by the UI
+    /// HTTP join to give the operator a stable handle to follow from a
+    /// VM into a run view; the run itself is exposed through
+    /// `/v1/agent-runs/<id>` and not inlined here.
     pub fn latest_agent_run_id_for_session(
         &self,
         session_id: SessionId,
@@ -367,10 +414,12 @@ impl AuditLog {
         self.with_conn(|c| {
             let raw: Option<String> = c
                 .query_row(
-                    "SELECT run_id FROM agent_run
-                     WHERE session_id = ?1
-                     ORDER BY requested_at DESC
-                     LIMIT 1",
+                    &format!(
+                        "SELECT run_id FROM agent_run
+                         WHERE session_id = ?1
+                         ORDER BY {LATEST_RUN_ORDER}
+                         LIMIT 1"
+                    ),
                     params![session_id.as_uuid().to_string()],
                     |row| row.get(0),
                 )
@@ -391,12 +440,12 @@ impl AuditLog {
     /// correlation id from the run onto the push it stages, so a
     /// `--correlation-id`'d run's pushes share the same join key.
     ///
-    /// Today's product flow creates one run per session. The
-    /// `ORDER BY requested_at DESC LIMIT 1` is defensive against a
-    /// future N>1 case so the answer stays deterministic; if the
-    /// invariant is ever loosened, the policy "most recent run wins"
-    /// is the obvious one and the audit row stores everything needed
-    /// to revisit it.
+    /// Today's product flow creates one run per session. Ordering by
+    /// `requested_at` descending with a `run_id` tiebreak (the
+    /// `LATEST_RUN_ORDER` constant) is defensive against a future N>1
+    /// case so the answer stays deterministic; if the invariant is ever
+    /// loosened, the policy "most recent run wins" is the obvious one
+    /// and the audit row stores everything needed to revisit it.
     pub fn correlation_id_for_session(
         &self,
         session_id: SessionId,
@@ -404,10 +453,12 @@ impl AuditLog {
         self.with_conn(|c| {
             let raw: Option<Option<String>> = c
                 .query_row(
-                    "SELECT correlation_id FROM agent_run
-                     WHERE session_id = ?1
-                     ORDER BY requested_at DESC
-                     LIMIT 1",
+                    &format!(
+                        "SELECT correlation_id FROM agent_run
+                         WHERE session_id = ?1
+                         ORDER BY {LATEST_RUN_ORDER}
+                         LIMIT 1"
+                    ),
                     params![session_id.as_uuid().to_string()],
                     |row| row.get(0),
                 )
@@ -424,10 +475,11 @@ impl AuditLog {
     /// The most-recently-requested `agent_run` belonging to a session,
     /// or `None` if the session has no run.
     ///
-    /// Today the product invariant is one run per session; the
-    /// `ORDER BY requested_at DESC LIMIT 1` is defensive against a
-    /// future N>1 case so the answer stays deterministic. "Most recent
-    /// run wins" matches the corresponding choice in
+    /// Today the product invariant is one run per session; ordering by
+    /// `requested_at` descending with a `run_id` tiebreak (the
+    /// `LATEST_RUN_ORDER` constant) is defensive against a future N>1
+    /// case so the answer stays deterministic. "Most recent run wins" matches
+    /// the corresponding choice in
     /// [`Self::correlation_id_for_session`].
     pub fn agent_run_for_session(
         &self,
@@ -436,19 +488,123 @@ impl AuditLog {
         self.with_conn(|c| {
             let row = c
                 .query_row(
-                    "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
-                            prompt_sha256, prompt_redacted_preview, correlation_id,
-                            purpose
-                     FROM agent_run
-                     WHERE session_id = ?1
-                     ORDER BY requested_at DESC
-                     LIMIT 1",
+                    &format!(
+                        "SELECT run_id, session_id, requested_at, agent_kind, prompt_bytes,
+                                prompt_sha256, prompt_redacted_preview, correlation_id,
+                                purpose
+                         FROM agent_run
+                         WHERE session_id = ?1
+                         ORDER BY {LATEST_RUN_ORDER}
+                         LIMIT 1"
+                    ),
                     params![session_id.as_uuid().to_string()],
                     agent_run_from_row,
                 )
                 .optional()?;
             row.transpose()
         })
+    }
+
+    /// The session row and latest run id for many sessions, in a bounded
+    /// number of queries rather than two per session.
+    ///
+    /// Equivalent to calling [`Self::get_session`] and
+    /// [`Self::latest_agent_run_id_for_session`] for each id — that
+    /// equivalence is the property the tests assert, against those
+    /// methods as the reference. Ids absent from the log map to a
+    /// `SessionRunSummary` with both fields `None`, so the returned map
+    /// has an entry for every id asked about and a caller never has to
+    /// distinguish "not in the map" from "nothing recorded".
+    ///
+    /// The UI's `/v1/agent-vms` list is the reason this exists: it
+    /// joins one row per live VM, and doing that per-session meant two
+    /// SQLite round trips *and two mutex acquisitions* per VM on every
+    /// request.
+    pub fn sessions_with_latest_run(
+        &self,
+        ids: &[SessionId],
+    ) -> Result<HashMap<SessionId, SessionRunSummary>, AuditError> {
+        let chunk = NonZeroUsize::new(SESSION_LOOKUP_CHUNK).expect("chunk size is a nonzero const");
+        self.sessions_with_latest_run_chunked(ids, chunk)
+    }
+
+    /// [`Self::sessions_with_latest_run`] with the chunk size exposed.
+    ///
+    /// Separate so the chunking can be tested at sizes that actually
+    /// split the input. The production constant is 256, and a test that
+    /// crossed it would have to insert hundreds of sessions to exercise
+    /// a single boundary — so it would not be written, and the
+    /// multi-chunk path would go unexercised.
+    fn sessions_with_latest_run_chunked(
+        &self,
+        ids: &[SessionId],
+        chunk: NonZeroUsize,
+    ) -> Result<HashMap<SessionId, SessionRunSummary>, AuditError> {
+        // Seeded with every id up front. The queries below only *fill
+        // in* what they find, so an id with no session row and no run
+        // still gets its (None, None) entry without a second pass.
+        let mut out: HashMap<SessionId, SessionRunSummary> = ids
+            .iter()
+            .map(|id| (*id, SessionRunSummary::default()))
+            .collect();
+        if out.is_empty() {
+            return Ok(out);
+        }
+
+        self.with_conn(|c| {
+            for window in ids.chunks(chunk.get()) {
+                let placeholders = std::iter::repeat_n("?", window.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let params: Vec<String> =
+                    window.iter().map(|id| id.as_uuid().to_string()).collect();
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+                let mut stmt = c.prepare(&format!(
+                    "SELECT session_id, label, agent_kind, agent_model, opened_at, closed_at
+                     FROM session WHERE session_id IN ({placeholders})"
+                ))?;
+                for row in stmt.query_map(params.as_slice(), super::session::session_from_row)? {
+                    let record = row?;
+                    let id = record.session_id;
+                    out.entry(id).or_default().session = Some(record);
+                }
+
+                // `ROW_NUMBER()` rather than `GROUP BY … HAVING MAX(…)`:
+                // the bare-column form leaves the tiebreak to SQLite,
+                // which is exactly the non-determinism `LATEST_RUN_ORDER`
+                // exists to remove, and would let this disagree with the
+                // per-session lookups it must match.
+                let mut stmt = c.prepare(&format!(
+                    "SELECT session_id, run_id FROM (
+                         SELECT session_id, run_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY session_id
+                                    ORDER BY {LATEST_RUN_ORDER}
+                                ) AS rn
+                         FROM agent_run WHERE session_id IN ({placeholders})
+                     ) WHERE rn = 1"
+                ))?;
+                for row in stmt.query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })? {
+                    let (session_raw, run_raw) = row?;
+                    let session_id = uuid::Uuid::parse_str(&session_raw)
+                        .map(SessionId::from_uuid)
+                        .map_err(|_| {
+                            AuditError::Invariant("agent run row: session_id not a uuid")
+                        })?;
+                    let run_id = uuid::Uuid::parse_str(&run_raw)
+                        .map(AgentRunId::from_uuid)
+                        .map_err(|_| AuditError::Invariant("agent run row: run_id not a uuid"))?;
+                    out.entry(session_id).or_default().latest_run_id = Some(run_id);
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(out)
     }
 }
 
@@ -1421,5 +1577,148 @@ mod tests {
                 dump_agent_run_outcome_rows(&guarded)
             );
         }
+    }
+
+    /// A session, how many runs it has, and whether the log knows it at
+    /// all. `runs` deliberately reaches 3 so ties are reachable: every
+    /// run in a session below is written at the *same* `requested_at`,
+    /// which is the case `LATEST_RUN_ORDER`'s tiebreak exists for and
+    /// the one a `requested_at`-only order answers arbitrarily.
+    #[derive(Clone, Debug)]
+    struct SessionPlan {
+        opened: bool,
+        runs: usize,
+    }
+
+    fn session_plan() -> impl Strategy<Value = SessionPlan> {
+        (any::<bool>(), 0usize..=3).prop_map(|(opened, runs)| SessionPlan {
+            // A session with no row cannot own runs: `record_agent_run`
+            // enforces the foreign key.
+            runs: if opened { runs } else { 0 },
+            opened,
+        })
+    }
+
+    /// Seed a log from the plans and return the ids in plan order,
+    /// including the ids of sessions that were never opened.
+    fn seed_sessions(log: &AuditLog, plans: &[SessionPlan]) -> Vec<SessionId> {
+        plans
+            .iter()
+            .map(|plan| {
+                let session = SessionRecord {
+                    session_id: SessionId::new(),
+                    ..sample_session()
+                };
+                let id = session.session_id;
+                if plan.opened {
+                    log.open_session(&session).unwrap();
+                    for _ in 0..plan.runs {
+                        log.record_agent_run(&AgentRunAuditRecord {
+                            run_id: AgentRunId::new(),
+                            session_id: id,
+                            // Identical for every run in the session:
+                            // the whole point is to force the tie.
+                            requested_at: UnixMillis::from_millis(1_700_000_050),
+                            agent_kind: AgentKind::Claude,
+                            prompt: writ_agent_run::AgentPrompt::new("p").summary(),
+                            correlation_id: None,
+                            purpose: None,
+                        })
+                        .unwrap();
+                    }
+                }
+                id
+            })
+            .collect()
+    }
+
+    proptest! {
+        /// The batched lookup answers exactly what the per-session
+        /// methods answer, for any mix of sessions and any chunk size.
+        ///
+        /// Those methods are the reference implementation: they are what
+        /// `/v1/agent-vms` called before, so any disagreement is a
+        /// behaviour change to the endpoint, not merely an internal
+        /// inconsistency. Chunk sizes from 1 upward mean the multi-chunk
+        /// path is exercised on almost every case rather than only when
+        /// someone runs 257 VMs.
+        #[test]
+        fn the_batched_lookup_agrees_with_the_per_session_reference(
+            plans in proptest::collection::vec(session_plan(), 0..8),
+            chunk in 1usize..=8,
+        ) {
+            let log = AuditLog::open_in_memory().unwrap();
+            let ids = seed_sessions(&log, &plans);
+
+            let batched = log
+                .sessions_with_latest_run_chunked(&ids, NonZeroUsize::new(chunk).unwrap())
+                .unwrap();
+
+            // An entry per id asked about, so callers never have to tell
+            // "absent from the map" from "nothing recorded".
+            prop_assert_eq!(batched.len(), ids.len());
+
+            for id in &ids {
+                let got = batched.get(id).expect("an entry for every id");
+                prop_assert_eq!(&got.session, &log.get_session(*id).unwrap());
+                prop_assert_eq!(
+                    &got.latest_run_id,
+                    &log.latest_agent_run_id_for_session(*id).unwrap()
+                );
+            }
+        }
+
+        /// Every reader of "the session's most recent run" picks the
+        /// same one, including when runs tie on `requested_at`.
+        ///
+        /// Asserted separately from the batch property because these
+        /// three are used in different places for different reasons —
+        /// the git-push handler inherits a correlation id, the UI shows
+        /// a handle — and nothing but this test stops one of them being
+        /// reordered on its own.
+        #[test]
+        fn the_per_session_lookups_agree_on_which_run_is_latest(
+            runs in 1usize..=4,
+        ) {
+            let log = AuditLog::open_in_memory().unwrap();
+            let ids = seed_sessions(&log, &[SessionPlan { opened: true, runs }]);
+            let id = ids[0];
+
+            let by_id = log.latest_agent_run_id_for_session(id).unwrap();
+            let by_record = log.agent_run_for_session(id).unwrap().map(|r| r.run_id);
+            prop_assert_eq!(by_id, by_record);
+            prop_assert!(by_id.is_some());
+        }
+    }
+
+    /// A repeated id is answered once, not counted twice — the caller
+    /// hands us whatever the VM daemon listed, and `IN (?, ?)` with a
+    /// duplicate returns one row.
+    #[test]
+    fn a_repeated_id_yields_one_consistent_entry() {
+        let log = AuditLog::open_in_memory().unwrap();
+        let ids = seed_sessions(
+            &log,
+            &[SessionPlan {
+                opened: true,
+                runs: 1,
+            }],
+        );
+        let id = ids[0];
+
+        let batched = log.sessions_with_latest_run(&[id, id, id]).unwrap();
+        assert_eq!(batched.len(), 1);
+        assert_eq!(
+            batched[&id].latest_run_id,
+            log.latest_agent_run_id_for_session(id).unwrap()
+        );
+    }
+
+    /// No ids means no queries and an empty map, rather than a
+    /// syntactically invalid `IN ()`.
+    #[test]
+    fn an_empty_request_is_not_a_query() {
+        let log = AuditLog::open_in_memory().unwrap();
+        assert!(log.sessions_with_latest_run(&[]).unwrap().is_empty());
     }
 }
