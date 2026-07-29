@@ -2,7 +2,6 @@
 //! the managed start/stop lifecycle, atomic record handling, lock
 //! semantics, corruption rejection, default state-dir resolution and
 //! file permissions.
-use super::state_store::default_agent_vm_state_dir_from_env;
 use super::test_support::*;
 use super::*;
 #[cfg(unix)]
@@ -1111,49 +1110,12 @@ fn wait_for_child(child: &mut std::process::Child) -> std::process::ExitStatus {
     }
 }
 
-#[test]
-fn default_state_dir_treats_empty_xdg_as_unset_and_uses_home() {
-    let got = default_agent_vm_state_dir_from_env(
-        Some(OsString::from("")),
-        Some(OsString::from("/Users/example")),
-    )
-    .unwrap();
-    assert_eq!(
-        got,
-        PathBuf::from("/Users/example/.local/state/writ/agent-vm-sessions")
-    );
-}
-
-#[test]
-fn default_state_dir_fails_when_home_is_unset_or_empty() {
-    assert_eq!(
-        default_agent_vm_state_dir_from_env(None, None),
-        Err(AgentVmStateDirError::HomeUnset)
-    );
-    assert_eq!(
-        default_agent_vm_state_dir_from_env(None, Some(OsString::from(""))),
-        Err(AgentVmStateDirError::HomeUnset)
-    );
-}
-
-#[test]
-fn default_state_dir_rejects_relative_environment_paths() {
-    assert_eq!(
-        default_agent_vm_state_dir_from_env(
-            Some(OsString::from("relative/state")),
-            Some(OsString::from("/Users/example")),
-        ),
-        Err(AgentVmStateDirError::XdgStateHomeRelative {
-            path: PathBuf::from("relative/state")
-        })
-    );
-    assert_eq!(
-        default_agent_vm_state_dir_from_env(None, Some(OsString::from("relative/home"))),
-        Err(AgentVmStateDirError::HomeRelative {
-            path: PathBuf::from("relative/home")
-        })
-    );
-}
+// The three `default_state_dir_*` tests that stood here moved to
+// `config::default_paths::tests` when this resolver was folded into the
+// shared table: they asserted exactly the properties that now hold for every
+// entry (empty means unset, relative is refused, an absent base is an error
+// rather than a `/tmp` guess), and asserting them for this one location while
+// the table quantifies over all of them would be the weaker of the two.
 
 #[cfg(unix)]
 #[test]

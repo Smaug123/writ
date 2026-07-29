@@ -39,7 +39,7 @@ use crate::audit::{AuditError, AuditLog};
 use crate::broker_protocol::BrokerReadyDoc;
 use crate::broker_session::{BearerTokenFileError, BrokerSessionSpec, read_bearer_token_file};
 use crate::config::{
-    AgentVmHttpConfigError, DaemonConfig, Errors, SecretStoreConfig, default_audit_db_path,
+    AgentVmHttpConfigError, BaseDirError, DaemonConfig, Errors, SecretStoreConfig,
 };
 use crate::core::{AgentKind, AgentVmConfigError, BrokerPort, BrokerPortRange, SessionId};
 use crate::github::GitHubMinter;
@@ -106,6 +106,10 @@ pub enum BrokerRunError {
         #[source]
         source: SecretError,
     },
+    /// A config key was left to its default and the broker VM's environment
+    /// names no base directory to derive it from.
+    #[error(transparent)]
+    BaseDir(#[from] BaseDirError),
     #[error("broker mode requires an `agent_vm` config section to source the vm_http runtime")]
     AgentVmConfigMissing,
     /// Carries the whole report, not one failure: the broker VM's stderr is
@@ -283,7 +287,7 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
             source,
         })?;
 
-    let secrets = open_file_secret_store(&config.secret_store)?;
+    let secrets = open_file_secret_store(&config.secret_store_or_default()?)?;
 
     // Only the vm_http slice is consumed; the lifecycle config (subnet pool,
     // container tooling) is the host's concern and is intentionally not
@@ -299,7 +303,8 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
     let broker_port = validate_broker_port(spec.broker_port, vm_http_config.broker_port_range())?;
     let bearer = read_bearer_token_file(&args.bearer_token_file)?;
 
-    let audit_db_path = config.audit_db.unwrap_or_else(default_audit_db_path);
+    let audit_db_path =
+        crate::config::default_paths::AUDIT_DB.or_resolve(config.audit_db.clone())?;
     let audit = AuditLog::open(&audit_db_path).map_err(|source| BrokerRunError::AuditOpen {
         path: audit_db_path.display().to_string(),
         source,

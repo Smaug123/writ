@@ -54,16 +54,6 @@ pub enum AgentVmSessionStateError {
     },
 }
 
-#[derive(Debug, thiserror::Error, Eq, PartialEq)]
-pub enum AgentVmStateDirError {
-    #[error("HOME is not set; pass --state-dir or set WRIT_AGENT_VM_STATE_DIR")]
-    HomeUnset,
-    #[error("XDG_STATE_HOME must be an absolute path when set, got {path}")]
-    XdgStateHomeRelative { path: PathBuf },
-    #[error("HOME must be an absolute path when deriving agent VM state dir, got {path}")]
-    HomeRelative { path: PathBuf },
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionState {
     status: AgentVmSessionStateStatus,
@@ -909,31 +899,14 @@ fn state_mismatch(session_id: SessionId, message: impl Into<String>) -> AgentVmS
     }
 }
 
-pub fn default_agent_vm_state_dir() -> Result<PathBuf, AgentVmStateDirError> {
-    default_agent_vm_state_dir_from_env(
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-    )
-}
-
-pub(super) fn default_agent_vm_state_dir_from_env(
-    xdg_state_home: Option<OsString>,
-    home: Option<OsString>,
-) -> Result<PathBuf, AgentVmStateDirError> {
-    if let Some(dir) = xdg_state_home.filter(|dir| !dir.as_os_str().is_empty()) {
-        let dir = PathBuf::from(dir);
-        if !dir.is_absolute() {
-            return Err(AgentVmStateDirError::XdgStateHomeRelative { path: dir });
-        }
-        return Ok(dir.join("writ/agent-vm-sessions"));
-    }
-
-    let home = home
-        .filter(|home| !home.as_os_str().is_empty())
-        .ok_or(AgentVmStateDirError::HomeUnset)?;
-    let home = PathBuf::from(home);
-    if !home.is_absolute() {
-        return Err(AgentVmStateDirError::HomeRelative { path: home });
-    }
-    Ok(home.join(".local/state/writ/agent-vm-sessions"))
+/// Where per-session agent-VM state lives when the operator has not said.
+///
+/// This function was the shape [`crate::config::default_paths`] generalised —
+/// alone among writ's default paths, it already filtered empty values and
+/// refused rather than inventing `/tmp`. It now *is* that machinery rather
+/// than a hand-rolled twin beside it, so the claim that
+/// [`crate::config::default_paths::DEFAULT_PATHS`] enumerates every location
+/// writ derives stays true.
+pub fn default_agent_vm_state_dir() -> Result<PathBuf, crate::config::BaseDirError> {
+    crate::config::default_paths::AGENT_VM_STATE_DIR.resolve()
 }

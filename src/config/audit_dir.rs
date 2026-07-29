@@ -283,19 +283,15 @@ pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotD
 /// `audit/` directory (see [`super::default_audit_db_path`]). Retained only so the
 /// daemon can detect an un-migrated legacy database and refuse to boot rather
 /// than silently fork audit history; it is not a supported configuration target.
-/// Resolves the environment **exactly** as [`super::default_audit_db_path`]
-/// does, empty-variable quirks included, and deliberately does not use
-/// `xdg_dir_or_home`. The two are a pair: this one says where the old database
-/// would be and that one says where the new one goes, so any divergence
-/// between them is a migration the guard fails to notice. If the empty-value
-/// handling changes, it changes for both at once.
-pub fn legacy_default_audit_db_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/audit.db")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/audit.db")
-    }
+/// Resolves the environment through the same [`DefaultPath`](super::DefaultPath) machinery as
+/// [`super::default_audit_db_path`]. The two are a pair: this one says where
+/// the old database would be and that one says where the new one goes, so any
+/// divergence between them is a migration the guard fails to notice. Sharing
+/// one resolver is what keeps them from drifting — they were previously two
+/// hand-copied `if let Some(dir) = var_os(..)` blocks held together by this
+/// comment.
+pub fn legacy_default_audit_db_path() -> Result<PathBuf, super::BaseDirError> {
+    super::default_paths::LEGACY_AUDIT_DB.resolve()
 }
 
 /// An install that relied on the *default* audit DB path, upgraded across the
@@ -396,29 +392,13 @@ mod tests {
     use crate::config::{default_audit_db_path, default_secret_store_path};
     use proptest::prelude::*;
 
-    /// The legacy and current audit-DB defaults must resolve the environment
-    /// identically: the guard compares "is there a database at the old place"
-    /// against "where does the new place resolve to", and if only one of them
-    /// normalises an exported-but-empty `XDG_DATA_HOME` the guard probes a
-    /// directory the old database was never in, finds nothing, and lets writd
-    /// start a fresh audit history.
-    ///
-    /// Both currently keep the raw `var_os` semantics. This test does not
-    /// assert *which* semantics; it asserts they are the same one, so a change
-    /// to either has to be a change to both.
-    #[test]
-    fn the_legacy_and_current_audit_defaults_share_a_base_directory() {
-        let legacy = legacy_default_audit_db_path();
-        let current = default_audit_db_path();
-        assert_eq!(
-            legacy.parent().map(Path::to_path_buf),
-            current
-                .parent()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf),
-            "legacy {legacy:?} and current {current:?} resolved to different bases",
-        );
-    }
+    // `the_legacy_and_current_audit_defaults_share_a_base_directory` stood
+    // here. It checked one environment — the test process's own — and could
+    // not check the case it was written for, since it cannot set
+    // `XDG_DATA_HOME` without racing every other test in the process. Both
+    // locations are now entries in `config::default_paths`, and the property
+    // `the_audit_db_locations_share_a_base_in_every_environment` quantifies
+    // over environments instead.
 
     #[test]
     fn audit_dir_with_only_db_and_sidecars_is_dedicated() {
@@ -608,10 +588,12 @@ mod tests {
         // The legacy detector must point at the old sibling location, not the new
         // dedicated dir, or it could never fire; the new default is that legacy
         // dir's `audit/` subdirectory.
-        assert_ne!(legacy_default_audit_db_path(), default_audit_db_path());
+        let legacy = legacy_default_audit_db_path().expect("the test env has HOME");
+        let current = default_audit_db_path().expect("the test env has HOME");
+        assert_ne!(legacy, current);
         assert_eq!(
-            default_audit_db_path().parent().unwrap().parent().unwrap(),
-            legacy_default_audit_db_path().parent().unwrap(),
+            current.parent().unwrap().parent().unwrap(),
+            legacy.parent().unwrap(),
         );
     }
 
@@ -620,11 +602,12 @@ mod tests {
         // Regression (P1): the broker VM read-write-mounts the audit DB's
         // directory, so the default secret store must not live inside it. Fails
         // on the pre-fix default (audit.db a sibling of secrets/ under writ/).
-        let audit_dir = default_audit_db_path().parent().unwrap().to_path_buf();
+        let audit_db = default_audit_db_path().expect("the test env has HOME");
+        let audit_dir = audit_db.parent().unwrap().to_path_buf();
+        let secrets = default_secret_store_path().expect("the test env has HOME");
         assert!(
-            !default_secret_store_path().starts_with(&audit_dir),
-            "default secret store {:?} must not be inside the default audit dir {audit_dir:?}",
-            default_secret_store_path(),
+            !secrets.starts_with(&audit_dir),
+            "default secret store {secrets:?} must not be inside the default audit dir {audit_dir:?}",
         );
     }
 

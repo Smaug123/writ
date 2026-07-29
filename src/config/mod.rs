@@ -12,9 +12,8 @@ use crate::agent_vm_daemon::{
     AgentVmLifecycleRuntimeConfigError,
 };
 use crate::agent_vm_lifecycle::{
-    AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmStateDirError,
-    AgentVmToolPaths, BrokerPlacement, ContainerImage, Ipv6IsolationMode,
-    default_agent_vm_state_dir,
+    AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmToolPaths,
+    BrokerPlacement, ContainerImage, Ipv6IsolationMode, default_agent_vm_state_dir,
 };
 use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
 use crate::flake_lock::{FlakeProvisionBounds, FlakeProvisionBoundsError};
@@ -49,6 +48,9 @@ pub use audit_dir::{
     ensure_audit_dir_is_dedicated, legacy_audit_db_needs_migration, legacy_default_audit_db_path,
     path_entry_present,
 };
+
+pub mod default_paths;
+pub use default_paths::{BaseDirError, DefaultPath};
 
 /// Top-level daemon configuration. Loaded from a JSON file at startup;
 /// runtime-mutable config is not a goal for v1.
@@ -89,12 +91,21 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub agent_vm: Option<AgentVmDaemonConfig>,
     /// Where long-lived secrets (notably the GitHub App private key) are
-    /// stored. Defaults to the file backend at [`default_secret_store_path`];
-    /// set to `{ "type": "keyring" }` to opt in to the OS keychain.
-    #[serde(default = "default_secret_store_config")]
-    pub secret_store: SecretStoreConfig,
+    /// stored. Absent means the file backend at [`default_secret_store_path`],
+    /// which [`Self::secret_store_or_default`] resolves; set to
+    /// `{ "type": "keyring" }` to opt in to the OS keychain.
+    ///
+    /// `Option` rather than a `serde` default because the default is derived
+    /// from the environment and can *fail* — an environment with no usable
+    /// base directory has nowhere to put a secret store, and inventing one
+    /// under `/tmp` is what this deliberately no longer does. A `serde`
+    /// default must be infallible, so the resolution moves out of
+    /// deserialization and into the boot path, where the failure can be
+    /// reported alongside every other config error.
+    #[serde(default)]
+    pub secret_store: Option<SecretStoreConfig>,
     /// Override the default Unix socket path. If absent, uses
-    /// `$XDG_RUNTIME_DIR/writ/writd.sock` (see [`crate::server::default_socket_path`]).
+    /// `$XDG_RUNTIME_DIR/writ/writd.sock` (see [`default_paths::SOCKET`]).
     #[serde(default)]
     pub socket_path: Option<PathBuf>,
     /// Override the default audit DB path. If absent, uses
@@ -188,10 +199,8 @@ impl UiHttpConfig {
         errors.finish()
     }
 
-    pub fn bearer_path_or_default(&self) -> PathBuf {
-        self.bearer_path
-            .clone()
-            .unwrap_or_else(default_ui_http_bearer_path)
+    pub fn bearer_path_or_default(&self) -> Result<PathBuf, BaseDirError> {
+        default_paths::UI_HTTP_BEARER.or_resolve(self.bearer_path.clone())
     }
 }
 
@@ -199,13 +208,8 @@ impl UiHttpConfig {
 /// Unix socket so the same `$XDG_RUNTIME_DIR/writ/` directory holds
 /// the runtime-secret material that consumers need to talk to the
 /// daemon.
-pub fn default_ui_http_bearer_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("writ/ui-bearer")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/run/writ/ui-bearer")
-    }
+pub fn default_ui_http_bearer_path() -> Result<PathBuf, BaseDirError> {
+    default_paths::UI_HTTP_BEARER.resolve()
 }
 
 /// Configuration for the `RunAgent` dispatch path. Absent from
@@ -276,10 +280,8 @@ pub const DEFAULT_WRIT_SIGNING_KEY_SECRET: &str = "writ-signing-key";
 impl RunAgentDaemonConfig {
     /// Resolve [`Self::notes_repo_path`] against the documented default
     /// so callers don't repeat the fallback logic.
-    pub fn notes_repo_path_or_default(&self) -> PathBuf {
-        self.notes_repo_path
-            .clone()
-            .unwrap_or_else(default_notes_repo_path)
+    pub fn notes_repo_path_or_default(&self) -> Result<PathBuf, BaseDirError> {
+        default_paths::NOTES_REPO.or_resolve(self.notes_repo_path.clone())
     }
 
     /// Resolve [`Self::signing_key_secret`] against the documented
@@ -314,8 +316,8 @@ impl RunAgentDaemonConfig {
         &self,
         store: &dyn SecretStore,
         agent_run_log_root: AgentRunLogRoot,
+        notes_repo_path: PathBuf,
     ) -> Result<RunAgentBootState, RunAgentBootError> {
-        let notes_repo_path = self.notes_repo_path_or_default();
         let notes_repo = NotesRepo::init_or_open(&notes_repo_path).map_err(|source| {
             RunAgentBootError::NotesRepo {
                 path: notes_repo_path.clone(),
@@ -377,19 +379,12 @@ pub enum RunAgentBootError {
 /// directory captures both writ's audit log and its signed-run
 /// envelopes.
 ///
-/// **Must agree with `bailiff`'s `default_writ_repo_path` in
-/// `src/bin/bailiff.rs`** — bailiff fetches notes from this same
-/// location when the operator runs with stock defaults. The two are
-/// independent functions because the bailiff binary doesn't link
-/// against writd's `config` module, so the convention is duplicated.
-/// If you move the path, move it on both sides at once.
-pub fn default_notes_repo_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/repo")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/repo")
-    }
+/// Bailiff fetches notes from this same location when the operator runs with
+/// stock defaults, and calls *this function* to find it rather than keeping its
+/// own copy of the convention — the two used to be independent functions kept
+/// in agreement by a comment.
+pub fn default_notes_repo_path() -> Result<PathBuf, BaseDirError> {
+    default_paths::NOTES_REPO.resolve()
 }
 
 #[derive(Debug, Deserialize)]
@@ -450,8 +445,12 @@ pub struct AgentVmHttpConfig {
     pub askpass_program: PathBuf,
     #[serde(default = "default_vm_git_token_env")]
     pub token_env: String,
-    #[serde(default = "default_vm_http_work_root")]
-    pub work_root: PathBuf,
+    /// `Option` rather than a `serde` default because the default is derived
+    /// from the environment and can *fail*; see
+    /// [`DaemonConfig::secret_store`]. Resolve with
+    /// [`Self::work_root_or_default`].
+    #[serde(default)]
+    pub work_root: Option<PathBuf>,
     #[serde(default = "default_clone_timeout_secs")]
     pub clone_timeout_secs: u64,
     #[serde(default = "default_max_bundle_bytes")]
@@ -564,7 +563,7 @@ pub struct AgentVmHttpOpenAiProxyConfig {
 /// Which secret backend to use. The file backend is recommended for
 /// headless Linux hosts; the keyring backend uses the OS native keychain
 /// (macOS Keychain or freedesktop Secret Service).
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SecretStoreConfig {
     File {
@@ -578,6 +577,9 @@ pub enum SecretStoreConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentVmHttpConfigError {
+    /// A key was left to its default and the environment could not supply one.
+    #[error(transparent)]
+    BaseDir(#[from] BaseDirError),
     #[error(transparent)]
     BrokerPortRange(#[from] AgentVmConfigError),
     #[error(transparent)]
@@ -662,6 +664,33 @@ pub enum AgentVmHttpConfigError {
 pub struct CheckedDaemonSections {
     pub agent_vm: Option<AgentVmDaemonRuntimeConfig>,
     pub agent_run_log_root: AgentRunLogRoot,
+    /// [`DaemonConfig::secret_store`] resolved against its default.
+    ///
+    /// Resolved *here* rather than at the point of use because the default is
+    /// derived from the environment and can fail: resolving it in `writd`
+    /// would return before this function ran, so an operator with both an
+    /// unusable environment and a bad `ui_http.bind` would learn about them
+    /// one restart at a time.
+    pub secret_store: SecretStoreConfig,
+    /// [`RunAgentDaemonConfig::notes_repo_path`] resolved against its default,
+    /// when a `run_agent` section is present.
+    ///
+    /// Resolved here rather than inside `materialize` for the same reason as
+    /// the bearer path: `materialize` runs after the audit DB is opened, the
+    /// socket bound and the reconcile passes done, so a path that could not be
+    /// derived would abort boot having already left filesystem and audit
+    /// side effects behind.
+    pub notes_repo_path: Option<PathBuf>,
+    /// [`UiHttpConfig::bearer_path`] resolved against its default, when a
+    /// `ui_http` section is present.
+    ///
+    /// Resolved here for a second reason beyond joining the report: at the
+    /// point of *use* the daemon has already created directories, reconciled
+    /// the audit DB, materialised signing state, and bound listeners. Exiting
+    /// there over a path that could have been resolved before any of it is
+    /// the "check before irreversible steps" rule this function exists for.
+    /// Writing the file still waits until after the bind.
+    pub ui_http_bearer_path: Option<PathBuf>,
 }
 
 /// Validate every daemon section that can be checked before writd takes an
@@ -680,17 +709,57 @@ pub fn check_daemon_sections(
     agent_vm: Option<&AgentVmDaemonConfig>,
     ui_http: Option<&UiHttpConfig>,
     agent_run_log_root: Option<&Path>,
+    secret_store: Option<&SecretStoreConfig>,
+    run_agent: Option<&RunAgentDaemonConfig>,
 ) -> Result<CheckedDaemonSections, Errors<DaemonConfigError>> {
     let mut errors = Accumulator::new();
     let agent_vm = errors.record_many(agent_vm.map(AgentVmDaemonConfig::check).transpose());
-    let ui_http = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
-    let agent_run_log_root = errors.record_from(AgentRunLogRoot::check(
-        agent_run_log_root
-            .map(Path::to_path_buf)
-            .unwrap_or_else(default_agent_run_log_root),
-    ));
-    let (agent_vm, _ui_http, agent_run_log_root) =
-        errors.unpack(all_recorded!(agent_vm, ui_http, agent_run_log_root))?;
+    let ui_http_validated = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
+    // Both of these are environment-derived defaults that can fail, so both
+    // are recorded rather than resolved at their point of use — see the
+    // fields they populate on `CheckedDaemonSections`.
+    let secret_store = errors.record_from(match secret_store {
+        Some(configured) => Ok(configured.clone()),
+        None => default_paths::SECRET_STORE
+            .resolve()
+            .map(|path| SecretStoreConfig::File { path }),
+    });
+    let ui_http_bearer_path = errors.record_from(
+        ui_http
+            .map(UiHttpConfig::bearer_path_or_default)
+            .transpose(),
+    );
+    let notes_repo_path = errors.record_from(
+        run_agent
+            .map(RunAgentDaemonConfig::notes_repo_path_or_default)
+            .transpose(),
+    );
+    // The default is derived from the environment and can fail, so resolving it
+    // is itself a recorded step: a daemon whose `agent_run_log_root` is absent
+    // *and* whose environment names no base directory has two things to tell
+    // the operator, and both should arrive in one message.
+    let agent_run_log_root = errors.record_from(
+        match agent_run_log_root.map(Path::to_path_buf) {
+            Some(configured) => Ok(configured),
+            None => default_agent_run_log_root().map_err(DaemonConfigError::from),
+        }
+        .and_then(|path| AgentRunLogRoot::check(path).map_err(DaemonConfigError::from)),
+    );
+    let (
+        agent_vm,
+        _ui_http,
+        agent_run_log_root,
+        secret_store,
+        ui_http_bearer_path,
+        notes_repo_path,
+    ) = errors.unpack(all_recorded!(
+        agent_vm,
+        ui_http_validated,
+        agent_run_log_root,
+        secret_store,
+        ui_http_bearer_path,
+        notes_repo_path
+    ))?;
 
     // Only now, with every section checked, is it right to create anything.
     // Creating the log root and materialising the agent-VM plan are
@@ -713,6 +782,9 @@ pub fn check_daemon_sections(
     Ok(CheckedDaemonSections {
         agent_vm,
         agent_run_log_root,
+        secret_store,
+        ui_http_bearer_path,
+        notes_repo_path,
     })
 }
 
@@ -729,6 +801,12 @@ pub enum DaemonConfigError {
     UiHttp(#[from] UiHttpConfigError),
     #[error(transparent)]
     AgentRunLogRoot(#[from] AgentRunLogRootError),
+    /// A key was left to its default and the environment could not supply one.
+    /// Reported through the same accumulator as every other config error so an
+    /// operator fixing a config gets the whole list, not one problem per
+    /// restart.
+    #[error(transparent)]
+    BaseDir(#[from] BaseDirError),
 }
 
 /// An `agent_run_log_root` that has passed its text checks: non-empty and
@@ -877,7 +955,7 @@ pub enum AgentVmDaemonConfigError {
     #[error(transparent)]
     Lifecycle(#[from] AgentVmLifecycleConfigError),
     #[error(transparent)]
-    StateDir(#[from] AgentVmStateDirError),
+    StateDir(#[from] BaseDirError),
     #[error(transparent)]
     LifecycleRuntime(#[from] AgentVmLifecycleRuntimeConfigError),
     #[error(transparent)]
@@ -1107,6 +1185,11 @@ impl VmHttpPlan {
 }
 
 impl AgentVmHttpConfig {
+    /// Resolve [`Self::work_root`] against the documented default.
+    pub fn work_root_or_default(&self) -> Result<PathBuf, AgentVmHttpConfigError> {
+        Ok(default_paths::VM_HTTP_WORK_ROOT.or_resolve(self.work_root.clone())?)
+    }
+
     /// Validate the whole `vm_http` section and build its runtime config,
     /// reporting **every** independent problem rather than stopping at the
     /// first.
@@ -1167,7 +1250,16 @@ impl AgentVmHttpConfig {
         // The work root is shape-checked before `ensure_vm_http_work_root_private`
         // may run: that function creates the directory, and on a relative path it
         // would create one relative to the daemon's cwd.
-        let work_root = errors.record(check_work_root(&self.work_root));
+        // Resolving the default is itself a recorded step, because the default
+        // is derived from the environment and can fail — an infallible `serde`
+        // default would have to invent a path. Two steps rather than one so
+        // the owned buffer outlives the borrowed `work_root` every derived
+        // root below is built from.
+        let resolved_work_root = errors.record(self.work_root_or_default());
+        let work_root = resolved_work_root
+            .as_ref()
+            .map_err(|failed| *failed)
+            .and_then(|root| errors.record(check_work_root(root)));
         let nix_prewarm_cache_dir = errors.record(
             self.nix_prewarm_cache_dir
                 .clone()
@@ -1830,21 +1922,9 @@ fn default_nix_cache_max_nar_bytes() -> ByteSize {
 }
 
 /// Default agent-VM working directory. Sits under `$XDG_STATE_HOME/writ/`
-/// alongside `agent-vm-sessions`, falling back to `~/.local/state/writ/` when
-/// XDG is unset — matching [`default_agent_vm_state_dir`].
-pub fn default_vm_http_work_root() -> PathBuf {
-    // Treat an empty `XDG_STATE_HOME` as unset (matches
-    // `default_agent_vm_state_dir`). Without this filter, an environment that
-    // exports `XDG_STATE_HOME=` would yield the relative path `writ/vm-work`
-    // and the absolute-path check downstream would refuse the daemon config —
-    // even though the `HOME` fallback would have worked.
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|dir| !dir.as_os_str().is_empty())
-    {
-        PathBuf::from(dir).join("writ/vm-work")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/state/writ/vm-work")
-    }
+/// alongside `agent-vm-sessions`.
+pub fn default_vm_http_work_root() -> Result<PathBuf, BaseDirError> {
+    default_paths::VM_HTTP_WORK_ROOT.resolve()
 }
 
 fn parse_ipv4_cidr_config(
@@ -1903,75 +1983,30 @@ fn parse_ipv6_cidr_config(
     Ipv6Cidr::new(addr, prefix).map_err(AgentVmDaemonConfigError::from)
 }
 
-fn default_secret_store_config() -> SecretStoreConfig {
-    SecretStoreConfig::File {
-        path: default_secret_store_path(),
-    }
-}
-
-/// Resolve an XDG base directory, treating an **empty** value as unset.
-///
-/// `var_os` cannot distinguish `XDG_DATA_HOME=` from a real setting, and an
-/// exported-but-empty XDG variable is a real thing to find in a container or a
-/// stripped-down CI environment. Joining onto it yields a *relative* path,
-/// which for a value later required to be absolute means the daemon refuses to
-/// start — over a path the operator never wrote.
-///
-/// Used only by [`default_agent_run_log_root`], deliberately. The neighbouring
-/// defaults have the same hole, but several of them name **durable** state:
-/// normalising where `default_audit_db_path` resolves would move an existing
-/// audit DB out from under the migration guard (which resolves the same way)
-/// and silently start a fresh history. Changing those is a migration, not a
-/// tidy-up — see the follow-up. The log-root default is new here and has no
-/// prior installation to strand.
-fn xdg_dir_or_home(xdg_var: &str, xdg_suffix: &str, home_suffix: &str) -> PathBuf {
-    resolve_base_dir(
-        std::env::var_os(xdg_var),
-        std::env::var_os("HOME"),
-        xdg_suffix,
-        home_suffix,
-    )
-}
-
-/// The pure half of [`xdg_dir_or_home`], so the property that matters — the
-/// result is absolute for *every* pair of environment values — can be tested
-/// without mutating process-global state.
-///
-/// Both variables get the empty filter, not just the XDG one: an exported-but-
-/// empty `HOME` is the same trap one level down, and `unwrap_or_else` does not
-/// fire on `Some("")`.
-fn resolve_base_dir(
-    xdg: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-    xdg_suffix: &str,
-    home_suffix: &str,
-) -> PathBuf {
-    let non_empty = |dir: Option<std::ffi::OsString>| dir.filter(|d| !d.as_os_str().is_empty());
-    match non_empty(xdg) {
-        Some(dir) => PathBuf::from(dir).join(xdg_suffix),
-        None => PathBuf::from(non_empty(home).unwrap_or_else(|| "/tmp".into())).join(home_suffix),
+impl DaemonConfig {
+    /// Resolve [`Self::secret_store`] against the documented default: the file
+    /// backend at [`default_secret_store_path`].
+    pub fn secret_store_or_default(&self) -> Result<SecretStoreConfig, BaseDirError> {
+        match self.secret_store.clone() {
+            Some(configured) => Ok(configured),
+            // Only the *file* backend has a path to derive; a keyring store
+            // has none, which is why this is not an `or_resolve`.
+            None => Ok(SecretStoreConfig::File {
+                path: default_secret_store_path()?,
+            }),
+        }
     }
 }
 
 /// Default base directory for the file secret store. Matches the
 /// `$XDG_DATA_HOME/writ/` location called out in `docs/design/broker.md`.
-pub fn default_secret_store_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/secrets")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/secrets")
-    }
+pub fn default_secret_store_path() -> Result<PathBuf, BaseDirError> {
+    default_paths::SECRET_STORE.resolve()
 }
 
 /// Default location for the daemon config file.
-pub fn default_config_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(dir).join("writ/config.json")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".config/writ/config.json")
-    }
+pub fn default_config_path() -> Result<PathBuf, BaseDirError> {
+    default_paths::CONFIG_FILE.resolve()
 }
 
 /// Default location for the SQLite audit database. The DB lives in a dedicated
@@ -1984,21 +2019,12 @@ pub fn default_config_path() -> PathBuf {
 /// outlive the run that produced them and are pointed at by audit rows, so
 /// they belong with writ's durable state and not with a subsystem's scratch
 /// space.
-pub fn default_agent_run_log_root() -> PathBuf {
-    xdg_dir_or_home(
-        "XDG_DATA_HOME",
-        "writ/agent-runs",
-        ".local/share/writ/agent-runs",
-    )
+pub fn default_agent_run_log_root() -> Result<PathBuf, BaseDirError> {
+    default_paths::AGENT_RUN_LOG_ROOT.resolve()
 }
 
-pub fn default_audit_db_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join("writ/audit/audit.db")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share/writ/audit/audit.db")
-    }
+pub fn default_audit_db_path() -> Result<PathBuf, BaseDirError> {
+    default_paths::AUDIT_DB.resolve()
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@
 
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -204,17 +204,6 @@ impl std::fmt::Debug for CapabilityOutcome {
                 .finish(),
             Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
         }
-    }
-}
-
-/// Return the default Unix socket path. Uses `$XDG_RUNTIME_DIR/writ/writd.sock`
-/// when set, falling back to `$HOME/.local/run/writ/writd.sock`.
-pub fn default_socket_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("writ/writd.sock")
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/run/writ/writd.sock")
     }
 }
 

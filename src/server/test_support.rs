@@ -6,6 +6,8 @@
 //! not pull in. Helpers are `pub(super)` so the sibling `*_tests`
 //! modules can reach them.
 
+use std::path::PathBuf;
+
 use super::*;
 use crate::core::{AgentKind, RepoRef};
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};

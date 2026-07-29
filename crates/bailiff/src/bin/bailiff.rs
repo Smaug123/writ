@@ -46,10 +46,10 @@ use bailiff::output::{
     write_bailiff_plan_dossier, write_bailiff_plan_list, write_bailiff_plan_show,
 };
 use writ::agent_run::{AgentPrompt, RunPurpose};
+use writ::config::{BaseDirError, DefaultPath};
 use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::run_verify::AllowedSigners;
-use writ::server::default_socket_path;
 use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 use writ::writ_client::WritClient;
 
@@ -64,7 +64,7 @@ const WRIT_OUTPUT_REF: &str = "refs/notes/writ/v1/agent-outputs";
 #[command(name = "bailiff", about = "bailiff workflow orchestrator")]
 struct Args {
     /// Path to the writ broker Unix socket. Falls back to
-    /// `default_socket_path()` if neither the flag nor `WRIT_SOCKET`
+    /// `writ::config::default_paths::SOCKET` if neither the flag nor `WRIT_SOCKET`
     /// is set, matching the writ CLI's resolution order.
     #[arg(long, env = "WRIT_SOCKET")]
     socket: Option<PathBuf>,
@@ -566,15 +566,25 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let args = Args::parse();
-    let socket_path = args.socket.unwrap_or_else(default_socket_path);
-
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(dispatch(args.cmd, socket_path))
+    runtime.block_on(dispatch(args.cmd, args.socket))
 }
 
-async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+/// The daemon socket, for the arms that actually talk to writd.
+///
+/// Resolved per-arm rather than once in `run`, because resolving it can now
+/// *fail*: `plan decide`, `list`, `show` and `dossier` never open a connection
+/// and work entirely from local paths the operator supplies, so making them
+/// depend on a usable `$XDG_RUNTIME_DIR`/`$HOME` would take away plan
+/// inspection and decisions in exactly the stripped-down environment where the
+/// operator most needs to look at what happened.
+fn socket_path(socket: Option<PathBuf>) -> Result<PathBuf, BaseDirError> {
+    writ::config::default_paths::SOCKET.or_resolve(socket)
+}
+
+async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Cmd::Plan { action } => match action {
             PlanCmd::Submit {
@@ -590,7 +600,7 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 model,
             } => {
                 plan_submit(
-                    socket_path,
+                    socket_path(socket)?,
                     prompt_file,
                     repo,
                     bailiff_repo,
@@ -624,7 +634,7 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 model,
             } => {
                 plan_review(
-                    socket_path,
+                    socket_path(socket)?,
                     plan_id,
                     prompt_file,
                     repo,
@@ -652,7 +662,7 @@ async fn dispatch(cmd: Cmd, socket_path: PathBuf) -> Result<(), Box<dyn std::err
                 workspace_destination,
             } => {
                 plan_implement(
-                    socket_path,
+                    socket_path(socket)?,
                     plan_id,
                     prompt_file,
                     repo,
@@ -725,8 +735,8 @@ async fn plan_submit(
         .parse()
         .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
 
-    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
-    let writ_repo_path = writ_repo.unwrap_or_else(default_writ_repo_path);
+    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
+    let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
 
     let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
         format!(
@@ -812,8 +822,8 @@ async fn plan_review(
         .parse()
         .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
 
-    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
-    let writ_repo_path = writ_repo.unwrap_or_else(default_writ_repo_path);
+    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
+    let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
 
     let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
         format!(
@@ -935,8 +945,8 @@ async fn plan_implement(
         .parse()
         .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
 
-    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
-    let writ_repo_path = writ_repo.unwrap_or_else(default_writ_repo_path);
+    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
+    let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
 
     let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
         format!(
@@ -1025,25 +1035,30 @@ async fn plan_implement(
     }
 }
 
-/// `$XDG_DATA_HOME/bailiff/repo` (or `~/.local/share/bailiff/repo`
-/// if `XDG_DATA_HOME` is unset). Mirrors writ's own
-/// `default_audit_db_path` / `default_secret_store_path` shape;
-/// see `docs/plans/2026-05-14-bailiff-split.md` slice B4.
-fn default_bailiff_repo_path() -> PathBuf {
-    xdg_data_subdir("bailiff/repo")
-}
+/// Bailiff's own bare repo, declared with writ's [`DefaultPath`] vocabulary
+/// and resolved by writ's resolver — it is bailiff's path, so bailiff owns the
+/// declaration, but there is only one implementation of "where does this go".
+/// See `docs/plans/2026-05-14-bailiff-split.md` slice B4.
+const BAILIFF_REPO: DefaultPath = DefaultPath {
+    what: "bailiff's notes repo",
+    override_hint: "`--bailiff-repo`",
+    xdg_var: "XDG_DATA_HOME",
+    xdg_suffix: "bailiff/repo",
+    home_suffix: ".local/share/bailiff/repo",
+};
 
-/// `$XDG_DATA_HOME/writ/repo`. Bailiff resolves writ's repo
-/// location from its own copy of the convention so there is no
-/// duplicate-config edit when moving the path (slice B4 pin).
+/// Where writd keeps the notes bailiff fetches from: writd's *own* entry,
+/// carrying bailiff's override advice.
 ///
-/// **Must agree with `writ::config::default_notes_repo_path`** —
-/// writd stores RunAgent envelopes at the same location bailiff
-/// fetches from. The two are independent functions because the
-/// bailiff binary doesn't depend on writd's `config` module.
-fn default_writ_repo_path() -> PathBuf {
-    xdg_data_subdir("writ/repo")
-}
+/// These used to be two independent resolvers kept in agreement by a comment
+/// saying they **must** agree — an invariant that holds until it doesn't, and
+/// whose failure is silent, since bailiff would fetch from an empty repo and
+/// report no notes rather than erroring. Reusing the entry makes agreement an
+/// identity rather than a coincidence worth testing. Only the override hint is
+/// replaced: an operator running `bailiff` cannot act on writd's
+/// `run_agent.notes_repo_path` config key.
+const WRIT_NOTES_REPO: DefaultPath =
+    writ::config::default_paths::NOTES_REPO.with_override_hint("`--writ-repo`");
 
 async fn plan_decide(
     plan_id: PlanId,
@@ -1055,7 +1070,7 @@ async fn plan_decide(
     let outcome = resolve_decision_outcome(accept, reject);
     let user_env = std::env::var("USER").ok().filter(|s| !s.is_empty());
     let decider = resolve_decider(decider, user_env)?;
-    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
 
     // `init_or_open` shells out to git; do it on a blocking thread so
     // the runtime stays responsive.
@@ -1128,7 +1143,7 @@ async fn plan_decide(
 }
 
 async fn plan_list(bailiff_repo: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
 
     // Both `init_or_open` and the read helpers shell out to git; do
     // them on a blocking thread so the runtime stays responsive
@@ -1204,7 +1219,7 @@ async fn plan_show(
         )
     })?;
 
-    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
+    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
 
     // Both `init_or_open` and `read_full_plan` shell out to git; do
     // them on a blocking thread so the runtime stays responsive
@@ -1284,8 +1299,8 @@ async fn plan_dossier(
         )
     })?;
 
-    let bailiff_repo_path = bailiff_repo.unwrap_or_else(default_bailiff_repo_path);
-    let writ_repo_path = writ_repo.unwrap_or_else(default_writ_repo_path);
+    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
+    let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
     let writ_output_ref =
         NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
 
@@ -1396,15 +1411,6 @@ fn resolve_decider(
         },
     };
     Decider::try_new(raw.clone()).map_err(|e| format!("--decider {raw:?} rejected: {e}").into())
-}
-
-fn xdg_data_subdir(suffix: &str) -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(dir).join(suffix)
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".local/share").join(suffix)
-    }
 }
 
 // A binary crate root resolves `mod tests;` to a sibling `src/bin/tests.rs`,

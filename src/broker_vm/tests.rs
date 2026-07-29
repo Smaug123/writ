@@ -713,7 +713,10 @@ fn broker_config_rewrites_paths_pins_port_and_drops_host_features() {
 
     let config: DaemonConfig = serde_json::from_str(&json).unwrap();
     // Secrets and audit point at the mounted guest locations.
-    match config.secret_store {
+    match config
+        .secret_store_or_default()
+        .expect("the test env has HOME")
+    {
         SecretStoreConfig::File { ref path } => {
             assert_eq!(path.to_str().unwrap(), BROKER_VM_SECRETS_DIR)
         }
