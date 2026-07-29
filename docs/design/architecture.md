@@ -334,15 +334,44 @@ steps order-independent: a log root named beneath a not-yet-existing
 `vm_http.work_root` creates that parent at 0700, which is exactly what
 `ensure_vm_http_work_root_private` demands, and it matches what the runtime
 (`writ_agent_run`'s `ensure_private_dir`) enforces before every run. Its
-default is the one path here that treats an exported-but-empty `XDG_DATA_HOME`
-as unset (`xdg_dir_or_home`); the neighbouring defaults have the same hole but
-name durable state, so normalising them is a migration — moving where
-`default_audit_db_path` resolves moves `legacy_default_audit_db_path` with it
-and the migration guard would stop finding the old DB. Both `RunAgent` arms
+default comes from the `config::default_paths` table like every other (see
+"Default paths" below). Both `RunAgent` arms
 write here: per-run `<root>/<run-id>/stdout.log` and `stderr.log`, pointed at
 by `agent_run_outcome` rows. The host arm reaches it through
 `RunAgentSpawnConfig.log_root`, which is non-optional — a spawn config with
 nowhere to put streams describes a run that could start but never be audited.
+
+**Default paths.** Every location writ derives from the environment is a
+`DefaultPath` entry in `config::default_paths` — the config file, the audit DB
+(and its legacy sibling), the notes repo, the secret store, the agent-run log
+root, the socket, the UI bearer file, the agent-VM work root and state dir.
+Each entry names the XDG variable that owns it, the two suffixes, and the
+config key that overrides it; `DefaultPath::resolve_from` is the one function
+that turns an entry plus an environment into a path. Consumers outside the
+crate declare their own entry (bailiff's repo) and resolve it with the same
+code.
+
+Resolution is **fallible, and refuses rather than guessing**. Two holes had
+been copy-pasted into all nine resolvers: `var_os` returns `Some("")` for an
+exported-but-empty XDG variable, so joining produced a *CWD-relative* path; and
+an unset `HOME` fell back to `/tmp`. The second is not hypothetical on macOS,
+which sets no `XDG_RUNTIME_DIR` — every macOS install already takes the `HOME`
+branch for the socket and bearer file. It matters most for two entries: the
+audit DB is consulted as a live authorisation oracle (`flake_provision` gates
+guest access on `session_holds_grant_authorising`, over unsigned rows), so a
+pre-created database fabricates *grants*, not just history; and writ performs
+no peer-credential check, so whoever binds the socket path first *is* writd to
+every client. Refusing was chosen over normalising because normalising moves
+durable state — the exact silent-fork failure the legacy-audit-DB guard exists
+to prevent — whereas refusing moves nothing and names both the variable and
+the config key. Because `AUDIT_DB` and `LEGACY_AUDIT_DB` are entries in one
+table resolved by one function, the guard can no longer probe a different base
+directory than the one writd is about to open.
+
+Resolving a path is **not** trusting it: nothing here checks directory
+ownership, and the mode-only (`mode & 0o077 == 0`) checks guarding the secret
+store, socket parent, and bearer file are bypassable by a macOS ACL, which
+`st_mode` does not reflect. That is a separate, still-open question.
 
 **Neighbours.** Calls audit, credential minting, the git pipeline
 (staged-push), and the VM sandbox (`AgentVmDaemon`). Called by the `writ` CLI

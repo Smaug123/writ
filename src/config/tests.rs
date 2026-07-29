@@ -7,7 +7,6 @@
 use super::*;
 use crate::core::AgentKind;
 use crate::github::GitHubAppRegistryConfigError;
-use proptest::prelude::*;
 
 const TEST_NIX_CACHE_PUBLIC_KEY: &str =
     "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
@@ -39,9 +38,10 @@ fn parses_minimal_config() {
     assert!(c.socket_path.is_none());
     assert!(c.ui_http.is_none());
     assert!(c.run_agent.is_none());
-    assert!(
-        matches!(&c.secret_store, SecretStoreConfig::File { path } if *path == default_secret_store_path())
-    );
+    assert!(matches!(
+        &c.secret_store_or_default().unwrap(),
+        SecretStoreConfig::File { path } if *path == default_secret_store_path().unwrap()
+    ));
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn parses_ui_http_config_with_bearer_path() {
     let c: DaemonConfig = serde_json::from_str(json).unwrap();
     let ui = c.ui_http.as_ref().expect("ui_http parsed");
     assert_eq!(
-        ui.bearer_path_or_default(),
+        ui.bearer_path_or_default().unwrap(),
         std::path::PathBuf::from("/tmp/writ/ui-bearer")
     );
 }
@@ -194,7 +194,9 @@ fn parses_config_with_overrides() {
         c.socket_path.as_deref(),
         Some(std::path::Path::new("/tmp/test.sock"))
     );
-    assert!(matches!(c.secret_store, SecretStoreConfig::Keyring { service } if service == "writ"));
+    assert!(
+        matches!(c.secret_store, Some(SecretStoreConfig::Keyring { service }) if service == "writ")
+    );
 }
 
 #[test]
@@ -529,7 +531,7 @@ fn valid_agent_vm_http_config() -> AgentVmHttpConfig {
         git_clone_base_url: DEFAULT_GIT_CLONE_BASE_URL.into(),
         askpass_program: PathBuf::from("/usr/local/libexec/writ-git-askpass"),
         token_env: "WRIT_GIT_TOKEN".into(),
-        work_root,
+        work_root: Some(work_root),
         clone_timeout_secs: 30,
         max_bundle_bytes: ByteSize::from_bytes(1_048_576),
         nix_cache_url: "https://cache.nixos.org".into(),
@@ -802,7 +804,7 @@ fn agent_vm_http_config_rejects_relative_askpass_program() {
 #[test]
 fn agent_vm_http_config_rejects_relative_work_root() {
     let mut c = valid_agent_vm_http_config();
-    c.work_root = PathBuf::from("relative");
+    c.work_root = Some(PathBuf::from("relative"));
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
@@ -943,7 +945,14 @@ fn agent_vm_http_config_applies_defaults_for_omitted_fields() {
     assert_eq!(c.git_program, PathBuf::from("git"));
     assert_eq!(c.git_clone_base_url, DEFAULT_GIT_CLONE_BASE_URL);
     assert_eq!(c.token_env, "WRIT_GIT_TOKEN");
-    assert_eq!(c.work_root, default_vm_http_work_root());
+    // Absent in the JSON, so the field itself is `None` and the default is
+    // resolved on demand — the resolution can fail, which is why it is no
+    // longer a `serde` default baked in at parse time.
+    assert_eq!(c.work_root, None);
+    assert_eq!(
+        c.work_root_or_default().unwrap(),
+        default_vm_http_work_root().unwrap()
+    );
     assert_eq!(c.clone_timeout_secs, 300);
     assert_eq!(c.max_bundle_bytes, ByteSize::mib(64));
     assert_eq!(c.nix_cache_url, "https://cache.nixos.org");
@@ -966,50 +975,17 @@ fn agent_vm_http_config_applies_defaults_for_omitted_fields() {
 #[test]
 fn the_default_agent_run_log_root_is_absolute_and_writ_owned() {
     let root = default_agent_run_log_root();
+    let root = root.expect("the test env has HOME");
     assert!(root.is_absolute(), "{root:?}");
     assert!(root.ends_with("writ/agent-runs"), "{root:?}");
 }
 
-/// `default_agent_run_log_root` resolves through `xdg_dir_or_home`, and the
-/// property that matters is that the result is **absolute for every
-/// environment**: a relative default reaches a caller that requires an
-/// absolute path and refuses the daemon over a path the operator never wrote.
-///
-/// The interesting input is the exported-but-empty variable. `var_os` returns
-/// `Some("")` for it — indistinguishable from a real setting unless you look —
-/// and joining onto it silently produces a relative path. Writing this as a
-/// property rather than a case is what found the second instance: the `HOME`
-/// fallback had the same hole as the XDG variable, since `unwrap_or_else` does
-/// not fire on `Some("")`.
-///
-/// Driven against the pure `resolve_base_dir` rather than the env-reading
-/// wrapper, so it mutates nothing that other tests in this process can see.
-#[test]
-fn a_default_path_is_absolute_whatever_the_environment_says() {
-    proptest!(|(xdg in "[/a-z]{0,12}", home in "[/a-z]{0,12}")| {
-        let resolved = resolve_base_dir(
-            Some(xdg.clone().into()),
-            Some(home.clone().into()),
-            "writ/thing",
-            ".local/share/writ/thing",
-        );
-        // A *relative* non-empty value is the operator naming a relative
-        // directory: their own doing, and reported to them as such. Empty is
-        // what the helper exists to catch, at either level.
-        if xdg.is_empty() && (home.is_empty() || home.starts_with('/')) {
-            prop_assert!(
-                resolved.is_absolute(),
-                "XDG={:?} HOME={:?} produced the relative {:?}", xdg, home, resolved,
-            );
-        }
-        // Exported-but-empty must be indistinguishable from absent — that is
-        // the whole claim, and it holds for any pair of suffixes.
-        prop_assert_eq!(
-            resolve_base_dir(Some("".into()), Some("".into()), "writ/thing", ".local/thing"),
-            resolve_base_dir(None, None, "writ/thing", ".local/thing"),
-        );
-    });
-}
+// `a_default_path_is_absolute_whatever_the_environment_says` stood here. It
+// drove the old `resolve_base_dir` helper, which only `default_agent_run_log_root`
+// used; every other default had the same two holes and none of them were
+// covered. The successor is `config::default_paths::tests`, which quantifies
+// over *every* declared location rather than over one helper's two suffixes,
+// and asserts refusal rather than a `/tmp` guess when the environment is empty.
 
 /// The agent-run log root is a *top-level* key, so it is checked whether or
 /// not an `agent_vm` section exists — a daemon serving only host-spawn
@@ -1017,7 +993,7 @@ fn a_default_path_is_absolute_whatever_the_environment_says() {
 #[test]
 fn daemon_config_rejects_relative_agent_run_log_root() {
     assert!(matches!(
-        sole_error(check_daemon_sections(None, None, Some(Path::new("agent-runs")))),
+        sole_error(check_daemon_sections(None, None, Some(Path::new("agent-runs")), None, None)),
         DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Relative(path))
             if path.as_os_str() == "agent-runs"
     ));
@@ -1030,7 +1006,7 @@ fn daemon_config_rejects_unwritable_agent_run_log_root() {
     std::fs::write(&path, b"file").unwrap();
 
     assert!(matches!(
-        sole_error(check_daemon_sections(None, None, Some(&path))),
+        sole_error(check_daemon_sections(None, None, Some(&path), None, None)),
         DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Create {
             path: failed,
             ..
@@ -1046,11 +1022,102 @@ fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
     let root = temp.path().join("named-explicitly");
     assert!(!root.exists());
 
-    let checked = check_daemon_sections(None, None, Some(&root)).unwrap();
+    let checked = check_daemon_sections(None, None, Some(&root), None, None).unwrap();
 
     assert_eq!(checked.agent_run_log_root.as_path(), root);
     assert!(root.is_dir(), "the root must exist after checking");
     assert!(checked.agent_vm.is_none());
+}
+
+/// The preflight resolves the environment-derived defaults that used to be
+/// resolved at their point of use.
+///
+/// Both moved here for the same reason and one extra. The shared reason is the
+/// report: resolving with `?` in `writd` returns *before* this function runs,
+/// so an operator with an unusable environment and a bad `ui_http.bind` learns
+/// about them one restart apart. The extra one is the bearer path, whose point
+/// of use is after directories are created, the audit DB reconciled, signing
+/// state materialised, and listeners bound — exiting there over a path that
+/// was knowable at boot is exactly what "check before irreversible steps"
+/// forbids.
+///
+/// This pins the wiring; the failure path is structural (`record_from`, not
+/// `?`) and cannot be driven here without mutating the process environment
+/// that every other test in this binary shares.
+#[test]
+fn the_preflight_resolves_the_environment_derived_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("agent-runs");
+
+    let checked = check_daemon_sections(None, None, Some(&root), None, None).unwrap();
+    assert!(
+        matches!(&checked.secret_store, SecretStoreConfig::File { path }
+            if *path == default_secret_store_path().unwrap()),
+        "an absent secret_store must resolve to the file default, got {:?}",
+        checked.secret_store,
+    );
+    assert_eq!(
+        checked.ui_http_bearer_path, None,
+        "no ui_http section means no bearer path to resolve",
+    );
+    assert_eq!(
+        checked.notes_repo_path, None,
+        "no run_agent section means no notes repo to resolve",
+    );
+
+    // An explicitly configured store is passed through untouched: the
+    // environment is not consulted for a path the operator named.
+    let configured = SecretStoreConfig::Keyring {
+        service: "writ".to_string(),
+    };
+    let checked = check_daemon_sections(None, None, Some(&root), Some(&configured), None).unwrap();
+    assert!(matches!(
+        checked.secret_store,
+        SecretStoreConfig::Keyring { .. }
+    ));
+}
+
+/// A `run_agent` section gets its notes-repo path resolved during the
+/// preflight, not inside `materialize`.
+///
+/// `materialize` runs after the audit DB is opened, the socket bound and the
+/// reconcile passes done, so a default that could not be derived would abort
+/// boot having already left filesystem and audit side effects behind.
+#[test]
+fn the_preflight_resolves_the_notes_repo_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("agent-runs");
+    let json = r#"{
+        "spawn_command": "/opt/agents/codex",
+        "spawn_agent_kind": "codex"
+    }"#;
+    let run_agent: RunAgentDaemonConfig = serde_json::from_str(json).unwrap();
+
+    let checked = check_daemon_sections(None, None, Some(&root), None, Some(&run_agent)).unwrap();
+
+    assert_eq!(
+        checked.notes_repo_path,
+        Some(default_notes_repo_path().unwrap()),
+    );
+}
+
+/// A `ui_http` section gets its bearer path resolved during the preflight,
+/// long before the listener it belongs to is bound.
+#[test]
+fn the_preflight_resolves_the_ui_http_bearer_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("agent-runs");
+    let ui_http = UiHttpConfig {
+        bind: "127.0.0.1:7378".parse().unwrap(),
+        bearer_path: None,
+    };
+
+    let checked = check_daemon_sections(None, Some(&ui_http), Some(&root), None, None).unwrap();
+
+    assert_eq!(
+        checked.ui_http_bearer_path,
+        Some(default_ui_http_bearer_path().unwrap()),
+    );
 }
 
 /// Preparing the root chmods it, and `set_permissions` follows symlinks — so a
@@ -1094,7 +1161,7 @@ fn the_direct_runtime_conversion_reports_a_bad_log_root_and_a_bad_staging_root()
     std::fs::write(&staging_root, b"file").unwrap();
 
     let mut vm_http = valid_agent_vm_http_config();
-    vm_http.work_root = temp.path().join("work-root");
+    vm_http.work_root = Some(temp.path().join("work-root"));
     vm_http.git_push_staging_root = Some(staging_root);
     let config = AgentVmDaemonConfig {
         lifecycle: valid_agent_vm_lifecycle_config(),
@@ -1194,13 +1261,13 @@ fn a_log_root_nested_under_an_uncreated_work_root_leaves_both_usable() {
     assert!(!work_root.exists());
 
     let mut vm_http = valid_agent_vm_http_config();
-    vm_http.work_root = work_root.clone();
+    vm_http.work_root = Some(work_root.clone());
     let agent_vm = AgentVmDaemonConfig {
         lifecycle: valid_agent_vm_lifecycle_config(),
         vm_http,
     };
 
-    let checked = check_daemon_sections(Some(&agent_vm), None, Some(&log_root))
+    let checked = check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None)
         .expect("a log root beneath an uncreated work root must be accepted");
 
     assert_eq!(checked.agent_run_log_root.as_path(), log_root);
@@ -1225,14 +1292,15 @@ fn a_broken_agent_run_log_root_does_not_hide_a_broken_push_staging_root() {
     std::fs::write(&staging_root, b"file").unwrap();
 
     let mut vm_http = valid_agent_vm_http_config();
-    vm_http.work_root = temp.path().join("work-root");
+    vm_http.work_root = Some(temp.path().join("work-root"));
     vm_http.git_push_staging_root = Some(staging_root.clone());
     let agent_vm = AgentVmDaemonConfig {
         lifecycle: valid_agent_vm_lifecycle_config(),
         vm_http,
     };
 
-    let Err(errors) = check_daemon_sections(Some(&agent_vm), None, Some(&log_root)) else {
+    let Err(errors) = check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None)
+    else {
         panic!("expected the config to be rejected");
     };
     let rendered = errors.to_string();
@@ -1607,7 +1675,7 @@ fn agent_vm_http_config_creates_work_root_at_mode_0700() {
     // one that creates the directory.
     let work_root = temp.path().join("fresh-vm-work");
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
 
     c.to_runtime_config().expect("runtime config builds");
 
@@ -1634,7 +1702,7 @@ fn agent_vm_http_config_rejects_existing_work_root_with_loose_perms() {
     std::fs::create_dir(&work_root).unwrap();
     std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
 
     let err = sole_error(c.to_runtime_config());
     assert!(
@@ -1655,7 +1723,7 @@ fn agent_vm_http_config_accepts_existing_work_root_at_mode_0700() {
     std::fs::create_dir(&work_root).unwrap();
     std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
 
     c.to_runtime_config()
         .expect("pre-existing 0700 work_root accepted");
@@ -1673,7 +1741,7 @@ fn agent_vm_http_config_rejects_work_root_that_is_a_file() {
     let work_root = temp.path().join("not-a-dir");
     std::fs::write(&work_root, b"file").unwrap();
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
 
     let err = sole_error(c.to_runtime_config());
     assert!(
@@ -1694,7 +1762,7 @@ fn agent_vm_http_config_defaults_git_push_staging_root_to_work_root_subdir() {
     let temp = tempfile::tempdir().unwrap();
     let work_root = temp.path().join("vm-work");
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
     c.git_push_staging_root = None;
 
     let runtime = c.to_runtime_config().unwrap();
@@ -1710,7 +1778,7 @@ fn agent_vm_http_config_defaults_flake_input_cache_dir_to_work_root_subdir() {
     let temp = tempfile::tempdir().unwrap();
     let work_root = temp.path().join("vm-work");
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
     c.flake_input_cache_dir = None;
 
     let runtime = c.to_runtime_config().unwrap();
@@ -1817,7 +1885,7 @@ fn parses_run_agent_section_with_all_fields() {
     assert_eq!(cfg.spawn_agent_kind, crate::core::AgentKind::Codex);
     assert_eq!(cfg.spawn_args, vec!["--headless", "--no-color"]);
     assert_eq!(
-        cfg.notes_repo_path_or_default(),
+        cfg.notes_repo_path_or_default().unwrap(),
         PathBuf::from("/var/lib/writ/notes")
     );
     assert_eq!(
@@ -1892,7 +1960,10 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
     let store = InMem::default();
     let log_root = AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap();
 
-    let first = cfg.materialize(&store, log_root.clone()).unwrap();
+    let notes_repo_path = cfg.notes_repo_path_or_default().unwrap();
+    let first = cfg
+        .materialize(&store, log_root.clone(), notes_repo_path.clone())
+        .unwrap();
     assert!(
         first.signing.was_generated(),
         "first boot generates the key"
@@ -1901,7 +1972,9 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
     assert!(first.notes_repo.path().exists());
     assert_eq!(first.spawn.command, PathBuf::from("/bin/cat"));
 
-    let second = cfg.materialize(&store, log_root.clone()).unwrap();
+    let second = cfg
+        .materialize(&store, log_root.clone(), notes_repo_path)
+        .unwrap();
     assert!(
         !second.signing.was_generated(),
         "second boot loads the existing key"
@@ -2034,7 +2107,7 @@ fn a_failed_input_skips_its_dependents_without_inventing_failures() {
 fn a_textually_invalid_config_creates_no_directories() {
     let mut c = valid_agent_vm_http_config();
     let work_root = unique_config_test_path("no-debris-work-root");
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
     c.nix_cache_url = "not-a-url".into();
 
     let errors = c.to_runtime_config().unwrap_err();
@@ -2054,7 +2127,7 @@ fn a_textually_invalid_config_creates_no_directories() {
 #[test]
 fn a_relative_work_root_is_reported_once_and_creates_nothing() {
     let mut c = valid_agent_vm_http_config();
-    c.work_root = PathBuf::from("writ-relative-work-root-should-not-appear");
+    c.work_root = Some(PathBuf::from("writ-relative-work-root-should-not-appear"));
 
     let errors = c.to_runtime_config().unwrap_err();
     let found: Vec<String> = errors.iter().map(ToString::to_string).collect();
@@ -2082,7 +2155,7 @@ fn a_bad_lifecycle_section_creates_no_vm_http_directories() {
     lifecycle.ipv4_pool = "not-a-cidr".into();
     let mut vm_http = valid_agent_vm_http_config();
     let work_root = unique_config_test_path("sibling-no-debris");
-    vm_http.work_root = work_root.clone();
+    vm_http.work_root = Some(work_root.clone());
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
     let errors = config
@@ -2120,7 +2193,7 @@ fn a_rejected_work_root_suppresses_every_root_probe() {
     std::fs::write(&staging_root, b"not a directory").unwrap();
 
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
     c.git_push_staging_root = Some(staging_root.clone());
 
     let errors = c.to_runtime_config().unwrap_err();
@@ -2151,7 +2224,7 @@ fn a_non_wildcard_bind_addr_is_reported_with_its_siblings_and_creates_nothing() 
     lifecycle.cpus = 0;
     let mut vm_http = valid_agent_vm_http_config();
     let work_root = unique_config_test_path("bind-addr-no-debris");
-    vm_http.work_root = work_root.clone();
+    vm_http.work_root = Some(work_root.clone());
     vm_http.bind_addr = Ipv4Addr::new(127, 0, 0, 1);
 
     let config = AgentVmDaemonConfig { lifecycle, vm_http };
@@ -2194,7 +2267,7 @@ fn a_root_under_an_unpreparable_work_root_fails_rather_than_creating_it() {
     std::fs::write(&work_root, b"not a directory").unwrap();
 
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
     c.git_push_staging_root = Some(work_root.join("staging"));
 
     let errors = c.to_runtime_config().unwrap_err();
@@ -2224,7 +2297,7 @@ fn a_rejected_work_root_creates_no_roots_beneath_it() {
     let staging_root = work_root.join("staging");
 
     let mut c = valid_agent_vm_http_config();
-    c.work_root = work_root.clone();
+    c.work_root = Some(work_root.clone());
     c.git_push_staging_root = Some(staging_root.clone());
 
     let errors = c.to_runtime_config().unwrap_err();
@@ -2279,7 +2352,7 @@ fn a_non_wildcard_bind_addr_is_reported_alongside_an_unrelated_vm_http_fault() {
 fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
     let mut vm_http = valid_agent_vm_http_config();
     let work_root = unique_config_test_path("ui-http-no-debris");
-    vm_http.work_root = work_root.clone();
+    vm_http.work_root = Some(work_root.clone());
     let agent_vm = AgentVmDaemonConfig {
         lifecycle: valid_agent_vm_lifecycle_config(),
         vm_http,
@@ -2293,6 +2366,8 @@ fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
         Some(&agent_vm),
         Some(&ui_http),
         Some(&unique_config_test_path("agent-runs")),
+        None,
+        None,
     )
     .unwrap_err();
     assert!(

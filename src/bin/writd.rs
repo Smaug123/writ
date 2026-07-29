@@ -18,19 +18,17 @@ use writ::boot_reconcile::{
 };
 use writ::broker_entrypoint::{BrokerArgs, run_broker};
 use writ::broker_session::BrokerSessionSpec;
+use writ::config::default_paths;
 use writ::config::{
     DaemonConfig, LegacyAuditDbNotMigrated, SecretStoreConfig, check_daemon_sections,
-    default_audit_db_path, default_config_path, ensure_audit_db_entry_is_regular_file,
-    ensure_audit_dir_is_dedicated, legacy_audit_db_needs_migration, legacy_default_audit_db_path,
-    path_entry_present,
+    ensure_audit_db_entry_is_regular_file, ensure_audit_dir_is_dedicated,
+    legacy_audit_db_needs_migration, legacy_default_audit_db_path, path_entry_present,
 };
 use writ::core::UnixMillis;
 use writ::git_push_staging::GitPushStagingStore;
 use writ::github::GitHubMinter;
 use writ::secret::{FileSecretStore, KeyringSecretStore, SecretStore};
-use writ::server::{
-    BrokerState, default_socket_path, prepare_broker_listener, serve_broker_with_agent_vm,
-};
+use writ::server::{BrokerState, prepare_broker_listener, serve_broker_with_agent_vm};
 use writ::ui_http::{
     UiHttpBearerToken, UiHttpService, bind_ui_http_listener, run_ui_http_until_shutdown,
     write_bearer_file,
@@ -149,7 +147,7 @@ async fn run_host_daemon(
     socket: Option<PathBuf>,
     audit_db: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = config.unwrap_or_else(default_config_path);
+    let config_path = default_paths::CONFIG_FILE.or_resolve(config)?;
     let json = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("cannot read config {}: {e}", config_path.display()))?;
     let config: DaemonConfig = serde_json::from_str(&json)
@@ -166,11 +164,11 @@ async fn run_host_daemon(
         agent_run_log_root,
     } = config;
 
-    let socket_path = socket.or(socket_path).unwrap_or_else(default_socket_path);
+    let socket_path = default_paths::SOCKET.or_resolve(socket.or(socket_path))?;
 
     let audit_db_selected = audit_db.or(audit_db_config);
     let used_default_audit_db = audit_db_selected.is_none();
-    let audit_db_path = audit_db_selected.unwrap_or_else(default_audit_db_path);
+    let audit_db_path = default_paths::AUDIT_DB.or_resolve(audit_db_selected)?;
 
     // The default audit DB path moved into a dedicated `audit/` directory so the
     // broker VM can mount it read-write without exposing the secret store. An
@@ -179,7 +177,10 @@ async fn run_host_daemon(
     // audit log and fork history (reconciliation and the UI would lose every
     // prior session and grant), so refuse and tell the operator to migrate.
     if used_default_audit_db {
-        let legacy = legacy_default_audit_db_path();
+        // Resolved through the same `DefaultPath` machinery as the current
+        // default, so this cannot silently probe a different base directory
+        // than the one writd is about to open.
+        let legacy = legacy_default_audit_db_path()?;
         // "new already migrated" means opening the new path yields the existing
         // DB rather than forking — a *following* existence check, so a dangling
         // symlink at the new path counts as absent and migration still fires
@@ -228,9 +229,22 @@ async fn run_host_daemon(
         agent_vm.as_ref(),
         ui_http.as_ref(),
         agent_run_log_root.as_deref(),
+        secret_store.as_ref(),
+        run_agent.as_ref(),
     )
     .map_err(|errors| errors.to_string())?;
     let agent_vm = checked.agent_vm;
+    // Both of these are environment-derived defaults, resolved inside the
+    // preflight above rather than at their point of use: the secret store so
+    // its failure joins the same report as every other config error, and the
+    // bearer path so the daemon cannot get as far as binding listeners before
+    // discovering it has nowhere to write a token.
+    let secret_store = checked.secret_store;
+    let ui_http_bearer_path = checked.ui_http_bearer_path;
+    // Likewise the notes repo: `materialize` runs after the audit DB is open,
+    // the socket is bound and the reconcile passes have run, so a path that
+    // could not be derived would abort boot having already left side effects.
+    let notes_repo_path = checked.notes_repo_path;
     // Both `RunAgent` arms write per-run stdout/stderr here, and the absolute
     // paths land on `agent_run_outcome` rows — so the operator needs to know
     // which directory this boot resolved, whether they configured it or took
@@ -381,7 +395,12 @@ async fn run_host_daemon(
     let (notes_repo, signing_key, run_agent_spawn) = match run_agent.as_ref() {
         Some(cfg) => {
             let boot = cfg
-                .materialize(&*store, checked.agent_run_log_root.clone())
+                .materialize(
+                    &*store,
+                    checked.agent_run_log_root.clone(),
+                    notes_repo_path
+                        .expect("a run_agent section resolves its notes repo in preflight"),
+                )
                 .map_err(|e| format!("cannot materialize RunAgent state from config: {e}"))?;
             let fingerprint = boot.signing.signing_key().fingerprint();
             if boot.signing.was_generated() {
@@ -526,7 +545,8 @@ async fn run_host_daemon(
         let listener = bind_ui_http_listener(ui_http.bind).await?;
         let bound = listener.local_addr()?;
         let bearer = UiHttpBearerToken::generate();
-        let bearer_path = ui_http.bearer_path_or_default();
+        let bearer_path =
+            ui_http_bearer_path.expect("a ui_http section resolves its bearer path in preflight");
         write_bearer_file(&bearer_path, &bearer)?;
         let service = UiHttpService::new(Arc::clone(&state.audit), agent_vm.clone(), bearer);
         // The broker's main accept loop has no shutdown signal today,

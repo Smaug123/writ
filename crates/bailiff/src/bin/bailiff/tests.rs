@@ -332,7 +332,7 @@ fn resolve_decider_fails_when_no_flag_and_no_user_env() {
     );
 }
 
-/// `default_bailiff_repo_path` honours `XDG_DATA_HOME` when
+/// `BAILIFF_REPO` honours `XDG_DATA_HOME` when
 /// set and falls back to the documented `~/.local/share`
 /// location otherwise. The env-var manipulation is process-
 /// scoped; running other tests concurrently in the same
@@ -350,18 +350,21 @@ fn default_paths_track_xdg_data_home() {
         std::env::set_var("XDG_DATA_HOME", "/data");
     }
     assert_eq!(
-        default_bailiff_repo_path(),
+        BAILIFF_REPO.resolve().unwrap(),
         PathBuf::from("/data/bailiff/repo")
     );
-    assert_eq!(default_writ_repo_path(), PathBuf::from("/data/writ/repo"));
-    // Pin the invariant: bailiff's writ-repo default must agree
-    // with the daemon's notes-repo default, because writd writes
-    // and bailiff fetches from the same disk location when both
-    // run with stock config.
+    // writd writes and bailiff fetches from the same disk location under stock
+    // config. Bailiff names writd's own `NOTES_REPO` constant, so this is an
+    // identity rather than two hand-copied functions that happen to agree —
+    // which is what the deleted `default_writ_repo_path` was, and what the
+    // comment above it could only ask the next reader to preserve.
     assert_eq!(
-        default_writ_repo_path(),
-        writ::config::default_notes_repo_path(),
-        "bailiff and writd default writ-repo path diverged — one was renamed without the other",
+        WRIT_NOTES_REPO.resolve().unwrap(),
+        writ::config::default_notes_repo_path().unwrap(),
+    );
+    assert_eq!(
+        WRIT_NOTES_REPO.resolve().unwrap(),
+        PathBuf::from("/data/writ/repo")
     );
 
     unsafe {
@@ -369,11 +372,11 @@ fn default_paths_track_xdg_data_home() {
         std::env::set_var("HOME", "/home/test");
     }
     assert_eq!(
-        default_bailiff_repo_path(),
+        BAILIFF_REPO.resolve().unwrap(),
         PathBuf::from("/home/test/.local/share/bailiff/repo")
     );
     assert_eq!(
-        default_writ_repo_path(),
+        WRIT_NOTES_REPO.resolve().unwrap(),
         PathBuf::from("/home/test/.local/share/writ/repo")
     );
 

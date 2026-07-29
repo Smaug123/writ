@@ -32,7 +32,7 @@ pub use parse::{
 };
 mod state_store;
 pub use state_store::{
-    AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStore, AgentVmStateDirError,
+    AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStore,
     default_agent_vm_state_dir,
 };
 mod network_health;

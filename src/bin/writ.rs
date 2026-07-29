@@ -34,7 +34,6 @@ use writ::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubRequest, RepoRef, RequestId, SessionId,
 };
 use writ::protocol::{ClientMessage, RejectionReason, ServerMessage};
-use writ::server::default_socket_path;
 use writ::vm_git::{AgentVmWorkspaceBootstrap, WorkspaceWarmMode};
 
 #[derive(Parser)]
@@ -372,7 +371,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let args = Args::parse();
-    let socket_path = args.socket.unwrap_or_else(default_socket_path);
+    let socket = args.socket;
 
     match args.cmd {
         Cmd::OpenSession {
@@ -385,7 +384,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 agent_kind: agent,
                 agent_model: model,
             };
-            match call(&socket_path, &msg)? {
+            match call(&socket_path(&socket)?, &msg)? {
                 ServerMessage::SessionOpened { session_id } => println!("{session_id}"),
                 ServerMessage::Error { message } => return Err(message.into()),
                 other => return Err(format!("unexpected response: {other:?}").into()),
@@ -397,7 +396,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()
                 .map_err(|e| format!("invalid session ID: {e}"))?;
             let msg = ClientMessage::CloseSession { session_id: id };
-            match call(&socket_path, &msg)? {
+            match call(&socket_path(&socket)?, &msg)? {
                 ServerMessage::SessionClosed => {}
                 ServerMessage::Error { message } => return Err(message.into()),
                 other => return Err(format!("unexpected response: {other:?}").into()),
@@ -418,7 +417,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 capability,
             };
 
-            match call(&socket_path, &msg)? {
+            match call(&socket_path(&socket)?, &msg)? {
                 ServerMessage::TokenGranted { token, .. } => println!("{token}"),
                 ServerMessage::Denied { reason } => return Err(format!("denied: {reason}").into()),
                 ServerMessage::UnknownSession { session_id } => {
@@ -444,14 +443,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let workspace =
                     build_workspace_bootstrap(repo, workspace, warm.map(WorkspaceWarmMode::from))?;
-                start_agent_vm(&socket_path, label, agent, model, workspace, guest_command)?;
+                start_agent_vm(
+                    &socket_path(&socket)?,
+                    label,
+                    agent,
+                    model,
+                    workspace,
+                    guest_command,
+                )?;
             }
             AgentVmCmd::Stop { session_id } => {
                 let id: SessionId = session_id
                     .parse()
                     .map_err(|e| format!("invalid session ID: {e}"))?;
                 let msg = ClientMessage::StopAgentVm { session_id: id };
-                match call_with_timeout(&socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
+                match call_with_timeout(&socket_path(&socket)?, &msg, AGENT_VM_CALL_TIMEOUT)? {
                     ServerMessage::AgentVmStopped => {}
                     ServerMessage::Error { message } => return Err(message.into()),
                     other => return Err(format!("unexpected response: {other:?}").into()),
@@ -459,7 +465,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             AgentVmCmd::List => {
                 let msg = ClientMessage::ListAgentVms {};
-                match call_with_timeout(&socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
+                match call_with_timeout(&socket_path(&socket)?, &msg, AGENT_VM_CALL_TIMEOUT)? {
                     ServerMessage::AgentVmSessions { sessions } => {
                         let mut out = std::io::stdout().lock();
                         write_agent_vm_sessions(&mut out, &sessions)?;
@@ -496,7 +502,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let warm_mode = warm.into();
                 let workspace = build_workspace_bootstrap_from_repo(repo, workspace, warm_mode)?;
                 start_agent_run(
-                    &socket_path,
+                    &socket_path(&socket)?,
                     label,
                     agent,
                     model,
@@ -506,7 +512,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             AgentCmd::Verify { envelope } => {
-                verify_agent_run(&socket_path, &envelope)?;
+                verify_agent_run(&socket_path(&socket)?, &envelope)?;
             }
         },
         Cmd::Promote { action } => match action {
@@ -518,7 +524,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .transpose()?;
                 let msg = ClientMessage::ListStagedPushes { session_id };
-                match call(&socket_path, &msg)? {
+                match call(&socket_path(&socket)?, &msg)? {
                     ServerMessage::StagedPushes { mut pushes } => {
                         // Disk iteration order is unspecified; sort here so the
                         // CLI output is deterministic and oldest-first.
@@ -535,7 +541,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .parse()
                     .map_err(|e| format!("invalid request ID: {e}"))?;
                 let msg = ClientMessage::ShowStagedPush { request_id: id };
-                match call(&socket_path, &msg)? {
+                match call(&socket_path(&socket)?, &msg)? {
                     ServerMessage::StagedPush { push } => {
                         let mut out = std::io::stdout().lock();
                         write_staged_push_detail(&mut out, &push)?;
@@ -562,7 +568,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // out before the broker would silently lose the
                 // `new_app_tip` receipt even though the push may have
                 // landed.
-                match call_with_timeout(&socket_path, &msg, PROMOTE_APPROVE_CALL_TIMEOUT)? {
+                match call_with_timeout(&socket_path(&socket)?, &msg, PROMOTE_APPROVE_CALL_TIMEOUT)?
+                {
                     ServerMessage::StagedPushApproved {
                         request_id,
                         new_app_tip,
@@ -593,7 +600,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     operator,
                     reason,
                 };
-                match call(&socket_path, &msg)? {
+                match call(&socket_path(&socket)?, &msg)? {
                     ServerMessage::StagedPushRejected { request_id } => {
                         println!("rejected push_request_id={request_id}");
                     }
@@ -634,7 +641,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     operator,
                     outcome,
                 };
-                match call(&socket_path, &msg)? {
+                match call(&socket_path(&socket)?, &msg)? {
                     ServerMessage::StagedPushReconciled { request_id } => {
                         println!("reconciled push_request_id={request_id}");
                     }
@@ -660,6 +667,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     }
     Ok(())
+}
+
+/// The daemon socket, for the subcommands that actually talk to writd.
+///
+/// Resolved per-use rather than once in `run`, because resolving it can now
+/// *fail*: `agent-vm build-image` and `build-broker-image` are local Nix and
+/// container operations that never open a connection, and a stripped build
+/// environment with no usable `$XDG_RUNTIME_DIR` or `$HOME` should not be
+/// refused over a daemon socket it has no use for.
+fn socket_path(socket: &Option<PathBuf>) -> Result<PathBuf, writ::config::BaseDirError> {
+    writ::config::default_paths::SOCKET.or_resolve(socket.clone())
 }
 
 fn start_agent_vm(
