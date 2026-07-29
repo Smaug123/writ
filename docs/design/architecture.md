@@ -1162,7 +1162,10 @@ capture's digest and this re-read's are comparable by construction.
   than nested under the session, because a run outlives its VM: the audit
   rows survive `close_agent_vm_session`, so nesting would shrink the
   reachable set as sessions end. Follow `current_run_id` from a VM row to
-  reach it.
+  reach it. The VM routes join audit state through one batched
+  `sessions_with_latest_run` rather than per-row lookups, so query count
+  is bounded by chunk size rather than by fleet size, and list and detail
+  cannot drift into answering differently about the same session.
 - **`crates/writ-vm-git/`** — the shared host↔guest wire-types crate.
 
 **Guarantees & invariants.** The guest client is an ergonomic wrapper, **not an

@@ -49,7 +49,7 @@ mod validation;
 
 pub use agent_run::{
     AgentRunAuditRecord, AgentRunAuditTable, AgentRunOutcomeAuditRecord,
-    AgentVmWorkspaceBootstrapAuditRecord,
+    AgentVmWorkspaceBootstrapAuditRecord, SessionRunSummary,
 };
 pub use agent_vm_network_health::AgentVmNetworkHealthEventRecord;
 pub use claude_proxy::{

@@ -9,6 +9,7 @@
 
 use crate::agent_run::AgentRunId;
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
+use crate::audit::SessionRunSummary;
 use crate::core::{AgentKind, SessionId, UnixMillis};
 use crate::protocol::AgentVmSessionInfo;
 use serde::Serialize;
@@ -56,12 +57,20 @@ pub(super) async fn list(service: &UiHttpService) -> UiHttpResponse {
         Err(err) => return UiHttpResponse::error_internal(err.to_string()),
     };
 
+    // One batched join for the whole listing. Per-VM lookups meant two
+    // SQLite round trips *and two mutex acquisitions* per VM per
+    // request, which is the one place in this endpoint that grows with
+    // the fleet.
+    let ids: Vec<SessionId> = infos.iter().map(|info| info.session_id).collect();
+    let joined = match service.audit().sessions_with_latest_run(&ids) {
+        Ok(joined) => joined,
+        Err(err) => return UiHttpResponse::error_internal(err.to_string()),
+    };
+
     let mut rows: Vec<AgentVmRow> = Vec::with_capacity(infos.len());
     for info in infos {
-        match build_row(service, info) {
-            Ok(row) => rows.push(row),
-            Err(err) => return err,
-        }
+        let summary = joined.get(&info.session_id).cloned().unwrap_or_default();
+        rows.push(build_row(info, summary));
     }
     // Newest session first by opened_at; sessions with no audit row sink
     // to the bottom so the active set stays at the top of the listing.
@@ -105,24 +114,31 @@ pub(super) async fn detail(service: &UiHttpService, session_id_str: &str) -> UiH
         );
     };
 
-    match build_row(service, info) {
-        Ok(row) => UiHttpResponse::json(200, &AgentVmDetailResponse { row }),
-        Err(err) => err,
-    }
+    // The same batched call with one id, so detail and list cannot
+    // drift into answering differently about the same session.
+    let joined = match service.audit().sessions_with_latest_run(&[session_id]) {
+        Ok(joined) => joined,
+        Err(err) => return UiHttpResponse::error_internal(err.to_string()),
+    };
+    let summary = joined.get(&session_id).cloned().unwrap_or_default();
+
+    UiHttpResponse::json(
+        200,
+        &AgentVmDetailResponse {
+            row: build_row(info, summary),
+        },
+    )
 }
 
-fn build_row(
-    service: &UiHttpService,
-    info: AgentVmSessionInfo,
-) -> Result<AgentVmRow, UiHttpResponse> {
-    let session = service
-        .audit()
-        .get_session(info.session_id)
-        .map_err(|err| UiHttpResponse::error_internal(err.to_string()))?;
-    let current_run_id = service
-        .audit()
-        .latest_agent_run_id_for_session(info.session_id)
-        .map_err(|err| UiHttpResponse::error_internal(err.to_string()))?;
+/// Pure projection of the daemon's runtime view plus the audit join.
+/// Takes the looked-up summary rather than the service, so the query
+/// count is the caller's business and this cannot smuggle in a
+/// per-row read.
+fn build_row(info: AgentVmSessionInfo, summary: SessionRunSummary) -> AgentVmRow {
+    let SessionRunSummary {
+        session,
+        latest_run_id,
+    } = summary;
     let (label, agent_kind, agent_model, opened_at, closed_at) = match session {
         Some(s) => (
             s.label,
@@ -133,7 +149,7 @@ fn build_row(
         ),
         None => (None, None, None, None, None),
     };
-    Ok(AgentVmRow {
+    AgentVmRow {
         session_id: info.session_id,
         status: info.status,
         vm_name: info.vm_name,
@@ -146,6 +162,82 @@ fn build_row(
         agent_model,
         opened_at,
         closed_at,
-        current_run_id,
-    })
+        current_run_id: latest_run_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_vm_lifecycle::NetworkHealth;
+    use crate::core::SessionRecord;
+
+    fn info(session_id: SessionId) -> AgentVmSessionInfo {
+        AgentVmSessionInfo {
+            session_id,
+            status: AgentVmSessionStateStatus::Running,
+            subnet_index: 7,
+            vm_name: "writ-vm-7".into(),
+            network_name: "writ-net-7".into(),
+            broker_urls: vec!["http://192.168.7.1:8080".into()],
+            runtime_attached: true,
+            network_health: NetworkHealth::unknown(),
+        }
+    }
+
+    /// The join projects the audit half onto the runtime half without
+    /// crossing the two over.
+    ///
+    /// Testable at all only because `build_row` now takes the
+    /// looked-up summary rather than the service: it previously needed
+    /// a live `AgentVmDaemon` to reach, so nothing exercised it.
+    #[test]
+    fn a_row_carries_both_halves_of_the_join() {
+        let session_id = SessionId::new();
+        let run_id = crate::agent_run::AgentRunId::new();
+        let row = build_row(
+            info(session_id),
+            SessionRunSummary {
+                session: Some(SessionRecord {
+                    session_id,
+                    label: Some("nightly".into()),
+                    agent_kind: Some(AgentKind::Codex),
+                    agent_model: Some("gpt-5".into()),
+                    opened_at: UnixMillis::from_millis(1_700_000_000),
+                    closed_at: Some(UnixMillis::from_millis(1_700_000_900)),
+                }),
+                latest_run_id: Some(run_id),
+            },
+        );
+
+        assert_eq!(row.session_id, session_id);
+        assert_eq!(row.vm_name, "writ-vm-7");
+        assert_eq!(row.subnet_index, 7);
+        assert_eq!(row.label.as_deref(), Some("nightly"));
+        assert_eq!(row.agent_kind, Some(AgentKind::Codex));
+        assert_eq!(row.agent_model.as_deref(), Some("gpt-5"));
+        assert_eq!(row.opened_at, Some(UnixMillis::from_millis(1_700_000_000)));
+        assert_eq!(row.closed_at, Some(UnixMillis::from_millis(1_700_000_900)));
+        assert_eq!(row.current_run_id, Some(run_id));
+    }
+
+    /// A VM the audit log has never seen still produces a row: the
+    /// daemon's runtime view survives and only the audit half is
+    /// `None`. Dropping such a VM from the listing would hide exactly
+    /// the session an operator is most likely to be hunting.
+    #[test]
+    fn a_session_with_no_audit_row_keeps_its_runtime_half() {
+        let session_id = SessionId::new();
+        let row = build_row(info(session_id), SessionRunSummary::default());
+
+        assert_eq!(row.session_id, session_id);
+        assert_eq!(row.vm_name, "writ-vm-7");
+        assert!(row.runtime_attached);
+        assert_eq!(row.label, None);
+        assert_eq!(row.agent_kind, None);
+        assert_eq!(row.agent_model, None);
+        assert_eq!(row.opened_at, None);
+        assert_eq!(row.closed_at, None);
+        assert_eq!(row.current_run_id, None);
+    }
 }
