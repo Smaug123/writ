@@ -134,6 +134,11 @@ pub enum UiHttpBearerWriteError {
 /// An existing parent is not chmod'd — we don't silently loosen or
 /// tighten a directory the operator already created.
 ///
+/// These are hygiene rather than a boundary: a hostile local uid is
+/// out of writ's threat model (`docs/design/architecture.md` §1), and
+/// on macOS an ACL defeats every mode check here anyway. Worth keeping
+/// at this cost; not worth extending.
+///
 /// We unlink any pre-existing `.tmp` (left behind by a previous
 /// crash, or planted by an attacker if the parent's privacy
 /// invariant ever lapses) before opening with `O_CREAT | O_EXCL`,
