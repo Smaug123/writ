@@ -82,6 +82,28 @@ impl CompactionThreshold {
     }
 }
 
+/// Whether a previous failed attempt is still holding compaction off.
+///
+/// Compaction runs on a request path, so a failure that repeats every request is
+/// not merely wasted work — it is a permanent tax on every agent run. The worst
+/// case is a `gc` that cannot finish inside the invocation deadline: it is killed
+/// having published nothing, the loose count is therefore still above the
+/// threshold, and the next request tries again from the start. Without a gate,
+/// that is every request paying the full deadline, forever, and never compacting
+/// — strictly worse than not compacting at all, which costs nothing.
+///
+/// The gate bounds that to one attempt per backoff window. It does not make a
+/// too-slow `gc` succeed; it makes failing cheap enough that the fallback is "no
+/// compaction", the behaviour writ had before, rather than "no compaction and a
+/// deadline's delay on everything".
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RetryGate {
+    /// No recent attempt has failed. Compaction may run if the count warrants it.
+    Open,
+    /// The last attempt failed; the next one is not due for this long.
+    ClosedFor(std::time::Duration),
+}
+
 /// What to do about a repo's current loose-object count: inert data, so the
 /// policy can be property-tested without spawning git, and so the shell that
 /// interprets it has one `match` rather than a condition spread across it.
@@ -89,6 +111,17 @@ impl CompactionThreshold {
 pub(crate) enum CompactionDecision {
     /// Below the threshold. Leave the repo alone.
     Skip { loose_objects: LooseObjectCount },
+    /// At or above the threshold, but a recent attempt failed and the backoff
+    /// window has not elapsed. Leave the repo alone *for now*.
+    ///
+    /// Distinct from [`CompactionDecision::Skip`] because the two describe
+    /// opposite states of the repo — nothing to do, versus something to do that
+    /// writ is deliberately not doing yet — and an operator reading the logs
+    /// needs to tell them apart.
+    Defer {
+        loose_objects: LooseObjectCount,
+        retry_in: std::time::Duration,
+    },
     /// At or above the threshold. Pack the loose objects.
     Compact { loose_objects: LooseObjectCount },
 }
@@ -97,14 +130,25 @@ pub(crate) enum CompactionDecision {
 ///
 /// At-or-above rather than strictly-above, so a threshold of zero means "always
 /// compact" — which is what a test wants, and what a reader would assume.
+///
+/// The threshold is checked before the gate, so a closed gate can never turn a
+/// repo with nothing to do into one that reports deferred work. A gate that
+/// manufactured `Defer` for an empty repo would put a permanent "compaction
+/// pending" line in front of an operator who has nothing to act on.
 pub(crate) const fn decide(
     loose_objects: LooseObjectCount,
     threshold: CompactionThreshold,
+    gate: RetryGate,
 ) -> CompactionDecision {
-    if loose_objects.get() >= threshold.0.get() {
-        CompactionDecision::Compact { loose_objects }
-    } else {
-        CompactionDecision::Skip { loose_objects }
+    if loose_objects.get() < threshold.0.get() {
+        return CompactionDecision::Skip { loose_objects };
+    }
+    match gate {
+        RetryGate::ClosedFor(retry_in) => CompactionDecision::Defer {
+            loose_objects,
+            retry_in,
+        },
+        RetryGate::Open => CompactionDecision::Compact { loose_objects },
     }
 }
 
@@ -275,7 +319,11 @@ mod tests {
             threshold: u64,
         ) {
             let loose = LooseObjectCount::new(count);
-            let decision = decide(loose, CompactionThreshold::new(LooseObjectCount::new(threshold)));
+            let decision = decide(
+                loose,
+                CompactionThreshold::new(LooseObjectCount::new(threshold)),
+                RetryGate::Open,
+            );
             let compacted = matches!(decision, CompactionDecision::Compact { .. });
             prop_assert_eq!(compacted, count >= threshold);
         }
@@ -294,7 +342,11 @@ mod tests {
             threshold in 0u64..32,
         ) {
             let loose = LooseObjectCount::new(count);
-            let decision = decide(loose, CompactionThreshold::new(LooseObjectCount::new(threshold)));
+            let decision = decide(
+                loose,
+                CompactionThreshold::new(LooseObjectCount::new(threshold)),
+                RetryGate::Open,
+            );
             let compacted = matches!(decision, CompactionDecision::Compact { .. });
             prop_assert_eq!(compacted, count >= threshold);
         }
@@ -307,12 +359,12 @@ mod tests {
         fn decide_compacts_at_the_threshold_and_skips_one_below(threshold: u64) {
             let t = CompactionThreshold::new(LooseObjectCount::new(threshold));
 
-            let at_threshold = decide(LooseObjectCount::new(threshold), t);
+            let at_threshold = decide(LooseObjectCount::new(threshold), t, RetryGate::Open);
             let compacts_at = matches!(at_threshold, CompactionDecision::Compact { .. });
             prop_assert!(compacts_at, "a count equal to the threshold must compact");
 
             if let Some(below) = threshold.checked_sub(1) {
-                let just_below = decide(LooseObjectCount::new(below), t);
+                let just_below = decide(LooseObjectCount::new(below), t, RetryGate::Open);
                 let skips_below = matches!(just_below, CompactionDecision::Skip { .. });
                 prop_assert!(skips_below, "one object below the threshold must skip");
             }
@@ -323,9 +375,14 @@ mod tests {
         #[test]
         fn decide_carries_the_observed_count_into_either_branch(count: u64, threshold: u64) {
             let loose = LooseObjectCount::new(count);
-            let decision = decide(loose, CompactionThreshold::new(LooseObjectCount::new(threshold)));
+            let decision = decide(
+                loose,
+                CompactionThreshold::new(LooseObjectCount::new(threshold)),
+                RetryGate::Open,
+            );
             let carried = match decision {
                 CompactionDecision::Skip { loose_objects }
+                | CompactionDecision::Defer { loose_objects, .. }
                 | CompactionDecision::Compact { loose_objects } => loose_objects,
             };
             prop_assert_eq!(carried, loose);
@@ -344,10 +401,74 @@ mod tests {
             let decision = decide(
                 LooseObjectCount::new(count),
                 CompactionThreshold::new(LooseObjectCount::new(0)),
+                RetryGate::Open,
             );
             let compacted = matches!(decision, CompactionDecision::Compact { .. });
             prop_assert!(compacted, "a zero threshold must always compact");
         }
+
+        /// A closed gate replaces exactly the `Compact` outcome, and nothing
+        /// else. Stated as an equivalence against the open-gate decision so it
+        /// cannot drift into "the gate suppresses something" without saying what.
+        #[test]
+        fn a_closed_gate_defers_precisely_what_an_open_one_would_compact(
+            count in 0u64..32,
+            threshold in 0u64..32,
+            secs in 1u64..10_000,
+        ) {
+            let loose = LooseObjectCount::new(count);
+            let t = CompactionThreshold::new(LooseObjectCount::new(threshold));
+            let retry_in = std::time::Duration::from_secs(secs);
+
+            let open = decide(loose, t, RetryGate::Open);
+            let closed = decide(loose, t, RetryGate::ClosedFor(retry_in));
+
+            match open {
+                CompactionDecision::Compact { .. } => prop_assert_eq!(
+                    closed,
+                    CompactionDecision::Defer { loose_objects: loose, retry_in }
+                ),
+                // Nothing to do stays nothing to do: the gate must not invent
+                // deferred work for a repo that is already packed.
+                other => prop_assert_eq!(closed, other),
+            }
+        }
+
+        /// The remaining wait is reported back unchanged, so an operator log line
+        /// says how long the pause actually is rather than how long it was.
+        #[test]
+        fn a_deferred_decision_reports_the_wait_it_was_given(secs in 1u64..10_000) {
+            let retry_in = std::time::Duration::from_secs(secs);
+            let decision = decide(
+                LooseObjectCount::new(9_000),
+                CompactionThreshold::GIT_DEFAULT,
+                RetryGate::ClosedFor(retry_in),
+            );
+            prop_assert_eq!(
+                decision,
+                CompactionDecision::Defer { loose_objects: LooseObjectCount::new(9_000), retry_in }
+            );
+        }
+    }
+
+    /// An empty repo behind a closed gate skips; it does not defer.
+    ///
+    /// The boundary case the property above generalises, pinned on its own
+    /// because it is the one an operator would notice: a freshly-initialised repo
+    /// must never report compaction pending.
+    #[test]
+    fn a_closed_gate_over_an_empty_repo_still_reports_nothing_to_do() {
+        let decision = decide(
+            LooseObjectCount::new(0),
+            CompactionThreshold::GIT_DEFAULT,
+            RetryGate::ClosedFor(std::time::Duration::from_secs(3600)),
+        );
+        assert_eq!(
+            decision,
+            CompactionDecision::Skip {
+                loose_objects: LooseObjectCount::new(0)
+            }
+        );
     }
 
     #[test]

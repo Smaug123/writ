@@ -1525,24 +1525,203 @@ fn notes_stay_readable_after_a_gc_prunes_the_unreachable_seed_blob() {
     );
 }
 
+/// A `git` that reports plenty of loose objects and whose `gc` behaves as told,
+/// recording each `gc` attempt as one line in `attempts`.
+///
+/// Compaction's motivating failure — a `gc` killed at the invocation deadline —
+/// cannot be provoked in a test without waiting out that deadline, and it is not
+/// the interesting part anyway: the gate turns on *any* failure. So the failure
+/// is faked and the thing actually asserted is how many times writ tries.
+fn counting_git_env(bin: &Path, attempts: &Path, gc_exit: u8) -> InheritedEnv {
+    fs::create_dir_all(bin).unwrap();
+    fake_git_env(
+        bin,
+        // The subcommand is not `$1`: production passes the repo as a leading
+        // `--git-dir=` argument, so skip flags to find it.
+        &format!(
+            r#"for a in "$@"; do
+  case "$a" in -*) continue ;; *) sub="$a"; break ;; esac
+done
+case "$sub" in
+  count-objects) echo "count: 9000"; echo "size: 36"; echo "packs: 0"; exit 0 ;;
+  gc) echo attempt >> '{attempts}'; exit {gc_exit} ;;
+  *) exit 0 ;;
+esac"#,
+            attempts = attempts.display(),
+        ),
+    )
+}
+
+fn attempt_count(attempts: &Path) -> usize {
+    fs::read_to_string(attempts).map_or(0, |s| s.lines().count())
+}
+
+/// Point a second handle at an existing repo through a different `git`.
+///
+/// The compaction gate is per-repo, keyed on the canonical path exactly as the
+/// notes-write mutex is, so a handle built this way shares the real repo's gate.
+fn handle_with_env(repo: &NotesRepo, env: InheritedEnv) -> NotesRepo {
+    NotesRepo {
+        canonical_path: repo.path().to_path_buf(),
+        inherited_env: env,
+    }
+}
+
+#[test]
+fn a_failed_compaction_is_not_retried_by_the_very_next_note_write() {
+    // Compaction runs on the request path, so a failure that repeats every
+    // request is a permanent tax on every agent run — and the worst case is
+    // self-sustaining: a `gc` killed at the deadline publishes nothing, so the
+    // loose count is still above the threshold and the next request pays the
+    // deadline again, forever, without ever compacting. That is strictly worse
+    // than never compacting, which is what writ did before.
+    //
+    // So a failure must buy a pause. What is asserted is the number of attempts,
+    // not the outcome type alone: an implementation that returned `Deferred`
+    // while still shelling out to `gc` would satisfy the weaker check and none of
+    // the intent.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let failing = handle_with_env(
+        &repo,
+        counting_git_env(&tmp.path().join("bin"), &attempts, 128),
+    );
+
+    failing
+        .compact_if_needed_with(always_compact())
+        .expect_err("the fake gc exits non-zero, so the first attempt must fail");
+    assert_eq!(attempt_count(&attempts), 1, "the first attempt must run gc");
+
+    let second = failing
+        .compact_if_needed_with(always_compact())
+        .expect("a deferred compaction is not an error: the note write succeeded");
+    assert!(
+        matches!(second, CompactionOutcome::Deferred { .. }),
+        "a compaction that failed moments ago must be deferred, not retried; got {second:?}"
+    );
+    assert_eq!(
+        attempt_count(&attempts),
+        1,
+        "the second write must not spawn gc again — that repeat is the whole cost \
+         being bounded here"
+    );
+}
+
+#[test]
+fn a_successful_compaction_leaves_the_gate_open_for_the_next_one() {
+    // The mirror of the test above, and the reason the gate cannot simply be
+    // "compact once per hour": a repo that is successfully packing must go on
+    // packing at whatever rate its loose-object count demands.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let succeeding = handle_with_env(
+        &repo,
+        counting_git_env(&tmp.path().join("bin"), &attempts, 0),
+    );
+
+    for round in 1..=3 {
+        let outcome = succeeding
+            .compact_if_needed_with(always_compact())
+            .expect("the fake gc succeeds");
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "round {round} must compact; got {outcome:?}"
+        );
+        assert_eq!(
+            attempt_count(&attempts),
+            round,
+            "every round above the threshold must run gc"
+        );
+    }
+}
+
+#[test]
+fn compaction_holds_the_prune_grace_open_against_the_repos_own_config() {
+    // The concurrency argument on `compact_if_needed` rests on the prune grace:
+    // an object written by another process but not yet referenced survives
+    // because its mtime is newer than the prune date. That grace is git's
+    // *default*, and a default is not a guarantee.
+    //
+    // Repo-local config outlives the hardened recipe by design —
+    // `GIT_CONFIG_NOSYSTEM` and `GIT_CONFIG_GLOBAL=/dev/null` silence the system
+    // and global files, and nothing silences `<repo>/config`. Measured on git
+    // 2.54: with `gc.pruneExpire=now` set there, a plain `gc` prunes a
+    // freshly-written unreferenced object immediately, and the grace writ
+    // documents is simply gone. So writ imposes the date on the command line,
+    // where it overrides the config, rather than inheriting it.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+
+    raw_git(repo.path(), &["config", "gc.pruneExpire", "now"]);
+
+    // A seed blob is exactly the object at risk: freshly written, and unreachable
+    // (git-gc(1): a note does not keep its annotated object alive). It stands in
+    // for the blob a concurrent writer has written but not yet referenced.
+    let seed = repo.write_note(&r, b"run-id-seed", b"envelope").unwrap();
+    assert!(
+        object_exists(repo.path(), &seed),
+        "precondition: the seed blob exists before compaction"
+    );
+    let reachable = raw_git(repo.path(), &["rev-list", "--objects", "--all"]);
+    assert!(
+        !reachable
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(seed.as_str())),
+        "precondition: the seed blob is unreachable, so only the grace protects it"
+    );
+
+    repo.compact_if_needed_with(always_compact()).unwrap();
+
+    assert!(
+        object_exists(repo.path(), &seed),
+        "a freshly-written unreferenced object must survive compaction even when \
+         the repo's own config says to prune immediately; otherwise the grace \
+         period `compact_if_needed` documents is not something writ actually has"
+    );
+}
+
 #[test]
 fn the_compaction_argv_carries_no_pruning_aggression_or_lock_override() {
     // Pinned exactly, so widening it is a deliberate edit to a test that says
-    // why each flag is absent. See `GC_ARGV` for the reasoning.
-    assert_eq!(GC_ARGV, ["gc", "--quiet"]);
+    // why each flag is present or absent. See `GC_ARGV` for the reasoning.
+    assert_eq!(GC_ARGV, ["gc", "--quiet", "--prune=2.weeks.ago"]);
 
     assert_eq!(
         GC_ARGV[0], "gc",
         "must be `gc`, not `maintenance`: only `gc` takes the gc.pid lock"
     );
-    for forbidden in [
-        "--prune=now",
-        "--prune",
-        "--aggressive",
-        "--force",
-        "--detach",
-        "gc.pruneExpire",
-    ] {
+
+    // An earlier version of this test forbade `--prune` outright, on the
+    // reasoning that git's default grace was already what writ wanted. That was
+    // the bug: the default is overridable from `<repo>/config`, so inheriting it
+    // means writ's documented grace can be moved by a file writ does not write.
+    // What must hold is not "no prune flag" but "a prune date that is not now".
+    let prune: Vec<&&str> = GC_ARGV
+        .iter()
+        .filter(|a| a.starts_with("--prune"))
+        .collect();
+    assert_eq!(
+        prune.len(),
+        1,
+        "exactly one prune date must be imposed, so there is no last-one-wins \
+         ambiguity about which grace applies"
+    );
+    assert_eq!(
+        *prune[0], GC_PRUNE_GRACE,
+        "the imposed date must be git's own default, spelled out"
+    );
+    for immediate in ["--prune=now", "--prune=all", "--prune=0"] {
+        assert_ne!(
+            *prune[0], immediate,
+            "compaction must never prune immediately: the grace is writ's only \
+             concurrent-writer mitigation in a bare repo"
+        );
+    }
+
+    for forbidden in ["--aggressive", "--force", "--detach", "gc.pruneExpire"] {
         assert!(
             !GC_ARGV.iter().any(|arg| arg.contains(forbidden)),
             "compaction must never pass {forbidden}"

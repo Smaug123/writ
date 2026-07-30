@@ -396,6 +396,19 @@ async fn sign_and_store_run(
                 "compacted writ's notes repo"
             );
         }
+        // A pause an operator should be able to see, because the repo wants
+        // packing and is not getting it. Logged every time rather than once, so
+        // the condition is visible for as long as it lasts.
+        Ok(crate::notes_repo::CompactionOutcome::Deferred {
+            loose_objects,
+            retry_in,
+        }) => {
+            tracing::info!(
+                loose_objects = loose_objects.get(),
+                retry_in_secs = retry_in.as_secs(),
+                "deferred compaction of writ's notes repo after a recent failure"
+            );
+        }
         // Worth an operator's attention rather than silence: this is the only
         // thing that packs the repo, so a failure that persists means the loose
         // objects grow without bound.

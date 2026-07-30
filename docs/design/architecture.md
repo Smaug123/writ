@@ -1087,8 +1087,12 @@ consult that lock at all, which is why `GC_ARGV` is a `gc` and why `--force` is
 forbidden. (2) The prune grace (default two weeks) is the *only* concurrent-writer
 mitigation these repos get: git-gc(1) lists two and the other is reflog
 retention, which does not apply because a bare repo defaults
-`core.logAllRefUpdates` to false and so writes no reflog. That is why
-`--prune=now` is forbidden. (3) Compaction is read-safe even though it eventually
+`core.logAllRefUpdates` to false and so writes no reflog. Because that grace is
+the only one, writ *imposes* the date (`--prune=2.weeks.ago`, git's own default
+spelled out) rather than inheriting it: the hardened recipe silences the system
+and global config but deliberately not `<repo>/config`, and a `gc.pruneExpire=now`
+set there makes a plain `gc` prune a freshly-written unreferenced object
+immediately. (3) Compaction is read-safe even though it eventually
 prunes writ's seed blobs. Those blobs are genuinely unreachable — git-gc(1) is
 explicit that a note attached to an object does not keep it alive — but a note
 lookup does not need them, because the notes tree keys entries on the OID's hex
@@ -1097,10 +1101,28 @@ prunes_the_unreachable_seed_blob` pins this, and bailiff has always relied on it
 implicitly: a fetch only ever transferred the reachable objects, so bailiff's
 mirror has never held writ's seed blobs.
 
-Still open: bailiff's own repo accumulates one pack per `fetch_from_remote` and
-nothing yet calls `compact_if_needed` for it, so the pack half of git's auto
-policy (`gc.autoPackLimit`) has no live trigger and is deliberately not
-implemented.
+Compaction runs on a request path, so a failure that repeats every request would
+be a permanent tax on every agent run — and the worst case is self-sustaining, a
+`gc` killed at the invocation deadline having published nothing, leaving the
+loose count above the threshold for the next request to retry from scratch. A
+per-repo retry gate (`COMPACTION_RETRY_BACKOFF`, one hour) bounds that to one
+attempt per window, so the fallback is "no compaction" — what writ did before —
+rather than "no compaction plus a deadline's delay on everything". The gate lives
+inside the notes-write mutex's payload rather than beside it, which makes
+consulting it without holding that lock unwriteable, and shares it between
+handles on one repo exactly as the lock is shared.
+
+Two things still open. Bailiff's own repo accumulates one pack per
+`fetch_from_remote` and nothing yet calls `compact_if_needed` for it, so the pack
+half of git's auto policy (`gc.autoPackLimit`) has no live trigger and is
+deliberately not implemented. And a plain `gc` rewrites all packs, so its cost
+grows with total history while the threshold that fires it counts only the recent
+backlog; a large enough repo may never finish inside `NOTES_GIT_TIMEOUT`. Raising
+that deadline is not obviously right, because the mutex is held throughout, so a
+longer deadline stalls every note write; the likelier answer is an operation
+whose cost matches its trigger (`git repack -d` packs loose objects without
+rewriting existing packs), at the price of the `gc.pid` exclusion above. That
+trade is unresolved rather than decided.
 
 ### 5.9 Run provenance — envelopes & verification
 
