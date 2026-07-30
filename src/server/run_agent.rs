@@ -354,15 +354,27 @@ async fn sign_and_store_run(
     let metadata = materialised.envelope.metadata;
     let signature = materialised.envelope.signature;
 
+    // Write the note, then give the repo the chance to pack itself. Both happen
+    // on the one blocking-pool thread: the compaction takes the same per-repo
+    // mutex the write just released, so running it here rather than in a second
+    // `spawn_blocking` costs no extra pool slot and cannot interleave with
+    // another writer of this repo in this process.
+    //
+    // Compaction is deliberately *after* the write and reported separately.
+    // Writ suppresses git's background auto-maintenance in the repos it owns, so
+    // this is the only thing that ever packs them; but by the time it runs the
+    // envelope is already durable, and a housekeeping failure must not turn a
+    // completed agent run into an error response the caller cannot act on.
     let write_result = {
         let notes_repo = Arc::clone(notes_repo);
         tokio::task::spawn_blocking(move || {
-            notes_repo.write_note(&output_ref, &run_id_seed, &envelope_bytes)
+            let oid = notes_repo.write_note(&output_ref, &run_id_seed, &envelope_bytes)?;
+            Ok::<_, crate::notes_repo::NotesRepoError>((oid, notes_repo.compact_if_needed()))
         })
         .await
     };
-    let output_oid = match write_result {
-        Ok(Ok(oid)) => oid,
+    let (output_oid, compaction) = match write_result {
+        Ok(Ok(pair)) => pair,
         Ok(Err(err)) => {
             return ServerMessage::Error {
                 message: format!("RunAgent: write signed-run note: {err}"),
@@ -374,6 +386,26 @@ async fn sign_and_store_run(
             };
         }
     };
+    match compaction {
+        Ok(crate::notes_repo::CompactionOutcome::Skipped { .. }) => {}
+        Ok(crate::notes_repo::CompactionOutcome::Compacted {
+            loose_objects_before,
+        }) => {
+            tracing::info!(
+                loose_objects_before = loose_objects_before.get(),
+                "compacted writ's notes repo"
+            );
+        }
+        // Worth an operator's attention rather than silence: this is the only
+        // thing that packs the repo, so a failure that persists means the loose
+        // objects grow without bound.
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not compact writ's notes repo; loose objects will keep accumulating"
+            );
+        }
+    }
 
     ServerMessage::RunAgentCompleted {
         output_oid,

@@ -261,7 +261,8 @@ dies with the VM). Nor can the env channel reach a `receive-pack` — `git push`
 strips `GIT_CONFIG_COUNT` for a local-transport child — but nothing in writd
 pushes into a repository it owns. Suppression does not remove writ's ability to
 compact: the `*.auto` knobs gate only the uninvited run, and an explicit
-`git gc` still packs. *When* writ compacts deliberately is still open.
+`git gc` still packs. Writ now schedules that itself — see
+`NotesRepo::compact_if_needed` below.
 
 **Invariants.** Make-illegal-states-unrepresentable: `Metadata` requests carry a
 one-variant `MetadataAccess::Read`; private constructors (`AgentNetwork::new`,
@@ -1067,6 +1068,39 @@ pinned slugs.
 **Current-state note.** `notes_repo` is *not* bailiff-only: each daemon owns its
 own bare repo (writ writes `refs/notes/writ/v1/*`; bailiff fetches those and
 curates `refs/notes/bailiff/v1/plans/*`).
+
+**Compaction.** Because §5.1 suppresses git's background auto-maintenance in
+every repo writ owns, packing loose objects is now writ's job.
+`NotesRepo::compact_if_needed` measures with `count-objects -v`, decides with the
+pure policy in `notes_repo/compaction.rs`, and runs a plain `git gc` when the
+loose count reaches git's own `gc.auto` default of 6700 — the aim being to do
+what git would have done, where git would have done it, but synchronously and
+under the per-repo mutex every other mutation here already takes. `writd` calls it
+after the note write in `sign_and_store_run`, so both `RunAgent` arms are covered;
+a compaction failure is logged and does not fail a run whose envelope is already
+durable.
+
+Three facts behind that shape, each measured on git 2.54 rather than assumed.
+(1) `gc` serialises against `gc` through `<repo>/gc.pid` — a second gc whose
+recorded pid looks live refuses outright — whereas `git maintenance` does not
+consult that lock at all, which is why `GC_ARGV` is a `gc` and why `--force` is
+forbidden. (2) The prune grace (default two weeks) is the *only* concurrent-writer
+mitigation these repos get: git-gc(1) lists two and the other is reflog
+retention, which does not apply because a bare repo defaults
+`core.logAllRefUpdates` to false and so writes no reflog. That is why
+`--prune=now` is forbidden. (3) Compaction is read-safe even though it eventually
+prunes writ's seed blobs. Those blobs are genuinely unreachable — git-gc(1) is
+explicit that a note attached to an object does not keep it alive — but a note
+lookup does not need them, because the notes tree keys entries on the OID's hex
+string rather than on a reference to the object. `notes_stay_readable_after_a_gc_
+prunes_the_unreachable_seed_blob` pins this, and bailiff has always relied on it
+implicitly: a fetch only ever transferred the reachable objects, so bailiff's
+mirror has never held writ's seed blobs.
+
+Still open: bailiff's own repo accumulates one pack per `fetch_from_remote` and
+nothing yet calls `compact_if_needed` for it, so the pack half of git's auto
+policy (`gc.autoPackLimit`) has no live trigger and is deliberately not
+implemented.
 
 ### 5.9 Run provenance — envelopes & verification
 

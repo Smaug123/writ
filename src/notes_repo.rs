@@ -38,6 +38,17 @@
 //! concurrent invocation on the same ref — colliding writes silently
 //! lose notes — and serialising at the only writer keeps that
 //! property load-bearing instead of relying on operator discipline.
+//! `fetch_from_remote` and `compact_if_needed` take the same lock: any
+//! mutation of the repo goes through it, with no exceptions for the
+//! ones that only rearrange objects.
+//!
+//! ## Compaction
+//!
+//! Writ suppresses git's background auto-maintenance in the repos it
+//! owns (`writ_core::git_env`), which means nothing packs them unless
+//! writ asks. `compact_if_needed` is where it asks; see its docstring
+//! for what holds still while a repack runs and why it is inline
+//! rather than backgrounded.
 //!
 //! Host-config isolation: every child `git` runs under `env_clear`
 //! plus the shared hardened recipe (`writ_core::git_env`, applied via
@@ -93,6 +104,7 @@ use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use self::compaction::{CompactionDecision, CompactionThreshold, LooseObjectCount};
 use crate::core::{NotesRef, NotesRefError};
 use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome, SupervisorError};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
@@ -133,6 +145,33 @@ use crate::process_supervisor::STDERR_CAPTURE_TAIL_CAP as NOTES_GIT_STDERR_TAIL_
 /// want is another ticket, not a wait. Three attempts put the residual odds past
 /// 1-in-10^10.
 const BORN_DEAD_RETRY_ATTEMPTS: usize = 3;
+
+/// The exact `git` invocation [`NotesRepo::compact_if_needed`] uses to pack a
+/// repo, pinned as a constant because *which* flags are absent is the
+/// load-bearing part.
+///
+/// Three flags must never appear here, and a test asserts each one's absence:
+///
+/// * `--prune=now` (or any shortened `gc.pruneExpire`). The default two-week
+///   grace on unreferenced objects is the *only* concurrent-writer mitigation
+///   this repo benefits from. git-gc(1) lists two, and the other one — reflog
+///   retention — does not apply: these repos are bare, and
+///   `core.logAllRefUpdates` defaults to false in a bare repo, so a ref update
+///   here writes no reflog at all. Shortening the grace converts writ's
+///   write-then-reference window from "safe by a factor of a million" into a
+///   real corruption window.
+/// * `--aggressive`. Unbounded CPU while holding the notes-write mutex, in
+///   exchange for a better packing of a repo whose contents are already small
+///   signed blobs.
+/// * `--force`. That is exactly the override that defeats the `gc.pid` lock
+///   described on [`NotesRepo::compact_if_needed`], which is what makes
+///   concurrent compaction of one repo impossible rather than merely unlikely.
+///
+/// `gc` rather than `maintenance run` for the same reason: `maintenance` repacks
+/// via `multi-pack-index` without consulting `gc.pid`, so two `maintenance`
+/// children — or a `maintenance` and a `gc` — do not exclude each other. Only
+/// `gc` participates in the lock.
+const GC_ARGV: [&str; 2] = ["gc", "--quiet"];
 
 /// What to do when an invocation comes back matching the phantom-SIGKILL
 /// signature.
@@ -224,6 +263,28 @@ pub enum WriteOutcome {
     /// written. The wrapped OID matches the one a subsequent
     /// [`NotesRepo::read_note_if_present`] would query.
     AlreadyPresent(GitObjectId),
+}
+
+/// What [`NotesRepo::compact_if_needed`] did.
+///
+/// Returned rather than logged in place: this module has no opinion on how loud
+/// a compaction should be, and its callers do — the daemon logs it and carries
+/// on, because a note is already durably written by the time compaction runs and
+/// failing the request over housekeeping would be the wrong trade.
+///
+/// Distinct from the internal `CompactionDecision` on purpose. That is the
+/// inert *plan* the pure policy produces; this is the *outcome* of interpreting
+/// it. Collapsing them would mean the shell returning a value that reads as "we
+/// decided to compact" whether or not the repack actually ran.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CompactionOutcome {
+    /// The repo was under the threshold; nothing was packed.
+    Skipped { loose_objects: LooseObjectCount },
+    /// The repo was at or over the threshold and `git gc` ran to completion.
+    /// The count is the measurement that triggered it, taken before the repack.
+    Compacted {
+        loose_objects_before: LooseObjectCount,
+    },
 }
 
 /// A validated handle on a daemon-owned bare notes repo.
@@ -534,6 +595,111 @@ impl NotesRepo {
             OnBornDead::Retry,
         )?;
         Ok(())
+    }
+
+    /// Pack this repo's loose objects, if it has accumulated enough of them to
+    /// be worth it.
+    ///
+    /// Writ suppresses git's own background auto-maintenance in every repo it
+    /// owns (see [`writ_core::git_env`]): a detached `git maintenance` child is
+    /// a writer writd never spawned, cannot wait for, and whose lifetime no
+    /// writd operation bounds. That removed the compaction the repo used to get
+    /// for free, so this is where writ does it deliberately instead. Call it
+    /// after a note write; it is cheap when there is nothing to do (one
+    /// `count-objects -v`) and it decides for itself whether to spend a repack.
+    ///
+    /// ## What holds still while this runs
+    ///
+    /// The per-repo notes-write mutex, for the whole measure-and-pack — the same
+    /// lock [`Self::write_note`] and [`Self::fetch_from_remote`] take, because
+    /// compaction *is* another mutation and gets no special treatment. So
+    /// in-process it is fully serialised against every other writer here.
+    ///
+    /// Across processes the mutex does not generalise (as
+    /// [`Self::write_note_if_absent`] already documents), and two further
+    /// mechanisms cover what it cannot, both verified against git 2.54 rather
+    /// than assumed:
+    ///
+    /// * **Against another `git gc`:** git's own `<repo>/gc.pid`. A second gc
+    ///   whose recorded pid looks live on this host refuses outright — `fatal: gc
+    ///   is already running on machine '...' pid N`. So concurrent compaction of
+    ///   one repo is impossible, not merely unlikely. (Note this is specific to
+    ///   `gc`: `git maintenance` does *not* consult `gc.pid`, which is one more
+    ///   reason the argv this runs is a `gc` and not a `maintenance run`.)
+    /// * **Against another writer mid-write:** the prune grace period. git-gc(1)
+    ///   keeps every object whose mtime is newer than the prune date (default
+    ///   two weeks) along with everything reachable from it. Our risk window —
+    ///   `hash-object` writes a blob, `notes add` references it moments later —
+    ///   sits inside that by a factor of about a million.
+    ///
+    /// git's documentation is candid that these "fall short of a complete
+    /// solution, so users who run commands concurrently have to live with some
+    /// risk of corruption (which seems to be low in practice)". Writ's position
+    /// is that this is strictly better than the status quo it replaces: the
+    /// writer being removed was an *unsupervised* one racing whatever writd was
+    /// doing, and this one is bounded, logged, and serialised against every
+    /// in-process writer.
+    ///
+    /// ## Why not spawn it in the background
+    ///
+    /// Because that is precisely the thing being fixed. A background compactor
+    /// is a second writer in a repo writd owns, and the only difference from
+    /// git's detached maintenance would be whose code spawned it. Running
+    /// inline costs the one request that crosses the threshold a repack —
+    /// roughly one in two thousand, in a request that already takes minutes.
+    pub fn compact_if_needed(&self) -> Result<CompactionOutcome, NotesRepoError> {
+        self.compact_if_needed_with(CompactionThreshold::GIT_DEFAULT)
+    }
+
+    /// [`Self::compact_if_needed`] at a caller-chosen threshold. Only tests want
+    /// anything other than [`CompactionThreshold::GIT_DEFAULT`]: one policy for
+    /// every production caller is what stops the threshold drifting per call
+    /// site, which is the same reason the git env recipe lives in one place.
+    fn compact_if_needed_with(
+        &self,
+        threshold: CompactionThreshold,
+    ) -> Result<CompactionOutcome, NotesRepoError> {
+        let _guard = lock_notes_write(&self.canonical_path);
+        let stdout = run_git(
+            &self.canonical_path,
+            ["count-objects", "-v"],
+            None,
+            CaptureOutput::Capture,
+            &self.inherited_env,
+            // Read-only: it counts files and prints. Nothing to double-apply.
+            OnBornDead::Retry,
+        )?;
+        let text = String::from_utf8(stdout)
+            .map_err(|source| NotesRepoError::CountObjectsNonUtf8 { source })?;
+        let loose_objects = compaction::parse_count_objects_verbose(&text)
+            .map_err(|source| NotesRepoError::CountObjectsParse { source })?;
+
+        match compaction::decide(loose_objects, threshold) {
+            CompactionDecision::Skip { loose_objects } => {
+                Ok(CompactionOutcome::Skipped { loose_objects })
+            }
+            CompactionDecision::Compact { loose_objects } => {
+                run_git(
+                    &self.canonical_path,
+                    GC_ARGV,
+                    None,
+                    CaptureOutput::Discard,
+                    &self.inherited_env,
+                    // Convergent, and the one invocation here where that needs
+                    // saying carefully. A `gc` killed partway leaves the repo
+                    // consistent — it writes a new pack and only then unlinks the
+                    // objects it copied — so a replay re-does work rather than
+                    // double-applying anything. It cannot even collide with the
+                    // child it is replacing: that child is dead, so the `gc.pid`
+                    // it left behind names a pid that no longer exists and git
+                    // treats the lock as stale.
+                    OnBornDead::Retry,
+                )?;
+                Ok(CompactionOutcome::Compacted {
+                    loose_objects_before: loose_objects,
+                })
+            }
+        }
     }
 
     /// Read the body of the note attached to `target_oid` under
@@ -1209,6 +1375,13 @@ pub enum NotesRepoError {
     ConfigNonUtf8 { source: std::string::FromUtf8Error },
     #[error("git hash-object output is not valid UTF-8: {source}")]
     HashObjectNonUtf8 { source: std::string::FromUtf8Error },
+    #[error("git count-objects output is not valid UTF-8: {source}")]
+    CountObjectsNonUtf8 { source: std::string::FromUtf8Error },
+    #[error("git count-objects -v output could not be read: {source}")]
+    CountObjectsParse {
+        #[source]
+        source: compaction::CountObjectsParseError,
+    },
     #[error("git hash-object produced unparseable OID {raw:?}: {source}")]
     HashObjectParse {
         raw: String,
@@ -1259,6 +1432,8 @@ pub enum NotesRepoError {
     #[error("git for-each-ref wrote to stderr (corruption signal): {stderr}")]
     ForEachRefStderr { stderr: String },
 }
+
+pub mod compaction;
 
 #[cfg(test)]
 mod tests;

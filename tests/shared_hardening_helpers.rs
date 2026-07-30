@@ -61,6 +61,27 @@ fn relative(path: &Path) -> String {
 /// This file, which necessarily spells out every needle it searches for.
 const THIS_FILE: &str = "tests/shared_hardening_helpers.rs";
 
+/// The source with whole-line comments removed, so a needle scan sees code.
+///
+/// Every guard here forbids *doing* something, never *describing* it, and the
+/// two are indistinguishable to a substring scan. Left unfiltered, the recipe
+/// guard forbids documentation from naming `gc.auto` at all — which is a bad
+/// trade, because the fix an author reaches for is either vaguer prose or a
+/// whole-file allowlist entry, and the second silently exempts that file's real
+/// code forever after.
+///
+/// The `killpg` guard already gets this right by keying on the syscall rather
+/// than the word; this is the same idea for needles that have no such spelling.
+/// Only lines whose first non-whitespace is `//` are dropped, which covers
+/// `//`, `///`, and `//!`. A trailing comment after code on the same line is
+/// kept: preferring a rare false positive to a class of false negative.
+fn code_only(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Report every file (other than `allowed`) containing any of `needles`.
 fn offenders(needles: &[&str], allowed: &[&str]) -> Vec<String> {
     let mut hits = Vec::new();
@@ -72,6 +93,7 @@ fn offenders(needles: &[&str], allowed: &[&str]) -> Vec<String> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
+        let text = code_only(&text);
         for needle in needles {
             if text.contains(needle) {
                 hits.push(format!("{rel}: contains {needle:?}"));

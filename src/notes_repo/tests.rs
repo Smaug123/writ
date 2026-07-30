@@ -1305,3 +1305,247 @@ fn a_child_proven_never_to_have_existed_is_retried() {
     );
     assert_eq!(probes.get(), 2, "exactly one retry was needed");
 }
+
+// ---------------------------------------------------------------------------
+// Compaction
+//
+// Writ suppresses git's background auto-maintenance in the repos it owns, so
+// packing loose objects is now writ's job. These tests cover the shell: that
+// compaction fires only over the threshold, that it really packs, and that the
+// one non-obvious property it depends on holds — a note stays readable after
+// the object it is attached to has been pruned. The policy itself (parsing and
+// the threshold comparison) is property-tested in `compaction::tests`.
+// ---------------------------------------------------------------------------
+
+/// Count loose objects by walking `objects/??/` directly.
+///
+/// Deliberately shares no code with production: if a repack is supposed to have
+/// packed the objects away, the evidence should be files missing from the disk,
+/// not two callers of `parse_count_objects_verbose` agreeing with each other.
+fn loose_objects_on_disk(repo: &Path) -> usize {
+    let mut total = 0;
+    for entry in fs::read_dir(repo.join("objects")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap();
+        // `objects/pack` and `objects/info` are not fanout directories.
+        if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        total += fs::read_dir(entry.path()).unwrap().count();
+    }
+    total
+}
+
+/// Run a raw `git` command against `repo` through exactly the command builder
+/// production uses, and require it to succeed.
+///
+/// For invocations production deliberately never makes. `gc --prune=now` is the
+/// motivating one: it is how a test reaches the state a production `gc` reaches
+/// only after the two-week prune grace has elapsed.
+fn raw_git(repo: &Path, args: &[&str]) -> String {
+    let mut command = prepare_git_command(repo, &InheritedEnv::from_process());
+    command.args(args);
+    let out = command.output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn object_exists(repo: &Path, oid: &GitObjectId) -> bool {
+    let mut command = prepare_git_command(repo, &InheritedEnv::from_process());
+    command.args(["cat-file", "-e", oid.as_str()]);
+    command.output().unwrap().status.success()
+}
+
+fn always_compact() -> CompactionThreshold {
+    CompactionThreshold::new(LooseObjectCount::new(0))
+}
+
+#[test]
+fn compaction_packs_the_loose_objects_note_writes_leave_behind() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+
+    // A binary body among them: the packing must not disturb the byte-exactness
+    // `write_note` goes to some trouble to preserve.
+    let bodies: [&[u8]; 3] = [b"first envelope", &[0x00, 0xff, 0x1b, 0x7f, 0x0a], b"third"];
+    let mut written = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        let seed = format!("run-{i}").into_bytes();
+        written.push((repo.write_note(&r, &seed, body).unwrap(), *body));
+    }
+
+    let before = loose_objects_on_disk(repo.path());
+    assert!(
+        before > 0,
+        "note writes should have left loose objects to pack"
+    );
+
+    let outcome = repo.compact_if_needed_with(always_compact()).unwrap();
+    assert_eq!(
+        outcome,
+        CompactionOutcome::Compacted {
+            loose_objects_before: LooseObjectCount::new(before as u64)
+        },
+        "the outcome must report the measurement that triggered it"
+    );
+
+    // Zero, not merely fewer: modern git moves even the *unreachable* objects
+    // (writ's seed blobs) into a cruft pack rather than leaving them loose. If a
+    // git version without `gc.cruftPacks` ever lands here this assertion is what
+    // will say so.
+    assert_eq!(
+        loose_objects_on_disk(repo.path()),
+        0,
+        "gc should have packed every loose object away"
+    );
+
+    for (oid, body) in &written {
+        assert_eq!(
+            &repo.read_note(&r, oid).unwrap(),
+            body,
+            "every note must read back byte-exact after compaction"
+        );
+    }
+}
+
+#[test]
+fn compaction_below_the_threshold_touches_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+    repo.write_note(&r, b"seed", b"body").unwrap();
+
+    let before = loose_objects_on_disk(repo.path());
+    let threshold = CompactionThreshold::new(LooseObjectCount::new(before as u64 + 1));
+    let outcome = repo.compact_if_needed_with(threshold).unwrap();
+
+    assert_eq!(
+        outcome,
+        CompactionOutcome::Skipped {
+            loose_objects: LooseObjectCount::new(before as u64)
+        }
+    );
+    // The real assertion: the objects are still loose, so no repack ran. A
+    // `Skipped` outcome that had quietly gc'd anyway would pass the check above.
+    assert_eq!(
+        loose_objects_on_disk(repo.path()),
+        before,
+        "a skipped compaction must leave the object database untouched"
+    );
+}
+
+#[test]
+fn the_public_entry_point_uses_gits_own_threshold() {
+    // The no-argument method is the only one production calls, so something has
+    // to pin that it carries the production threshold rather than, say, zero. A
+    // handful of notes is far below 6700, so it must skip.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    repo.write_note(&notes_ref(), b"seed", b"body").unwrap();
+
+    let before = loose_objects_on_disk(repo.path());
+    let outcome = repo.compact_if_needed().unwrap();
+
+    assert!(
+        matches!(outcome, CompactionOutcome::Skipped { .. }),
+        "a repo with a handful of objects is nowhere near git's 6700; got {outcome:?}"
+    );
+    assert_eq!(loose_objects_on_disk(repo.path()), before);
+}
+
+#[test]
+fn compaction_is_safe_to_repeat() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+    let oid = repo.write_note(&r, b"seed", b"body").unwrap();
+
+    for round in 0..3 {
+        repo.compact_if_needed_with(always_compact())
+            .unwrap_or_else(|e| panic!("compaction round {round} failed: {e}"));
+        assert_eq!(
+            repo.read_note(&r, &oid).unwrap(),
+            b"body",
+            "the note must survive round {round} of compaction"
+        );
+    }
+}
+
+#[test]
+fn notes_stay_readable_after_a_gc_prunes_the_unreachable_seed_blob() {
+    // The property compaction rests on, and the one that is not obvious.
+    //
+    // `write_note` attaches a note to a seed blob, and git-gc(1) is explicit
+    // that "a note ... attached to an object does not contribute in keeping the
+    // object alive". So writ's seed blobs are unreachable, and a `gc` will
+    // eventually prune them once they age past the grace period. That is fine
+    // *only* because a note lookup does not need the annotated object to exist:
+    // the notes tree keys entries on the OID's hex string, not on a reference to
+    // it. If a future git ever makes `notes show` resolve its argument as a
+    // present object, compaction would start destroying readability of the audit
+    // trail, and this test is what will catch it.
+    //
+    // `--prune=now` is the test's way of reaching the state production reaches
+    // after two weeks. Production must never pass it — see `GC_ARGV`.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+    let body: &[u8] = &[0x00, 0x01, 0xfe, 0xff, b'\n'];
+    let seed_oid = repo.write_note(&r, b"run-id-seed", body).unwrap();
+
+    assert!(
+        object_exists(repo.path(), &seed_oid),
+        "precondition: the seed blob exists before pruning"
+    );
+    let reachable = raw_git(repo.path(), &["rev-list", "--objects", "--all"]);
+    assert!(
+        !reachable
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(seed_oid.as_str())),
+        "precondition: the seed blob is unreachable, so gc is entitled to prune it"
+    );
+
+    raw_git(repo.path(), &["gc", "--prune=now", "--quiet"]);
+
+    assert!(
+        !object_exists(repo.path(), &seed_oid),
+        "precondition: gc --prune=now must actually have pruned the seed blob, \
+         otherwise this test proves nothing about the pruned state"
+    );
+    assert_eq!(
+        repo.read_note(&r, &seed_oid).unwrap(),
+        body,
+        "a note must still read back byte-exact after its seed blob is pruned"
+    );
+}
+
+#[test]
+fn the_compaction_argv_carries_no_pruning_aggression_or_lock_override() {
+    // Pinned exactly, so widening it is a deliberate edit to a test that says
+    // why each flag is absent. See `GC_ARGV` for the reasoning.
+    assert_eq!(GC_ARGV, ["gc", "--quiet"]);
+
+    assert_eq!(
+        GC_ARGV[0], "gc",
+        "must be `gc`, not `maintenance`: only `gc` takes the gc.pid lock"
+    );
+    for forbidden in [
+        "--prune=now",
+        "--prune",
+        "--aggressive",
+        "--force",
+        "--detach",
+        "gc.pruneExpire",
+    ] {
+        assert!(
+            !GC_ARGV.iter().any(|arg| arg.contains(forbidden)),
+            "compaction must never pass {forbidden}"
+        );
+    }
+}
