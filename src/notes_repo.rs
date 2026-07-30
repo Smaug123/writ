@@ -714,12 +714,16 @@ impl NotesRepo {
     /// What is bounded is the damage: `COMPACTION_RETRY_BACKOFF` holds off the
     /// next attempt, so that state costs one killed `gc` per hour rather than one
     /// per request, and writ degrades to the behaviour it had before compaction
-    /// existed. The gate covers the whole attempt, not just the repack — the
-    /// measurement is a git invocation against the same object directory and can
-    /// be the thing that is slow, so it is consulted before anything runs — and
-    /// it closes on a `gc` that returns success while moving the count not at
-    /// all, which is otherwise a full repack per request for as long as the cause
-    /// lasts. Raising the deadline instead is not obviously right — this holds
+    /// existed. The gate covers the whole attempt, not just the repack: it is
+    /// consulted before anything runs (measuring is a git invocation against the
+    /// same object directory and can itself be the slow thing), it closes on any
+    /// failure whichever step raised it, and it closes on a `gc` that returns
+    /// success while moving the count not at all — otherwise a full repack per
+    /// request for as long as the cause lasts. That "whichever step" is
+    /// structural rather than remembered: the inner `attempt_compaction` is not
+    /// given the state, so no exit of it can fail to record.
+    ///
+    /// Raising the deadline instead is not obviously right — this holds
     /// the notes-write mutex throughout, so a longer deadline is a longer stall
     /// on every note write — and the better answer is probably to make the
     /// operation's cost match its trigger (`git repack -d` packs the loose
@@ -777,20 +781,51 @@ impl NotesRepo {
             return Ok(CompactionOutcome::Deferred { retry_in });
         }
 
-        let loose_objects = match self.count_loose_objects() {
-            Ok(count) => count,
-            Err(err) => {
+        let outcome = self.attempt_compaction(threshold);
+
+        // The only place the gate is written. Deliberately not at the exits of
+        // the attempt above: this rule has three failure paths to cover — the
+        // measurement, the repack, and the measurement *after* the repack — and
+        // writing it at each of them missed one twice. `attempt_compaction`
+        // cannot record anything, because it is not given the state to record it
+        // in, so there is no exit left that can forget.
+        match &outcome {
+            // Ran, and moved nothing. Worse than failing, because nothing else
+            // here would stop the next request repacking again.
+            Ok(CompactionOutcome::Compacted {
+                loose_objects_before,
+                loose_objects_after,
+            }) if !compaction::made_progress(*loose_objects_before, *loose_objects_after) => {
                 state.compaction_retry_after = Some(now + COMPACTION_RETRY_BACKOFF);
-                return Err(err);
             }
-        };
+            // Cleared rather than left to expire: a repo that is packing
+            // successfully must go on packing at whatever rate its loose-object
+            // count demands.
+            Ok(_) => state.compaction_retry_after = None,
+            Err(_) => state.compaction_retry_after = Some(now + COMPACTION_RETRY_BACKOFF),
+        }
+
+        outcome
+    }
+
+    /// One compaction attempt: measure, decide, repack, measure again.
+    ///
+    /// Takes no lock and holds no state — [`Self::compact_if_needed_with`] has
+    /// both, and interprets whatever this returns. That split is what makes the
+    /// retry gate hard to get wrong: every `?` below is an exit this function
+    /// could otherwise have had to remember to record.
+    fn attempt_compaction(
+        &self,
+        threshold: CompactionThreshold,
+    ) -> Result<CompactionOutcome, NotesRepoError> {
+        let loose_objects = self.count_loose_objects()?;
 
         match compaction::decide(loose_objects, threshold) {
             CompactionDecision::Skip { loose_objects } => {
                 Ok(CompactionOutcome::Skipped { loose_objects })
             }
             CompactionDecision::Compact { loose_objects } => {
-                match run_git(
+                run_git(
                     &self.canonical_path,
                     GC_ARGV,
                     None,
@@ -805,32 +840,17 @@ impl NotesRepo {
                     // it left behind names a pid that no longer exists and git
                     // treats the lock as stale.
                     OnBornDead::Retry,
-                ) {
-                    Ok(_) => {
-                        // A `gc` can succeed and achieve nothing, which is worse
-                        // than failing: the count is still over the threshold, so
-                        // without this the next request runs another full repack,
-                        // forever. Re-measuring costs one `count-objects` against
-                        // a repo that was just packed.
-                        let after = self.count_loose_objects()?;
-                        if compaction::made_progress(loose_objects, after) {
-                            // Cleared rather than left to expire: a repo that is
-                            // packing successfully must go on packing at whatever
-                            // rate its loose-object count demands.
-                            state.compaction_retry_after = None;
-                        } else {
-                            state.compaction_retry_after = Some(now + COMPACTION_RETRY_BACKOFF);
-                        }
-                        Ok(CompactionOutcome::Compacted {
-                            loose_objects_before: loose_objects,
-                            loose_objects_after: after,
-                        })
-                    }
-                    Err(err) => {
-                        state.compaction_retry_after = Some(now + COMPACTION_RETRY_BACKOFF);
-                        Err(err)
-                    }
-                }
+                )?;
+
+                // A `gc` can succeed and achieve nothing, so completion is
+                // measured rather than assumed. Costs one `count-objects` against
+                // a repo that was just packed; the caller decides what an
+                // unmoved count means.
+                let after = self.count_loose_objects()?;
+                Ok(CompactionOutcome::Compacted {
+                    loose_objects_before: loose_objects,
+                    loose_objects_after: after,
+                })
             }
         }
     }

@@ -1114,9 +1114,14 @@ handles on one repo exactly as the lock is shared.
 
 The gate covers the whole attempt. It is consulted *before* `count-objects`,
 because measuring is itself an invocation against the object directory and can be
-the thing holding to the deadline; and it closes on a `gc` that returns success
-having moved the count not at all, which would otherwise be a full repack per
-request for as long as the cause lasts. That is reachable rather than theoretical:
+the thing holding to the deadline; it closes on a failure at any step, including
+the measurement taken *after* a successful repack; and it closes on a `gc` that
+returns success having moved the count not at all, which would otherwise be a
+full repack per request for as long as the cause lasts. "At any step" is
+structural rather than remembered: `attempt_compaction` is not given the state to
+record in, so the gate is written in exactly one place and no exit can forget it.
+Three separate hand-written exits were tried first, and two of them missed a
+path. That is reachable rather than theoretical:
 measured on git 2.54, `gc.cruftPacks=false` in `<repo>/config` leaves young
 unreachable objects loose, and writ's seed blobs are exactly those, so `GC_ARGV`
 imposes `--cruft` alongside the prune date. Those two are where imposition stops

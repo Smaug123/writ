@@ -1540,13 +1540,29 @@ fn counting_git_env(bin: &Path, attempts: &Path, gc: FakeGc) -> InheritedEnv {
     fs::create_dir_all(bin).unwrap();
     // A gc that works shrinks the repo; one that is ineffective leaves the count
     // exactly where it was, which is the `gc.cruftPacks=false` shape.
-    let count = match gc {
-        FakeGc::Succeeds => "count: $((9000 - n * 1000))",
-        FakeGc::Fails | FakeGc::SucceedsWithoutPacking | FakeGc::MeasurementFails => "count: 9000",
+    // What `count-objects` does. `case` rather than `[` or `test` so this stays
+    // within shell builtins (see below).
+    let count_objects = match gc {
+        FakeGc::Succeeds => {
+            r#"echo "count: $((9000 - n * 1000))"; echo "packs: 0"; exit 0"#.to_string()
+        }
+        FakeGc::Fails | FakeGc::SucceedsWithoutPacking => {
+            r#"echo "count: 9000"; echo "packs: 0"; exit 0"#.to_string()
+        }
+        FakeGc::MeasurementFails => "exit 1".to_string(),
+        // Succeeds until a gc has run, then fails: the post-repack measurement is
+        // the one that breaks.
+        FakeGc::PostMeasurementFails => {
+            r#"case "$n" in 0) echo "count: 9000"; echo "packs: 0"; exit 0 ;; *) exit 1 ;; esac"#
+                .to_string()
+        }
     };
     let gc_exit = match gc {
         FakeGc::Fails => 128,
-        FakeGc::Succeeds | FakeGc::SucceedsWithoutPacking | FakeGc::MeasurementFails => 0,
+        FakeGc::Succeeds
+        | FakeGc::SucceedsWithoutPacking
+        | FakeGc::MeasurementFails
+        | FakeGc::PostMeasurementFails => 0,
     };
     fake_git_env(
         bin,
@@ -1564,15 +1580,11 @@ done
 n=0
 while IFS= read -r _; do n=$((n + 1)); done < '{attempts}' 2>/dev/null
 case "$sub" in
-  count-objects) echo "{count}"; echo "size: 36"; echo "packs: 0"; exit {count_exit} ;;
+  count-objects) {count_objects} ;;
   gc) echo attempt >> '{attempts}'; exit {gc_exit} ;;
   *) exit 0 ;;
 esac"#,
             attempts = attempts.display(),
-            count_exit = match gc {
-                FakeGc::MeasurementFails => 1,
-                _ => 0,
-            },
         ),
     )
 }
@@ -1590,6 +1602,9 @@ enum FakeGc {
     SucceedsWithoutPacking,
     /// `count-objects` itself fails, so compaction cannot even measure.
     MeasurementFails,
+    /// The repack succeeds and the measurement that checks whether it helped
+    /// fails — the one failure path that is not on the way *in*.
+    PostMeasurementFails,
 }
 
 fn attempt_count(attempts: &Path) -> usize {
@@ -1702,6 +1717,48 @@ fn a_measurement_that_fails_also_buys_a_pause() {
     assert!(
         matches!(second, CompactionOutcome::Deferred { .. }),
         "a failed measurement must close the gate just as a failed gc does; got {second:?}"
+    );
+}
+
+#[test]
+fn a_failure_after_the_repack_buys_a_pause_like_any_other() {
+    // The failure path that is not on the way in: the repack ran, and the
+    // measurement checking whether it helped is the thing that fails. Nothing
+    // about it makes repeating it cheaper — it is the same object directory, and
+    // the loose count is still over the threshold, so an ungated return means the
+    // next request measures *and* repacks again.
+    //
+    // This is the third distinct exit that has to record the same fact, which is
+    // why the recording no longer lives at the exits at all: the attempt cannot
+    // touch the gate, and its caller writes it in exactly one place.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let broken = handle_with_env(
+        &repo,
+        counting_git_env(
+            &tmp.path().join("bin"),
+            &attempts,
+            FakeGc::PostMeasurementFails,
+        ),
+    );
+
+    broken
+        .compact_if_needed_with(always_compact())
+        .expect_err("the measurement after the repack fails");
+    assert_eq!(attempt_count(&attempts), 1, "the repack itself did run");
+
+    let second = broken
+        .compact_if_needed_with(always_compact())
+        .expect("the pause is not an error");
+    assert!(
+        matches!(second, CompactionOutcome::Deferred { .. }),
+        "a failure after the repack must close the gate too; got {second:?}"
+    );
+    assert_eq!(
+        attempt_count(&attempts),
+        1,
+        "and must not let the next write run another full repack"
     );
 }
 
