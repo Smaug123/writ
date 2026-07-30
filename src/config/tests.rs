@@ -2410,3 +2410,66 @@ fn the_run_agent_section_requires_an_agent_kind() {
         "the parse error must name the missing field, got: {err}",
     );
 }
+
+/// The concurrency bound is optional, and its absence means the built-in
+/// default rather than "unbounded".
+///
+/// The distinction matters: `Option::None` here is read by `writd` as
+/// [`DEFAULT_MAX_CONCURRENT_AGENT_RUNS`](crate::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
+/// so an operator who never heard of the key still gets a bound. A config
+/// format where silence meant "no limit" would put every existing install back
+/// where this work started.
+#[test]
+fn max_concurrent_agent_runs_is_absent_by_default_and_parses_when_given() {
+    let base = r#"{
+        "github_apps": {
+            "claude": {
+                "app_id": 1,
+                "installation_id": 2,
+                "installation_owner": "o",
+                "private_key_secret": "pk"
+            }
+        },
+        "policy": { "default_ttl": 600, "writable_repos": [] }"#;
+
+    let silent: DaemonConfig = serde_json::from_str(&format!("{base} }}")).unwrap();
+    assert!(
+        silent.max_concurrent_agent_runs.is_none(),
+        "an unset key must stay unset here; writd is what supplies the default"
+    );
+
+    let configured: DaemonConfig =
+        serde_json::from_str(&format!("{base}, \"max_concurrent_agent_runs\": 7 }}")).unwrap();
+    assert_eq!(
+        configured.max_concurrent_agent_runs.map(|n| n.get()),
+        Some(7)
+    );
+}
+
+/// A limit of zero is refused by the parser.
+///
+/// Not a style point. Zero permits means every `RunAgent` waits forever on a
+/// permit that can never be issued — the daemon would accept the config, start
+/// cleanly, and then hang the first run with no diagnostic. `NonZeroUsize`
+/// moves that from a runtime mystery to a startup error naming the field.
+#[test]
+fn a_zero_concurrency_limit_is_refused_at_parse_time() {
+    let json = r#"{
+        "github_apps": {
+            "claude": {
+                "app_id": 1,
+                "installation_id": 2,
+                "installation_owner": "o",
+                "private_key_secret": "pk"
+            }
+        },
+        "policy": { "default_ttl": 600, "writable_repos": [] },
+        "max_concurrent_agent_runs": 0
+    }"#;
+    let err = serde_json::from_str::<DaemonConfig>(json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_concurrent_agent_runs") || msg.contains("zero"),
+        "the error must point at the offending key or say what was wrong; got {msg:?}"
+    );
+}

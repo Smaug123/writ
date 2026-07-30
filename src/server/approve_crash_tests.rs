@@ -234,6 +234,7 @@ fn build_state(
         notes_repo: None,
         signing_key: Some(WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap()),
         run_agent_spawn: None,
+        agent_run_slots: Default::default(),
         promote_runtime: Some(Arc::new(promote_runtime)),
         git_data_http: std::sync::OnceLock::new(),
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),

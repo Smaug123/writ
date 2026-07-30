@@ -150,6 +150,24 @@ pub struct DaemonConfig {
     /// written.
     #[serde(default)]
     pub agent_run_log_root: Option<PathBuf>,
+    /// How many agent runs writd will execute at once, across *both* `RunAgent`
+    /// dispatch arms. Defaults to
+    /// [`DEFAULT_MAX_CONCURRENT_AGENT_RUNS`](crate::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS).
+    ///
+    /// Requests over the limit **queue**; they are not refused. An agent run is
+    /// a minutes-long job dispatched by a workflow tool, so a delay is a far
+    /// better answer than a failure the caller has to build retry logic around.
+    ///
+    /// Top-level for the same reason as [`Self::agent_run_log_root`]: neither
+    /// section can own it. A daemon serving only VM runs has no `run_agent`
+    /// section, and one serving only host runs has no `agent_vm` section, but
+    /// the bound has to hold across both.
+    ///
+    /// `NonZeroUsize` so a zero — which would wedge every run forever behind a
+    /// permit that can never be issued — is rejected by the config parser rather
+    /// than discovered at runtime.
+    #[serde(default)]
+    pub max_concurrent_agent_runs: Option<std::num::NonZeroUsize>,
 }
 
 /// Configuration for the read-only UI HTTP transport. Distinct from

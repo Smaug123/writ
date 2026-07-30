@@ -162,6 +162,7 @@ async fn run_host_daemon(
         ui_http,
         run_agent,
         agent_run_log_root,
+        max_concurrent_agent_runs,
     } = config;
 
     let socket_path = default_paths::SOCKET.or_resolve(socket.or(socket_path))?;
@@ -459,6 +460,9 @@ async fn run_host_daemon(
         notes_repo,
         signing_key,
         run_agent_spawn,
+        agent_run_slots: writ::server::AgentRunSlots::new(
+            max_concurrent_agent_runs.unwrap_or(writ::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
+        ),
         promote_runtime,
         git_data_http: std::sync::OnceLock::new(),
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),

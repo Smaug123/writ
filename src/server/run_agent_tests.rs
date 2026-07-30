@@ -1469,3 +1469,184 @@ async fn a_stream_file_rewritten_after_the_run_fails_the_provenance_check() {
         "the error must name the tampered file, got: {message}",
     );
 }
+
+/// A `RunAgent` fixture whose agent records its own lifetime, so a test can
+/// reconstruct how many runs were ever in flight together.
+///
+/// The script appends one line when it starts and one when it finishes. Small
+/// `>>` writes to the same file are atomic under `O_APPEND`, so the file is a
+/// faithful interleaving of the runs rather than a lossy one, and replaying it
+/// as +1/-1 gives the concurrency at every instant.
+fn overlap_recording_agent(dir: &std::path::Path, ledger: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             echo start >> '{ledger}'\n\
+             # Long enough that every queued run would overlap if nothing bounded\n\
+             # them, short enough to keep the suite quick.\n\
+             sleep 0.4\n\
+             echo end >> '{ledger}'\n",
+            ledger = ledger.display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+/// Replay the ledger as +1 per start and -1 per end, returning the high-water
+/// mark.
+fn peak_concurrency(ledger: &std::path::Path) -> usize {
+    let text = std::fs::read_to_string(ledger).unwrap_or_default();
+    let mut live = 0usize;
+    let mut peak = 0usize;
+    for line in text.lines() {
+        match line.trim() {
+            "start" => {
+                live += 1;
+                peak = peak.max(live);
+            }
+            "end" => live = live.saturating_sub(1),
+            other => panic!("unexpected ledger line {other:?}"),
+        }
+    }
+    peak
+}
+
+/// Concurrent `RunAgent` calls are bounded, and the ones over the bound wait
+/// their turn rather than being refused.
+///
+/// Both halves matter and neither implies the other. A daemon that refused the
+/// surplus would also keep the peak at the limit, and a daemon that queued
+/// without bounding would also complete every request; only asserting both says
+/// "queued, not dropped".
+///
+/// Each in-flight host run costs a blocking-pool thread (of tokio's 512, shared
+/// with notes writes and every other `spawn_blocking` here), two OS threads for
+/// the stream captures, and a child process — so an unbounded burst is a real
+/// resource commitment, not just untidy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_runs_are_bounded_and_the_surplus_queues() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("ledger");
+    let agent = overlap_recording_agent(tmp.path(), &ledger);
+
+    let server = MockServer::start().await;
+    let mut fixture = make_run_agent_state(&server, agent, Vec::new());
+    // Pinned here rather than read from the state's own configuration. Asserting
+    // `peak <= state.agent_run_slots.limit()` would compare the mechanism with
+    // itself and hold for *any* limit, including one high enough to be no bound
+    // at all — a mutation raising the default sailed through that version. It
+    // would also scale the burst with the default, so raising it would silently
+    // make this test spawn dozens of processes.
+    const LIMIT: usize = 2;
+    {
+        let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
+        inner.agent_run_slots = AgentRunSlots::new(std::num::NonZeroUsize::new(LIMIT).unwrap());
+    }
+    let state = &fixture.state;
+    let limit = LIMIT;
+    let session_id = open_session(state).await;
+
+    // Comfortably more than the bound, so the queue is exercised rather than
+    // merely present.
+    let burst = limit * 3;
+    let mut runs = tokio::task::JoinSet::new();
+    for i in 0..burst {
+        let state = Arc::clone(state);
+        runs.spawn(async move {
+            dispatch_message(
+                ClientMessage::RunAgent {
+                    prompt: crate::agent_run::AgentPrompt::new(format!("run {i}")),
+                    capabilities: Vec::new(),
+                    purpose: "concurrency-bound-test".parse().unwrap(),
+                    output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
+                        .unwrap(),
+                    session_id: Some(session_id),
+                    workspace: None,
+                    agent_kind: None,
+                    agent_model: None,
+                },
+                &state,
+            )
+            .await
+        });
+    }
+
+    let mut completed = 0usize;
+    while let Some(joined) = runs.join_next().await {
+        match joined.unwrap() {
+            ServerMessage::RunAgentCompleted { .. } => completed += 1,
+            other => panic!("every queued run must eventually run: got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        completed, burst,
+        "the surplus must queue and complete, not be refused"
+    );
+    let peak = peak_concurrency(&ledger);
+    assert!(
+        peak <= limit,
+        "at most {limit} agents may run at once; {peak} overlapped"
+    );
+    assert!(
+        peak > 1,
+        "with a bound above one the runs should actually overlap; a peak of \
+         {peak} means this test never exercised concurrency at all"
+    );
+}
+
+/// The shipped default is two concurrent runs.
+///
+/// Pinned separately from the mechanism test, which now fixes its own limit:
+/// "the bound is enforced" and "the bound is 2" are different claims, and a test
+/// that reads the limit out of the state it is testing can only ever check the
+/// first. Changing this number should be a deliberate edit here.
+#[test]
+fn the_default_concurrency_bound_is_two() {
+    assert_eq!(DEFAULT_MAX_CONCURRENT_AGENT_RUNS.get(), 2);
+}
+
+/// Both dispatch arms take a slot before starting a run.
+///
+/// A source scan, because the alternative is no coverage at all: the VM arm
+/// needs a real agent-VM runtime, so no test in this suite reaches its body, and
+/// a mutation deleting its `acquire` survived the end-to-end concurrency test
+/// silently. The bound is one rule with two implementations, which is exactly
+/// the shape `tests/shared_hardening_helpers.rs` exists to guard.
+///
+/// It is a backstop, not a proof. It shows an `acquire` is *present* in each
+/// arm, not that it is placed correctly — the placement (after validation,
+/// before committing resources) is stated at each call site and checked for the
+/// host arm by `concurrent_runs_are_bounded_and_the_surplus_queues`. The durable
+/// version would be a type that cannot start a run without a slot to show for
+/// it; until the two arms share such a funnel, this is what catches a deletion.
+#[test]
+fn every_run_agent_arm_acquires_a_slot() {
+    let source = include_str!("run_agent.rs");
+    // The two arms, by the function that owns each one's "start the run" step.
+    for arm in [
+        "pub(super) async fn run_agent<",
+        "async fn run_agent_in_vm<",
+    ] {
+        let at = source
+            .find(arm)
+            .unwrap_or_else(|| panic!("dispatch arm {arm:?} not found; rename the guard with it"));
+        // Up to the next `\n}` at column zero: the whole function body.
+        let body_end = source[at..]
+            .find("\n}\n")
+            .map_or(source.len(), |offset| at + offset);
+        let body = &source[at..body_end];
+        assert!(
+            body.contains("agent_run_slots.acquire()"),
+            "{arm} must take an agent-run slot before starting a run; without it \
+             that arm is unbounded and nothing else here would notice"
+        );
+    }
+}

@@ -15,6 +15,7 @@
 //! directly.
 
 use super::*;
+use std::num::NonZeroUsize;
 
 /// Total wall-clock budget the VM dispatch arm gives a per-run VM
 /// agent to complete and POST its outcome to writd. Implementer runs
@@ -31,6 +32,86 @@ const RUN_AGENT_VM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// the observed latency from "outcome lands" to "wait returns" is
 /// bounded by this interval rather than the full timeout.
 const RUN_AGENT_VM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many agent runs writd will execute at once when configuration is silent.
+///
+/// Two, chosen to be obviously safe rather than tuned: the cost of a run is a
+/// child process plus threads (host arm) or a whole VM (VM arm), and no
+/// measurement here would generalise across operators' hardware. It is a config
+/// key precisely so the number can move without a release.
+pub const DEFAULT_MAX_CONCURRENT_AGENT_RUNS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
+/// The bound on how many agent runs may be in flight at once, across *both*
+/// dispatch arms.
+///
+/// One bound rather than one per arm. The arms differ in what a run costs — the
+/// host arm holds a tokio blocking-pool thread (of 512, shared with notes writes
+/// and every other `spawn_blocking` in writd), two OS threads for the stream
+/// captures, and a child process; the VM arm holds a VM — but they do not
+/// differ in *whose* machine pays, and a per-arm bound would let twice the
+/// configured number run.
+///
+/// Waiting, not refusing: a caller over the limit queues. That is the operator's
+/// decision recorded, and it suits the shape of the traffic — an agent run is a
+/// minutes-long job dispatched by a workflow tool, so a queue is a delay where a
+/// refusal would be a failed workflow step needing its own retry logic.
+/// [`tokio::sync::Semaphore`] hands permits out in FIFO order, so "queue" is
+/// what waiting on it already means, and a burst cannot starve its own tail.
+#[derive(Clone, Debug)]
+pub struct AgentRunSlots {
+    slots: Arc<tokio::sync::Semaphore>,
+    limit: NonZeroUsize,
+}
+
+impl AgentRunSlots {
+    pub fn new(limit: NonZeroUsize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(limit.get())),
+            limit,
+        }
+    }
+
+    /// The configured bound, for tests and operator-facing reporting.
+    pub fn limit(&self) -> NonZeroUsize {
+        self.limit
+    }
+
+    /// Wait for a slot, then hold it until the returned guard is dropped.
+    ///
+    /// Callers must acquire *after* validating the request and *before* starting
+    /// the run: queueing behind minutes-long runs only to answer "that request
+    /// was malformed" would be a worse answer than refusing outright, and each
+    /// arm's preconditions differ, so this is not something the dispatcher can
+    /// do once on their behalf.
+    async fn acquire(&self) -> AgentRunSlot {
+        AgentRunSlot(
+            Arc::clone(&self.slots)
+                .acquire_owned()
+                .await
+                // The semaphore is owned by `BrokerState` and never closed;
+                // `acquire_owned` fails only on a closed semaphore.
+                .expect("the agent-run semaphore is never closed"),
+        )
+    }
+}
+
+impl Default for AgentRunSlots {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_CONCURRENT_AGENT_RUNS)
+    }
+}
+
+/// One in-flight agent run's claim on the bound. Releases on drop, so every
+/// early return frees it.
+#[derive(Debug)]
+struct AgentRunSlot(
+    #[expect(
+        dead_code,
+        reason = "held for its Drop: releasing the slot when the run ends is the \
+                  entire purpose, so the permit is never read"
+    )]
+    tokio::sync::OwnedSemaphorePermit,
+);
 
 fn run_agent_not_configured(component: &str) -> ServerMessage {
     ServerMessage::Error {
@@ -181,6 +262,15 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
             ),
         };
     }
+
+    // Every precondition above is settled, so from here the run is going to
+    // happen and the only question is when. Wait for a slot before the audit row
+    // rather than after: a row recorded now would claim a run that has not
+    // started, and `requested_at` would date the request rather than the run.
+    //
+    // Held until this function returns, which is when the child has exited and
+    // its note is written.
+    let _slot = state.agent_run_slots.acquire().await;
 
     let run_id = AgentRunId::new();
     let prompt_summary = prompt.summary();
@@ -496,6 +586,13 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
     let Some(signing_key) = state.signing_key.clone() else {
         return run_agent_not_configured("signing_key");
     };
+
+    // Same rule as the host arm, and the same bound: preconditions first, then
+    // wait for a slot, then commit resources. Here the resource is a whole VM,
+    // and `start_agent_run_session` both mints the session and records the run's
+    // audit row, so acquiring after it would mean a row and a live VM belonging
+    // to a run that is only queued.
+    let _slot = state.agent_run_slots.acquire().await;
 
     let prompt_bytes = prompt.as_bytes().to_vec();
     let prompt_sha256_str = sha256_hex(&prompt_bytes);
