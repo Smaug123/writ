@@ -1112,6 +1112,18 @@ inside the notes-write mutex's payload rather than beside it, which makes
 consulting it without holding that lock unwriteable, and shares it between
 handles on one repo exactly as the lock is shared.
 
+The gate covers the whole attempt. It is consulted *before* `count-objects`,
+because measuring is itself an invocation against the object directory and can be
+the thing holding to the deadline; and it closes on a `gc` that returns success
+having moved the count not at all, which would otherwise be a full repack per
+request for as long as the cause lasts. That is reachable rather than theoretical:
+measured on git 2.54, `gc.cruftPacks=false` in `<repo>/config` leaves young
+unreachable objects loose, and writ's seed blobs are exactly those, so `GC_ARGV`
+imposes `--cruft` alongside the prune date. Those two are where imposition stops
+— they are the settings writ's stated guarantees rest on, whereas other config
+can make a `gc` slower or looser without breaking a guarantee, and chasing every
+knob would be re-implementing git's configuration in argv.
+
 Two things still open. Bailiff's own repo accumulates one pack per
 `fetch_from_remote` and nothing yet calls `compact_if_needed` for it, so the pack
 half of git's auto policy (`gc.autoPackLimit`) has no live trigger and is

@@ -390,21 +390,21 @@ async fn sign_and_store_run(
         Ok(crate::notes_repo::CompactionOutcome::Skipped { .. }) => {}
         Ok(crate::notes_repo::CompactionOutcome::Compacted {
             loose_objects_before,
+            loose_objects_after,
         }) => {
+            // Both counts, because "gc succeeded" and "gc helped" are different
+            // claims and only the pair distinguishes them.
             tracing::info!(
                 loose_objects_before = loose_objects_before.get(),
+                loose_objects_after = loose_objects_after.get(),
                 "compacted writ's notes repo"
             );
         }
-        // A pause an operator should be able to see, because the repo wants
+        // A pause an operator should be able to see, because the repo may want
         // packing and is not getting it. Logged every time rather than once, so
         // the condition is visible for as long as it lasts.
-        Ok(crate::notes_repo::CompactionOutcome::Deferred {
-            loose_objects,
-            retry_in,
-        }) => {
+        Ok(crate::notes_repo::CompactionOutcome::Deferred { retry_in }) => {
             tracing::info!(
-                loose_objects = loose_objects.get(),
                 retry_in_secs = retry_in.as_secs(),
                 "deferred compaction of writ's notes repo after a recent failure"
             );

@@ -1390,9 +1390,13 @@ fn compaction_packs_the_loose_objects_note_writes_leave_behind() {
     assert_eq!(
         outcome,
         CompactionOutcome::Compacted {
-            loose_objects_before: LooseObjectCount::new(before as u64)
+            loose_objects_before: LooseObjectCount::new(before as u64),
+            // Real git with `--cruft`: the unreachable seed blobs move into a
+            // cruft pack, so nothing is left loose at all.
+            loose_objects_after: LooseObjectCount::new(0),
         },
-        "the outcome must report the measurement that triggered it"
+        "the outcome must report the measurement that triggered it, and what it \
+         achieved"
     );
 
     // Zero, not merely fewer: modern git moves even the *unreachable* objects
@@ -1532,24 +1536,60 @@ fn notes_stay_readable_after_a_gc_prunes_the_unreachable_seed_blob() {
 /// cannot be provoked in a test without waiting out that deadline, and it is not
 /// the interesting part anyway: the gate turns on *any* failure. So the failure
 /// is faked and the thing actually asserted is how many times writ tries.
-fn counting_git_env(bin: &Path, attempts: &Path, gc_exit: u8) -> InheritedEnv {
+fn counting_git_env(bin: &Path, attempts: &Path, gc: FakeGc) -> InheritedEnv {
     fs::create_dir_all(bin).unwrap();
+    // A gc that works shrinks the repo; one that is ineffective leaves the count
+    // exactly where it was, which is the `gc.cruftPacks=false` shape.
+    let count = match gc {
+        FakeGc::Succeeds => "count: $((9000 - n * 1000))",
+        FakeGc::Fails | FakeGc::SucceedsWithoutPacking | FakeGc::MeasurementFails => "count: 9000",
+    };
+    let gc_exit = match gc {
+        FakeGc::Fails => 128,
+        FakeGc::Succeeds | FakeGc::SucceedsWithoutPacking | FakeGc::MeasurementFails => 0,
+    };
     fake_git_env(
         bin,
-        // The subcommand is not `$1`: production passes the repo as a leading
-        // `--git-dir=` argument, so skip flags to find it.
+        // Two constraints on this script. The subcommand is not `$1`, because
+        // production passes the repo as a leading `--git-dir=` argument, so flags
+        // are skipped to find it. And it may use *only* shell builtins:
+        // `fake_git_env` puts nothing but its own directory on `PATH`, so `wc`
+        // and friends do not resolve — a `$(wc -l ...)` here silently yields the
+        // `|| echo 0` fallback on every call, which reads as "the count never
+        // moved".
         &format!(
             r#"for a in "$@"; do
   case "$a" in -*) continue ;; *) sub="$a"; break ;; esac
 done
+n=0
+while IFS= read -r _; do n=$((n + 1)); done < '{attempts}' 2>/dev/null
 case "$sub" in
-  count-objects) echo "count: 9000"; echo "size: 36"; echo "packs: 0"; exit 0 ;;
+  count-objects) echo "{count}"; echo "size: 36"; echo "packs: 0"; exit {count_exit} ;;
   gc) echo attempt >> '{attempts}'; exit {gc_exit} ;;
   *) exit 0 ;;
 esac"#,
             attempts = attempts.display(),
+            count_exit = match gc {
+                FakeGc::MeasurementFails => 1,
+                _ => 0,
+            },
         ),
     )
+}
+
+/// How the fake `git` should behave, named rather than passed as an exit code so
+/// each test reads as the scenario it is exercising.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum FakeGc {
+    /// Packs the repo: the count falls by 1000 per attempt.
+    Succeeds,
+    /// Refuses, as a real `gc` does when `gc.pid` names a live process.
+    Fails,
+    /// Returns success and packs nothing — the shape a repo takes when
+    /// `gc.cruftPacks=false` keeps young unreachable objects loose.
+    SucceedsWithoutPacking,
+    /// `count-objects` itself fails, so compaction cannot even measure.
+    MeasurementFails,
 }
 
 fn attempt_count(attempts: &Path) -> usize {
@@ -1585,7 +1625,7 @@ fn a_failed_compaction_is_not_retried_by_the_very_next_note_write() {
     let attempts = tmp.path().join("gc-attempts");
     let failing = handle_with_env(
         &repo,
-        counting_git_env(&tmp.path().join("bin"), &attempts, 128),
+        counting_git_env(&tmp.path().join("bin"), &attempts, FakeGc::Fails),
     );
 
     failing
@@ -1618,7 +1658,7 @@ fn a_successful_compaction_leaves_the_gate_open_for_the_next_one() {
     let attempts = tmp.path().join("gc-attempts");
     let succeeding = handle_with_env(
         &repo,
-        counting_git_env(&tmp.path().join("bin"), &attempts, 0),
+        counting_git_env(&tmp.path().join("bin"), &attempts, FakeGc::Succeeds),
     );
 
     for round in 1..=3 {
@@ -1635,6 +1675,82 @@ fn a_successful_compaction_leaves_the_gate_open_for_the_next_one() {
             "every round above the threshold must run gc"
         );
     }
+}
+
+#[test]
+fn a_measurement_that_fails_also_buys_a_pause() {
+    // The gate has to sit in front of `count-objects`, not just in front of `gc`.
+    // Measuring is itself a git invocation against the object directory, and a
+    // slow or damaged one can hold it to the full deadline — so a gate consulted
+    // only after a successful measurement leaves precisely the per-request cost
+    // it exists to remove.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let broken = handle_with_env(
+        &repo,
+        counting_git_env(&tmp.path().join("bin"), &attempts, FakeGc::MeasurementFails),
+    );
+
+    broken
+        .compact_if_needed_with(always_compact())
+        .expect_err("count-objects exits non-zero, so the measurement must fail");
+
+    let second = broken
+        .compact_if_needed_with(always_compact())
+        .expect("the pause is not an error");
+    assert!(
+        matches!(second, CompactionOutcome::Deferred { .. }),
+        "a failed measurement must close the gate just as a failed gc does; got {second:?}"
+    );
+}
+
+#[test]
+fn a_gc_that_packs_nothing_does_not_run_again_on_the_next_write() {
+    // Succeeding and achieving something are different. Measured on git 2.54:
+    // with `gc.cruftPacks=false`, a `gc` returns zero and leaves young
+    // unreachable objects — writ's seed blobs are exactly that — loose, so the
+    // count does not move. `GC_ARGV` imposes `--cruft` against that specific
+    // cause, but since success is what leaves the gate open, an ineffective
+    // repack would otherwise run a full `gc` on every request forever, for any
+    // cause at all. So progress is checked rather than assumed.
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let ineffective = handle_with_env(
+        &repo,
+        counting_git_env(
+            &tmp.path().join("bin"),
+            &attempts,
+            FakeGc::SucceedsWithoutPacking,
+        ),
+    );
+
+    let first = ineffective
+        .compact_if_needed_with(always_compact())
+        .expect("the fake gc exits zero, so the call succeeds");
+    assert_eq!(
+        first,
+        CompactionOutcome::Compacted {
+            loose_objects_before: LooseObjectCount::new(9000),
+            loose_objects_after: LooseObjectCount::new(9000),
+        },
+        "the outcome must report both counts, so 'ran' and 'helped' stay distinguishable"
+    );
+    assert_eq!(attempt_count(&attempts), 1);
+
+    let second = ineffective
+        .compact_if_needed_with(always_compact())
+        .expect("the pause is not an error");
+    assert!(
+        matches!(second, CompactionOutcome::Deferred { .. }),
+        "a gc that moved nothing must not be repeated immediately; got {second:?}"
+    );
+    assert_eq!(
+        attempt_count(&attempts),
+        1,
+        "the second write must not spawn another full repack"
+    );
 }
 
 #[test]
@@ -1687,7 +1803,17 @@ fn compaction_holds_the_prune_grace_open_against_the_repos_own_config() {
 fn the_compaction_argv_carries_no_pruning_aggression_or_lock_override() {
     // Pinned exactly, so widening it is a deliberate edit to a test that says
     // why each flag is present or absent. See `GC_ARGV` for the reasoning.
-    assert_eq!(GC_ARGV, ["gc", "--quiet", "--prune=2.weeks.ago"]);
+    assert_eq!(GC_ARGV, ["gc", "--quiet", "--prune=2.weeks.ago", "--cruft"]);
+
+    // Both imposed settings are here because a repo-local config value can
+    // otherwise break a guarantee this policy states: the grace that protects a
+    // concurrent writer, and the cruft packing without which a successful `gc`
+    // can leave the count exactly where it was.
+    assert!(
+        GC_ARGV.contains(&"--cruft"),
+        "compaction must impose cruft packing: with gc.cruftPacks=false a gc \
+         succeeds while packing none of writ's young unreachable seed blobs"
+    );
 
     assert_eq!(
         GC_ARGV[0], "gc",
