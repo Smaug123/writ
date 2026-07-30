@@ -73,14 +73,24 @@ pub(crate) fn git_failure(args: &[&str], cwd: &Path, out: &std::process::Output)
     )
 }
 
-/// `-c` flags that stop git spawning a *detached background process* over
-/// the fixture repository.
+/// A fixture `git` command: the hardened config recipe, which is also what
+/// keeps git from spawning a *detached background process* over the fixture
+/// repository.
 ///
-/// This is not tidiness. `git commit` runs
-/// `git maintenance run --auto --quiet --detach`, which keeps writing to
-/// `objects/` after `git commit` has exited and returned to the caller.
-/// A fixture that commits and then immediately clones is therefore
-/// racing a writer it never asked for, and lost that race in CI:
+/// That suppression used to live here, as a local pair of `-c` flags, because
+/// it was unclear whether production wanted it. It does — `writ_core::git_env`
+/// now imposes the auto-maintenance knobs on every git command writd runs
+/// against a repository it owns, and names them in one place — so the fixtures
+/// get it from the shared recipe and the local copy is gone. (Naming the
+/// settings here again is what `tests/shared_hardening_helpers.rs` exists to
+/// prevent, which is why this paragraph does not.)
+///
+/// Worth keeping the motivating failure recorded, since it is the reason the
+/// production recipe changed. `git commit` runs `git maintenance run --auto
+/// --quiet --detach`, which keeps writing to `objects/` after `git commit` has
+/// exited and returned to the caller. A fixture that commits and then
+/// immediately clones is racing a writer it never asked for, and lost that race
+/// in CI:
 ///
 /// ```text
 /// fatal: failed to copy file to '…/mirror.git/objects/pack/
@@ -94,25 +104,9 @@ pub(crate) fn git_failure(args: &[&str], cwd: &Path, out: &std::process::Output)
 /// *destination* path, which is why the message reads as though the
 /// destination directory were missing.) The pid in the name belongs to
 /// neither the test nor its clone: it is the detached child.
-///
-/// So the fix is to remove the second writer rather than to retry around
-/// it. Verified directly: with `maintenance.auto=false`, `GIT_TRACE`
-/// shows zero `maintenance run --auto` spawns where an unconfigured
-/// commit shows three. `gc.auto=0` covers the older direct-gc path.
-///
-/// Deliberately *not* added to `apply_clean_git_config`: that recipe is
-/// production code's, and whether writd wants background maintenance
-/// suppressed on the repositories it manages is a real operational
-/// decision (repacking has to happen sometime) rather than a test-harness
-/// one. Tracked separately.
-const NO_AUTO_MAINTENANCE: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
-
-/// A fixture `git` command: the hardened config recipe, plus no detached
-/// background maintenance.
 fn fixture_git_command(program: &Path, args: &[&str], cwd: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     apply_clean_git_config(&mut command)
-        .args(NO_AUTO_MAINTENANCE)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null());

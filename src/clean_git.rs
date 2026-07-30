@@ -386,11 +386,20 @@ mod tests {
             vec![
                 ("GIT_CONFIG_NOSYSTEM", "1"),
                 ("GIT_CONFIG_GLOBAL", "/dev/null"),
-                ("GIT_CONFIG_COUNT", "0"),
-                // Not covered by `GIT_CONFIG_COUNT=0`: git parses this on an
-                // independent path, so `-c`-style injection needs its own denial.
+                // Not `0`, unlike the denial-only recipe: the clean recipe
+                // *uses* the numbered channel to impose the settings below, and
+                // the count is what keeps an inherited pair out of range.
+                ("GIT_CONFIG_COUNT", "2"),
+                // Not covered by the count: git parses this on an independent
+                // path, so `-c`-style injection needs its own denial.
                 ("GIT_CONFIG_PARAMETERS", ""),
                 ("HOME", "/dev/null"),
+                // No detached `git maintenance run --auto` rewriting a store
+                // writd is concurrently reasoning about.
+                ("GIT_CONFIG_KEY_0", "maintenance.auto"),
+                ("GIT_CONFIG_VALUE_0", "false"),
+                ("GIT_CONFIG_KEY_1", "gc.auto"),
+                ("GIT_CONFIG_VALUE_1", "0"),
             ]
         );
     }
@@ -485,9 +494,13 @@ mod tests {
         let hardened: BTreeMap<&str, &str> = [
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
-            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_COUNT", "2"),
             ("GIT_CONFIG_PARAMETERS", ""),
             ("HOME", "/dev/null"),
+            ("GIT_CONFIG_KEY_0", "maintenance.auto"),
+            ("GIT_CONFIG_VALUE_0", "false"),
+            ("GIT_CONFIG_KEY_1", "gc.auto"),
+            ("GIT_CONFIG_VALUE_1", "0"),
         ]
         .into_iter()
         .collect();
