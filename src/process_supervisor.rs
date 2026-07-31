@@ -1985,6 +1985,56 @@ mod blocking_tests {
         }
     }
 
+    /// The repeated sweep reports the **first** kill's verdict, not the last.
+    ///
+    /// The later kills are aimed at a group that should already be empty, so
+    /// they tolerate emptiness unconditionally. If the sweep returned one of
+    /// those instead, a caller that asked for strictness would be told "fine" by
+    /// an attempt that was never strict — and a genuine `EPERM` on a group writ
+    /// could not signal would become invisible. Same construction as
+    /// `an_empty_process_group_is_tolerated_only_when_the_caller_says_so`, whose
+    /// platform note applies here too: what is pinned is not *which* answer an
+    /// empty group gives, but that only the first attempt's tolerance decides.
+    #[test]
+    fn the_repeated_sweep_reports_the_first_kills_verdict() {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let pgid = pid as libc::pid_t;
+
+        loop {
+            if pid_has_exited_without_reaping(pgid).expect("waitid") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let strict = writ_core::process_group::sweep_process_group(pgid, false);
+        let tolerant = writ_core::process_group::sweep_process_group(pgid, true);
+        child.wait().expect("reap");
+
+        assert!(
+            tolerant.is_ok(),
+            "an empty group must be success when tolerated, got {tolerant:?}"
+        );
+        // Whatever the platform says about an empty group, the strict sweep must
+        // say the same as a strict single kill would — the retries must not
+        // launder it into success.
+        if let Err(error) = strict {
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EPERM),
+                "the only error an empty group may produce here is EPERM; anything \
+                 else means this test is measuring something other than emptiness"
+            );
+        }
+    }
+
     /// `getpgid` answering `ESRCH` does **not** mean the child never ran.
     ///
     /// This is the load-bearing platform fact behind

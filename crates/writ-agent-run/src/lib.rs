@@ -989,25 +989,39 @@ mod process_runner {
             .and_then(|timeout| started.checked_add(timeout.get()));
         let ended = child.wait_to_deadline(deadline)?;
 
-        // The agent is gone, but the *run* may not be: anything it forked
-        // inherited the stream pipes, so the capture threads see no EOF while a
-        // descendant holds one. Bound that with the same deadline, and sweep
-        // the group if it passes.
+        // The agent is gone, so the run is over — and a run that is over tears
+        // down what it started. Sweep the group unconditionally, whether the
+        // agent exited by itself or writ ended it, and whether or not this run
+        // was ever given a deadline.
         //
-        // This has to happen before the leader is reaped — `child` is still
-        // holding it — because the group kill's safety rests on the leader's pid
-        // still being claimed. See `writ_core::process_group`.
-        child.kill_group_if_streams_outlive_deadline(deadline, || {
-            prompt_thread.is_finished()
-                && stdout_thread.is_finished()
-                && stderr_thread.is_finished()
-        });
+        // Two things follow from doing it here rather than on the timeout path
+        // alone. Containment stops being a property only bounded runs have: an
+        // operator who configures no timeout still gets a run that leaves
+        // nothing behind. And the run stops being able to hang on its own
+        // leftovers — anything the agent forked inherited the stream pipes, so
+        // the capture threads below see no EOF while a descendant holds one,
+        // which held a finished run open for a descendant's entire lifetime.
+        child.kill_group();
+
+        // The sweep above is the last thing that needs the group addressable, so
+        // the leader is released here — `child` had been holding it unreaped
+        // precisely to keep the pgid ours. See `writ_core::process_group`.
+        //
+        // **Anything added between the sweep and this line must not need the
+        // group**, and anything that does need it belongs above the reap. That
+        // is the whole constraint: releasing the pid releases the pgid, because
+        // they are the same number.
+        //
+        // Reaping before the drains rather than after them matters when a drain
+        // does not finish — a descendant outside the group can hold a stream
+        // open indefinitely — because the leader would otherwise sit as a zombie
+        // for exactly as long as the stall. Nothing here fixes the stall itself;
+        // it just does not add a second leak to it.
+        let ended = child.reap(ended)?;
 
         join_prompt_thread(prompt_thread)??;
         let stdout = join_capture_thread("stdout", stdout_thread)??;
         let stderr = join_capture_thread("stderr", stderr_thread)??;
-        // Reaped last, once nothing else needs the group to stay addressable.
-        let ended = child.reap(ended)?;
         let (status, exit_code) = match ended {
             AgentRunEnd::Exited(status) => (
                 if status.success() {
@@ -1058,15 +1072,15 @@ mod process_runner {
     /// something that owns the child can enforce that against paths nobody
     /// wrote by hand — including a panic in between.
     ///
-    /// **Its reach is that one process.** `kill(2)` signals a pid, so an agent
-    /// that had already forked — or a `spawn_command` that is a wrapper script
-    /// around the real binary — leaves descendants this does not touch. That
-    /// gap is not specific to the failure path: descendants outlive a
-    /// *successful* run too, since a normal wait sweeps nothing either.
-    /// Closing it means running each agent in its own process group and
-    /// signalling the group, which is a decision about what a finished run
-    /// guarantees rather than a detail of this guard — see the agent-run
-    /// lifecycle work.
+    /// **Its reach on the failure path is that one process.** `kill(2)` signals
+    /// a pid, so an agent that had already forked — or a `spawn_command` that is
+    /// a wrapper script around the real binary — leaves descendants the `Drop`
+    /// below does not touch. The ordinary paths do not have that gap: they call
+    /// [`Self::kill_group`], which signals the whole group. The `Drop` keeps the
+    /// narrower reach deliberately, because it runs while something is already
+    /// failing and a group sweep there would sleep — see
+    /// `writ_core::process_group::sweep_process_group` — on a path whose job is
+    /// to give the pid back and get out.
     struct ChildGuard(Option<Child>);
 
     impl ChildGuard {
@@ -1079,36 +1093,24 @@ mod process_runner {
         /// Wait for the agent, killing its process group if it is still alive
         /// when `deadline` passes.
         ///
-        /// With no deadline this is one blocking `wait(2)` — no polling, no
+        /// Either way the agent ends up **observed** rather than reaped. Every
+        /// run now sweeps its group once the agent is gone, and a group kill is
+        /// only safe while the leader's pid is still claimed — see
+        /// `writ_core::process_group`. [`Self::reap`] is what finally releases
+        /// it, after the last thing that needed the group to be addressable.
+        ///
+        /// With no deadline this is still one blocking call — no polling, no
         /// timer. "Unbounded" is the absence of a deadline rather than a
-        /// deadline set to infinity, so the default path is exactly the code it
-        /// has always run. It also reaps as it waits, which is safe precisely
-        /// because no group kill can follow: an unbounded run never signals the
-        /// group, so nothing later needs the pgid to still be ours.
-        ///
-        /// The take-before-wait is deliberate on that path. A `wait` that fails
-        /// means `ECHILD` — the child was reaped by someone else — and a reaped
-        /// pid is free for the OS to reassign, so a `Drop` that then killed it
-        /// would be signalling a stranger. Disarming first means there is no
-        /// armed-on-error path to get wrong.
-        ///
-        /// With one, the agent is **observed** rather than reaped: the caller
-        /// still has the streams to drain, and draining them may need another
-        /// group kill, which is only safe while the leader's pid is still
-        /// claimed. See `writ_core::process_group`. [`Self::reap`] closes it.
+        /// deadline set to infinity. What changed is only *which* blocking call:
+        /// `waitid(WEXITED | WNOWAIT)` rather than `wait(2)`, because the latter
+        /// reaps and a reaped pid can be recycled onto a group writ does not
+        /// own.
         fn wait_to_deadline(
             &mut self,
             deadline: Option<std::time::Instant>,
         ) -> Result<AgentExit, AgentProcessRunError> {
             let Some(deadline) = deadline else {
-                let mut child = self
-                    .0
-                    .take()
-                    .expect("the guard is disarmed only by a wait or a reap");
-                return child
-                    .wait()
-                    .map(AgentExit::Reaped)
-                    .map_err(AgentProcessRunError::Wait);
+                return self.wait_without_reaping();
             };
             loop {
                 if self.has_exited()? {
@@ -1127,36 +1129,42 @@ mod process_runner {
             }
         }
 
-        /// Sweep the agent's process group if its streams are still open when
-        /// `deadline` passes.
+        /// Block until the agent exits, leaving it unreaped.
         ///
-        /// The second thing a bounded run waits on. The agent has ended, but a
-        /// descendant that inherited its stdout or stderr keeps the capture
-        /// threads from ever seeing EOF, so without this a deadline bounds the
-        /// agent and not the run — measured at a 500ms deadline held open for a
-        /// descendant's full lifetime. Killing the group closes those pipes.
-        ///
-        /// Does nothing when there is no deadline: the unbounded path blocks in
-        /// `join` exactly as it always has.
-        fn kill_group_if_streams_outlive_deadline(
-            &mut self,
-            deadline: Option<std::time::Instant>,
-            streams_finished: impl Fn() -> bool,
-        ) {
-            let Some(deadline) = deadline else {
-                return;
-            };
-            loop {
-                if streams_finished() {
-                    return;
+        /// **Disarms the guard on `ECHILD`**, for the reason [`Self::has_exited`]
+        /// gives: that error is the one that means the pid is *gone*, so a
+        /// `Drop` that went on to kill it would be signalling a stranger.
+        #[cfg(unix)]
+        fn wait_without_reaping(&mut self) -> Result<AgentExit, AgentProcessRunError> {
+            let pid = agent_pid(self.as_mut())?;
+            match writ_core::process_group::wait_for_pid_without_reaping(pid) {
+                Ok(()) => Ok(AgentExit::Observed {
+                    killed_by_writ: false,
+                }),
+                Err(source) => {
+                    let err = AgentProcessRunError::Wait(source);
+                    if is_no_such_child(&err) {
+                        self.0 = None;
+                    }
+                    Err(err)
                 }
-                let now = std::time::Instant::now();
-                let Some(remaining) = deadline.checked_duration_since(now) else {
-                    self.kill_group();
-                    return;
-                };
-                thread::sleep(sleep_before_next_poll(remaining, EXIT_POLL_INTERVAL));
             }
+        }
+
+        /// Off Unix there is no way to wait without consuming the status — and
+        /// no process group to keep addressable either, since the sweep there
+        /// reaches the one process through the `Child` itself. Reaping here is
+        /// both unavoidable and harmless.
+        #[cfg(not(unix))]
+        fn wait_without_reaping(&mut self) -> Result<AgentExit, AgentProcessRunError> {
+            let mut child = self
+                .0
+                .take()
+                .expect("the guard is disarmed only by a wait or a reap");
+            child
+                .wait()
+                .map(AgentExit::Reaped)
+                .map_err(AgentProcessRunError::Wait)
         }
 
         /// Reap the agent and say how the run ended.
@@ -1173,6 +1181,7 @@ mod process_runner {
         ///   failure it is rather than attributed to a deadline writ enforced.
         fn reap(mut self, exit: AgentExit) -> Result<AgentRunEnd, AgentProcessRunError> {
             let (status, killed_by_writ) = match exit {
+                #[cfg(not(unix))]
                 AgentExit::Reaped(status) => (status, false),
                 AgentExit::Observed { killed_by_writ } => {
                     let mut child = self
@@ -1236,13 +1245,20 @@ mod process_runner {
 
     /// How the agent's lifetime ended, before its status has been collected.
     ///
-    /// Two shapes because the two paths differ in whether the pid has been
-    /// released: the unbounded path reaps as it waits and has nothing left to
-    /// address, while a deadline-bounded run must keep the leader unreaped
-    /// until it is finished killing the group.
+    /// On Unix there is only `Observed`: every run sweeps its process group once
+    /// the agent is gone, and that is safe only while the leader is still
+    /// unreaped, so no path here may reap early. `killed_by_writ` is what later
+    /// separates a deadline from an agent's own ending.
+    #[derive(Debug)]
     enum AgentExit {
+        /// Reaped by the wait itself, because the platform offers no way to
+        /// observe an exit without consuming it. Off Unix that costs nothing:
+        /// there are no process groups to keep addressable.
+        #[cfg(not(unix))]
         Reaped(std::process::ExitStatus),
-        Observed { killed_by_writ: bool },
+        Observed {
+            killed_by_writ: bool,
+        },
     }
 
     /// Is this the error that means the pid no longer exists to be waited on?
@@ -1278,14 +1294,26 @@ mod process_runner {
     /// with it the process group id — stays claimed.
     #[cfg(unix)]
     fn has_exited_without_reaping(child: &mut Child) -> Result<bool, AgentProcessRunError> {
-        let Some(pid) = writ_core::process_group::process_group_id(child.id()) else {
-            return Err(AgentProcessRunError::Wait(std::io::Error::other(format!(
-                "agent process id {} cannot be represented as a pid",
-                child.id()
-            ))));
-        };
+        let pid = agent_pid(child)?;
         writ_core::process_group::pid_has_exited_without_reaping(pid)
             .map_err(AgentProcessRunError::Wait)
+    }
+
+    /// The agent's pid in the signed form the wait and signal calls take.
+    ///
+    /// Fails rather than casting. A pid too large for `pid_t` would wrap to a
+    /// negative number, and a negative pid is a different request entirely —
+    /// `kill(2)` reads it as a process group. Unreachable for a child of this
+    /// process on any real platform, which is why it is an error rather than a
+    /// case with behaviour.
+    #[cfg(unix)]
+    fn agent_pid(child: &Child) -> Result<libc::pid_t, AgentProcessRunError> {
+        writ_core::process_group::process_group_id(child.id()).ok_or_else(|| {
+            AgentProcessRunError::Wait(std::io::Error::other(format!(
+                "agent process id {} cannot be represented as a pid",
+                child.id()
+            )))
+        })
     }
 
     /// Off Unix there is no way to observe an exit without consuming it, and no
@@ -1376,13 +1404,16 @@ mod process_runner {
     /// deadline that only reaches agents which never fork would be a bound in
     /// name only.
     ///
-    /// The group is set on **every** run, not only deadline-bounded ones, so
-    /// there is one spawn path rather than two. What is deliberately *not*
-    /// changed here is the normal completion path: a run that ends by itself
-    /// still sweeps nothing, exactly as before. Whether it should is a separate
-    /// question about what a finished run guarantees — see the agent-run
-    /// lifecycle work — and answering it by accident, as a side effect of
-    /// adding timeouts, would be the wrong way to decide it.
+    /// The group is set on **every** run, and **every** run sweeps it once the
+    /// agent is gone — deadline or no deadline. A finished run tears down what
+    /// it started, which is the only version of "finished" that is worth
+    /// stating: an operator who configures no timeout would otherwise get
+    /// containment as an accident of having set one.
+    ///
+    /// What the sweep reaches is the group, so it reaches everything the agent
+    /// started that did not deliberately leave — see
+    /// [`kill_agent_process_group`] for the fork race it also has to survive,
+    /// and `docs/design/architecture.md` §5.2 for the boundary.
     ///
     /// A side effect worth naming: a new group is not in the daemon's, so a
     /// terminal signal sent to writd's group no longer reaches agents. For a
@@ -1413,12 +1444,18 @@ mod process_runner {
     /// hand: the agent may have exited between the last poll and this kill,
     /// which empties the group, and that is an ordinary ending rather than a
     /// failure to report.
+    ///
+    /// Uses the *repeated* sweep rather than one kill. Every caller here signals
+    /// the group immediately after the agent's exit, which is precisely when a
+    /// descendant is most likely to be mid-`fork` and so to be missed — measured
+    /// at 32 escapes in 80 runs with a single kill. See
+    /// [`writ_core::process_group::sweep_process_group`].
     #[cfg(unix)]
     fn kill_agent_process_group(pid: u32) -> bool {
         let Some(pgid) = writ_core::process_group::process_group_id(pid) else {
             return false;
         };
-        writ_core::process_group::kill_process_group(pgid, true).is_ok()
+        writ_core::process_group::sweep_process_group(pgid, true).is_ok()
     }
 
     #[cfg(not(unix))]
@@ -1923,28 +1960,88 @@ mod process_runner {
             );
         }
 
-        /// Waiting through the guard disarms it, so the drop does not then try
-        /// to kill and reap a pid the OS is free to have reassigned. The
-        /// disarm happens before the wait, so it holds on the `ECHILD` path
-        /// too — which is the one that matters, since there the pid is
-        /// *already* free.
+        /// An unbounded wait observes the agent without reaping it, leaving the
+        /// pid — and so the process group id, which equals it — still ours.
+        ///
+        /// This is what makes the sweep that follows safe. Production kills the
+        /// group between the wait and the reap, and a wait that reaped would
+        /// free the pid for the OS to hand to somebody else, so the kill could
+        /// land on a group writ never created. The unbounded path used to reap
+        /// here, which was fine only while it never swept.
+        ///
+        /// Driven through `wait_to_deadline(None)` — the path production takes
+        /// — rather than a method only this test calls.
         #[test]
-        fn waiting_through_the_guard_disarms_it() {
+        fn an_unbounded_wait_leaves_the_agent_unreaped() {
             let child = Command::new("true")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("true(1) is available");
-            // Through the unbounded path production actually takes, rather than
-            // a method only this test calls.
-            let exit = ChildGuard(Some(child))
+            let mut guard = ChildGuard(Some(child));
+
+            let exit = guard.wait_to_deadline(None).expect("wait must succeed");
+
+            assert!(
+                matches!(
+                    exit,
+                    super::AgentExit::Observed {
+                        killed_by_writ: false
+                    }
+                ),
+                "an unbounded wait must observe rather than reap, and must not \
+                 claim writ ended a run that ended itself"
+            );
+            // Still there to be reaped, which is the property the sweep needs.
+            let ended = guard
+                .reap(exit)
+                .expect("an observed agent is still there to be reaped");
+            match ended {
+                super::AgentRunEnd::Exited(status) => assert!(status.success()),
+                super::AgentRunEnd::KilledAtDeadline => {
+                    panic!("nothing killed this agent; it exited on its own")
+                }
+            }
+        }
+
+        /// The blocking wait disarms the guard when it finds the pid already
+        /// gone, so the `Drop` cannot signal whoever holds that number next.
+        ///
+        /// The same `ECHILD` hazard `a_probe_that_finds_the_pid_gone_disarms_the_guard`
+        /// covers for the polling path. It needs its own test because it is a
+        /// second call site with its own disarm: the unbounded path no longer
+        /// takes the child before waiting — it cannot, since the sweep needs it
+        /// — so the protection that used to be structural is now explicit, and
+        /// explicit code is what regresses silently.
+        #[test]
+        fn an_unbounded_wait_that_finds_the_pid_gone_disarms_the_guard() {
+            let mut child = Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("true(1) is available");
+            let pid = child.id();
+            // Reaped out from under the guard, which is the state an ignored
+            // `SIGCHLD` or an outer reaper produces.
+            child.wait().expect("the direct wait reaps it");
+            let mut guard = ChildGuard(Some(child));
+
+            let err = guard
                 .wait_to_deadline(None)
-                .expect("wait must succeed");
-            let super::AgentExit::Reaped(status) = exit else {
-                panic!("an unbounded wait reaps as it waits");
-            };
-            assert!(status.success());
+                .expect_err("waiting on a reaped pid must fail");
+
+            assert!(
+                super::is_no_such_child(&err),
+                "expected ECHILD, got {err}: this test no longer provokes the \
+                 case it exists for"
+            );
+            assert!(
+                guard.0.is_none(),
+                "pid {pid} was released, so the guard must be disarmed rather \
+                 than left to kill whatever holds that number next"
+            );
         }
     }
 }
@@ -2746,6 +2843,69 @@ mod tests {
             outcome.status,
             AgentRunTerminalStatus::Succeeded | AgentRunTerminalStatus::TimedOut
         ));
+    }
+
+    /// A run that ends by itself tears down what it started — with no deadline
+    /// configured at all.
+    ///
+    /// This is the default path, and until now it swept nothing: an agent that
+    /// exited in milliseconds left the run blocked in the capture-thread join
+    /// for as long as a descendant held the stream pipes, and that descendant
+    /// then outlived the run entirely. A finished run is supposed to be
+    /// finished.
+    ///
+    /// The fake's descendant would hold the pipes for a minute and the plan
+    /// carries no timeout, so a run that returns in a fraction of that has had
+    /// its group swept — there is nothing else in the code that could end the
+    /// wait. The return itself is the proof that the pipes closed: this fake
+    /// never closes a descriptor, so the only way EOF arrives is the death of
+    /// what was holding it.
+    ///
+    /// **Repeated, because the thing being tested is a race.** A sweep sent the
+    /// instant the agent exits can miss a descendant that is mid-`fork`, and one
+    /// trial would then pass against a sweep that is wrong three times in five:
+    /// measured at 32 escapes in 80 single-kill trials. Over this many trials a
+    /// sweep with that hole survives about twice in a thousand runs, so a green
+    /// test means the retry is doing its job rather than that the dice were
+    /// kind. See `writ_core::process_group::sweep_process_group`.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_run_that_ends_by_itself_sweeps_its_process_group() {
+        const TRIALS: u32 = 12;
+        let dir = tempfile::tempdir().unwrap();
+        let descendant_lifetime = Duration::from_secs(60);
+        let fake = write_quick_exit_forking_fake_agent(dir.path(), descendant_lifetime);
+
+        for trial in 0..TRIALS {
+            let run_id: AgentRunId = format!("00000000-0000-0000-0000-0000003090{trial:02}")
+                .parse()
+                .unwrap();
+            let plan = AgentProcessPlan::new(run_id, fake.clone(), [] as [OsString; 0]).unwrap();
+            assert!(
+                plan.timeout().is_none(),
+                "this test is about the unbounded path; a timeout would prove the wrong thing"
+            );
+
+            let started = std::time::Instant::now();
+            let outcome = run_within(
+                plan,
+                AgentPrompt::new("exit at once, leave something behind"),
+                dir.path().join("logs"),
+                descendant_lifetime / 2,
+            );
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < descendant_lifetime / 2,
+                "trial {trial} took {elapsed:?}: its descendant outlived the run"
+            );
+            // The sweep never changes what writ reports. It happens after the
+            // agent has exited, so the agent's own verdict is still the run's
+            // verdict — writ tidying up behind a successful run must not make it
+            // look killed.
+            assert_eq!(outcome.status, AgentRunTerminalStatus::Succeeded);
+            assert_eq!(outcome.exit_code, 0);
+        }
     }
 
     /// A deadline that is not reached changes nothing: the agent's own verdict

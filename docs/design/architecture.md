@@ -367,16 +367,22 @@ host run waits on three things, and all three are under it:
 * **The stream drains.** The half a wait-shaped deadline cannot reach: when the
   agent exits promptly but leaves a descendant holding the pipes, the wait is
   *over*, so there is nothing left for it to fire on, and yet the run is not
-  assembled until EOF. Bounded by the same deadline, which sweeps the group.
+  assembled until EOF. Reached by the sweep below, which runs before them.
 
 Ordering is load-bearing: **observe, then kill, then reap**, the discipline
 `writ_core::process_group` documents. A group kill is only safe while the leader
 is unreaped, because the pgid *is* the leader's pid and a reaped pid can be
-recycled onto a group writ does not own. So a deadline-bounded run observes the
-agent's exit with `waitid(WNOWAIT)`, keeps the zombie until the drains are done
-(which may need a second group kill), and reaps last. That primitive lives in
-`writ-core` rather than beside either caller because there are now two of them in
-different crates, and its errno argument took three review rounds to state.
+recycled onto a group writ does not own. So **every** run observes the agent's
+exit with `waitid(WNOWAIT)` — blocking on the unbounded path, polled on the
+bounded one — then sweeps the group, then reaps, and only then drains the
+streams. The three steps are adjacent on purpose: the reap releases the pid and
+with it the pgid, so it must follow the last thing that needs the group and
+precede anything that can block for a long time. Draining is the latter — a
+stream held open by a descendant outside the group has no bound — and leaving the
+reap until after it would park a zombie for the length of the stall. That
+primitive lives in `writ-core` rather than beside either caller because there are
+now two of them in different crates, and its errno argument took three review
+rounds to state.
 
 Which ending gets recorded turns on **who ended the process**: an exit code means
 the agent decided, even a moment past its deadline; `SIGKILL` *that writ sent* is
@@ -384,20 +390,47 @@ the timeout; any other signal is somebody else's doing and is recorded as the
 failure it is. So a run whose agent finished and whose leftovers writ swept is
 recorded as the agent's own outcome — writ stopped a descendant, not the run.
 
-The group is set on every run, but only the deadline path signals it. **An
-unbounded run still sweeps nothing** — whether it should is the separate open
-question about what a finished run guarantees, and answering it as a side effect
-of adding timeouts would be the wrong way to decide it.
+**Every run sweeps its group, deadline or no deadline.** The sweep happens once
+the agent is gone, on the way to assembling the outcome, so a run that ends by
+itself leaves no more behind than one writ stopped. Containment is not something
+an operator should get only as a side effect of having configured a timeout, and
+the unbounded path is the default. It also stops a finished run hanging on its
+own leftovers: a descendant holding the pipes used to keep a run that had
+completed in milliseconds open for that descendant's entire lifetime.
 
-**State the guarantee precisely: the deadline bounds a run whose descendants stay
-in the agent's process group.** A descendant that calls `setsid`/`setpgid` while
-holding stdout or stderr is outside the group the kill reaches, so the drains
-never see EOF and the run hangs — the deadline's own failure mode, one syscall
-away. Closing it means capture threads that stop draining at the deadline, which
-introduces a third way a captured stream can be incomplete ("writ stopped
-reading") alongside the two that already have deliberately chosen meanings; that
-is a decision about what a note lets a verifier conclude, tracked separately
-rather than settled here.
+**One `killpg` is not atomic against `fork`.** The kernel walks the group's
+members, and a member that forks after the walk has passed it hands its child the
+pgid without the signal ever reaching that child. The child is then alive, in a
+group writ believes it emptied, holding the stream pipes. This is not a corner
+case at the moment writ signals: sweeping the instant the leader exits is exactly
+when its subshell is likely to be mid-fork, and **one kill left a live descendant
+in 32 of 80 measured trials**. So the sweep is repeated over a short window (0,
+2ms, 10ms), which left 0 of 80. `SIGSTOP` first is not the fix and was measured
+too: signal delivery is asynchronous, so a process with a stop pending still
+completes the fork it had started.
+
+Repetition narrows the race; it cannot close it, because nothing here freezes the
+group. That is a bound on how *likely* an escape is, not a guarantee there is
+none — the guarantee has to come from bounding the drain.
+
+**State the guarantee precisely: a run tears down descendants that stay in the
+agent's process group.** Two things leave that set. A descendant may call
+`setsid`/`setpgid` and step out deliberately — one syscall, and anything that
+daemonises does it. Or it may be forked in the window above and never signalled.
+Either way it holds stdout or stderr, the drains never see EOF, and the run
+hangs. Closing that means capture threads that stop draining, which introduces a
+third way a captured stream can be incomplete ("writ stopped reading") alongside
+the two that already have deliberately chosen meanings; that is a decision about
+what a note lets a verifier conclude, tracked separately rather than settled
+here.
+
+The same fork race applies to `process_supervisor`'s group kill, which is
+single-shot. Its consequence there is already bounded — that supervisor stops
+waiting on an escaped descendant rather than hanging — so it is tracked rather
+than changed here; and its kill runs in a `Drop` that may execute inside an async
+executor, where the sweep's sleeps would block a runtime thread. That is why
+`kill_process_group` stays single-shot and `sweep_process_group` is a separate,
+blocking-only call.
 
 `GuestReportedRunStatus` is the guest-facing half of the status enum, and it has
 no `TimedOut`. A guest asserting that the broker stopped its run would give one
