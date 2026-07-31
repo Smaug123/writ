@@ -653,11 +653,12 @@ impl<'de> Deserialize<'de> for AgentRunTimeout {
     }
 }
 
-impl Serialize for AgentRunTimeout {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(self.0.as_secs())
-    }
-}
+// Deliberately **not** `Serialize`. The config key is whole seconds, but the
+// type admits any positive `Duration` — the tests use milliseconds — so a
+// seconds-shaped serialiser is lossy in a way that bites: 500ms would write as
+// `0`, which this type's own `Deserialize` then refuses. There is no caller that
+// needs to write one of these (the config is read-only), so the fix is to not
+// have a second representation at all rather than to pick which way it lies.
 
 #[cfg(any(feature = "host", feature = "vm-client"))]
 mod process_runner {
@@ -923,6 +924,15 @@ mod process_runner {
             put_in_own_process_group(&mut command);
             process_spawn::spawn(&mut command).map_err(AgentProcessRunError::Spawn)?
         };
+        // Taken here, not further down, because *here* is when the agent starts
+        // consuming the operator's budget. Every line below this — three thread
+        // spawns, two file creations — can be delayed arbitrarily by scheduler
+        // contention while the child is already running, and a deadline
+        // measured from after them would give a one-second timeout more than a
+        // second of agent. Taken after the spawn rather than before it so that
+        // `process_spawn`'s retries on a refused spawn do not eat the budget
+        // either.
+        let started = std::time::Instant::now();
 
         // From here on every failure must leave no agent behind: see
         // `ChildGuard`.
@@ -964,11 +974,11 @@ mod process_runner {
         // that now comes first returns immediately.
         let prompt_thread = spawn_prompt_thread(stdin, prompt.clone())?;
 
-        // One deadline for the whole call, taken once the child exists so a
-        // retried spawn does not eat the operator's budget. "The run may take
-        // at most this long" is a promise about the call, not about one of the
-        // things the call waits on — and this call waits on two: the agent, and
-        // then the threads draining its streams.
+        // One deadline for the whole call, measured from when the agent started
+        // rather than from here. "The run may take at most this long" is a
+        // promise about the call, not about one of the things the call waits on
+        // — and this call waits on two: the agent, and then the threads
+        // draining its streams.
         //
         // `checked_add` cannot fail for an `AgentRunTimeout`, which is capped at
         // `MAX_AGENT_RUN_TIMEOUT_SECS` precisely so this arithmetic is total; a
@@ -976,7 +986,7 @@ mod process_runner {
         // can hold, and treating it as "no deadline" is the safe reading.
         let deadline = plan
             .timeout
-            .and_then(|timeout| std::time::Instant::now().checked_add(timeout.get()));
+            .and_then(|timeout| started.checked_add(timeout.get()));
         let ended = child.wait_to_deadline(deadline)?;
 
         // The agent is gone, but the *run* may not be: anything it forked
