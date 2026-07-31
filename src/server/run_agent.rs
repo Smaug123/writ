@@ -361,7 +361,15 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         // The capture cap matches the envelope cap so the file on disk is
         // exactly what the envelope carries — see
         // `crate::agent_run_envelope`'s note on the two stacking caps.
-        Ok(plan) => plan.with_max_stream_capture_bytes(MAX_RUN_AGENT_STREAM_BYTES as u64),
+        Ok(plan) => {
+            let plan = plan.with_max_stream_capture_bytes(MAX_RUN_AGENT_STREAM_BYTES as u64);
+            // Absent by default, and absent means the run is genuinely
+            // unbounded — see `RunAgentDaemonConfig::spawn_timeout_secs`.
+            match spawn_config.timeout {
+                Some(timeout) => plan.with_timeout(timeout),
+                None => plan,
+            }
+        }
         // No audit row to abandon: nothing has been recorded yet, which is the
         // other half of why this belongs before the queue.
         Err(err) => {

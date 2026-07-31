@@ -87,6 +87,10 @@ pub struct RunAgentSpawnConfig {
     /// value a caller's session kind must agree with.
     pub agent_kind: crate::core::AgentKind,
     pub log_root: crate::config::AgentRunLogRoot,
+    /// How long a host-spawned run may take before writd stops it, or `None`
+    /// for the default of no bound at all. Parsed from
+    /// `run_agent.spawn_timeout_secs`.
+    pub timeout: Option<crate::agent_run::AgentRunTimeout>,
 }
 
 /// Shared state for the broker. Wrapped in `Arc` so connections spawned

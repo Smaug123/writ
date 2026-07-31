@@ -333,6 +333,48 @@ decoded prompt.
 A restart does not carry slots over, because it does not carry sessions over:
 boot reconciliation tears down every persisted agent VM before writd serves.
 
+**Agent-run deadlines.** A host-spawned run may be bounded by
+`run_agent.spawn_timeout_secs`. It is **absent by default and absent means
+unbounded** — writ has no basis for guessing an agent's longest legitimate run,
+and a wrong guess kills real work — so the default path is the plain blocking
+`wait(2)` it has always been, not a deadline set to infinity. Zero is refused at
+parse time rather than read as either "unbounded" or "immediately", since those
+are opposites and absence already spells the first.
+
+A run stopped this way is recorded `AgentRunTerminalStatus::TimedOut`, which
+exists precisely so it is not recorded `Failed`: `Failed` means the agent ran to
+completion and chose a non-zero code, and this ending is writ's decision, not the
+agent's. The run is *paired* in the log — request and outcome both — because
+writ knows exactly how it ended; contrast the VM arm, whose `RUN_AGENT_VM_TIMEOUT`
+leaves the request unpaired because a guest that never uploaded an outcome leaves
+writ with nothing truthful to record. Whatever the agent emitted before the kill
+is still captured, minus anything left unflushed in the dead process's buffers.
+
+Enforcing it required two things that are easy to miss:
+
+* **The deadline covers the prompt write, not just the wait.** The prompt goes to
+  its own thread, so waiting for the agent is the only thing the run blocks on.
+  Written inline, a 1 MiB prompt to an agent that neither reads stdin nor exits
+  blocks in `write(2)` against a 64 KiB pipe buffer and the deadline is never
+  evaluated at all.
+* **The agent gets its own process group, and the deadline signals the group.**
+  Killing a pid reaches one process; any descendant it left behind inherits the
+  stdout/stderr pipes, so the capture threads never see EOF and the run cannot be
+  assembled until that descendant exits. Measured, not assumed: before the group
+  kill, a fake agent that backgrounds a `sleep` kept a 500ms-deadline run pending
+  past a 60-second backstop. Real coding agents spawn subprocesses constantly, so
+  without this the timeout would have been a bound in name only.
+
+The group is set on every run, but only the deadline path signals it. **A run
+that ends by itself still sweeps nothing** — whether it should is the separate
+open question about what a finished run guarantees, and answering it as a side
+effect of adding timeouts would be the wrong way to decide it.
+
+`GuestReportedRunStatus` is the guest-facing half of the status enum, and it has
+no `TimedOut`. A guest asserting that the broker stopped its run would give one
+audit value two meanings, so the wire type simply cannot express it and
+`"timed_out"` from a guest fails to deserialise.
+
 **Entry points.** Accept loop `serve_broker_with_agent_vm` (`server.rs:843`,
 task-per-connection) → `handle_connection` (`server.rs:662`) →
 `dispatch_message_with_agent_vm` (`server.rs:189`, the big `ClientMessage`

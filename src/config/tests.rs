@@ -1860,6 +1860,9 @@ fn parses_run_agent_section_with_defaults() {
     assert!(cfg.spawn_args.is_empty());
     assert!(cfg.notes_repo_path.is_none());
     assert!(cfg.signing_key_secret.is_none());
+    // The user's decision: a host-arm timeout exists, and defaults to none.
+    assert_eq!(cfg.spawn_timeout_secs, None);
+    assert_eq!(cfg.spawn_timeout().unwrap(), None);
     assert_eq!(cfg.notes_repo_path_or_default(), default_notes_repo_path());
     assert_eq!(
         cfg.signing_key_secret_or_default().as_str(),
@@ -1887,7 +1890,8 @@ fn parses_run_agent_section_with_all_fields() {
             "spawn_agent_kind": "codex",
             "spawn_args": ["--headless", "--no-color"],
             "notes_repo_path": "/var/lib/writ/notes",
-            "signing_key_secret": "custom-signing"
+            "signing_key_secret": "custom-signing",
+            "spawn_timeout_secs": 5400
         }
     }"#;
     let c: DaemonConfig = serde_json::from_str(json).unwrap();
@@ -1903,6 +1907,33 @@ fn parses_run_agent_section_with_all_fields() {
         cfg.signing_key_secret_or_default().as_str(),
         "custom-signing"
     );
+    assert_eq!(
+        cfg.spawn_timeout().unwrap(),
+        Some(crate::agent_run::AgentRunTimeout::from_secs(5400).unwrap())
+    );
+}
+
+/// A zero timeout is a configuration error, not a synonym for "no timeout".
+///
+/// The two readings of `0` — "unbounded" and "stop immediately" — are opposites,
+/// and an operator who types it means one of them. Refusing says which spelling
+/// gets the behaviour they want; accepting it would silently pick for them.
+#[test]
+fn a_zero_spawn_timeout_is_refused_rather_than_read_as_no_timeout() {
+    let json = r#"{
+        "spawn_command": "/usr/bin/claude",
+        "spawn_agent_kind": "claude",
+        "spawn_timeout_secs": 0
+    }"#;
+    let cfg: RunAgentDaemonConfig = serde_json::from_str(json).unwrap();
+
+    let err = cfg.spawn_timeout().unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("spawn_timeout_secs"), "{message}");
+    // The error has to say what to do instead, or an operator reading "must be
+    // greater than zero" will pick some arbitrary large number.
+    assert!(message.contains("omit the key"), "{message}");
 }
 
 /// `deny_unknown_fields` on `RunAgentDaemonConfig` keeps the
@@ -1967,6 +1998,7 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
         spawn_command: PathBuf::from("/bin/cat"),
         spawn_agent_kind: crate::core::AgentKind::Claude,
         spawn_args: vec![],
+        spawn_timeout_secs: None,
     };
     let store = InMem::default();
     let log_root = AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap();

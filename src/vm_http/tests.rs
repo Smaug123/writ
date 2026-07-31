@@ -1839,7 +1839,7 @@ mod brokered_route_audit_oracle {
                     &vm_agent_run_outcome_path(run_id),
                     serde_json::to_vec(&VmAgentRunOutcomeUpload {
                         run_id,
-                        status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+                        status: crate::agent_run::GuestReportedRunStatus::Succeeded,
                         exit_code: 0,
                         stdout: empty.clone(),
                         stderr: empty,

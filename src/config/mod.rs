@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use writ_core::byte_size::ByteSize;
 
+use crate::agent_run::AgentRunTimeout;
 use crate::agent_vm_daemon::{
     AgentVmDaemonRuntimeConfig, AgentVmDaemonRuntimeConfigError, AgentVmLifecycleRuntimeConfig,
     AgentVmLifecycleRuntimeConfigError,
@@ -302,6 +303,23 @@ pub struct RunAgentDaemonConfig {
     /// arrives on the child's stdin.
     #[serde(default)]
     pub spawn_args: Vec<String>,
+    /// How long writd will let one host-spawned agent run before killing it
+    /// and its process group, in seconds.
+    ///
+    /// **Absent means no timeout**, and that is the default: a host run waits
+    /// for its agent however long that takes, which is what writd has always
+    /// done. Setting it is a deliberate choice by the operator who knows what
+    /// their agent's longest legitimate run looks like — writ has no basis for
+    /// guessing that number, and a wrong guess kills real work.
+    ///
+    /// Zero is refused rather than treated as "no timeout": absence already
+    /// means that, and a second spelling of it would be one an operator could
+    /// reach by accident while meaning "immediately".
+    ///
+    /// Bounds only the host arm. The VM arm has its own, unrelated deadline on
+    /// waiting for a guest's outcome upload.
+    #[serde(default)]
+    pub spawn_timeout_secs: Option<u64>,
 }
 
 /// Default `SecretStore` key under which writd persists its SSH
@@ -320,6 +338,21 @@ impl RunAgentDaemonConfig {
     /// default ([`DEFAULT_WRIT_SIGNING_KEY_SECRET`]). The default name
     /// is a static string that satisfies [`SecretKey::new`]'s
     /// parse-don't-validate constraint, so the `expect` is correct.
+    /// Parse [`Self::spawn_timeout_secs`] into the deadline the runner takes.
+    ///
+    /// `Ok(None)` is the configured default and means "no deadline"; a zero is
+    /// refused rather than silently becoming one, so an operator who typed `0`
+    /// meaning "stop it at once" is told their config is wrong instead of
+    /// getting the opposite of what they asked for.
+    pub fn spawn_timeout(&self) -> Result<Option<AgentRunTimeout>, RunAgentBootError> {
+        self.spawn_timeout_secs
+            .map(|secs| {
+                AgentRunTimeout::from_secs(secs)
+                    .map_err(|source| RunAgentBootError::SpawnTimeout { secs, source })
+            })
+            .transpose()
+    }
+
     pub fn signing_key_secret_or_default(&self) -> SecretKey {
         self.signing_key_secret.clone().unwrap_or_else(|| {
             SecretKey::new(DEFAULT_WRIT_SIGNING_KEY_SECRET)
@@ -371,6 +404,7 @@ impl RunAgentDaemonConfig {
                 args: self.spawn_args.clone(),
                 agent_kind: self.spawn_agent_kind,
                 log_root: agent_run_log_root,
+                timeout: self.spawn_timeout()?,
             },
         })
     }
@@ -403,6 +437,12 @@ pub enum RunAgentBootError {
         key: String,
         #[source]
         source: SigningKeyStoreError,
+    },
+    #[error("run_agent.spawn_timeout_secs = {secs}: {source}; omit the key for no timeout")]
+    SpawnTimeout {
+        secs: u64,
+        #[source]
+        source: crate::agent_run::AgentRunTimeoutError,
     },
 }
 
