@@ -150,12 +150,50 @@ impl AgentVmDaemon {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
         let session_lock = self.session_lock_handle(session_id).await;
+
+        // Answers this request already has, given before it can be made to wait
+        // for one it does not. Both of these were previously discovered *after*
+        // the slot was acquired, so at capacity a request whose fate was already
+        // decided — a malformed workspace destination, or an agent run under a
+        // broker placement that cannot serve one — would queue behind other
+        // people's agents before being told what was wrong with it.
+        //
+        // Recomputed rather than threaded onward: the checks are cheap and pure,
+        // and a second call cannot disagree with the first.
+        if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
+            return Err(AgentVmDaemonError::StartFailed {
+                session_id,
+                source: Box::new(AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
+            });
+        }
+        workspace_bootstrap_audit_record(session_id, &workspace).map_err(|source| {
+            AgentVmDaemonError::StartFailed {
+                session_id,
+                source: Box::new(source),
+            }
+        })?;
+
         // Before the audit session is opened, and before any VM work: a queued
         // run has not started, and an open session with no VM behind it would
         // claim otherwise. `StartAgentRun` answers as soon as the VM is up, so
         // this slot cannot live in this function's scope — it is handed to the
         // running session below and released when that session is torn down.
-        let run_slot = state.agent_run_slots.acquire().await;
+        //
+        // Bounded, unlike the host arm's wait, because this reply has a client
+        // waiting on a socket with its own deadline. Past that the caller has
+        // gone, and a slot granted afterwards would boot a VM whose session id
+        // reaches nobody — a running agent with no one to stop it. Refusing is
+        // the better answer once the answer can no longer be delivered.
+        let Some(run_slot) = state
+            .agent_run_slots
+            .acquire_within(AGENT_RUN_QUEUE_WAIT)
+            .await
+        else {
+            return Err(AgentVmDaemonError::AgentRunsAtCapacity {
+                limit: state.agent_run_slots.limit().get(),
+                waited: AGENT_RUN_QUEUE_WAIT,
+            });
+        };
         let outcome = async {
             let _session_guard = session_lock.lock().await;
             state.audit.open_session(&SessionRecord {

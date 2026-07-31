@@ -1675,9 +1675,12 @@ fn every_path_that_starts_an_agent_run_takes_a_slot() {
     );
 
     let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
+    let session_start = body_of(daemon, "pub async fn start_agent_run_session<");
+    // Either form of the wait counts here; *which* one is asserted by
+    // `only_the_vm_path_bounds_how_long_it_will_queue`. This guard is about the
+    // slot being taken at all.
     assert!(
-        body_of(daemon, "pub async fn start_agent_run_session<")
-            .contains("agent_run_slots.acquire()"),
+        session_start.contains(".acquire_within(") || session_start.contains(".acquire()"),
         "every VM agent run starts here — `RunAgent`'s VM arm and `StartAgentRun` \
          both — so this is the one place that can bound them"
     );
@@ -1703,4 +1706,65 @@ fn a_limit_above_the_semaphores_ceiling_is_refused() {
     let at_ceiling =
         std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).expect("non-zero");
     assert!(AgentRunSlots::new(at_ceiling).is_ok());
+}
+
+/// A bounded wait gives up rather than hanging, and returns nothing when it does.
+///
+/// The distinction that matters: a caller that times out must not end up holding
+/// a slot it does not know about, because the work it would unblock is work
+/// nobody is waiting for.
+#[tokio::test(start_paused = true)]
+async fn a_bounded_wait_gives_up_when_no_slot_frees() {
+    let slots = AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+    let held = slots.acquire().await;
+    assert_eq!(slots.available(), 0);
+
+    let refused = slots
+        .acquire_within(std::time::Duration::from_secs(30))
+        .await;
+    assert!(
+        refused.is_none(),
+        "with the only slot held, a bounded wait must expire rather than hang"
+    );
+    assert_eq!(
+        slots.available(),
+        0,
+        "a wait that gave up must not have taken anything with it"
+    );
+
+    drop(held);
+    let granted = slots
+        .acquire_within(std::time::Duration::from_secs(30))
+        .await;
+    assert!(
+        granted.is_some(),
+        "once a slot frees, the same bounded wait must succeed — this is a queue \
+         with a deadline, not a refusal dressed up as one"
+    );
+}
+
+/// Only the VM path bounds its wait; the host arm still queues indefinitely.
+///
+/// The asymmetry is the point, so it is pinned rather than left to a reader
+/// comparing two files. A VM run's slot is released by a human stopping the
+/// session, and its caller is a CLI holding a socket open with its own deadline,
+/// so an unbounded wait there strands a VM nobody can name. A host run ends by
+/// itself, so its queue drains unattended and a caller that waits is waiting for
+/// something that will actually happen.
+#[test]
+fn only_the_vm_path_bounds_how_long_it_will_queue() {
+    let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
+    assert!(
+        daemon.contains("acquire_within(AGENT_RUN_QUEUE_WAIT)"),
+        "the VM session start must bound its wait: its caller's socket has a \
+         deadline, and a slot granted after that boots a VM whose id reaches \
+         nobody"
+    );
+
+    let dispatch = include_str!("run_agent.rs");
+    assert!(
+        dispatch.contains("agent_run_slots.acquire().await"),
+        "the host arm keeps the unbounded wait: its runs end without \
+         intervention, so its queue drains on its own"
+    );
 }

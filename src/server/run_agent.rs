@@ -16,6 +16,7 @@
 
 use super::*;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 /// Total wall-clock budget the VM dispatch arm gives a per-run VM
 /// agent to complete and POST its outcome to writd. Implementer runs
@@ -99,6 +100,17 @@ impl AgentRunSlots {
     /// holds it if all you can see is that `acquire` was called.
     pub fn available(&self) -> usize {
         self.slots.available_permits()
+    }
+
+    /// Wait up to `budget` for a slot, giving up rather than waiting forever.
+    ///
+    /// For callers whose reply travels back over a socket the client will stop
+    /// listening on. Waiting past that point is worse than refusing: the client
+    /// has already given up, so the work this slot unblocks produces something
+    /// nobody is waiting for — for a VM run, an agent left running that the
+    /// caller never learns the id of.
+    pub(crate) async fn acquire_within(&self, budget: Duration) -> Option<AgentRunSlot> {
+        tokio::time::timeout(budget, self.acquire()).await.ok()
     }
 
     /// Wait for a slot, then hold it until the returned guard is dropped.

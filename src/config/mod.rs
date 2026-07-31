@@ -162,14 +162,15 @@ pub struct DaemonConfig {
     /// One consequence is worth knowing before setting this low. A
     /// `StartAgentRun` session holds its place until someone stops it, so
     /// leaving `max_concurrent_agent_runs` sessions running and walking away
-    /// blocks every later run indefinitely — `writ agent list` shows what is
-    /// holding them, and `writ agent stop` returns one.
+    /// blocks every later run — `writ agent-vm list` shows what is holding them
+    /// and `writ agent-vm stop <session-id>` returns one.
     ///
-    /// The bound governs *new* starts, not state that already exists: a writd
-    /// restart reattaches every session that was running, even if there are more
-    /// of them than this allows, and drains back under the limit as they end.
-    /// Refusing to reattach would orphan a live VM, which is worse than being
-    /// briefly over-subscribed.
+    /// A writd restart does not carry these slots over, because it does not
+    /// carry the sessions over: boot reconciliation tears down every persisted
+    /// agent VM before the daemon serves, so a fresh writd starts with the full
+    /// limit available and no agents running. If session reattachment is ever
+    /// added, this is the paragraph to revisit — a reattached VM is a running
+    /// agent that holds no slot.
     ///
     /// Top-level for the same reason as [`Self::agent_run_log_root`]: neither
     /// section can own it. A daemon serving only VM runs has no `run_agent`
