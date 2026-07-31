@@ -196,6 +196,13 @@ pub enum VmClientError {
     },
     #[error("workspace checkout is dirty after bootstrap: {status}")]
     WorkspaceDirty { status: String },
+    /// Unreachable as things stand — the guest builds no plan with a deadline,
+    /// so its runs never end `TimedOut` — and kept as a refusal rather than a
+    /// coercion for exactly that reason. If the guest ever does gain its own
+    /// deadline, this fails loudly instead of quietly reporting the guest's
+    /// timeout as if the broker had enforced it.
+    #[error("cannot report this run to the broker: {0}")]
+    UnreportableStatus(#[from] writ_agent_run::GuestCannotReportStatus),
     #[error("{step} git command could not be spawned: {source}")]
     GitPushSpawn {
         step: VmGitPushStep,
@@ -524,7 +531,7 @@ pub async fn upload_agent_run_outcome(
 ) -> Result<(), VmClientError> {
     let upload = VmAgentRunOutcomeUpload {
         run_id: capture.run_id,
-        status: capture.status.clone(),
+        status: capture.status.clone().try_into()?,
         exit_code: capture.exit_code,
         stdout: agent_run_stream_upload(&capture.stdout)?,
         stderr: agent_run_stream_upload(&capture.stderr)?,

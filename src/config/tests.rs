@@ -1860,6 +1860,8 @@ fn parses_run_agent_section_with_defaults() {
     assert!(cfg.spawn_args.is_empty());
     assert!(cfg.notes_repo_path.is_none());
     assert!(cfg.signing_key_secret.is_none());
+    // The user's decision: a host-arm timeout exists, and defaults to none.
+    assert_eq!(cfg.spawn_timeout_secs, None);
     assert_eq!(cfg.notes_repo_path_or_default(), default_notes_repo_path());
     assert_eq!(
         cfg.signing_key_secret_or_default().as_str(),
@@ -1887,7 +1889,8 @@ fn parses_run_agent_section_with_all_fields() {
             "spawn_agent_kind": "codex",
             "spawn_args": ["--headless", "--no-color"],
             "notes_repo_path": "/var/lib/writ/notes",
-            "signing_key_secret": "custom-signing"
+            "signing_key_secret": "custom-signing",
+            "spawn_timeout_secs": 5400
         }
     }"#;
     let c: DaemonConfig = serde_json::from_str(json).unwrap();
@@ -1902,6 +1905,83 @@ fn parses_run_agent_section_with_all_fields() {
     assert_eq!(
         cfg.signing_key_secret_or_default().as_str(),
         "custom-signing"
+    );
+    assert_eq!(
+        cfg.spawn_timeout_secs,
+        Some(crate::agent_run::AgentRunTimeout::from_secs(5400).unwrap())
+    );
+}
+
+/// A zero timeout is a configuration error, not a synonym for "no timeout" —
+/// and it is refused *while parsing*, before writd does anything.
+///
+/// The two readings of `0` — "unbounded" and "stop immediately" — are opposites,
+/// and an operator who types it means one of them. Refusing says which spelling
+/// gets the behaviour they want; accepting it would silently pick for them.
+///
+/// Parse-time is the load-bearing part. Boot creates a notes repo, generates a
+/// signing key, and migrates the audit log; a config refused after any of that
+/// has already made changes the previous binary cannot open, so "writd exits
+/// with a clear error" would still have cost the operator their rollback.
+#[test]
+fn a_zero_spawn_timeout_is_refused_at_parse_time() {
+    let json = r#"{
+        "spawn_command": "/usr/bin/claude",
+        "spawn_agent_kind": "claude",
+        "spawn_timeout_secs": 0
+    }"#;
+
+    let err = serde_json::from_str::<RunAgentDaemonConfig>(json).unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("greater than zero"), "{message}");
+    // The error has to say what to do instead, or an operator reading "must be
+    // greater than zero" will pick some arbitrary large number.
+    assert!(message.contains("omit the key"), "{message}");
+}
+
+/// A timeout too large to turn into a deadline is refused at parse time too.
+///
+/// `Instant::now() + timeout` panics on overflow, and that addition happens per
+/// run inside `spawn_blocking` — so an accepted `u64::MAX` would not fail at
+/// boot but abandon every agent run, one at a time, looking like a runtime
+/// fault rather than a typo in the config.
+#[test]
+fn an_unrepresentable_spawn_timeout_is_refused_at_parse_time() {
+    let json = format!(
+        r#"{{
+            "spawn_command": "/usr/bin/claude",
+            "spawn_agent_kind": "claude",
+            "spawn_timeout_secs": {}
+        }}"#,
+        u64::MAX
+    );
+
+    let err = serde_json::from_str::<RunAgentDaemonConfig>(&json).unwrap_err();
+
+    assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+
+    // And the boundary itself is accepted, so the ceiling is a real one rather
+    // than an off-by-one that refuses the value it documents.
+    let at_limit = format!(
+        r#"{{
+            "spawn_command": "/usr/bin/claude",
+            "spawn_agent_kind": "claude",
+            "spawn_timeout_secs": {}
+        }}"#,
+        crate::agent_run::MAX_AGENT_RUN_TIMEOUT_SECS
+    );
+    let cfg: RunAgentDaemonConfig = serde_json::from_str(&at_limit).unwrap();
+    assert_eq!(
+        cfg.spawn_timeout_secs.map(|t| t.get().as_secs()),
+        Some(crate::agent_run::MAX_AGENT_RUN_TIMEOUT_SECS)
+    );
+    // The deadline arithmetic that motivated the ceiling actually works there.
+    assert!(
+        std::time::Instant::now()
+            .checked_add(cfg.spawn_timeout_secs.unwrap().get())
+            .is_some(),
+        "the accepted maximum must be representable as a deadline"
     );
 }
 
@@ -1967,6 +2047,7 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
         spawn_command: PathBuf::from("/bin/cat"),
         spawn_agent_kind: crate::core::AgentKind::Claude,
         spawn_args: vec![],
+        spawn_timeout_secs: None,
     };
     let store = InMem::default();
     let log_root = AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap();

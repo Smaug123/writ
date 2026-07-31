@@ -299,6 +299,65 @@ async fn run_agent_signs_non_zero_exit() {
     );
 }
 
+/// A configured `spawn_timeout_secs` reaches an actual host run, ends it, and
+/// is recorded as writ's doing.
+///
+/// End-to-end on purpose. Every step between the config key and the audit row
+/// is somewhere the deadline could be silently dropped — the plan builder, the
+/// spawn config, the blocking-pool hop — and none of those is visible from a
+/// unit test of the runner. The agent here sleeps for 300 seconds, so no
+/// outcome this test observes has "it finished on its own" as an explanation.
+#[tokio::test]
+async fn a_configured_timeout_ends_a_host_run_and_the_log_says_writ_ended_it() {
+    let sh = find_in_path_any(&["sh", "bash"]);
+    let server = MockServer::start().await;
+    let fixture = make_run_agent_state(&server, sh, vec!["-c".into(), "sleep 300".into()])
+        .with_agent_timeout(crate::agent_run::AgentRunTimeout::from_secs(1).unwrap());
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    let started = std::time::Instant::now();
+    let resp = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("this will not finish"),
+            capabilities: Vec::new(),
+            purpose: "timeout".parse().unwrap(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let run_id = match resp {
+        ServerMessage::RunAgentCompleted {
+            signed_metadata, ..
+        } => signed_metadata.run_id,
+        other => panic!("expected RunAgentCompleted, got {other:?}"),
+    };
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "the run took {elapsed:?}, so the deadline is not reaching the host arm"
+    );
+
+    // A timed-out run is a *completed* run in the log — the request row is
+    // paired, not left dangling — because writ knows exactly how it ended.
+    let outcome = state
+        .audit
+        .get_agent_run_outcome(run_id)
+        .unwrap()
+        .expect("a timed-out run records its outcome");
+    assert_eq!(
+        outcome.outcome.status,
+        crate::agent_run::AgentRunTerminalStatus::TimedOut
+    );
+    assert_eq!(outcome.outcome.exit_code, -1);
+}
+
 /// Stderr from the agent must reach the signed envelope verbatim.
 /// A child whose diagnostics land on stderr (the common case for
 /// non-zero exits) would otherwise produce a signed note that

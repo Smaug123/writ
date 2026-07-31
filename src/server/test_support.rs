@@ -185,6 +185,17 @@ impl RunAgentFixture {
     pub(super) fn run_dir(&self, run_id: crate::agent_run::AgentRunId) -> PathBuf {
         self.log_root.join(run_id.to_string())
     }
+
+    /// Bound this fixture's host runs, as `run_agent.spawn_timeout_secs` does.
+    pub(super) fn with_agent_timeout(mut self, timeout: crate::agent_run::AgentRunTimeout) -> Self {
+        let inner = Arc::get_mut(&mut self.state).expect("the fixture holds the only handle");
+        inner
+            .run_agent_spawn
+            .as_mut()
+            .expect("the fixture always configures a spawn")
+            .timeout = Some(timeout);
+        self
+    }
 }
 
 /// Build a [`RunAgentFixture`] spawning `command` with `args`.
@@ -220,6 +231,7 @@ pub(super) fn make_run_agent_state(
         agent_kind: AgentKind::Claude,
         log_root: AgentRunLogRoot::check(log_root.clone())
             .expect("a tempdir-rooted log path is absolute"),
+        timeout: None,
     });
 
     RunAgentFixture {

@@ -333,6 +333,77 @@ decoded prompt.
 A restart does not carry slots over, because it does not carry sessions over:
 boot reconciliation tears down every persisted agent VM before writd serves.
 
+**Agent-run deadlines.** A host-spawned run may be bounded by
+`run_agent.spawn_timeout_secs`. It is **absent by default and absent means
+unbounded** — writ has no basis for guessing an agent's longest legitimate run,
+and a wrong guess kills real work — so the default path is the plain blocking
+`wait(2)` it has always been, not a deadline set to infinity. Zero is refused at
+parse time rather than read as either "unbounded" or "immediately", since those
+are opposites and absence already spells the first.
+
+A run stopped this way is recorded `AgentRunTerminalStatus::TimedOut`, which
+exists precisely so it is not recorded `Failed`: `Failed` means the agent ran to
+completion and chose a non-zero code, and this ending is writ's decision, not the
+agent's. The run is *paired* in the log — request and outcome both — because
+writ knows exactly how it ended; contrast the VM arm, whose `RUN_AGENT_VM_TIMEOUT`
+leaves the request unpaired because a guest that never uploaded an outcome leaves
+writ with nothing truthful to record. Whatever the agent emitted before the kill
+is still captured, minus anything left unflushed in the dead process's buffers.
+
+**The deadline is a promise about the call, not about one of the things the call
+waits on** — the same rule `process_supervisor` states for its own timeout. A
+host run waits on three things, and all three are under it:
+
+* **The prompt write.** It goes to its own thread, so waiting for the agent is
+  the only thing the run blocks on. Written inline, a 1 MiB prompt to an agent
+  that neither reads stdin nor exits blocks in `write(2)` against a 64 KiB pipe
+  buffer and the deadline is never evaluated at all.
+* **The agent.** Polled to the deadline, then its process group is signalled.
+  Killing a pid reaches one process; any descendant inherits the stdout/stderr
+  pipes, so the capture threads never see EOF. Measured: before the group kill, a
+  fake agent that backgrounds a `sleep` kept a 500ms-deadline run pending past a
+  60-second backstop. Real coding agents spawn subprocesses constantly, so
+  without this the timeout would have been a bound in name only.
+* **The stream drains.** The half a wait-shaped deadline cannot reach: when the
+  agent exits promptly but leaves a descendant holding the pipes, the wait is
+  *over*, so there is nothing left for it to fire on, and yet the run is not
+  assembled until EOF. Bounded by the same deadline, which sweeps the group.
+
+Ordering is load-bearing: **observe, then kill, then reap**, the discipline
+`writ_core::process_group` documents. A group kill is only safe while the leader
+is unreaped, because the pgid *is* the leader's pid and a reaped pid can be
+recycled onto a group writ does not own. So a deadline-bounded run observes the
+agent's exit with `waitid(WNOWAIT)`, keeps the zombie until the drains are done
+(which may need a second group kill), and reaps last. That primitive lives in
+`writ-core` rather than beside either caller because there are now two of them in
+different crates, and its errno argument took three review rounds to state.
+
+Which ending gets recorded turns on **who ended the process**: an exit code means
+the agent decided, even a moment past its deadline; `SIGKILL` *that writ sent* is
+the timeout; any other signal is somebody else's doing and is recorded as the
+failure it is. So a run whose agent finished and whose leftovers writ swept is
+recorded as the agent's own outcome — writ stopped a descendant, not the run.
+
+The group is set on every run, but only the deadline path signals it. **An
+unbounded run still sweeps nothing** — whether it should is the separate open
+question about what a finished run guarantees, and answering it as a side effect
+of adding timeouts would be the wrong way to decide it.
+
+**State the guarantee precisely: the deadline bounds a run whose descendants stay
+in the agent's process group.** A descendant that calls `setsid`/`setpgid` while
+holding stdout or stderr is outside the group the kill reaches, so the drains
+never see EOF and the run hangs — the deadline's own failure mode, one syscall
+away. Closing it means capture threads that stop draining at the deadline, which
+introduces a third way a captured stream can be incomplete ("writ stopped
+reading") alongside the two that already have deliberately chosen meanings; that
+is a decision about what a note lets a verifier conclude, tracked separately
+rather than settled here.
+
+`GuestReportedRunStatus` is the guest-facing half of the status enum, and it has
+no `TimedOut`. A guest asserting that the broker stopped its run would give one
+audit value two meanings, so the wire type simply cannot express it and
+`"timed_out"` from a guest fails to deserialise.
+
 **Entry points.** Accept loop `serve_broker_with_agent_vm` (`server.rs:843`,
 task-per-connection) → `handle_connection` (`server.rs:662`) →
 `dispatch_message_with_agent_vm` (`server.rs:189`, the big `ClientMessage`

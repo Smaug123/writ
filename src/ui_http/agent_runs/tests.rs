@@ -75,10 +75,10 @@ fn recorded_run() -> impl Strategy<Value = (AgentRunAuditRecord, Option<AgentRun
         proptest::option::of((
             0i64..4_000_000_000_000,
             any::<i32>(),
-            prop_oneof![
-                Just(AgentRunTerminalStatus::Succeeded),
-                Just(AgentRunTerminalStatus::Failed)
-            ],
+            // Driven off `ALL` rather than a hand-written list, so a new
+            // terminal status is covered here by construction instead of
+            // leaving this proptest quietly ranging over the old set.
+            proptest::sample::select(AgentRunTerminalStatus::ALL.to_vec()),
             stream_summary(),
             stream_summary(),
         )),
@@ -262,6 +262,7 @@ proptest! {
                 let expected_status = match o.outcome.status {
                     AgentRunTerminalStatus::Succeeded => "succeeded",
                     AgentRunTerminalStatus::Failed => "failed",
+                    AgentRunTerminalStatus::TimedOut => "timed_out",
                 };
                 prop_assert_eq!(got["status"].as_str(), Some(expected_status));
                 // Checked separately rather than through a helper, so a

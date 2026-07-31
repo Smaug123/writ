@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 8;
+pub(super) const SCHEMA_VERSION: i32 = 9;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -100,6 +100,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "0008_agent_run_purpose",
         sql: include_str!("migrations/0008_agent_run_purpose.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "0009_agent_run_timed_out",
+        sql: include_str!("migrations/0009_agent_run_timed_out.sql"),
     },
 ];
 
@@ -511,6 +516,122 @@ mod tests {
             })
             .unwrap();
         assert_eq!(current, 1);
+    }
+
+    /// Migration 9 rebuilds `agent_run_outcome` to widen a CHECK, and a rebuild
+    /// is the migration shape that can silently lose data: it copies rows from
+    /// the old table to a new one and drops the original. So this plants a real
+    /// outcome row at v8 and checks every column of it comes back.
+    ///
+    /// It also checks the *new* status is accepted afterwards and the old CHECK
+    /// is really gone — otherwise the migration could "pass" by having rebuilt
+    /// the table with the same constraint it started with.
+    #[test]
+    fn migration_9_widens_the_status_check_without_losing_outcomes() {
+        let db = NamedTempFile::new().unwrap();
+        let run_id = writ_agent_run::AgentRunId::new();
+        let session_id = SessionId::new();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            for migration in MIGRATIONS.iter().take_while(|m| m.version < 9) {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                tx.execute_batch(migration.sql).unwrap();
+                tx.execute(
+                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, 1_i64],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute(
+                "INSERT INTO session (session_id, opened_at, agent_kind) \
+                 VALUES (?1, 1, 'claude')",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_run \
+                 (run_id, session_id, requested_at, agent_kind, prompt_bytes, \
+                  prompt_sha256, prompt_redacted_preview) \
+                 VALUES (?1, ?2, 2, 'claude', 7, ?3, '<redacted>')",
+                params![
+                    run_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    "a".repeat(64),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_run_outcome \
+                 (run_id, completed_at, status, exit_code, \
+                  stdout_path, stdout_bytes, stdout_sha256, stdout_truncated, \
+                  stderr_path, stderr_bytes, stderr_sha256, stderr_truncated) \
+                 VALUES (?1, 3, 'failed', 7, '/runs/out.log', 11, ?2, 1, \
+                         '/runs/err.log', 22, ?3, 0)",
+                params![run_id.as_uuid().to_string(), "b".repeat(64), "c".repeat(64),],
+            )
+            .unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        let row = log
+            .get_agent_run_outcome(run_id)
+            .unwrap()
+            .expect("the pre-migration outcome survives the table rebuild");
+        assert_eq!(
+            row.outcome.status,
+            writ_agent_run::AgentRunTerminalStatus::Failed
+        );
+        assert_eq!(row.outcome.exit_code, 7);
+        assert_eq!(row.completed_at.as_millis(), 3);
+        assert_eq!(
+            row.outcome.stdout.path,
+            std::path::PathBuf::from("/runs/out.log")
+        );
+        assert_eq!(row.outcome.stdout.byte_len, 11);
+        assert_eq!(row.outcome.stdout.sha256_hex, "b".repeat(64));
+        assert!(row.outcome.stdout.truncated);
+        assert_eq!(
+            row.outcome.stderr.path,
+            std::path::PathBuf::from("/runs/err.log")
+        );
+        assert_eq!(row.outcome.stderr.byte_len, 22);
+        assert_eq!(row.outcome.stderr.sha256_hex, "c".repeat(64));
+        assert!(!row.outcome.stderr.truncated);
+
+        // The point of the rebuild: 'timed_out' is now storable, and the
+        // constraint still rejects everything else.
+        log.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_run_outcome SET status = 'timed_out' WHERE run_id = ?1",
+                params![run_id.as_uuid().to_string()],
+            )?;
+            Ok(())
+        })
+        .expect("the widened CHECK admits the new status");
+        assert_eq!(
+            log.get_agent_run_outcome(run_id)
+                .unwrap()
+                .unwrap()
+                .outcome
+                .status,
+            writ_agent_run::AgentRunTerminalStatus::TimedOut
+        );
+        let rejected = log.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_run_outcome SET status = 'abandoned' WHERE run_id = ?1",
+                params![run_id.as_uuid().to_string()],
+            )?;
+            Ok(())
+        });
+        assert!(
+            rejected.is_err(),
+            "the rebuilt CHECK must still be a closed set, not dropped"
+        );
     }
 
     /// A DB written by a future broker will carry a `schema_version`

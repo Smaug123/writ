@@ -1068,6 +1068,7 @@ mod end_to_end_tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
                     .unwrap(),
+                timeout: None,
             }),
             agent_run_slots: Default::default(),
             promote_runtime: None,
@@ -1245,6 +1246,7 @@ mod end_to_end_tests {
                 agent_kind: crate::core::AgentKind::Claude,
                 log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
                     .unwrap(),
+                timeout: None,
             }),
             agent_run_slots: Default::default(),
             promote_runtime: None,

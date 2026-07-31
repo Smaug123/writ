@@ -386,7 +386,10 @@ fn materialize_agent_run_outcome_upload(
     let stderr = materialize_agent_run_stream(upload.stderr, &stderr_path)?;
     Ok(AgentRunOutcome {
         run_id: upload.run_id,
-        status: upload.status,
+        // Widening, not trusting: the guest's enum has no `TimedOut` to widen
+        // *from*, which is what keeps a guest from claiming the broker stopped
+        // its run. See `GuestReportedRunStatus`.
+        status: upload.status.into(),
         exit_code: upload.exit_code,
         stdout,
         stderr,
@@ -598,7 +601,7 @@ mod tests {
             VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
         let upload = VmAgentRunOutcomeUpload {
             run_id,
-            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            status: crate::agent_run::GuestReportedRunStatus::Succeeded,
             exit_code: 0,
             stdout: AgentRunStreamUpload {
                 byte_len: 6,
@@ -682,7 +685,7 @@ mod tests {
             VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
         let upload = VmAgentRunOutcomeUpload {
             run_id,
-            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            status: crate::agent_run::GuestReportedRunStatus::Succeeded,
             exit_code: 0,
             stdout: AgentRunStreamUpload {
                 byte_len: 6,
@@ -748,7 +751,7 @@ mod tests {
         };
         VmAgentRunOutcomeUpload {
             run_id,
-            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            status: crate::agent_run::GuestReportedRunStatus::Succeeded,
             exit_code: 0,
             stdout: empty.clone(),
             stderr: empty,
@@ -955,7 +958,7 @@ mod tests {
             VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
         let upload = VmAgentRunOutcomeUpload {
             run_id,
-            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            status: crate::agent_run::GuestReportedRunStatus::Succeeded,
             exit_code: 0,
             stdout: AgentRunStreamUpload {
                 byte_len: 0,
@@ -1013,7 +1016,7 @@ mod tests {
         };
         let upload = VmAgentRunOutcomeUpload {
             run_id,
-            status: crate::agent_run::AgentRunTerminalStatus::Succeeded,
+            status: crate::agent_run::GuestReportedRunStatus::Succeeded,
             exit_code: 0,
             stdout: AgentRunStreamUpload {
                 byte_len: u64::MAX,

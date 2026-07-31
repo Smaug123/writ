@@ -10,6 +10,10 @@ thiserror = "2"
 # Only the shared runtime bits need these; see the feature table below.
 writ-core = { path = "../writ-core", optional = true }
 ring = { version = "0.17", optional = true }
+# Signalling an agent's whole process group at its deadline; see
+# `kill_at_deadline`.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [features]
 # Feature names mirror the root `writ` crate so the moved module's `#[cfg(...)]`
@@ -18,7 +22,7 @@ ring = { version = "0.17", optional = true }
 # (`writ_core::process_spawn`). `host` additionally compiles host-only helpers
 # (`AgentPrompt::summary`), so it implies `vm-client`.
 host = ["vm-client"]
-vm-client = ["dep:ring", "dep:writ-core"]
+vm-client = ["dep:ring", "dep:writ-core", "dep:libc"]
 # Exposes the test-only `AgentPrompt::new` convenience constructor to downstream
 # test code (the root crate enables this as a dev-dependency feature).
 test-support = []

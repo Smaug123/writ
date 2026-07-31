@@ -231,23 +231,37 @@ fn only_process_spawn_classifies_transient_spawn_failures() {
 /// Running a child with a timeout and a process-group kill must go through
 /// `process_supervisor`.
 ///
-/// The needle is the syscall (`libc::killpg`), not the word, so prose that
-/// *explains* the group-kill ordering is unaffected — only a second
-/// implementation of it trips this.
+/// The needles are the syscalls, not the words, so prose that *explains* the
+/// group-kill ordering is unaffected — only a second implementation of it trips
+/// this.
 ///
-/// A `killpg` outside the supervisor means a second, parallel supervision
-/// discipline. `git_push_objects_cat_file` had exactly that: its own cleanup
-/// guard, its own `ESRCH`/`EPERM` tolerance, and its own `waitid(WNOWAIT)` probe,
-/// ~75 lines duplicating the supervisor's. It legitimately cannot use
-/// `run_supervised` (its `cat-file --batch` child is a long-lived session, not a
-/// spawn-and-wait), but it can and now does share the primitives.
+/// A group kill outside the shared primitive means a second, parallel
+/// supervision discipline. `git_push_objects_cat_file` had exactly that: its own
+/// cleanup guard, its own `ESRCH`/`EPERM` tolerance, and its own
+/// `waitid(WNOWAIT)` probe, ~75 lines duplicating the supervisor's. It
+/// legitimately cannot use `run_supervised` (its `cat-file --batch` child is a
+/// long-lived session, not a spawn-and-wait), but it can and now does share the
+/// primitives.
+///
+/// **`libc::kill(-` is a needle because the first version of this guard missed
+/// it.** `kill` with a negated pid is `killpg` spelled differently — same
+/// syscall, same semantics — and the agent-run deadline was written that way and
+/// sailed past a guard that only knew one spelling. A guard blind to an
+/// equivalent spelling reads as coverage while providing none.
+///
+/// The allowlist is `writ-core`'s module rather than `process_supervisor`
+/// because the primitive moved there: `writ-agent-run` needs it too, and it
+/// cannot depend on the root crate.
 #[test]
 fn only_process_supervisor_kills_process_groups() {
-    let hits = offenders(&["libc::killpg"], &["src/process_supervisor.rs"]);
+    let hits = offenders(
+        &["libc::killpg", "libc::kill(-"],
+        &["crates/writ-core/src/process_group.rs"],
+    );
     assert!(
         hits.is_empty(),
-        "process-group signalling belongs to `process_supervisor`; use \
-         `run_supervised` or `run_supervised_blocking`.\n  {}",
+        "process-group signalling belongs to `writ_core::process_group`; use \
+         `kill_process_group`, or `run_supervised`/`run_supervised_blocking`.\n  {}",
         hits.join("\n  ")
     );
 }

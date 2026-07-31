@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use writ_core::byte_size::ByteSize;
 
+use crate::agent_run::AgentRunTimeout;
 use crate::agent_vm_daemon::{
     AgentVmDaemonRuntimeConfig, AgentVmDaemonRuntimeConfigError, AgentVmLifecycleRuntimeConfig,
     AgentVmLifecycleRuntimeConfigError,
@@ -302,6 +303,29 @@ pub struct RunAgentDaemonConfig {
     /// arrives on the child's stdin.
     #[serde(default)]
     pub spawn_args: Vec<String>,
+    /// How long writd will let one host-spawned agent run before killing it
+    /// and its process group, in seconds.
+    ///
+    /// **Absent means no timeout**, and that is the default: a host run waits
+    /// for its agent however long that takes, which is what writd has always
+    /// done. Setting it is a deliberate choice by the operator who knows what
+    /// their agent's longest legitimate run looks like — writ has no basis for
+    /// guessing that number, and a wrong guess kills real work.
+    ///
+    /// Zero is refused rather than treated as "no timeout": absence already
+    /// means that, and a second spelling of it would be one an operator could
+    /// reach by accident while meaning "immediately". So is anything past
+    /// [`crate::agent_run::MAX_AGENT_RUN_TIMEOUT_SECS`].
+    ///
+    /// Both refusals happen *at deserialisation* — the field's type is the
+    /// checked one — so a bad value stops writd before it has created a notes
+    /// repo, generated a signing key, or migrated the audit log to a schema the
+    /// previous binary would refuse to open.
+    ///
+    /// Bounds only the host arm. The VM arm has its own, unrelated deadline on
+    /// waiting for a guest's outcome upload.
+    #[serde(default)]
+    pub spawn_timeout_secs: Option<AgentRunTimeout>,
 }
 
 /// Default `SecretStore` key under which writd persists its SSH
@@ -371,6 +395,7 @@ impl RunAgentDaemonConfig {
                 args: self.spawn_args.clone(),
                 agent_kind: self.spawn_agent_kind,
                 log_root: agent_run_log_root,
+                timeout: self.spawn_timeout_secs,
             },
         })
     }

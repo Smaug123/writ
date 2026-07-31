@@ -755,6 +755,7 @@ fn agent_run_status_str(status: &AgentRunTerminalStatus) -> &'static str {
     match status {
         AgentRunTerminalStatus::Succeeded => "succeeded",
         AgentRunTerminalStatus::Failed => "failed",
+        AgentRunTerminalStatus::TimedOut => "timed_out",
     }
 }
 
@@ -762,6 +763,7 @@ fn agent_run_status_from_str(raw: &str) -> Result<AgentRunTerminalStatus, AuditE
     match raw {
         "succeeded" => Ok(AgentRunTerminalStatus::Succeeded),
         "failed" => Ok(AgentRunTerminalStatus::Failed),
+        "timed_out" => Ok(AgentRunTerminalStatus::TimedOut),
         _ => Err(AuditError::Invariant("agent run status is invalid")),
     }
 }
@@ -1501,7 +1503,10 @@ mod tests {
             purpose in proptest::option::of(
                 proptest::sample::select(vec!["plan-submit", "review:plan-abc", "a b #3"])
             ),
-            status_succeeded in any::<bool>(),
+            // From `ALL` rather than a hand-written list: this is the oracle
+            // that says a status survives the round trip through SQLite, so it
+            // must range over every status there is, including any added later.
+            status in proptest::sample::select(AgentRunTerminalStatus::ALL.to_vec()),
             exit_code in any::<i32>(),
             stdout_bytes in 0u64..=(i64::MAX as u64),
             stderr_bytes in 0u64..=(i64::MAX as u64),
@@ -1539,11 +1544,7 @@ mod tests {
                 completed_at: UnixMillis::from_millis(1_700_000_200),
                 outcome: AgentRunOutcome {
                     run_id,
-                    status: if status_succeeded {
-                        AgentRunTerminalStatus::Succeeded
-                    } else {
-                        AgentRunTerminalStatus::Failed
-                    },
+                    status: status.clone(),
                     exit_code,
                     stdout: AgentRunStreamSummary {
                         path: "/private/writ/runs/stdout.log".into(),

@@ -506,6 +506,7 @@ mod end_to_end_tests {
                 agent_kind: writ::core::AgentKind::Claude,
                 log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
                     .unwrap(),
+                timeout: None,
             }),
             agent_run_slots: Default::default(),
             promote_runtime: None,

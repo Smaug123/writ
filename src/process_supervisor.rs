@@ -16,7 +16,6 @@
 //! diverge between callers: the race-free `waitid(WNOWAIT)` observation, the
 //! process-group kill, and the stdout/stderr drains.
 
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -1157,24 +1156,7 @@ fn child_has_exited_without_reaping(pid: libc::pid_t) -> Result<bool, Supervisor
 /// which its `killpg` can hit an unrelated group that inherited the pid. Every
 /// group kill in this codebase is ordered observe-then-kill-then-reap because of
 /// this, and getting that order wrong is silent and rare.
-pub(crate) fn pid_has_exited_without_reaping(pid: libc::pid_t) -> std::io::Result<bool> {
-    let mut status = MaybeUninit::<libc::siginfo_t>::zeroed();
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            status.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let status = unsafe { status.assume_init() };
-    let observed_pid = unsafe { status.si_pid() };
-    Ok(observed_pid != 0)
-}
+pub(crate) use writ_core::process_group::pid_has_exited_without_reaping;
 
 /// Poll [`pid_has_exited_without_reaping`] until the leader is observed exited.
 ///
@@ -1191,8 +1173,7 @@ pub(crate) async fn wait_for_pid_exit_no_reap(pid: libc::pid_t) -> std::io::Resu
 }
 
 fn process_group_id(pid: u32) -> Result<libc::pid_t, SupervisorError> {
-    pid.try_into()
-        .map_err(|_| SupervisorError::InvalidProcessId(pid))
+    writ_core::process_group::process_group_id(pid).ok_or(SupervisorError::InvalidProcessId(pid))
 }
 
 /// Guarantees a process group is SIGKILLed on *every* exit path — including a
@@ -1273,49 +1254,15 @@ fn kill_process_group_inner(
         .map_err(|source| SupervisorError::KillProcessGroup { pgid, source })
 }
 
-/// SIGKILL a process group this process created, tolerating exactly the two
-/// benign outcomes and no others.
+/// The group kill, which now lives in `writ-core` so that `writ-agent-run` can
+/// use the same one — see [`writ_core::process_group`] for the errno argument
+/// and the leader-unreaped precondition it depends on.
 ///
-/// The single definition of the group kill. Both benign cases are easy to get
-/// wrong in opposite directions — swallow too much and a real permission failure
-/// becomes invisible; swallow too little and normal shutdown reports a spurious
-/// error:
-///
-/// * `ESRCH` — the group is already gone. Always fine.
-/// * `EPERM` — macOS reports this, rather than `ESRCH`, for a group with no
-///   signalable member left. Tolerated when `empty_group_is_benign`.
-///
-/// The condition that makes `EPERM` safe to accept is that the caller still holds
-/// the group's **leader unreaped**. The leader's pid is then still claimed, so the
-/// pgid — which equals it — cannot have been recycled onto a group we do not own;
-/// and since we created this group with `process_group(0)`, the only way we can
-/// fail to signal our own group is that every member has already exited. Every
-/// group kill in this codebase is ordered observe-then-kill-then-reap, so the
-/// condition holds at each of them.
-///
-/// This was previously gated on having *observed* the leader exit, which is a
-/// strictly narrower condition than the argument requires, and it left the timeout
-/// arms exposed: a child that exits between the deadline and the kill — or that
-/// takes `SIGPIPE` when a capture pipe closes — empties the group, and a plain
-/// timeout surfaced as `KillProcessGroup`. Reproduced at roughly 1 run in 24
-/// before the fix. Two earlier rounds of review each fixed one arm of this;
-/// naming the real precondition is what stops it recurring in a third.
-pub(crate) fn kill_process_group(
-    pgid: libc::pid_t,
-    empty_group_is_benign: bool,
-) -> std::io::Result<()> {
-    // The child was spawned with process_group(0), making its pid the process
-    // group id inherited by any ordinary helpers it starts.
-    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
-        return Ok(());
-    }
-    let source = std::io::Error::last_os_error();
-    match source.raw_os_error() {
-        Some(libc::ESRCH) => Ok(()),
-        Some(libc::EPERM) if empty_group_is_benign => Ok(()),
-        _ => Err(source),
-    }
-}
+/// Kept as a name here because this module's reasoning refers to it throughout,
+/// and because every group kill in this codebase is ordered
+/// observe-then-kill-then-reap, which is what makes the precondition hold at
+/// each of them.
+pub(crate) use writ_core::process_group::kill_process_group;
 
 #[cfg(test)]
 mod tests {
