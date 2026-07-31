@@ -341,6 +341,7 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
         notes_repo: None,
         signing_key: None,
         run_agent_spawn: None,
+        agent_run_slots: Default::default(),
         promote_runtime,
         git_data_http: std::sync::OnceLock::new(),
         mirror_pins: MirrorPins::new(),

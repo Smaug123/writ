@@ -53,6 +53,10 @@ mod staged_push;
 /// Run-agent orchestration (the `RunAgent` handler and its VM-dispatch
 /// path), split out of this file to keep the dispatcher readable.
 mod run_agent;
+pub(crate) use run_agent::AgentRunSlot;
+pub use run_agent::{
+    AgentRunQueueing, AgentRunSlots, AgentRunSlotsError, DEFAULT_MAX_CONCURRENT_AGENT_RUNS,
+};
 
 /// Boot-time description of the child process that produces an agent
 /// run's streams, and where those streams are kept. Pure data —
@@ -114,6 +118,12 @@ pub struct BrokerState<S: SecretStore> {
     pub notes_repo: Option<Arc<NotesRepo>>,
     pub signing_key: Option<WritSigningKey>,
     pub run_agent_spawn: Option<RunAgentSpawnConfig>,
+    /// How many agent runs may execute at once, across both `RunAgent` arms.
+    ///
+    /// Not inside `run_agent_spawn`: that is `None` on a daemon serving only the
+    /// VM arm, and the bound has to hold for both. Same reason
+    /// `agent_run_log_root` is a top-level config key.
+    pub agent_run_slots: run_agent::AgentRunSlots,
     pub promote_runtime: Option<Arc<PromoteRuntimeConfig>>,
     /// The broker-wide transport every GitHub Git Data call runs over,
     /// built once and borrowed by each approve's short-lived
@@ -332,6 +342,12 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                             correlation_id,
                             purpose: None,
                         },
+                        // The CLI that sent this has its own deadline and will
+                        // stop listening; a slot granted afterwards would boot a
+                        // VM whose session id reaches nobody.
+                        crate::server::AgentRunQueueing::UpTo(
+                            crate::agent_vm_daemon::AGENT_RUN_QUEUE_WAIT,
+                        ),
                     )
                     .await
                 {

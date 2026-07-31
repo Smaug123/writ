@@ -15,6 +15,8 @@
 //! directly.
 
 use super::*;
+use std::num::NonZeroUsize;
+use std::time::Duration;
 
 /// Total wall-clock budget the VM dispatch arm gives a per-run VM
 /// agent to complete and POST its outcome to writd. Implementer runs
@@ -31,6 +33,167 @@ const RUN_AGENT_VM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// the observed latency from "outcome lands" to "wait returns" is
 /// bounded by this interval rather than the full timeout.
 const RUN_AGENT_VM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many agent runs writd will execute at once when configuration is silent.
+///
+/// Two, chosen to be obviously safe rather than tuned: the cost of a run is a
+/// child process plus threads (host arm) or a whole VM (VM arm), and no
+/// measurement here would generalise across operators' hardware. It is a config
+/// key precisely so the number can move without a release.
+pub const DEFAULT_MAX_CONCURRENT_AGENT_RUNS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
+/// The bound on how many agent runs may be in flight at once, across *both*
+/// dispatch arms.
+///
+/// One bound rather than one per arm. The arms differ in what a run costs — the
+/// host arm holds a tokio blocking-pool thread (of 512, shared with notes writes
+/// and every other `spawn_blocking` in writd), two OS threads for the stream
+/// captures, and a child process; the VM arm holds a VM — but they do not
+/// differ in *whose* machine pays, and a per-arm bound would let twice the
+/// configured number run.
+///
+/// Waiting, not refusing: a caller over the limit queues. That is the operator's
+/// decision recorded, and it suits the shape of the traffic — an agent run is a
+/// minutes-long job dispatched by a workflow tool, so a queue is a delay where a
+/// refusal would be a failed workflow step needing its own retry logic.
+/// [`tokio::sync::Semaphore`] hands permits out in FIFO order, so "queue" is
+/// what waiting on it already means, and a burst cannot starve its own tail.
+#[derive(Clone, Debug)]
+pub struct AgentRunSlots {
+    slots: Arc<tokio::sync::Semaphore>,
+    limit: NonZeroUsize,
+}
+
+impl AgentRunSlots {
+    /// Build a bound, refusing a limit the underlying semaphore cannot hold.
+    ///
+    /// Fallible only because of that ceiling: [`tokio::sync::Semaphore::new`]
+    /// *panics* above [`tokio::sync::Semaphore::MAX_PERMITS`], and a limit is
+    /// operator input, so the failure would land as a daemon crash during
+    /// startup rather than as a message naming the bad field. No configuration
+    /// value should be able to do that.
+    pub fn new(limit: NonZeroUsize) -> Result<Self, AgentRunSlotsError> {
+        if limit.get() > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(AgentRunSlotsError::AboveMaxPermits {
+                limit,
+                max: tokio::sync::Semaphore::MAX_PERMITS,
+            });
+        }
+        Ok(Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(limit.get())),
+            limit,
+        })
+    }
+
+    /// The configured bound, for tests and operator-facing reporting.
+    pub fn limit(&self) -> NonZeroUsize {
+        self.limit
+    }
+
+    /// How many runs could start right now without waiting.
+    ///
+    /// A momentary reading, not a reservation — by the time a caller acts on it
+    /// the number may have changed, so it is for reporting and for tests, never
+    /// for deciding whether to start a run. Tests need it because the property
+    /// that matters for a VM run is *when the slot is released*, and a run that
+    /// takes a slot and drops it immediately is indistinguishable from one that
+    /// holds it if all you can see is that `acquire` was called.
+    pub fn available(&self) -> usize {
+        self.slots.available_permits()
+    }
+
+    /// Wait for a slot on the caller's terms.
+    ///
+    /// The error carries the budget that expired, so a caller reporting "no slot
+    /// came free within X" cannot name a different X from the one it actually
+    /// waited. Only a bounded caller can fail, and only by exhausting its own
+    /// budget. See [`AgentRunQueueing`] for why the budget is per-caller.
+    pub(crate) async fn acquire_with(
+        &self,
+        queueing: AgentRunQueueing,
+    ) -> Result<AgentRunSlot, Duration> {
+        match queueing {
+            AgentRunQueueing::UntilASlotFrees => Ok(self.acquire().await),
+            AgentRunQueueing::UpTo(budget) => tokio::time::timeout(budget, self.acquire())
+                .await
+                .map_err(|_elapsed| budget),
+        }
+    }
+
+    /// Wait for a slot, then hold it until the returned guard is dropped.
+    ///
+    /// Callers must acquire *after* validating the request and *before* starting
+    /// the run: queueing behind minutes-long runs only to answer "that request
+    /// was malformed" would be a worse answer than refusing outright, and each
+    /// arm's preconditions differ, so this is not something the dispatcher can
+    /// do once on their behalf.
+    pub(crate) async fn acquire(&self) -> AgentRunSlot {
+        AgentRunSlot(
+            Arc::clone(&self.slots)
+                .acquire_owned()
+                .await
+                // The semaphore is owned by `BrokerState` and never closed;
+                // `acquire_owned` fails only on a closed semaphore.
+                .expect("the agent-run semaphore is never closed"),
+        )
+    }
+}
+
+impl Default for AgentRunSlots {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_CONCURRENT_AGENT_RUNS)
+            .expect("the built-in default is far below the semaphore's ceiling")
+    }
+}
+
+/// Why a configured concurrency limit was refused.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum AgentRunSlotsError {
+    #[error(
+        "max_concurrent_agent_runs is {limit}, above the maximum this daemon can \
+         represent ({max}); a limit that large is not a bound in any case"
+    )]
+    AboveMaxPermits { limit: NonZeroUsize, max: usize },
+}
+
+/// How long a caller is willing to wait for a slot.
+///
+/// Caller-specific because the callers differ in one way that matters: whether
+/// anyone is still listening when the wait ends.
+///
+/// `StartAgentRun` answers over a socket whose client has its own deadline, so a
+/// slot granted after that deadline boots a VM whose session id reaches nobody.
+/// `RunAgent`'s VM arm holds its caller for the whole run — bailiff's client sets
+/// no start deadline and stops the VM when it is done — so waiting is exactly
+/// what its caller asked for, and refusing it would break the queueing the
+/// configuration promises.
+///
+/// An enum rather than an `Option<Duration>`, so neither arm can be read as "no
+/// timeout configured yet".
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AgentRunQueueing {
+    /// Wait for as long as it takes. For callers that will still be there.
+    UntilASlotFrees,
+    /// Give up after this long, and answer at-capacity instead.
+    UpTo(Duration),
+}
+
+/// One in-flight agent run's claim on the bound. Releases on drop, so every
+/// early return frees it.
+///
+/// Visible to the agent-VM daemon because a VM run's slot outlives the request
+/// that started it: `StartAgentRun` boots a VM and answers immediately, so the
+/// slot has to live with the session and be released when the session is torn
+/// down, not when the handler returns.
+#[derive(Debug)]
+pub(crate) struct AgentRunSlot(
+    #[expect(
+        dead_code,
+        reason = "held for its Drop: releasing the slot when the run ends is the \
+                  entire purpose, so the permit is never read"
+    )]
+    tokio::sync::OwnedSemaphorePermit,
+);
 
 fn run_agent_not_configured(component: &str) -> ServerMessage {
     ServerMessage::Error {
@@ -183,6 +346,59 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     }
 
     let run_id = AgentRunId::new();
+
+    // Built before the queue, not after it. `AgentProcessPlan::new` rejects a
+    // spawn command this daemon cannot run — a configuration error whose answer
+    // does not depend on capacity — and a request whose fate is already decided
+    // should not wait behind other people's agents to hear it. That wait has no
+    // bound on this path, and the runs ahead of it may be VM sessions that only
+    // a human ends.
+    let plan = match crate::agent_run::AgentProcessPlan::new(
+        run_id,
+        spawn_config.command.clone(),
+        spawn_config.args.iter().map(std::ffi::OsString::from),
+    ) {
+        // The capture cap matches the envelope cap so the file on disk is
+        // exactly what the envelope carries — see
+        // `crate::agent_run_envelope`'s note on the two stacking caps.
+        Ok(plan) => plan.with_max_stream_capture_bytes(MAX_RUN_AGENT_STREAM_BYTES as u64),
+        // No audit row to abandon: nothing has been recorded yet, which is the
+        // other half of why this belongs before the queue.
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!(
+                    "RunAgent: agent command {}: {err}",
+                    spawn_config.command.display()
+                ),
+            };
+        }
+    };
+
+    // Every precondition is settled, so from here the run is going to happen and
+    // the only question is when. Wait for a slot before the audit row rather than
+    // after: a row recorded now would claim a run that has not started, and
+    // `requested_at` would date the request rather than the run.
+    //
+    // Held until this function returns, which is when the child has exited and
+    // its note is written.
+    let _slot = state.agent_run_slots.acquire().await;
+
+    // The session was open when this request arrived. That wait has no bound, so
+    // by now another connection may have closed it — and the caller deserves to
+    // hear *that*, not a generic error. `begin_effect` below does refuse a closed
+    // session, but it refuses it as an opaque audit failure, so a client that
+    // waited minutes would lose the typed `ClosedSession` it could have acted on.
+    match state.audit.get_session(session_id) {
+        Ok(Some(session)) if session.closed_at.is_none() => {}
+        Ok(Some(_)) => return ServerMessage::ClosedSession { session_id },
+        Ok(None) => return ServerMessage::UnknownSession { session_id },
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: re-read session {session_id}: {err}"),
+            };
+        }
+    }
+
     let prompt_summary = prompt.summary();
     let prompt_sha256 = Sha256Hex::try_new(prompt_summary.sha256_hex.clone())
         .expect("AgentPrompt::summary hashes via sha256_hex");
@@ -207,26 +423,6 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         Err(err) => {
             return ServerMessage::Error {
                 message: format!("RunAgent: record agent run: {err}"),
-            };
-        }
-    };
-
-    let plan = match crate::agent_run::AgentProcessPlan::new(
-        run_id,
-        spawn_config.command.clone(),
-        spawn_config.args.iter().map(std::ffi::OsString::from),
-    ) {
-        // The capture cap matches the envelope cap so the file on disk is
-        // exactly what the envelope carries — see
-        // `crate::agent_run_envelope`'s note on the two stacking caps.
-        Ok(plan) => plan.with_max_stream_capture_bytes(MAX_RUN_AGENT_STREAM_BYTES as u64),
-        Err(err) => {
-            recorded.abandon();
-            return ServerMessage::Error {
-                message: format!(
-                    "RunAgent: agent command {}: {err}",
-                    spawn_config.command.display()
-                ),
             };
         }
     };
@@ -497,6 +693,17 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
         return run_agent_not_configured("signing_key");
     };
 
+    // No slot is taken here, deliberately. Every VM run — this arm's and
+    // `StartAgentRun`'s — goes through `start_agent_run_session`, which acquires
+    // one and hands it to the running session, so the slot is released when the
+    // VM is torn down rather than when a request handler returns. That matters
+    // because `StartAgentRun` answers as soon as the VM is up and the session
+    // outlives its request entirely.
+    //
+    // Acquiring again here would be worse than redundant: this arm would hold
+    // two slots for one run, and at the default limit of two a single request
+    // would exhaust the bound and then wait forever for the slot it is itself
+    // blocking.
     let prompt_bytes = prompt.as_bytes().to_vec();
     let prompt_sha256_str = sha256_hex(&prompt_bytes);
     let prompt_sha256 = Sha256Hex::try_new(prompt_sha256_str)
@@ -517,6 +724,11 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
                 correlation_id: None,
                 purpose: Some(purpose),
             },
+            // Bailiff's client holds this connection for the whole run and sets
+            // no start deadline, so waiting is what it asked for: refusing a
+            // surplus workflow after five minutes would break the queueing the
+            // configuration promises.
+            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
     {

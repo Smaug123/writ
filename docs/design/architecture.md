@@ -298,7 +298,40 @@ operator CLI verbs).
 `deny_unknown_fields` since outbound); `Decision`/`AuthorizedMint`
 (`policy.rs:97,52`); config root `DaemonConfig` (`config/mod.rs`,
 `deny_unknown_fields`): `github_apps`, `policy`, `agent_vm?`, `secret_store`,
-`socket_path?`, `audit_db?`, `ui_http?`, `run_agent?`, `agent_run_log_root?`.
+`socket_path?`, `audit_db?`, `ui_http?`, `run_agent?`, `agent_run_log_root?`,
+`max_concurrent_agent_runs?`.
+
+**Agent-run concurrency.** One broker-wide bound, `BrokerState::agent_run_slots`
+(`AgentRunSlots`, default 2, `max_concurrent_agent_runs?`), covers every way to
+start an agent run: both `RunAgent` arms and `StartAgentRun`. One bound rather
+than one per path — the paths differ in what a run costs (a child plus threads,
+or a whole VM) but not in whose machine pays. Top-level config for the same
+reason as `agent_run_log_root`: a VM-only daemon has no `run_agent` section and a
+host-only one has no `agent_vm` section. `NonZeroUsize`, and rejected above
+`Semaphore::MAX_PERMITS` during preflight, so neither a wedged daemon nor a
+startup panic is reachable from a config value.
+
+The slot's *lifetime* differs by path, and that is the load-bearing part. A host
+run ends when its handler returns, so a function-scoped permit is the run's
+lifetime. A VM run does not: `StartAgentRun` answers as soon as the VM is up, so
+`start_agent_run_session` hands the permit to the running session, where it lives
+inside the `running` map's value and is released when the session is removed —
+by construction rather than by remembering, since a missed release is permanent
+and shrinks the bound for the daemon's lifetime.
+
+Whether a caller *waits* is also per-path (`AgentRunQueueing`), for one reason:
+whether anyone is still listening when the wait ends. `RunAgent` (both arms)
+queues indefinitely — its caller holds the connection for the whole run.
+`StartAgentRun` waits at most `AGENT_RUN_QUEUE_WAIT` and then answers
+`AgentRunsAtCapacity`, because its CLI has a 30-minute deadline of which the
+bootstrap may take 20; a permit granted after that would boot a VM whose session
+id reaches nobody. Refusals happen before the per-session lock is registered, so
+a rejected start leaves nothing behind. Still open: the bound covers *executing*
+runs, not *waiting* callers, each of which holds a task, a connection, and a
+decoded prompt.
+
+A restart does not carry slots over, because it does not carry sessions over:
+boot reconciliation tears down every persisted agent VM before writd serves.
 
 **Entry points.** Accept loop `serve_broker_with_agent_vm` (`server.rs:843`,
 task-per-connection) → `handle_connection` (`server.rs:662`) →

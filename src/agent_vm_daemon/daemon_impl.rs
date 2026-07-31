@@ -70,6 +70,16 @@ impl AgentVmDaemon {
         }
     }
 
+    /// How many per-session lock entries are currently registered.
+    ///
+    /// For tests. The map is an implementation detail with no operator meaning,
+    /// but "does a refused start leave one behind" is not observable any other
+    /// way, and the answer used to be yes.
+    #[cfg(test)]
+    pub(crate) async fn session_lock_count(&self) -> usize {
+        self.session_locks.lock().await.len()
+    }
+
     pub fn config(&self) -> &AgentVmDaemonRuntimeConfig {
         &self.config
     }
@@ -115,6 +125,7 @@ impl AgentVmDaemon {
                     workspace,
                     guest_command,
                     None,
+                    None,
                 )
                 .await
             }
@@ -145,9 +156,63 @@ impl AgentVmDaemon {
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
         tags: AgentRunTags,
+        // How long this caller will wait for a slot. Not a property of the
+        // daemon: `StartAgentRun`'s client has a deadline and goes away,
+        // `RunAgent`'s holds the connection for the whole run.
+        queueing: crate::server::AgentRunQueueing,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
+        // Everything that can refuse this request happens before the per-session
+        // lock is registered, so a refusal leaves nothing behind. Session ids are
+        // fresh UUIDs that no later request reuses, so an entry added for a start
+        // that never happened is never collected — the map would grow by one per
+        // rejection for the daemon's lifetime.
+        //
+        // Answers this request already has come first, before it can be made to
+        // wait for one it does not. Both were previously discovered *after* the
+        // slot was acquired, so at capacity a request whose fate was already
+        // decided — a malformed workspace destination, or an agent run under a
+        // broker placement that cannot serve one — would queue behind other
+        // people's agents before being told what was wrong with it.
+        //
+        // Recomputed rather than threaded onward: the checks are cheap and pure,
+        // and a second call cannot disagree with the first.
+        if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
+            return Err(AgentVmDaemonError::StartFailed {
+                session_id,
+                source: Box::new(AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
+            });
+        }
+        workspace_bootstrap_audit_record(session_id, &workspace).map_err(|source| {
+            AgentVmDaemonError::StartFailed {
+                session_id,
+                source: Box::new(source),
+            }
+        })?;
+
+        // Before the audit session is opened, and before any VM work: a queued
+        // run has not started, and an open session with no VM behind it would
+        // claim otherwise. `StartAgentRun` answers as soon as the VM is up, so
+        // this slot cannot live in this function's scope — it is handed to the
+        // running session below and released when that session is torn down.
+        //
+        // Whether this wait is bounded is the caller's call, not ours — see
+        // `AgentRunQueueing`. Both kinds of caller reach this one function, and
+        // they differ in whether anyone is still listening when the wait ends.
+        let run_slot = match state.agent_run_slots.acquire_with(queueing).await {
+            Ok(slot) => slot,
+            // The budget comes back from the wait itself rather than being named
+            // again here, so this cannot report a duration the caller did not
+            // actually wait.
+            Err(waited) => {
+                return Err(AgentVmDaemonError::AgentRunsAtCapacity {
+                    limit: state.agent_run_slots.limit().get(),
+                    waited,
+                });
+            }
+        };
+
         let session_lock = self.session_lock_handle(session_id).await;
         let outcome = async {
             let _session_guard = session_lock.lock().await;
@@ -188,6 +253,7 @@ impl AgentVmDaemon {
                     Some(workspace),
                     guest_command,
                     Some(agent_runs),
+                    Some(run_slot),
                 )
                 .await
             }
@@ -405,7 +471,10 @@ impl AgentVmDaemon {
         // `shutdown()` so a slow drain cannot block listing or unrelated sessions.
         let running = self.running.lock().await.remove(&session_id);
         let http_shutdown = match running {
-            Some(running) => running.shutdown().await,
+            // Destructured so the concurrency slot's release is visible here
+            // rather than implied: it is freed when `_slot` drops at the end of
+            // this statement, whatever the shutdown returns.
+            Some(RunningAgentVm { session, _slot }) => session.shutdown().await,
             None => Ok(()),
         };
 
@@ -630,8 +699,12 @@ impl AgentVmDaemon {
             return Err(err);
         }
 
-        if let Some(running) = self.running.lock().await.remove(&session_id) {
-            running.shutdown().await?;
+        if let Some(RunningAgentVm { session, _slot }) =
+            self.running.lock().await.remove(&session_id)
+        {
+            // `_slot` drops here, returning this run's place in the bound even if
+            // the shutdown below fails.
+            session.shutdown().await?;
         }
 
         // Remove the copied secrets before dropping the state record: a removal
@@ -850,6 +923,11 @@ impl AgentVmDaemon {
         Ok(guest_env)
     }
 
+    // Eight now, because a VM run's concurrency slot has to travel with the
+    // session rather than live in a caller's scope. Splitting the parameter list
+    // into a struct would move the same fields behind a name without making any
+    // of them optional.
+    #[allow(clippy::too_many_arguments)]
     async fn start_session_after_audit_opened<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: Arc<BrokerState<S>>,
@@ -858,6 +936,10 @@ impl AgentVmDaemon {
         workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
         agent_runs: Option<VmHttpAgentRunService<S>>,
+        // `run_slot` is this run's claim on the concurrency bound, released when
+        // the session is torn down. `Some` exactly when `agent_runs` is: a
+        // session that is not an agent run does not consume an agent-run slot.
+        run_slot: Option<crate::server::AgentRunSlot>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
         // Broker placement seam (see docs/vmnet-accept-bug-and-broker-vm-plan.md):
         // the host path runs an in-process broker; the vm path runs the broker in a
@@ -950,7 +1032,13 @@ impl AgentVmDaemon {
         .await??;
 
         let running = prepared.spawn();
-        self.running.lock().await.insert(session_id, running);
+        self.running.lock().await.insert(
+            session_id,
+            RunningAgentVm {
+                session: running,
+                _slot: run_slot,
+            },
+        );
         // Start the host-side network-health monitor (idempotent). Lazy here
         // because it needs the audit handle, which arrives with the request.
         self.ensure_network_health_monitor(Arc::clone(&state.audit));

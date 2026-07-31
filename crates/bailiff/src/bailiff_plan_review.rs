@@ -507,6 +507,7 @@ mod end_to_end_tests {
                 log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
                     .unwrap(),
             }),
+            agent_run_slots: Default::default(),
             promote_runtime: None,
             git_data_http: std::sync::OnceLock::new(),
             mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),

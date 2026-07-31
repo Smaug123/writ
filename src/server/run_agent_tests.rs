@@ -1469,3 +1469,407 @@ async fn a_stream_file_rewritten_after_the_run_fails_the_provenance_check() {
         "the error must name the tampered file, got: {message}",
     );
 }
+
+/// A `RunAgent` fixture whose agent records its own lifetime, so a test can
+/// reconstruct how many runs were ever in flight together.
+///
+/// The script appends one line when it starts and one when it finishes. Small
+/// `>>` writes to the same file are atomic under `O_APPEND`, so the file is a
+/// faithful interleaving of the runs rather than a lossy one, and replaying it
+/// as +1/-1 gives the concurrency at every instant.
+fn overlap_recording_agent(dir: &std::path::Path, ledger: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             echo start >> '{ledger}'\n\
+             # Long enough that every queued run would overlap if nothing bounded\n\
+             # them, short enough to keep the suite quick.\n\
+             sleep 0.4\n\
+             echo end >> '{ledger}'\n",
+            ledger = ledger.display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+/// Replay the ledger as +1 per start and -1 per end, returning the high-water
+/// mark.
+fn peak_concurrency(ledger: &std::path::Path) -> usize {
+    let text = std::fs::read_to_string(ledger).unwrap_or_default();
+    let mut live = 0usize;
+    let mut peak = 0usize;
+    for line in text.lines() {
+        match line.trim() {
+            "start" => {
+                live += 1;
+                peak = peak.max(live);
+            }
+            "end" => live = live.saturating_sub(1),
+            other => panic!("unexpected ledger line {other:?}"),
+        }
+    }
+    peak
+}
+
+/// Concurrent `RunAgent` calls are bounded, and the ones over the bound wait
+/// their turn rather than being refused.
+///
+/// Both halves matter and neither implies the other. A daemon that refused the
+/// surplus would also keep the peak at the limit, and a daemon that queued
+/// without bounding would also complete every request; only asserting both says
+/// "queued, not dropped".
+///
+/// Each in-flight host run costs a blocking-pool thread (of tokio's 512, shared
+/// with notes writes and every other `spawn_blocking` here), two OS threads for
+/// the stream captures, and a child process — so an unbounded burst is a real
+/// resource commitment, not just untidy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_runs_are_bounded_and_the_surplus_queues() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("ledger");
+    let agent = overlap_recording_agent(tmp.path(), &ledger);
+
+    let server = MockServer::start().await;
+    let mut fixture = make_run_agent_state(&server, agent, Vec::new());
+    // Pinned here rather than read from the state's own configuration. Asserting
+    // `peak <= state.agent_run_slots.limit()` would compare the mechanism with
+    // itself and hold for *any* limit, including one high enough to be no bound
+    // at all — a mutation raising the default sailed through that version. It
+    // would also scale the burst with the default, so raising it would silently
+    // make this test spawn dozens of processes.
+    const LIMIT: usize = 2;
+    {
+        let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
+        inner.agent_run_slots =
+            AgentRunSlots::new(std::num::NonZeroUsize::new(LIMIT).unwrap()).unwrap();
+    }
+    let state = &fixture.state;
+    let limit = LIMIT;
+    let session_id = open_session(state).await;
+
+    // Comfortably more than the bound, so the queue is exercised rather than
+    // merely present.
+    let burst = limit * 3;
+    let mut runs = tokio::task::JoinSet::new();
+    for i in 0..burst {
+        let state = Arc::clone(state);
+        runs.spawn(async move {
+            dispatch_message(
+                ClientMessage::RunAgent {
+                    prompt: crate::agent_run::AgentPrompt::new(format!("run {i}")),
+                    capabilities: Vec::new(),
+                    purpose: "concurrency-bound-test".parse().unwrap(),
+                    output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
+                        .unwrap(),
+                    session_id: Some(session_id),
+                    workspace: None,
+                    agent_kind: None,
+                    agent_model: None,
+                },
+                &state,
+            )
+            .await
+        });
+    }
+
+    let mut completed = 0usize;
+    while let Some(joined) = runs.join_next().await {
+        match joined.unwrap() {
+            ServerMessage::RunAgentCompleted { .. } => completed += 1,
+            other => panic!("every queued run must eventually run: got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        completed, burst,
+        "the surplus must queue and complete, not be refused"
+    );
+    let peak = peak_concurrency(&ledger);
+    assert!(
+        peak <= limit,
+        "at most {limit} agents may run at once; {peak} overlapped"
+    );
+    assert!(
+        peak > 1,
+        "with a bound above one the runs should actually overlap; a peak of \
+         {peak} means this test never exercised concurrency at all"
+    );
+}
+
+/// The shipped default is two concurrent runs.
+///
+/// Pinned separately from the mechanism test, which now fixes its own limit:
+/// "the bound is enforced" and "the bound is 2" are different claims, and a test
+/// that reads the limit out of the state it is testing can only ever check the
+/// first. Changing this number should be a deliberate edit here.
+#[test]
+fn the_default_concurrency_bound_is_two() {
+    assert_eq!(DEFAULT_MAX_CONCURRENT_AGENT_RUNS.get(), 2);
+}
+
+/// Every path that starts an agent run takes a slot.
+///
+/// A source scan, because the alternative is no coverage at all: the VM paths
+/// need a real agent-VM runtime, so the end-to-end concurrency test cannot reach
+/// them, and a mutation deleting a VM-side `acquire` survived it silently.
+///
+/// There are exactly two acquire sites, shaped differently on purpose. The host
+/// arm's run ends when its handler returns, so a function-scoped slot *is* the
+/// run's lifetime. A VM run's does not: `StartAgentRun` answers as soon as the
+/// VM is up, so `start_agent_run_session` acquires and hands the slot to the
+/// running session, which releases it at teardown. Both `RunAgent`'s VM arm and
+/// `StartAgentRun` funnel through that one function — which is why
+/// `run_agent_in_vm` must *not* acquire: two slots for one run would let a
+/// single request exhaust the default limit and then wait on itself.
+///
+/// A backstop, not a proof. It shows an `acquire` is present where one belongs
+/// and absent where it does not, not that the placement is right; the host arm's
+/// placement is checked by `concurrent_runs_are_bounded_and_the_surplus_queues`.
+#[test]
+fn every_path_that_starts_an_agent_run_takes_a_slot() {
+    /// The function's body, delimited by brace matching.
+    ///
+    /// Not by scanning for a closing brace at a fixed indent: these functions
+    /// live at two different nesting depths (one in a module, one in an `impl`),
+    /// and an indent-based terminator silently truncated the module-level one at
+    /// its first inner block — which read as "the host arm does not acquire".
+    fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+        let at = source.find(signature).unwrap_or_else(|| {
+            panic!("{signature:?} not found; rename the guard along with the function")
+        });
+        let open = at + source[at..].find('{').expect("a function has a body");
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[at..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after {signature:?}")
+    }
+
+    let dispatch = include_str!("run_agent.rs");
+    assert!(
+        body_of(dispatch, "pub(super) async fn run_agent<").contains("agent_run_slots.acquire()"),
+        "the host arm runs the agent inside its own handler, so it must hold a \
+         slot for that handler's lifetime"
+    );
+    assert!(
+        !body_of(dispatch, "async fn run_agent_in_vm<").contains("agent_run_slots.acquire()"),
+        "the VM arm must not take a slot of its own: it starts its run through \
+         `start_agent_run_session`, which takes one, and two slots for one run \
+         would deadlock at the default limit"
+    );
+
+    let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
+    let session_start = body_of(daemon, "pub async fn start_agent_run_session<");
+    // Any form of the wait counts here; *which* one each caller chooses is
+    // asserted by `only_the_vm_path_bounds_how_long_it_will_queue`. This guard is
+    // about the slot being taken at all.
+    assert!(
+        session_start.contains(".acquire_with(") || session_start.contains(".acquire()"),
+        "every VM agent run starts here — `RunAgent`'s VM arm and `StartAgentRun` \
+         both — so this is the one place that can bound them"
+    );
+}
+
+/// A limit the semaphore cannot represent is refused, not panicked on.
+///
+/// `tokio::sync::Semaphore::new` panics above `MAX_PERMITS`, and this limit is
+/// operator input, so without the check a config file could crash writd during
+/// startup — a stack trace where the operator needs a sentence naming the field.
+#[test]
+fn a_limit_above_the_semaphores_ceiling_is_refused() {
+    let too_many =
+        std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).expect("non-zero");
+    let err = AgentRunSlots::new(too_many).expect_err("above MAX_PERMITS must not be accepted");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_concurrent_agent_runs"),
+        "the error must name the config field an operator would have to edit; got {msg:?}"
+    );
+
+    // The boundary itself is representable, so the check refuses only what it must.
+    let at_ceiling =
+        std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).expect("non-zero");
+    assert!(AgentRunSlots::new(at_ceiling).is_ok());
+}
+
+/// A bounded wait gives up rather than hanging, and returns nothing when it does.
+///
+/// The distinction that matters: a caller that times out must not end up holding
+/// a slot it does not know about, because the work it would unblock is work
+/// nobody is waiting for.
+#[tokio::test(start_paused = true)]
+async fn a_bounded_wait_gives_up_when_no_slot_frees() {
+    let slots = AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+    let held = slots.acquire().await;
+    assert_eq!(slots.available(), 0);
+
+    let refused = slots
+        .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
+        .await;
+    assert_eq!(
+        refused.err(),
+        Some(std::time::Duration::from_secs(30)),
+        "with the only slot held, a bounded wait must expire rather than hang — \
+         and report back the budget it actually spent"
+    );
+    assert_eq!(
+        slots.available(),
+        0,
+        "a wait that gave up must not have taken anything with it"
+    );
+
+    drop(held);
+    let granted = slots
+        .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
+        .await;
+    assert!(
+        granted.is_ok(),
+        "once a slot frees, the same bounded wait must succeed — this is a queue \
+         with a deadline, not a refusal dressed up as one"
+    );
+}
+
+/// Only the VM path bounds its wait; the host arm still queues indefinitely.
+///
+/// The asymmetry is the point, so it is pinned rather than left to a reader
+/// comparing two files. A VM run's slot is released by a human stopping the
+/// session, and its caller is a CLI holding a socket open with its own deadline,
+/// so an unbounded wait there strands a VM nobody can name. A host run ends by
+/// itself, so its queue drains unattended and a caller that waits is waiting for
+/// something that will actually happen.
+#[test]
+fn only_the_vm_path_bounds_how_long_it_will_queue() {
+    let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
+    assert!(
+        daemon.contains("acquire_with(queueing)"),
+        "the VM session start must take its wait policy from the caller: the two \
+         callers differ in whether anyone is still listening when it ends"
+    );
+
+    // And the callers must choose the policy that matches their own shape.
+    let start_agent_run = include_str!("../server.rs");
+    assert!(
+        start_agent_run.contains("AgentRunQueueing::UpTo("),
+        "`StartAgentRun` answers a client with its own deadline, so its wait must \
+         be bounded — otherwise a slot granted later boots a VM whose id reaches \
+         nobody"
+    );
+
+    let dispatch = include_str!("run_agent.rs");
+    assert!(
+        dispatch.contains("AgentRunQueueing::UntilASlotFrees"),
+        "`RunAgent`'s VM arm holds its caller for the whole run, so it must queue \
+         rather than refuse a surplus workflow"
+    );
+    assert!(
+        dispatch.contains("agent_run_slots.acquire().await"),
+        "the host arm keeps the unbounded wait: its runs end without \
+         intervention, so its queue drains on its own"
+    );
+}
+
+/// A session closed *while a run is queued* is reported as closed, not as a
+/// generic failure.
+///
+/// The precheck happens before the wait, and the host arm's wait has no bound,
+/// so by the time a slot frees the answer may have changed. `begin_effect` does
+/// refuse a closed session — but as an opaque audit error, so a caller that
+/// waited minutes for its turn would learn only that something went wrong.
+///
+/// Getting this test to mean anything took a correction. Its first version closed
+/// the session immediately after dispatching, which was fast enough that the
+/// *pre-acquire* check answered — so it passed with the recheck deleted, proving
+/// nothing. The permit is now held by the test itself, and the test refuses to
+/// conclude anything unless it has confirmed the request is parked past its
+/// precheck: if the request has already answered by then, the assertion below
+/// says so rather than reporting success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_closed_while_queued_is_reported_as_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("ledger");
+    let agent = overlap_recording_agent(tmp.path(), &ledger);
+
+    let server = MockServer::start().await;
+    let mut fixture = make_run_agent_state(&server, agent, Vec::new());
+    {
+        let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
+        inner.agent_run_slots =
+            AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+    }
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    // Held here rather than by another run: the test controls exactly when the
+    // queued request is allowed to proceed, so the window it is parked in is not
+    // a matter of scheduling luck.
+    let held = state.agent_run_slots.acquire().await;
+    assert_eq!(state.agent_run_slots.available(), 0);
+
+    let queued = tokio::spawn({
+        let state = Arc::clone(state);
+        async move {
+            dispatch_message(
+                ClientMessage::RunAgent {
+                    prompt: crate::agent_run::AgentPrompt::new("queued"),
+                    capabilities: Vec::new(),
+                    purpose: "closed-while-queued".parse().unwrap(),
+                    output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
+                        .unwrap(),
+                    session_id: Some(session_id),
+                    workspace: None,
+                    agent_kind: None,
+                    agent_model: None,
+                },
+                &state,
+            )
+            .await
+        }
+    });
+
+    // Long enough for the request to clear its preconditions and park on the
+    // permit. Generous rather than tight: overshooting costs a moment, while
+    // undershooting is caught by the assertion after the close.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !queued.is_finished(),
+        "the request must still be waiting for a permit; if it has already \
+         answered, it never reached the queue and this test proves nothing"
+    );
+
+    state
+        .audit
+        .close_session(session_id, crate::core::UnixMillis::now())
+        .unwrap();
+
+    // Still parked *after* the close: so whatever it answers now, it answers on
+    // the far side of the wait, which is the only place the recheck runs.
+    assert!(
+        !queued.is_finished(),
+        "closing a session must not wake a queued request early; if it answered \
+         here it did so from the pre-acquire check and the recheck is untested"
+    );
+
+    drop(held);
+    let answer = queued.await.unwrap();
+    assert!(
+        matches!(answer, ServerMessage::ClosedSession { session_id: got } if got == session_id),
+        "a session closed during the queue must come back as ClosedSession, not \
+         as an opaque failure; got {answer:?}"
+    );
+}

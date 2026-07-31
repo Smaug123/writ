@@ -180,9 +180,43 @@ pub struct AgentVmLifecycleRuntimeConfig {
     tools: AgentVmToolPaths,
 }
 
+/// A live VM session and, for agent runs, its claim on the concurrency bound.
+///
+/// The slot is *inside* the map value rather than in a second map keyed by
+/// session id, so removing the session releases the slot by construction. Two
+/// maps that must be kept in step would be one more place to forget, and a
+/// forgotten release leaks a permit permanently — the bound would shrink by one
+/// every time, until nothing could run at all.
+struct RunningAgentVm {
+    session: RunningVmHttpSession,
+    /// `None` for sessions that are not agent runs (the broker VM), and for
+    /// sessions reattached at boot: writd counts new starts, not a state that
+    /// already exists, so a restart with more live sessions than the limit comes
+    /// up over-subscribed and drains back under as they end.
+    _slot: Option<crate::server::AgentRunSlot>,
+}
+
+/// How long a `StartAgentRun` will wait for a concurrency slot before answering
+/// "at capacity".
+///
+/// Bounded by the caller's patience, not by ours. The CLI gives a workspace
+/// start 30 minutes end to end (`AGENT_VM_WORKSPACE_CALL_TIMEOUT`), and the
+/// bootstrap it then waits on is itself allowed 20, so only about ten minutes of
+/// that budget can be spent queueing before the client stops listening. Five
+/// leaves room for the boot to finish inside the budget and still be reported.
+///
+/// Waiting longer would not be more generous, it would be worse: writd is inside
+/// `dispatch`, never sees the client's EOF, and would go on to boot a VM whose
+/// session id reaches nobody. The operator would be left with a running agent
+/// they cannot name, only findable through `writ agent-vm list`.
+///
+/// The synchronous host arm deliberately has no such bound — its runs end by
+/// themselves, so its queue drains without anyone intervening.
+pub(crate) const AGENT_RUN_QUEUE_WAIT: Duration = Duration::from_secs(5 * 60);
+
 pub struct AgentVmDaemon {
     config: AgentVmDaemonRuntimeConfig,
-    running: Mutex<HashMap<SessionId, RunningVmHttpSession>>,
+    running: Mutex<HashMap<SessionId, RunningAgentVm>>,
     /// Serialises the load-state → choose-subnet → write-`Starting`-record
     /// window so concurrent starts cannot pick the same subnet index. Held
     /// only across that fast window; the slow VM boot in
@@ -273,6 +307,14 @@ pub enum AgentVmDaemonError {
          clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
     )]
     AgentRunUnsupportedForVmBroker,
+    #[error(
+        "writd is already running its maximum of {limit} concurrent agent runs, and no slot came \
+         free within {waited:?}. The bound is shared with host-spawned runs, which finish on \
+         their own and appear in no VM listing; VM sessions hold their slot until stopped, and \
+         `writ agent-vm list` shows those (`writ agent-vm stop <session-id>` returns one). Raise \
+         `max_concurrent_agent_runs` to allow more."
+    )]
+    AgentRunsAtCapacity { limit: usize, waited: Duration },
     #[error(
         "broker_placement = vm runtime config is incomplete (missing {0}); this is a writd wiring \
          bug — the daemon should carry it for vm placement"

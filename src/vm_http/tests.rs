@@ -140,6 +140,7 @@ pub(super) fn make_broker_state_with_extra_secrets(
         notes_repo: None,
         signing_key: None,
         run_agent_spawn: None,
+        agent_run_slots: Default::default(),
         promote_runtime: None,
         git_data_http: std::sync::OnceLock::new(),
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),

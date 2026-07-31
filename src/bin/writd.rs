@@ -162,6 +162,7 @@ async fn run_host_daemon(
         ui_http,
         run_agent,
         agent_run_log_root,
+        max_concurrent_agent_runs,
     } = config;
 
     let socket_path = default_paths::SOCKET.or_resolve(socket.or(socket_path))?;
@@ -231,8 +232,13 @@ async fn run_host_daemon(
         agent_run_log_root.as_deref(),
         secret_store.as_ref(),
         run_agent.as_ref(),
+        max_concurrent_agent_runs,
     )
     .map_err(|errors| errors.to_string())?;
+    // Validated in the preflight above alongside every other section, so an
+    // out-of-range limit is reported with the rest rather than one restart at a
+    // time — and before anything has been created on disk.
+    let agent_run_slots = checked.agent_run_slots;
     let agent_vm = checked.agent_vm;
     // Both of these are environment-derived defaults, resolved inside the
     // preflight above rather than at their point of use: the secret store so
@@ -459,6 +465,7 @@ async fn run_host_daemon(
         notes_repo,
         signing_key,
         run_agent_spawn,
+        agent_run_slots,
         promote_runtime,
         git_data_http: std::sync::OnceLock::new(),
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
