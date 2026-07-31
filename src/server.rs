@@ -53,7 +53,8 @@ mod staged_push;
 /// Run-agent orchestration (the `RunAgent` handler and its VM-dispatch
 /// path), split out of this file to keep the dispatcher readable.
 mod run_agent;
-pub use run_agent::{AgentRunSlots, DEFAULT_MAX_CONCURRENT_AGENT_RUNS};
+pub(crate) use run_agent::AgentRunSlot;
+pub use run_agent::{AgentRunSlots, AgentRunSlotsError, DEFAULT_MAX_CONCURRENT_AGENT_RUNS};
 
 /// Boot-time description of the child process that produces an agent
 /// run's streams, and where those streams are kept. Pure data —

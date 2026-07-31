@@ -64,16 +64,41 @@ pub struct AgentRunSlots {
 }
 
 impl AgentRunSlots {
-    pub fn new(limit: NonZeroUsize) -> Self {
-        Self {
+    /// Build a bound, refusing a limit the underlying semaphore cannot hold.
+    ///
+    /// Fallible only because of that ceiling: [`tokio::sync::Semaphore::new`]
+    /// *panics* above [`tokio::sync::Semaphore::MAX_PERMITS`], and a limit is
+    /// operator input, so the failure would land as a daemon crash during
+    /// startup rather than as a message naming the bad field. No configuration
+    /// value should be able to do that.
+    pub fn new(limit: NonZeroUsize) -> Result<Self, AgentRunSlotsError> {
+        if limit.get() > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(AgentRunSlotsError::AboveMaxPermits {
+                limit,
+                max: tokio::sync::Semaphore::MAX_PERMITS,
+            });
+        }
+        Ok(Self {
             slots: Arc::new(tokio::sync::Semaphore::new(limit.get())),
             limit,
-        }
+        })
     }
 
     /// The configured bound, for tests and operator-facing reporting.
     pub fn limit(&self) -> NonZeroUsize {
         self.limit
+    }
+
+    /// How many runs could start right now without waiting.
+    ///
+    /// A momentary reading, not a reservation — by the time a caller acts on it
+    /// the number may have changed, so it is for reporting and for tests, never
+    /// for deciding whether to start a run. Tests need it because the property
+    /// that matters for a VM run is *when the slot is released*, and a run that
+    /// takes a slot and drops it immediately is indistinguishable from one that
+    /// holds it if all you can see is that `acquire` was called.
+    pub fn available(&self) -> usize {
+        self.slots.available_permits()
     }
 
     /// Wait for a slot, then hold it until the returned guard is dropped.
@@ -83,7 +108,7 @@ impl AgentRunSlots {
     /// was malformed" would be a worse answer than refusing outright, and each
     /// arm's preconditions differ, so this is not something the dispatcher can
     /// do once on their behalf.
-    async fn acquire(&self) -> AgentRunSlot {
+    pub(crate) async fn acquire(&self) -> AgentRunSlot {
         AgentRunSlot(
             Arc::clone(&self.slots)
                 .acquire_owned()
@@ -98,13 +123,29 @@ impl AgentRunSlots {
 impl Default for AgentRunSlots {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_CONCURRENT_AGENT_RUNS)
+            .expect("the built-in default is far below the semaphore's ceiling")
     }
+}
+
+/// Why a configured concurrency limit was refused.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum AgentRunSlotsError {
+    #[error(
+        "max_concurrent_agent_runs is {limit}, above the maximum this daemon can \
+         represent ({max}); a limit that large is not a bound in any case"
+    )]
+    AboveMaxPermits { limit: NonZeroUsize, max: usize },
 }
 
 /// One in-flight agent run's claim on the bound. Releases on drop, so every
 /// early return frees it.
+///
+/// Visible to the agent-VM daemon because a VM run's slot outlives the request
+/// that started it: `StartAgentRun` boots a VM and answers immediately, so the
+/// slot has to live with the session and be released when the session is torn
+/// down, not when the handler returns.
 #[derive(Debug)]
-struct AgentRunSlot(
+pub(crate) struct AgentRunSlot(
     #[expect(
         dead_code,
         reason = "held for its Drop: releasing the slot when the run ends is the \
@@ -587,13 +628,17 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
         return run_agent_not_configured("signing_key");
     };
 
-    // Same rule as the host arm, and the same bound: preconditions first, then
-    // wait for a slot, then commit resources. Here the resource is a whole VM,
-    // and `start_agent_run_session` both mints the session and records the run's
-    // audit row, so acquiring after it would mean a row and a live VM belonging
-    // to a run that is only queued.
-    let _slot = state.agent_run_slots.acquire().await;
-
+    // No slot is taken here, deliberately. Every VM run — this arm's and
+    // `StartAgentRun`'s — goes through `start_agent_run_session`, which acquires
+    // one and hands it to the running session, so the slot is released when the
+    // VM is torn down rather than when a request handler returns. That matters
+    // because `StartAgentRun` answers as soon as the VM is up and the session
+    // outlives its request entirely.
+    //
+    // Acquiring again here would be worse than redundant: this arm would hold
+    // two slots for one run, and at the default limit of two a single request
+    // would exhaust the bound and then wait forever for the slot it is itself
+    // blocking.
     let prompt_bytes = prompt.as_bytes().to_vec();
     let prompt_sha256_str = sha256_hex(&prompt_bytes);
     let prompt_sha256 = Sha256Hex::try_new(prompt_sha256_str)

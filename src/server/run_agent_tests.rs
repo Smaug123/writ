@@ -1547,7 +1547,8 @@ async fn concurrent_runs_are_bounded_and_the_surplus_queues() {
     const LIMIT: usize = 2;
     {
         let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
-        inner.agent_run_slots = AgentRunSlots::new(std::num::NonZeroUsize::new(LIMIT).unwrap());
+        inner.agent_run_slots =
+            AgentRunSlots::new(std::num::NonZeroUsize::new(LIMIT).unwrap()).unwrap();
     }
     let state = &fixture.state;
     let limit = LIMIT;
@@ -1613,40 +1614,93 @@ fn the_default_concurrency_bound_is_two() {
     assert_eq!(DEFAULT_MAX_CONCURRENT_AGENT_RUNS.get(), 2);
 }
 
-/// Both dispatch arms take a slot before starting a run.
+/// Every path that starts an agent run takes a slot.
 ///
-/// A source scan, because the alternative is no coverage at all: the VM arm
-/// needs a real agent-VM runtime, so no test in this suite reaches its body, and
-/// a mutation deleting its `acquire` survived the end-to-end concurrency test
-/// silently. The bound is one rule with two implementations, which is exactly
-/// the shape `tests/shared_hardening_helpers.rs` exists to guard.
+/// A source scan, because the alternative is no coverage at all: the VM paths
+/// need a real agent-VM runtime, so the end-to-end concurrency test cannot reach
+/// them, and a mutation deleting a VM-side `acquire` survived it silently.
 ///
-/// It is a backstop, not a proof. It shows an `acquire` is *present* in each
-/// arm, not that it is placed correctly — the placement (after validation,
-/// before committing resources) is stated at each call site and checked for the
-/// host arm by `concurrent_runs_are_bounded_and_the_surplus_queues`. The durable
-/// version would be a type that cannot start a run without a slot to show for
-/// it; until the two arms share such a funnel, this is what catches a deletion.
+/// There are exactly two acquire sites, shaped differently on purpose. The host
+/// arm's run ends when its handler returns, so a function-scoped slot *is* the
+/// run's lifetime. A VM run's does not: `StartAgentRun` answers as soon as the
+/// VM is up, so `start_agent_run_session` acquires and hands the slot to the
+/// running session, which releases it at teardown. Both `RunAgent`'s VM arm and
+/// `StartAgentRun` funnel through that one function — which is why
+/// `run_agent_in_vm` must *not* acquire: two slots for one run would let a
+/// single request exhaust the default limit and then wait on itself.
+///
+/// A backstop, not a proof. It shows an `acquire` is present where one belongs
+/// and absent where it does not, not that the placement is right; the host arm's
+/// placement is checked by `concurrent_runs_are_bounded_and_the_surplus_queues`.
 #[test]
-fn every_run_agent_arm_acquires_a_slot() {
-    let source = include_str!("run_agent.rs");
-    // The two arms, by the function that owns each one's "start the run" step.
-    for arm in [
-        "pub(super) async fn run_agent<",
-        "async fn run_agent_in_vm<",
-    ] {
-        let at = source
-            .find(arm)
-            .unwrap_or_else(|| panic!("dispatch arm {arm:?} not found; rename the guard with it"));
-        // Up to the next `\n}` at column zero: the whole function body.
-        let body_end = source[at..]
-            .find("\n}\n")
-            .map_or(source.len(), |offset| at + offset);
-        let body = &source[at..body_end];
-        assert!(
-            body.contains("agent_run_slots.acquire()"),
-            "{arm} must take an agent-run slot before starting a run; without it \
-             that arm is unbounded and nothing else here would notice"
-        );
+fn every_path_that_starts_an_agent_run_takes_a_slot() {
+    /// The function's body, delimited by brace matching.
+    ///
+    /// Not by scanning for a closing brace at a fixed indent: these functions
+    /// live at two different nesting depths (one in a module, one in an `impl`),
+    /// and an indent-based terminator silently truncated the module-level one at
+    /// its first inner block — which read as "the host arm does not acquire".
+    fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+        let at = source.find(signature).unwrap_or_else(|| {
+            panic!("{signature:?} not found; rename the guard along with the function")
+        });
+        let open = at + source[at..].find('{').expect("a function has a body");
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[at..open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after {signature:?}")
     }
+
+    let dispatch = include_str!("run_agent.rs");
+    assert!(
+        body_of(dispatch, "pub(super) async fn run_agent<").contains("agent_run_slots.acquire()"),
+        "the host arm runs the agent inside its own handler, so it must hold a \
+         slot for that handler's lifetime"
+    );
+    assert!(
+        !body_of(dispatch, "async fn run_agent_in_vm<").contains("agent_run_slots.acquire()"),
+        "the VM arm must not take a slot of its own: it starts its run through \
+         `start_agent_run_session`, which takes one, and two slots for one run \
+         would deadlock at the default limit"
+    );
+
+    let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
+    assert!(
+        body_of(daemon, "pub async fn start_agent_run_session<")
+            .contains("agent_run_slots.acquire()"),
+        "every VM agent run starts here — `RunAgent`'s VM arm and `StartAgentRun` \
+         both — so this is the one place that can bound them"
+    );
+}
+
+/// A limit the semaphore cannot represent is refused, not panicked on.
+///
+/// `tokio::sync::Semaphore::new` panics above `MAX_PERMITS`, and this limit is
+/// operator input, so without the check a config file could crash writd during
+/// startup — a stack trace where the operator needs a sentence naming the field.
+#[test]
+fn a_limit_above_the_semaphores_ceiling_is_refused() {
+    let too_many =
+        std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).expect("non-zero");
+    let err = AgentRunSlots::new(too_many).expect_err("above MAX_PERMITS must not be accepted");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_concurrent_agent_runs"),
+        "the error must name the config field an operator would have to edit; got {msg:?}"
+    );
+
+    // The boundary itself is representable, so the check refuses only what it must.
+    let at_ceiling =
+        std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).expect("non-zero");
+    assert!(AgentRunSlots::new(at_ceiling).is_ok());
 }

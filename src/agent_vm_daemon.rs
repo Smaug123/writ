@@ -180,9 +180,25 @@ pub struct AgentVmLifecycleRuntimeConfig {
     tools: AgentVmToolPaths,
 }
 
+/// A live VM session and, for agent runs, its claim on the concurrency bound.
+///
+/// The slot is *inside* the map value rather than in a second map keyed by
+/// session id, so removing the session releases the slot by construction. Two
+/// maps that must be kept in step would be one more place to forget, and a
+/// forgotten release leaks a permit permanently — the bound would shrink by one
+/// every time, until nothing could run at all.
+struct RunningAgentVm {
+    session: RunningVmHttpSession,
+    /// `None` for sessions that are not agent runs (the broker VM), and for
+    /// sessions reattached at boot: writd counts new starts, not a state that
+    /// already exists, so a restart with more live sessions than the limit comes
+    /// up over-subscribed and drains back under as they end.
+    _slot: Option<crate::server::AgentRunSlot>,
+}
+
 pub struct AgentVmDaemon {
     config: AgentVmDaemonRuntimeConfig,
-    running: Mutex<HashMap<SessionId, RunningVmHttpSession>>,
+    running: Mutex<HashMap<SessionId, RunningAgentVm>>,
     /// Serialises the load-state → choose-subnet → write-`Starting`-record
     /// window so concurrent starts cannot pick the same subnet index. Held
     /// only across that fast window; the slow VM boot in

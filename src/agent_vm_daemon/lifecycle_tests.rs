@@ -1665,3 +1665,117 @@ async fn workspace_bootstrap_wait_preserves_tail_of_large_failure() {
         "the actionable tail of a large failure must survive, got: {message:?}"
     );
 }
+
+/// A state whose agent-run bound is exactly one, so a single session exhausts it
+/// and the slot's whereabouts are unambiguous.
+fn state_with_one_run_slot(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
+    let mut state = make_state_with_audit(audit);
+    let inner = Arc::get_mut(&mut state).expect("fresh state Arc is unshared");
+    inner.agent_run_slots =
+        crate::server::AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+    state
+}
+
+/// An agent-run start that fails gives its slot back.
+///
+/// A leak here is permanent and silent: the semaphore has no owner to reclaim
+/// from, so every failed start would shrink the bound by one until the daemon
+/// could run nothing at all, with no error to explain why. The rejection this
+/// uses (agent runs are unsupported under a VM broker) happens after the slot is
+/// taken and before any container work, which is exactly the window that matters.
+#[tokio::test]
+async fn a_failed_agent_run_start_returns_its_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) =
+        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    let daemon = AgentVmDaemon::new(config);
+    let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    assert_eq!(state.agent_run_slots.available(), 1, "precondition");
+
+    daemon
+        .start_agent_run_session(
+            Arc::clone(&state),
+            Some("run".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .await
+        .expect_err("agent runs are unsupported under a VM broker");
+
+    assert_eq!(
+        state.agent_run_slots.available(),
+        1,
+        "a start that failed holds no run, so it must hold no slot either"
+    );
+}
+
+/// A running agent-run session holds its slot for as long as it exists, and
+/// gives it back when it is stopped.
+///
+/// This is the property the whole VM-side design rests on, and the one a source
+/// scan cannot see. `StartAgentRun` answers as soon as the VM is up, so a slot
+/// scoped to the request handler would be released while the VM was still
+/// running — `acquire` would still be there to find, and the bound would count
+/// requests in flight rather than agents. A mutation that dropped the slot at
+/// start survived every other test in this suite.
+#[tokio::test]
+async fn a_running_agent_run_session_holds_its_slot_until_it_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool =
+        write_fake_workspace_success_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    assert_eq!(state.agent_run_slots.available(), 1, "precondition");
+
+    let started = daemon
+        .start_agent_run_session(
+            Arc::clone(&state),
+            Some("held".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::Sources,
+            },
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .await
+        .expect("the fake container tooling completes a session start");
+
+    assert_eq!(
+        state.agent_run_slots.available(),
+        0,
+        "the VM is up and the agent is running, so its slot must still be held; \
+         a slot released here would bound requests rather than agents"
+    );
+
+    daemon
+        .stop_session(&state, started.session_id())
+        .await
+        .expect("stopping a started session");
+
+    assert_eq!(
+        state.agent_run_slots.available(),
+        1,
+        "teardown must return the slot, or the bound shrinks permanently"
+    );
+}

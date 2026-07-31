@@ -451,6 +451,13 @@ async fn run_host_daemon(
         .as_ref()
         .map(|cfg| Arc::new(cfg.vm_http().git_clone().to_promote_runtime_config()));
 
+    // Surfaced as a configuration error rather than a panic inside the state
+    // literal: this value comes from the operator's config file.
+    let agent_run_slots = writ::server::AgentRunSlots::new(
+        max_concurrent_agent_runs.unwrap_or(writ::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
+    )
+    .map_err(|e| format!("invalid config {}: {e}", config_path.display()))?;
+
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(github_apps),
@@ -460,9 +467,7 @@ async fn run_host_daemon(
         notes_repo,
         signing_key,
         run_agent_spawn,
-        agent_run_slots: writ::server::AgentRunSlots::new(
-            max_concurrent_agent_runs.unwrap_or(writ::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
-        ),
+        agent_run_slots,
         promote_runtime,
         git_data_http: std::sync::OnceLock::new(),
         mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),

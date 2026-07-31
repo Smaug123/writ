@@ -150,13 +150,26 @@ pub struct DaemonConfig {
     /// written.
     #[serde(default)]
     pub agent_run_log_root: Option<PathBuf>,
-    /// How many agent runs writd will execute at once, across *both* `RunAgent`
-    /// dispatch arms. Defaults to
+    /// How many agent runs writd will execute at once — every way of starting
+    /// one: both `RunAgent` dispatch arms and `StartAgentRun` (what
+    /// `writ agent run` sends). Defaults to
     /// [`DEFAULT_MAX_CONCURRENT_AGENT_RUNS`](crate::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS).
     ///
     /// Requests over the limit **queue**; they are not refused. An agent run is
     /// a minutes-long job dispatched by a workflow tool, so a delay is a far
     /// better answer than a failure the caller has to build retry logic around.
+    ///
+    /// One consequence is worth knowing before setting this low. A
+    /// `StartAgentRun` session holds its place until someone stops it, so
+    /// leaving `max_concurrent_agent_runs` sessions running and walking away
+    /// blocks every later run indefinitely — `writ agent list` shows what is
+    /// holding them, and `writ agent stop` returns one.
+    ///
+    /// The bound governs *new* starts, not state that already exists: a writd
+    /// restart reattaches every session that was running, even if there are more
+    /// of them than this allows, and drains back under the limit as they end.
+    /// Refusing to reattach would orphan a live VM, which is worse than being
+    /// briefly over-subscribed.
     ///
     /// Top-level for the same reason as [`Self::agent_run_log_root`]: neither
     /// section can own it. A daemon serving only VM runs has no `run_agent`
