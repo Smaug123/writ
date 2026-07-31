@@ -102,15 +102,18 @@ impl AgentRunSlots {
         self.slots.available_permits()
     }
 
-    /// Wait up to `budget` for a slot, giving up rather than waiting forever.
+    /// Wait for a slot on the caller's terms.
     ///
-    /// For callers whose reply travels back over a socket the client will stop
-    /// listening on. Waiting past that point is worse than refusing: the client
-    /// has already given up, so the work this slot unblocks produces something
-    /// nobody is waiting for — for a VM run, an agent left running that the
-    /// caller never learns the id of.
-    pub(crate) async fn acquire_within(&self, budget: Duration) -> Option<AgentRunSlot> {
-        tokio::time::timeout(budget, self.acquire()).await.ok()
+    /// Returns `None` only when a bounded caller's budget expired. See
+    /// [`AgentRunQueueing`] for why that is a per-caller choice rather than a
+    /// property of the bound.
+    pub(crate) async fn acquire_with(&self, queueing: AgentRunQueueing) -> Option<AgentRunSlot> {
+        match queueing {
+            AgentRunQueueing::UntilASlotFrees => Some(self.acquire().await),
+            AgentRunQueueing::UpTo(budget) => {
+                tokio::time::timeout(budget, self.acquire()).await.ok()
+            }
+        }
     }
 
     /// Wait for a slot, then hold it until the returned guard is dropped.
@@ -147,6 +150,28 @@ pub enum AgentRunSlotsError {
          represent ({max}); a limit that large is not a bound in any case"
     )]
     AboveMaxPermits { limit: NonZeroUsize, max: usize },
+}
+
+/// How long a caller is willing to wait for a slot.
+///
+/// Caller-specific because the callers differ in one way that matters: whether
+/// anyone is still listening when the wait ends.
+///
+/// `StartAgentRun` answers over a socket whose client has its own deadline, so a
+/// slot granted after that deadline boots a VM whose session id reaches nobody.
+/// `RunAgent`'s VM arm holds its caller for the whole run — bailiff's client sets
+/// no start deadline and stops the VM when it is done — so waiting is exactly
+/// what its caller asked for, and refusing it would break the queueing the
+/// configuration promises.
+///
+/// An enum rather than an `Option<Duration>`, so neither arm can be read as "no
+/// timeout configured yet".
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AgentRunQueueing {
+    /// Wait for as long as it takes. For callers that will still be there.
+    UntilASlotFrees,
+    /// Give up after this long, and answer at-capacity instead.
+    UpTo(Duration),
 }
 
 /// One in-flight agent run's claim on the bound. Releases on drop, so every
@@ -671,6 +696,11 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
                 correlation_id: None,
                 purpose: Some(purpose),
             },
+            // Bailiff's client holds this connection for the whole run and sets
+            // no start deadline, so waiting is what it asked for: refusing a
+            // surplus workflow after five minutes would break the queueing the
+            // configuration promises.
+            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
     {

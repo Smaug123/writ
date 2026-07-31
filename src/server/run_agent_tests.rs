@@ -1676,11 +1676,11 @@ fn every_path_that_starts_an_agent_run_takes_a_slot() {
 
     let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
     let session_start = body_of(daemon, "pub async fn start_agent_run_session<");
-    // Either form of the wait counts here; *which* one is asserted by
-    // `only_the_vm_path_bounds_how_long_it_will_queue`. This guard is about the
-    // slot being taken at all.
+    // Any form of the wait counts here; *which* one each caller chooses is
+    // asserted by `only_the_vm_path_bounds_how_long_it_will_queue`. This guard is
+    // about the slot being taken at all.
     assert!(
-        session_start.contains(".acquire_within(") || session_start.contains(".acquire()"),
+        session_start.contains(".acquire_with(") || session_start.contains(".acquire()"),
         "every VM agent run starts here — `RunAgent`'s VM arm and `StartAgentRun` \
          both — so this is the one place that can bound them"
     );
@@ -1720,7 +1720,7 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
     assert_eq!(slots.available(), 0);
 
     let refused = slots
-        .acquire_within(std::time::Duration::from_secs(30))
+        .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
         .await;
     assert!(
         refused.is_none(),
@@ -1734,7 +1734,7 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
 
     drop(held);
     let granted = slots
-        .acquire_within(std::time::Duration::from_secs(30))
+        .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
         .await;
     assert!(
         granted.is_some(),
@@ -1755,13 +1755,26 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
 fn only_the_vm_path_bounds_how_long_it_will_queue() {
     let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
     assert!(
-        daemon.contains("acquire_within(AGENT_RUN_QUEUE_WAIT)"),
-        "the VM session start must bound its wait: its caller's socket has a \
-         deadline, and a slot granted after that boots a VM whose id reaches \
+        daemon.contains("acquire_with(queueing)"),
+        "the VM session start must take its wait policy from the caller: the two \
+         callers differ in whether anyone is still listening when it ends"
+    );
+
+    // And the callers must choose the policy that matches their own shape.
+    let start_agent_run = include_str!("../server.rs");
+    assert!(
+        start_agent_run.contains("AgentRunQueueing::UpTo("),
+        "`StartAgentRun` answers a client with its own deadline, so its wait must \
+         be bounded — otherwise a slot granted later boots a VM whose id reaches \
          nobody"
     );
 
     let dispatch = include_str!("run_agent.rs");
+    assert!(
+        dispatch.contains("AgentRunQueueing::UntilASlotFrees"),
+        "`RunAgent`'s VM arm holds its caller for the whole run, so it must queue \
+         rather than refuse a surplus workflow"
+    );
     assert!(
         dispatch.contains("agent_run_slots.acquire().await"),
         "the host arm keeps the unbounded wait: its runs end without \

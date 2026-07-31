@@ -156,6 +156,10 @@ impl AgentVmDaemon {
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
         tags: AgentRunTags,
+        // How long this caller will wait for a slot. Not a property of the
+        // daemon: `StartAgentRun`'s client has a deadline and goes away,
+        // `RunAgent`'s holds the connection for the whole run.
+        queueing: crate::server::AgentRunQueueing,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
@@ -193,16 +197,10 @@ impl AgentVmDaemon {
         // this slot cannot live in this function's scope — it is handed to the
         // running session below and released when that session is torn down.
         //
-        // Bounded, unlike the host arm's wait, because this reply has a client
-        // waiting on a socket with its own deadline. Past that the caller has
-        // gone, and a slot granted afterwards would boot a VM whose session id
-        // reaches nobody — a running agent with no one to stop it. Refusing is
-        // the better answer once the answer can no longer be delivered.
-        let Some(run_slot) = state
-            .agent_run_slots
-            .acquire_within(AGENT_RUN_QUEUE_WAIT)
-            .await
-        else {
+        // Whether this wait is bounded is the caller's call, not ours — see
+        // `AgentRunQueueing`. Both kinds of caller reach this one function, and
+        // they differ in whether anyone is still listening when the wait ends.
+        let Some(run_slot) = state.agent_run_slots.acquire_with(queueing).await else {
             return Err(AgentVmDaemonError::AgentRunsAtCapacity {
                 limit: state.agent_run_slots.limit().get(),
                 waited: AGENT_RUN_QUEUE_WAIT,

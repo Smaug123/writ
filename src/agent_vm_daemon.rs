@@ -212,7 +212,7 @@ struct RunningAgentVm {
 ///
 /// The synchronous host arm deliberately has no such bound — its runs end by
 /// themselves, so its queue drains without anyone intervening.
-const AGENT_RUN_QUEUE_WAIT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const AGENT_RUN_QUEUE_WAIT: Duration = Duration::from_secs(5 * 60);
 
 pub struct AgentVmDaemon {
     config: AgentVmDaemonRuntimeConfig,

@@ -54,7 +54,9 @@ mod staged_push;
 /// path), split out of this file to keep the dispatcher readable.
 mod run_agent;
 pub(crate) use run_agent::AgentRunSlot;
-pub use run_agent::{AgentRunSlots, AgentRunSlotsError, DEFAULT_MAX_CONCURRENT_AGENT_RUNS};
+pub use run_agent::{
+    AgentRunQueueing, AgentRunSlots, AgentRunSlotsError, DEFAULT_MAX_CONCURRENT_AGENT_RUNS,
+};
 
 /// Boot-time description of the child process that produces an agent
 /// run's streams, and where those streams are kept. Pure data —
@@ -340,6 +342,12 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                             correlation_id,
                             purpose: None,
                         },
+                        // The CLI that sent this has its own deadline and will
+                        // stop listening; a slot granted afterwards would boot a
+                        // VM whose session id reaches nobody.
+                        crate::server::AgentRunQueueing::UpTo(
+                            crate::agent_vm_daemon::AGENT_RUN_QUEUE_WAIT,
+                        ),
                     )
                     .await
                 {

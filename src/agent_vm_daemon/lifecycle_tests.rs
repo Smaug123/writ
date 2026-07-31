@@ -77,6 +77,7 @@ async fn vm_broker_placement_rejects_agent_run_sessions() {
             },
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
+            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
         .unwrap_err();
@@ -1676,22 +1677,24 @@ fn state_with_one_run_slot(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
     state
 }
 
-/// An agent-run start that fails gives its slot back.
+/// An agent-run start that fails *after taking a slot* gives it back.
 ///
-/// A leak here is permanent and silent: the semaphore has no owner to reclaim
-/// from, so every failed start would shrink the bound by one until the daemon
-/// could run nothing at all, with no error to explain why. The rejection this
-/// uses (agent runs are unsupported under a VM broker) happens after the slot is
-/// taken and before any container work, which is exactly the window that matters.
+/// A leak here is permanent and silent: nothing reclaims from the semaphore, so
+/// every failed start would shrink the bound by one until the daemon could run
+/// nothing at all, with no error to explain why.
+///
+/// The failure has to happen after acquisition to prove anything, which is a
+/// sharper requirement than it looks. This test previously used the
+/// broker-placement rejection — until that check moved *ahead* of the acquire to
+/// stop refusals queueing, at which point the test passed without a permit ever
+/// being taken and was asserting nothing. So it now fails inside VM startup,
+/// which is downstream of the slot.
 #[tokio::test]
 async fn a_failed_agent_run_start_returns_its_slot() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) =
-        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    let fake_tool = write_fake_network_create_failure_tool(dir.path(), &args_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
     let daemon = AgentVmDaemon::new(config);
     let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
 
@@ -1710,10 +1713,16 @@ async fn a_failed_agent_run_start_returns_its_slot() {
             },
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
+            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
-        .expect_err("agent runs are unsupported under a VM broker");
+        .expect_err("the fake tooling fails network creation during startup");
 
+    assert!(
+        args_log.exists(),
+        "the failure must happen inside startup, i.e. after the slot was taken; \
+         a failure before it would make the assertion below vacuous"
+    );
     assert_eq!(
         state.agent_run_slots.available(),
         1,
@@ -1757,6 +1766,7 @@ async fn a_running_agent_run_session_holds_its_slot_until_it_is_stopped() {
             },
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
+            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
         .expect("the fake container tooling completes a session start");
@@ -1818,6 +1828,7 @@ async fn a_refused_agent_run_start_registers_no_session_lock() {
                 },
                 crate::agent_run::AgentPrompt::new("do it"),
                 crate::agent_vm_daemon::AgentRunTags::default(),
+                crate::server::AgentRunQueueing::UntilASlotFrees,
             )
             .await
             .expect_err("agent runs are unsupported under a VM broker");

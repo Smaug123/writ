@@ -165,6 +165,16 @@ async fn run_host_daemon(
         max_concurrent_agent_runs,
     } = config;
 
+    // Built here, before writd creates directories, opens and reconciles the
+    // audit DB, generates signing material, or binds the socket. It is pure
+    // validation of a config value, and a config writd will refuse should be
+    // refused before it has changed anything on disk — otherwise a typo leaves
+    // durable side effects behind on the way to the error message.
+    let agent_run_slots = writ::server::AgentRunSlots::new(
+        max_concurrent_agent_runs.unwrap_or(writ::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
+    )
+    .map_err(|e| format!("invalid config {}: {e}", config_path.display()))?;
+
     let socket_path = default_paths::SOCKET.or_resolve(socket.or(socket_path))?;
 
     let audit_db_selected = audit_db.or(audit_db_config);
@@ -450,13 +460,6 @@ async fn run_host_daemon(
     let promote_runtime = agent_vm
         .as_ref()
         .map(|cfg| Arc::new(cfg.vm_http().git_clone().to_promote_runtime_config()));
-
-    // Surfaced as a configuration error rather than a panic inside the state
-    // literal: this value comes from the operator's config file.
-    let agent_run_slots = writ::server::AgentRunSlots::new(
-        max_concurrent_agent_runs.unwrap_or(writ::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
-    )
-    .map_err(|e| format!("invalid config {}: {e}", config_path.display()))?;
 
     let state = Arc::new(BrokerState {
         audit: Arc::new(audit),
