@@ -104,15 +104,19 @@ impl AgentRunSlots {
 
     /// Wait for a slot on the caller's terms.
     ///
-    /// Returns `None` only when a bounded caller's budget expired. See
-    /// [`AgentRunQueueing`] for why that is a per-caller choice rather than a
-    /// property of the bound.
-    pub(crate) async fn acquire_with(&self, queueing: AgentRunQueueing) -> Option<AgentRunSlot> {
+    /// The error carries the budget that expired, so a caller reporting "no slot
+    /// came free within X" cannot name a different X from the one it actually
+    /// waited. Only a bounded caller can fail, and only by exhausting its own
+    /// budget. See [`AgentRunQueueing`] for why the budget is per-caller.
+    pub(crate) async fn acquire_with(
+        &self,
+        queueing: AgentRunQueueing,
+    ) -> Result<AgentRunSlot, Duration> {
         match queueing {
-            AgentRunQueueing::UntilASlotFrees => Some(self.acquire().await),
-            AgentRunQueueing::UpTo(budget) => {
-                tokio::time::timeout(budget, self.acquire()).await.ok()
-            }
+            AgentRunQueueing::UntilASlotFrees => Ok(self.acquire().await),
+            AgentRunQueueing::UpTo(budget) => tokio::time::timeout(budget, self.acquire())
+                .await
+                .map_err(|_elapsed| budget),
         }
     }
 
@@ -341,16 +345,44 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         };
     }
 
-    // Every precondition above is settled, so from here the run is going to
-    // happen and the only question is when. Wait for a slot before the audit row
-    // rather than after: a row recorded now would claim a run that has not
-    // started, and `requested_at` would date the request rather than the run.
+    let run_id = AgentRunId::new();
+
+    // Built before the queue, not after it. `AgentProcessPlan::new` rejects a
+    // spawn command this daemon cannot run — a configuration error whose answer
+    // does not depend on capacity — and a request whose fate is already decided
+    // should not wait behind other people's agents to hear it. That wait has no
+    // bound on this path, and the runs ahead of it may be VM sessions that only
+    // a human ends.
+    let plan = match crate::agent_run::AgentProcessPlan::new(
+        run_id,
+        spawn_config.command.clone(),
+        spawn_config.args.iter().map(std::ffi::OsString::from),
+    ) {
+        // The capture cap matches the envelope cap so the file on disk is
+        // exactly what the envelope carries — see
+        // `crate::agent_run_envelope`'s note on the two stacking caps.
+        Ok(plan) => plan.with_max_stream_capture_bytes(MAX_RUN_AGENT_STREAM_BYTES as u64),
+        // No audit row to abandon: nothing has been recorded yet, which is the
+        // other half of why this belongs before the queue.
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!(
+                    "RunAgent: agent command {}: {err}",
+                    spawn_config.command.display()
+                ),
+            };
+        }
+    };
+
+    // Every precondition is settled, so from here the run is going to happen and
+    // the only question is when. Wait for a slot before the audit row rather than
+    // after: a row recorded now would claim a run that has not started, and
+    // `requested_at` would date the request rather than the run.
     //
     // Held until this function returns, which is when the child has exited and
     // its note is written.
     let _slot = state.agent_run_slots.acquire().await;
 
-    let run_id = AgentRunId::new();
     let prompt_summary = prompt.summary();
     let prompt_sha256 = Sha256Hex::try_new(prompt_summary.sha256_hex.clone())
         .expect("AgentPrompt::summary hashes via sha256_hex");
@@ -375,26 +407,6 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
         Err(err) => {
             return ServerMessage::Error {
                 message: format!("RunAgent: record agent run: {err}"),
-            };
-        }
-    };
-
-    let plan = match crate::agent_run::AgentProcessPlan::new(
-        run_id,
-        spawn_config.command.clone(),
-        spawn_config.args.iter().map(std::ffi::OsString::from),
-    ) {
-        // The capture cap matches the envelope cap so the file on disk is
-        // exactly what the envelope carries — see
-        // `crate::agent_run_envelope`'s note on the two stacking caps.
-        Ok(plan) => plan.with_max_stream_capture_bytes(MAX_RUN_AGENT_STREAM_BYTES as u64),
-        Err(err) => {
-            recorded.abandon();
-            return ServerMessage::Error {
-                message: format!(
-                    "RunAgent: agent command {}: {err}",
-                    spawn_config.command.display()
-                ),
             };
         }
     };

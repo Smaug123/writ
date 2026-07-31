@@ -993,7 +993,14 @@ fn the_default_agent_run_log_root_is_absolute_and_writ_owned() {
 #[test]
 fn daemon_config_rejects_relative_agent_run_log_root() {
     assert!(matches!(
-        sole_error(check_daemon_sections(None, None, Some(Path::new("agent-runs")), None, None)),
+        sole_error(check_daemon_sections(
+            None,
+            None,
+            Some(Path::new("agent-runs")),
+            None,
+            None,
+            None,
+        )),
         DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Relative(path))
             if path.as_os_str() == "agent-runs"
     ));
@@ -1006,7 +1013,7 @@ fn daemon_config_rejects_unwritable_agent_run_log_root() {
     std::fs::write(&path, b"file").unwrap();
 
     assert!(matches!(
-        sole_error(check_daemon_sections(None, None, Some(&path), None, None)),
+        sole_error(check_daemon_sections(None, None, Some(&path), None, None, None)),
         DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Create {
             path: failed,
             ..
@@ -1022,7 +1029,7 @@ fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
     let root = temp.path().join("named-explicitly");
     assert!(!root.exists());
 
-    let checked = check_daemon_sections(None, None, Some(&root), None, None).unwrap();
+    let checked = check_daemon_sections(None, None, Some(&root), None, None, None).unwrap();
 
     assert_eq!(checked.agent_run_log_root.as_path(), root);
     assert!(root.is_dir(), "the root must exist after checking");
@@ -1049,7 +1056,7 @@ fn the_preflight_resolves_the_environment_derived_defaults() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("agent-runs");
 
-    let checked = check_daemon_sections(None, None, Some(&root), None, None).unwrap();
+    let checked = check_daemon_sections(None, None, Some(&root), None, None, None).unwrap();
     assert!(
         matches!(&checked.secret_store, SecretStoreConfig::File { path }
             if *path == default_secret_store_path().unwrap()),
@@ -1070,7 +1077,8 @@ fn the_preflight_resolves_the_environment_derived_defaults() {
     let configured = SecretStoreConfig::Keyring {
         service: "writ".to_string(),
     };
-    let checked = check_daemon_sections(None, None, Some(&root), Some(&configured), None).unwrap();
+    let checked =
+        check_daemon_sections(None, None, Some(&root), Some(&configured), None, None).unwrap();
     assert!(matches!(
         checked.secret_store,
         SecretStoreConfig::Keyring { .. }
@@ -1093,7 +1101,8 @@ fn the_preflight_resolves_the_notes_repo_path() {
     }"#;
     let run_agent: RunAgentDaemonConfig = serde_json::from_str(json).unwrap();
 
-    let checked = check_daemon_sections(None, None, Some(&root), None, Some(&run_agent)).unwrap();
+    let checked =
+        check_daemon_sections(None, None, Some(&root), None, Some(&run_agent), None).unwrap();
 
     assert_eq!(
         checked.notes_repo_path,
@@ -1112,7 +1121,8 @@ fn the_preflight_resolves_the_ui_http_bearer_path() {
         bearer_path: None,
     };
 
-    let checked = check_daemon_sections(None, Some(&ui_http), Some(&root), None, None).unwrap();
+    let checked =
+        check_daemon_sections(None, Some(&ui_http), Some(&root), None, None, None).unwrap();
 
     assert_eq!(
         checked.ui_http_bearer_path,
@@ -1267,7 +1277,7 @@ fn a_log_root_nested_under_an_uncreated_work_root_leaves_both_usable() {
         vm_http,
     };
 
-    let checked = check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None)
+    let checked = check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None, None)
         .expect("a log root beneath an uncreated work root must be accepted");
 
     assert_eq!(checked.agent_run_log_root.as_path(), log_root);
@@ -1299,7 +1309,8 @@ fn a_broken_agent_run_log_root_does_not_hide_a_broken_push_staging_root() {
         vm_http,
     };
 
-    let Err(errors) = check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None)
+    let Err(errors) =
+        check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None, None)
     else {
         panic!("expected the config to be rejected");
     };
@@ -2366,6 +2377,7 @@ fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
         Some(&agent_vm),
         Some(&ui_http),
         Some(&unique_config_test_path("agent-runs")),
+        None,
         None,
         None,
     )

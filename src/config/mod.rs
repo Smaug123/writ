@@ -695,6 +695,14 @@ pub enum AgentVmHttpConfigError {
 #[derive(Debug)]
 pub struct CheckedDaemonSections {
     pub agent_vm: Option<AgentVmDaemonRuntimeConfig>,
+    /// The broker-wide agent-run bound, built from
+    /// [`DaemonConfig::max_concurrent_agent_runs`] or its default.
+    ///
+    /// Built during the preflight rather than at the point of use so that an
+    /// unrepresentable limit joins the same error report as every other config
+    /// problem, and so it is refused before writd creates directories, opens the
+    /// audit DB, or binds a socket.
+    pub agent_run_slots: crate::server::AgentRunSlots,
     pub agent_run_log_root: AgentRunLogRoot,
     /// [`DaemonConfig::secret_store`] resolved against its default.
     ///
@@ -743,8 +751,19 @@ pub fn check_daemon_sections(
     agent_run_log_root: Option<&Path>,
     secret_store: Option<&SecretStoreConfig>,
     run_agent: Option<&RunAgentDaemonConfig>,
+    max_concurrent_agent_runs: Option<std::num::NonZeroUsize>,
 ) -> Result<CheckedDaemonSections, Errors<DaemonConfigError>> {
     let mut errors = Accumulator::new();
+    // Recorded rather than returned early, so an operator with both an
+    // out-of-range limit and, say, a bad `ui_http.bind` learns about both at
+    // once. Building it here also keeps every "can this config even run"
+    // question in the one place that answers them before anything is created.
+    let agent_run_slots = errors.record_from(
+        crate::server::AgentRunSlots::new(
+            max_concurrent_agent_runs.unwrap_or(crate::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
+        )
+        .map_err(DaemonConfigError::from),
+    );
     let agent_vm = errors.record_many(agent_vm.map(AgentVmDaemonConfig::check).transpose());
     let ui_http_validated = errors.record_many(ui_http.map(UiHttpConfig::validate).transpose());
     // Both of these are environment-derived defaults that can fail, so both
@@ -784,13 +803,15 @@ pub fn check_daemon_sections(
         secret_store,
         ui_http_bearer_path,
         notes_repo_path,
+        agent_run_slots,
     ) = errors.unpack(all_recorded!(
         agent_vm,
         ui_http_validated,
         agent_run_log_root,
         secret_store,
         ui_http_bearer_path,
-        notes_repo_path
+        notes_repo_path,
+        agent_run_slots
     ))?;
 
     // Only now, with every section checked, is it right to create anything.
@@ -812,6 +833,7 @@ pub fn check_daemon_sections(
     );
     let (agent_vm, ()) = errors.unpack(all_recorded!(agent_vm, prepared))?;
     Ok(CheckedDaemonSections {
+        agent_run_slots,
         agent_vm,
         agent_run_log_root,
         secret_store,
@@ -829,6 +851,8 @@ pub fn check_daemon_sections(
 pub enum DaemonConfigError {
     #[error(transparent)]
     AgentVm(#[from] AgentVmDaemonConfigError),
+    #[error(transparent)]
+    AgentRunSlots(#[from] crate::server::AgentRunSlotsError),
     #[error(transparent)]
     UiHttp(#[from] UiHttpConfigError),
     #[error(transparent)]

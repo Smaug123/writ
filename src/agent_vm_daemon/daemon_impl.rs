@@ -200,11 +200,17 @@ impl AgentVmDaemon {
         // Whether this wait is bounded is the caller's call, not ours — see
         // `AgentRunQueueing`. Both kinds of caller reach this one function, and
         // they differ in whether anyone is still listening when the wait ends.
-        let Some(run_slot) = state.agent_run_slots.acquire_with(queueing).await else {
-            return Err(AgentVmDaemonError::AgentRunsAtCapacity {
-                limit: state.agent_run_slots.limit().get(),
-                waited: AGENT_RUN_QUEUE_WAIT,
-            });
+        let run_slot = match state.agent_run_slots.acquire_with(queueing).await {
+            Ok(slot) => slot,
+            // The budget comes back from the wait itself rather than being named
+            // again here, so this cannot report a duration the caller did not
+            // actually wait.
+            Err(waited) => {
+                return Err(AgentVmDaemonError::AgentRunsAtCapacity {
+                    limit: state.agent_run_slots.limit().get(),
+                    waited,
+                });
+            }
         };
 
         let session_lock = self.session_lock_handle(session_id).await;

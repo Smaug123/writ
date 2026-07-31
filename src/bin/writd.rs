@@ -165,16 +165,6 @@ async fn run_host_daemon(
         max_concurrent_agent_runs,
     } = config;
 
-    // Built here, before writd creates directories, opens and reconciles the
-    // audit DB, generates signing material, or binds the socket. It is pure
-    // validation of a config value, and a config writd will refuse should be
-    // refused before it has changed anything on disk — otherwise a typo leaves
-    // durable side effects behind on the way to the error message.
-    let agent_run_slots = writ::server::AgentRunSlots::new(
-        max_concurrent_agent_runs.unwrap_or(writ::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
-    )
-    .map_err(|e| format!("invalid config {}: {e}", config_path.display()))?;
-
     let socket_path = default_paths::SOCKET.or_resolve(socket.or(socket_path))?;
 
     let audit_db_selected = audit_db.or(audit_db_config);
@@ -242,8 +232,13 @@ async fn run_host_daemon(
         agent_run_log_root.as_deref(),
         secret_store.as_ref(),
         run_agent.as_ref(),
+        max_concurrent_agent_runs,
     )
     .map_err(|errors| errors.to_string())?;
+    // Validated in the preflight above alongside every other section, so an
+    // out-of-range limit is reported with the rest rather than one restart at a
+    // time — and before anything has been created on disk.
+    let agent_run_slots = checked.agent_run_slots;
     let agent_vm = checked.agent_vm;
     // Both of these are environment-derived defaults, resolved inside the
     // preflight above rather than at their point of use: the secret store so

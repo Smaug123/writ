@@ -1722,9 +1722,11 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
     let refused = slots
         .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
         .await;
-    assert!(
-        refused.is_none(),
-        "with the only slot held, a bounded wait must expire rather than hang"
+    assert_eq!(
+        refused.err(),
+        Some(std::time::Duration::from_secs(30)),
+        "with the only slot held, a bounded wait must expire rather than hang — \
+         and report back the budget it actually spent"
     );
     assert_eq!(
         slots.available(),
@@ -1737,7 +1739,7 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
         .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
         .await;
     assert!(
-        granted.is_some(),
+        granted.is_ok(),
         "once a slot frees, the same bounded wait must succeed — this is a queue \
          with a deadline, not a refusal dressed up as one"
     );
