@@ -383,6 +383,22 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     // its note is written.
     let _slot = state.agent_run_slots.acquire().await;
 
+    // The session was open when this request arrived. That wait has no bound, so
+    // by now another connection may have closed it — and the caller deserves to
+    // hear *that*, not a generic error. `begin_effect` below does refuse a closed
+    // session, but it refuses it as an opaque audit failure, so a client that
+    // waited minutes would lose the typed `ClosedSession` it could have acted on.
+    match state.audit.get_session(session_id) {
+        Ok(Some(session)) if session.closed_at.is_none() => {}
+        Ok(Some(_)) => return ServerMessage::ClosedSession { session_id },
+        Ok(None) => return ServerMessage::UnknownSession { session_id },
+        Err(err) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: re-read session {session_id}: {err}"),
+            };
+        }
+    }
+
     let prompt_summary = prompt.summary();
     let prompt_sha256 = Sha256Hex::try_new(prompt_summary.sha256_hex.clone())
         .expect("AgentPrompt::summary hashes via sha256_hex");

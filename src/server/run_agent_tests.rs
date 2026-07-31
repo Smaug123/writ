@@ -1783,3 +1783,93 @@ fn only_the_vm_path_bounds_how_long_it_will_queue() {
          intervention, so its queue drains on its own"
     );
 }
+
+/// A session closed *while a run is queued* is reported as closed, not as a
+/// generic failure.
+///
+/// The precheck happens before the wait, and the host arm's wait has no bound,
+/// so by the time a slot frees the answer may have changed. `begin_effect` does
+/// refuse a closed session — but as an opaque audit error, so a caller that
+/// waited minutes for its turn would learn only that something went wrong.
+///
+/// Getting this test to mean anything took a correction. Its first version closed
+/// the session immediately after dispatching, which was fast enough that the
+/// *pre-acquire* check answered — so it passed with the recheck deleted, proving
+/// nothing. The permit is now held by the test itself, and the test refuses to
+/// conclude anything unless it has confirmed the request is parked past its
+/// precheck: if the request has already answered by then, the assertion below
+/// says so rather than reporting success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_closed_while_queued_is_reported_as_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("ledger");
+    let agent = overlap_recording_agent(tmp.path(), &ledger);
+
+    let server = MockServer::start().await;
+    let mut fixture = make_run_agent_state(&server, agent, Vec::new());
+    {
+        let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
+        inner.agent_run_slots =
+            AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+    }
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    // Held here rather than by another run: the test controls exactly when the
+    // queued request is allowed to proceed, so the window it is parked in is not
+    // a matter of scheduling luck.
+    let held = state.agent_run_slots.acquire().await;
+    assert_eq!(state.agent_run_slots.available(), 0);
+
+    let queued = tokio::spawn({
+        let state = Arc::clone(state);
+        async move {
+            dispatch_message(
+                ClientMessage::RunAgent {
+                    prompt: crate::agent_run::AgentPrompt::new("queued"),
+                    capabilities: Vec::new(),
+                    purpose: "closed-while-queued".parse().unwrap(),
+                    output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs")
+                        .unwrap(),
+                    session_id: Some(session_id),
+                    workspace: None,
+                    agent_kind: None,
+                    agent_model: None,
+                },
+                &state,
+            )
+            .await
+        }
+    });
+
+    // Long enough for the request to clear its preconditions and park on the
+    // permit. Generous rather than tight: overshooting costs a moment, while
+    // undershooting is caught by the assertion after the close.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !queued.is_finished(),
+        "the request must still be waiting for a permit; if it has already \
+         answered, it never reached the queue and this test proves nothing"
+    );
+
+    state
+        .audit
+        .close_session(session_id, crate::core::UnixMillis::now())
+        .unwrap();
+
+    // Still parked *after* the close: so whatever it answers now, it answers on
+    // the far side of the wait, which is the only place the recheck runs.
+    assert!(
+        !queued.is_finished(),
+        "closing a session must not wake a queued request early; if it answered \
+         here it did so from the pre-acquire check and the recheck is untested"
+    );
+
+    drop(held);
+    let answer = queued.await.unwrap();
+    assert!(
+        matches!(answer, ServerMessage::ClosedSession { session_id: got } if got == session_id),
+        "a session closed during the queue must come back as ClosedSession, not \
+         as an opaque failure; got {answer:?}"
+    );
+}
