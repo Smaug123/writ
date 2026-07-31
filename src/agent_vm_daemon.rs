@@ -309,9 +309,10 @@ pub enum AgentVmDaemonError {
     AgentRunUnsupportedForVmBroker,
     #[error(
         "writd is already running its maximum of {limit} concurrent agent runs, and no slot came \
-         free within {waited:?}. `writ agent-vm list` shows what is holding them; \
-         `writ agent-vm stop <session-id>` returns one. Raise `max_concurrent_agent_runs` to \
-         allow more."
+         free within {waited:?}. The bound is shared with host-spawned runs, which finish on \
+         their own and appear in no VM listing; VM sessions hold their slot until stopped, and \
+         `writ agent-vm list` shows those (`writ agent-vm stop <session-id>` returns one). Raise \
+         `max_concurrent_agent_runs` to allow more."
     )]
     AgentRunsAtCapacity { limit: usize, waited: Duration },
     #[error(

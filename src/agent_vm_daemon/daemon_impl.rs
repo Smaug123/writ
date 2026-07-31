@@ -70,6 +70,16 @@ impl AgentVmDaemon {
         }
     }
 
+    /// How many per-session lock entries are currently registered.
+    ///
+    /// For tests. The map is an implementation detail with no operator meaning,
+    /// but "does a refused start leave one behind" is not observable any other
+    /// way, and the answer used to be yes.
+    #[cfg(test)]
+    pub(crate) async fn session_lock_count(&self) -> usize {
+        self.session_locks.lock().await.len()
+    }
+
     pub fn config(&self) -> &AgentVmDaemonRuntimeConfig {
         &self.config
     }
@@ -149,11 +159,15 @@ impl AgentVmDaemon {
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
-        let session_lock = self.session_lock_handle(session_id).await;
-
-        // Answers this request already has, given before it can be made to wait
-        // for one it does not. Both of these were previously discovered *after*
-        // the slot was acquired, so at capacity a request whose fate was already
+        // Everything that can refuse this request happens before the per-session
+        // lock is registered, so a refusal leaves nothing behind. Session ids are
+        // fresh UUIDs that no later request reuses, so an entry added for a start
+        // that never happened is never collected — the map would grow by one per
+        // rejection for the daemon's lifetime.
+        //
+        // Answers this request already has come first, before it can be made to
+        // wait for one it does not. Both were previously discovered *after* the
+        // slot was acquired, so at capacity a request whose fate was already
         // decided — a malformed workspace destination, or an agent run under a
         // broker placement that cannot serve one — would queue behind other
         // people's agents before being told what was wrong with it.
@@ -194,6 +208,8 @@ impl AgentVmDaemon {
                 waited: AGENT_RUN_QUEUE_WAIT,
             });
         };
+
+        let session_lock = self.session_lock_handle(session_id).await;
         let outcome = async {
             let _session_guard = session_lock.lock().await;
             state.audit.open_session(&SessionRecord {

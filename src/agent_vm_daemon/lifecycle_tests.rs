@@ -1779,3 +1779,54 @@ async fn a_running_agent_run_session_holds_its_slot_until_it_is_stopped() {
         "teardown must return the slot, or the bound shrinks permanently"
     );
 }
+
+/// A start that is refused registers no per-session lock.
+///
+/// Session ids are fresh UUIDs no later request reuses, so the lock map's own
+/// eviction — which runs when a *started* session finishes — never sees an entry
+/// left by a start that never happened. One per rejection, for the life of the
+/// daemon. A caller repeatedly hitting a refusal (a misconfigured
+/// `broker_placement`, say) would grow it without bound while every visible
+/// symptom stayed normal.
+///
+/// The refusal used here is the cheapest to provoke; the fix is positional
+/// rather than per-branch — every refusal now happens before the lock is
+/// registered — so this covers the capacity and workspace refusals too.
+#[tokio::test]
+async fn a_refused_agent_run_start_registers_no_session_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) =
+        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    for _ in 0..5 {
+        daemon
+            .start_agent_run_session(
+                Arc::clone(&state),
+                Some("refused".into()),
+                AgentKind::Claude,
+                "claude-test".into(),
+                AgentVmWorkspaceBootstrap {
+                    repo: "owner/repo".parse().unwrap(),
+                    destination: None,
+                    warm: WorkspaceWarmMode::None,
+                },
+                crate::agent_run::AgentPrompt::new("do it"),
+                crate::agent_vm_daemon::AgentRunTags::default(),
+            )
+            .await
+            .expect_err("agent runs are unsupported under a VM broker");
+    }
+
+    assert!(
+        daemon.session_lock_count().await == 0,
+        "a refused start must leave no lock-map entry; after five refusals there \
+         were {}",
+        daemon.session_lock_count().await
+    );
+}
