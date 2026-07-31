@@ -350,25 +350,44 @@ leaves the request unpaired because a guest that never uploaded an outcome leave
 writ with nothing truthful to record. Whatever the agent emitted before the kill
 is still captured, minus anything left unflushed in the dead process's buffers.
 
-Enforcing it required two things that are easy to miss:
+**The deadline is a promise about the call, not about one of the things the call
+waits on** — the same rule `process_supervisor` states for its own timeout. A
+host run waits on three things, and all three are under it:
 
-* **The deadline covers the prompt write, not just the wait.** The prompt goes to
-  its own thread, so waiting for the agent is the only thing the run blocks on.
-  Written inline, a 1 MiB prompt to an agent that neither reads stdin nor exits
-  blocks in `write(2)` against a 64 KiB pipe buffer and the deadline is never
-  evaluated at all.
-* **The agent gets its own process group, and the deadline signals the group.**
-  Killing a pid reaches one process; any descendant it left behind inherits the
-  stdout/stderr pipes, so the capture threads never see EOF and the run cannot be
-  assembled until that descendant exits. Measured, not assumed: before the group
-  kill, a fake agent that backgrounds a `sleep` kept a 500ms-deadline run pending
-  past a 60-second backstop. Real coding agents spawn subprocesses constantly, so
+* **The prompt write.** It goes to its own thread, so waiting for the agent is
+  the only thing the run blocks on. Written inline, a 1 MiB prompt to an agent
+  that neither reads stdin nor exits blocks in `write(2)` against a 64 KiB pipe
+  buffer and the deadline is never evaluated at all.
+* **The agent.** Polled to the deadline, then its process group is signalled.
+  Killing a pid reaches one process; any descendant inherits the stdout/stderr
+  pipes, so the capture threads never see EOF. Measured: before the group kill, a
+  fake agent that backgrounds a `sleep` kept a 500ms-deadline run pending past a
+  60-second backstop. Real coding agents spawn subprocesses constantly, so
   without this the timeout would have been a bound in name only.
+* **The stream drains.** The half a wait-shaped deadline cannot reach: when the
+  agent exits promptly but leaves a descendant holding the pipes, the wait is
+  *over*, so there is nothing left for it to fire on, and yet the run is not
+  assembled until EOF. Bounded by the same deadline, which sweeps the group.
 
-The group is set on every run, but only the deadline path signals it. **A run
-that ends by itself still sweeps nothing** — whether it should is the separate
-open question about what a finished run guarantees, and answering it as a side
-effect of adding timeouts would be the wrong way to decide it.
+Ordering is load-bearing: **observe, then kill, then reap**, the discipline
+`writ_core::process_group` documents. A group kill is only safe while the leader
+is unreaped, because the pgid *is* the leader's pid and a reaped pid can be
+recycled onto a group writ does not own. So a deadline-bounded run observes the
+agent's exit with `waitid(WNOWAIT)`, keeps the zombie until the drains are done
+(which may need a second group kill), and reaps last. That primitive lives in
+`writ-core` rather than beside either caller because there are now two of them in
+different crates, and its errno argument took three review rounds to state.
+
+Which ending gets recorded turns on **who ended the process**: an exit code means
+the agent decided, even a moment past its deadline; `SIGKILL` *that writ sent* is
+the timeout; any other signal is somebody else's doing and is recorded as the
+failure it is. So a run whose agent finished and whose leftovers writ swept is
+recorded as the agent's own outcome — writ stopped a descendant, not the run.
+
+The group is set on every run, but only the deadline path signals it. **An
+unbounded run still sweeps nothing** — whether it should is the separate open
+question about what a finished run guarantees, and answering it as a side effect
+of adding timeouts would be the wrong way to decide it.
 
 `GuestReportedRunStatus` is the guest-facing half of the status enum, and it has
 no `TimedOut`. A guest asserting that the broker stopped its run would give one

@@ -314,12 +314,18 @@ pub struct RunAgentDaemonConfig {
     ///
     /// Zero is refused rather than treated as "no timeout": absence already
     /// means that, and a second spelling of it would be one an operator could
-    /// reach by accident while meaning "immediately".
+    /// reach by accident while meaning "immediately". So is anything past
+    /// [`crate::agent_run::MAX_AGENT_RUN_TIMEOUT_SECS`].
+    ///
+    /// Both refusals happen *at deserialisation* — the field's type is the
+    /// checked one — so a bad value stops writd before it has created a notes
+    /// repo, generated a signing key, or migrated the audit log to a schema the
+    /// previous binary would refuse to open.
     ///
     /// Bounds only the host arm. The VM arm has its own, unrelated deadline on
     /// waiting for a guest's outcome upload.
     #[serde(default)]
-    pub spawn_timeout_secs: Option<u64>,
+    pub spawn_timeout_secs: Option<AgentRunTimeout>,
 }
 
 /// Default `SecretStore` key under which writd persists its SSH
@@ -338,21 +344,6 @@ impl RunAgentDaemonConfig {
     /// default ([`DEFAULT_WRIT_SIGNING_KEY_SECRET`]). The default name
     /// is a static string that satisfies [`SecretKey::new`]'s
     /// parse-don't-validate constraint, so the `expect` is correct.
-    /// Parse [`Self::spawn_timeout_secs`] into the deadline the runner takes.
-    ///
-    /// `Ok(None)` is the configured default and means "no deadline"; a zero is
-    /// refused rather than silently becoming one, so an operator who typed `0`
-    /// meaning "stop it at once" is told their config is wrong instead of
-    /// getting the opposite of what they asked for.
-    pub fn spawn_timeout(&self) -> Result<Option<AgentRunTimeout>, RunAgentBootError> {
-        self.spawn_timeout_secs
-            .map(|secs| {
-                AgentRunTimeout::from_secs(secs)
-                    .map_err(|source| RunAgentBootError::SpawnTimeout { secs, source })
-            })
-            .transpose()
-    }
-
     pub fn signing_key_secret_or_default(&self) -> SecretKey {
         self.signing_key_secret.clone().unwrap_or_else(|| {
             SecretKey::new(DEFAULT_WRIT_SIGNING_KEY_SECRET)
@@ -404,7 +395,7 @@ impl RunAgentDaemonConfig {
                 args: self.spawn_args.clone(),
                 agent_kind: self.spawn_agent_kind,
                 log_root: agent_run_log_root,
-                timeout: self.spawn_timeout()?,
+                timeout: self.spawn_timeout_secs,
             },
         })
     }
@@ -437,12 +428,6 @@ pub enum RunAgentBootError {
         key: String,
         #[source]
         source: SigningKeyStoreError,
-    },
-    #[error("run_agent.spawn_timeout_secs = {secs}: {source}; omit the key for no timeout")]
-    SpawnTimeout {
-        secs: u64,
-        #[source]
-        source: crate::agent_run::AgentRunTimeoutError,
     },
 }
 

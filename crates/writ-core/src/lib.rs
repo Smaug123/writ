@@ -19,5 +19,6 @@ pub mod bearer;
 pub mod byte_size;
 pub mod core;
 pub mod git_env;
+pub mod process_group;
 pub mod process_spawn;
 pub mod telemetry;
