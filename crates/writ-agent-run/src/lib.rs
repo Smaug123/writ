@@ -1190,7 +1190,26 @@ mod process_runner {
         }
 
         /// Has the agent exited, without consuming its status?
+        ///
+        /// **Disarms the guard on `ECHILD`**, which is the one failure that
+        /// means the pid is *gone*: somebody else reaped it — `SIGCHLD`
+        /// ignored, `SA_NOCLDWAIT`, an outer reaper — so the number is free for
+        /// the OS to hand to an unrelated process. Propagating the error with
+        /// the guard still armed would send its `Drop` to kill that stranger.
+        /// This is the same reasoning the unbounded path encodes by taking the
+        /// child before it waits; the polling path has to state it explicitly
+        /// because it keeps the child across many probes.
         fn has_exited(&mut self) -> Result<bool, AgentProcessRunError> {
+            match self.probe_exited() {
+                Err(err) if is_no_such_child(&err) => {
+                    self.0 = None;
+                    Err(err)
+                }
+                other => other,
+            }
+        }
+
+        fn probe_exited(&mut self) -> Result<bool, AgentProcessRunError> {
             let child = self
                 .0
                 .as_mut()
@@ -1224,6 +1243,20 @@ mod process_runner {
     enum AgentExit {
         Reaped(std::process::ExitStatus),
         Observed { killed_by_writ: bool },
+    }
+
+    /// Is this the error that means the pid no longer exists to be waited on?
+    #[cfg(unix)]
+    fn is_no_such_child(err: &AgentProcessRunError) -> bool {
+        let AgentProcessRunError::Wait(err) = err else {
+            return false;
+        };
+        err.raw_os_error() == Some(libc::ECHILD)
+    }
+
+    #[cfg(not(unix))]
+    fn is_no_such_child(_err: &AgentProcessRunError) -> bool {
+        false
     }
 
     /// Did this status describe a process killed by `SIGKILL`?
@@ -1765,6 +1798,46 @@ mod process_runner {
                     panic!("an agent that exited on its own was recorded as stopped by writ")
                 }
             }
+        }
+
+        /// A probe that finds the pid already gone disarms the guard, so the
+        /// `Drop` cannot signal whoever holds that number next.
+        ///
+        /// `ECHILD` means somebody else reaped the child — `SIGCHLD` ignored,
+        /// `SA_NOCLDWAIT`, an outer reaper — and a reaped pid is immediately
+        /// available for reuse. Returning the error with the guard still armed
+        /// would send `Drop`'s `kill` to a stranger.
+        ///
+        /// Provoked by reaping the child out from under the guard, which is
+        /// exactly the state those three causes produce.
+        #[test]
+        fn a_probe_that_finds_the_pid_gone_disarms_the_guard() {
+            let mut child = Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("true(1) is available");
+            let pid = child.id();
+            // Reap it here, releasing the pid — the guard is about to look for
+            // a child that no longer exists.
+            child.wait().expect("the direct wait reaps it");
+            let mut guard = ChildGuard(Some(child));
+
+            let err = guard
+                .has_exited()
+                .expect_err("waiting on a reaped pid must fail");
+
+            assert!(
+                super::is_no_such_child(&err),
+                "expected ECHILD, got {err}: this test no longer provokes the \
+                 case it exists for"
+            );
+            assert!(
+                guard.0.is_none(),
+                "pid {pid} was released, so the guard must be disarmed rather \
+                 than left to kill whatever holds that number next"
+            );
         }
 
         /// An agent killed by somebody else's signal is not recorded as having

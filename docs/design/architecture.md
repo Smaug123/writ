@@ -389,6 +389,16 @@ unbounded run still sweeps nothing** — whether it should is the separate open
 question about what a finished run guarantees, and answering it as a side effect
 of adding timeouts would be the wrong way to decide it.
 
+**State the guarantee precisely: the deadline bounds a run whose descendants stay
+in the agent's process group.** A descendant that calls `setsid`/`setpgid` while
+holding stdout or stderr is outside the group the kill reaches, so the drains
+never see EOF and the run hangs — the deadline's own failure mode, one syscall
+away. Closing it means capture threads that stop draining at the deadline, which
+introduces a third way a captured stream can be incomplete ("writ stopped
+reading") alongside the two that already have deliberately chosen meanings; that
+is a decision about what a note lets a verifier conclude, tracked separately
+rather than settled here.
+
 `GuestReportedRunStatus` is the guest-facing half of the status enum, and it has
 no `TimedOut`. A guest asserting that the broker stopped its run would give one
 audit value two meanings, so the wire type simply cannot express it and
