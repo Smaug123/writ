@@ -429,6 +429,18 @@ Two consequences worth stating, because both are load-bearing:
   says to retry; the two ways to close it are worse, and `stop_session_locked`
   records why.
 
+  **How far that reaches, exactly.** Promptly, while the run is queued. Once the
+  start claims its registration it holds the session lock through
+  `start_session_after_audit_opened`, which includes the container invocations
+  and a workspace bootstrap allowed 20 minutes, so a stop arriving then does not
+  interrupt the start — it serialises behind it and tears down whatever the start
+  produced. Correct, but slower than the CLI's 5-minute call timeout, so an
+  operator can see their stop time out against a start that is still running.
+  This is not new (`StartAgentVm` has always held the lock across its bootstrap);
+  what is new is that a caller now holds the id early enough to try. Making an
+  in-progress start interruptible is its own question — it applies to both start
+  paths, and needs an answer for what a stop does to a half-built VM.
+
 Failures after the accept have nobody to return to, so they must be legible
 afterwards: an error-level log line, plus — for anything downstream of the audit
 session being opened — a closed session with an unpaired `agent_run` row, which

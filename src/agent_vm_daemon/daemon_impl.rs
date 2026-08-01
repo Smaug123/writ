@@ -256,6 +256,16 @@ impl AgentVmDaemon {
     /// for the whole run by design. What a queued run can no longer do is
     /// outlive the operator's patience unnoticed — it is stoppable by name from
     /// the moment it is accepted.
+    ///
+    /// "Stoppable" reaches exactly as far as the queue. Past the claim below
+    /// this holds the session lock through `start_session_after_audit_opened`,
+    /// whose workspace bootstrap is allowed twenty minutes, and `stop_session`
+    /// wants that same lock — so a stop arriving mid-start does not interrupt
+    /// it, it waits and then tears down what the start produced. That is
+    /// correct and it is what the old shape did too, but it outlasts the CLI's
+    /// call timeout, so the operator's stop can report a timeout against a start
+    /// that is still going. Interrupting a start in progress is a separate
+    /// question, and one `start_session` shares.
     pub async fn complete_agent_run_session<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: Arc<BrokerState<S>>,
