@@ -26,8 +26,23 @@
 //! recognised `ETXTBSY` and *not* the resource errnos — so each caller was flaky
 //! under precisely the pressure the other had been hardened against. Merging them
 //! onto a single 2s deadline then over-waited the `ETXTBSY` path, which
-//! poll-loop callers pay per spawn; hence one classifier, two bounds. Anything
-//! that spawns a child goes through here.
+//! poll-loop callers pay per spawn; hence one classifier, two bounds.
+//!
+//! Anything that spawns a child goes through here — and that is checked, not
+//! merely asked for: `every_child_spawn_goes_through_the_retrying_primitive` in
+//! `tests/shared_hardening_helpers.rs` fails on a `.spawn()`/`.status()`/
+//! `.output()` chained onto a bare `Command`. The sentence used to be an
+//! aspiration while 27 call sites — including the fixture spawn that had already
+//! failed CI on `ETXTBSY` — quietly disagreed with it. Note the guard's stated
+//! blind spot: it only sees terminators chained onto the `Command::new(…)`
+//! expression, so a command stashed in a local and spawned later still relies on
+//! the author.
+//!
+//! One migration note for callers: [`output`] does **not** inherit
+//! `Command::output`'s stdio defaults. It leaves stdin/stdout/stderr inherited,
+//! where `Command::output` quietly sets stdin to null and pipes both outputs. A
+//! site that read `output.stdout` and was switched over without configuring
+//! stdio would collect nothing and print to the terminal instead.
 
 use std::io;
 use std::time::{Duration, Instant};

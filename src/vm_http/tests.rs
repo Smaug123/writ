@@ -1335,18 +1335,25 @@ async fn nix_cli_can_authenticate_to_vm_http_nix_cache_route_with_netrc() {
     std::fs::create_dir(&nix_conf).unwrap();
     std::fs::write(nix_conf.join("nix.conf"), "").unwrap();
 
-    let output = tokio::process::Command::new("nix")
-        .args(args)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg_config)
-        .env("NIX_CONF_DIR", &nix_conf)
-        .env("NIX_CONFIG", "")
-        .env("TMPDIR", std::env::temp_dir())
-        .output()
-        .await
-        .unwrap();
+    let output = writ_core::process_spawn::spawn_async(
+        tokio::process::Command::new("nix")
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("NIX_CONF_DIR", &nix_conf)
+            .env("NIX_CONFIG", "")
+            .env("TMPDIR", std::env::temp_dir())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .await
+    .unwrap()
+    .wait_with_output()
+    .await
+    .unwrap();
 
     shutdown_tx.send(true).unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), server)

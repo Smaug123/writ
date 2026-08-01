@@ -559,12 +559,16 @@ mod tests {
     /// environment on purpose, which made the fixture's results partly a
     /// property of the developer's machine.
     fn run_git(repo: &Path, args: &[&str]) -> String {
-        let output = writ_core::git_env::apply_clean_git_config(&mut StdCommand::new("git"))
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("spawn git");
+        let output = writ_core::process_spawn::output(
+            writ_core::git_env::apply_clean_git_config(&mut StdCommand::new("git"))
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("spawn git");
         assert!(
             output.status.success(),
             "git {args:?} failed: stdout={:?}, stderr={:?}",
@@ -579,15 +583,16 @@ mod tests {
 
     fn run_git_stdin(repo: &Path, args: &[&str], stdin: &[u8]) -> String {
         use std::io::Write as _;
-        let mut child = writ_core::git_env::apply_clean_git_config(&mut StdCommand::new("git"))
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn git");
+        let mut child = writ_core::process_spawn::spawn(
+            writ_core::git_env::apply_clean_git_config(&mut StdCommand::new("git"))
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("spawn git");
         child
             .stdin
             .as_mut()
@@ -959,10 +964,14 @@ mod tests {
         // result would be meaningless — silently treating that as "still
         // alive" once produced a misleading "helper survived" failure on
         // NixOS when procps wasn't in nativeCheckInputs. Fail loudly.
-        let output = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "stat="])
-            .output()
-            .expect("spawn `ps` to inspect helper state");
+        let output = writ_core::process_spawn::output(
+            std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("spawn `ps` to inspect helper state");
         let stat = String::from_utf8_lossy(&output.stdout);
         let stat = stat.trim();
         stat.is_empty() || stat.starts_with('Z')

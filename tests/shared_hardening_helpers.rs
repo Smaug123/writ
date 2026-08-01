@@ -277,7 +277,13 @@ fn only_process_supervisor_kills_process_groups() {
 /// spellings in use here (`Command`, `std::process::Command`, and the
 /// `StdCommand` alias used where tokio's `Command` is also in scope).
 fn builds_a_process_command(body: &str) -> bool {
-    body.match_indices("Command::new(").any(|(at, _)| {
+    process_command_sites(body).next().is_some()
+}
+
+/// Byte offsets of every `Command::new(` in `body` that names a *process*
+/// command, with the wire types resolved away as described above.
+fn process_command_sites(body: &str) -> impl Iterator<Item = usize> + '_ {
+    body.match_indices("Command::new(").filter_map(|(at, _)| {
         let path_start = body[..at]
             .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
             .map_or(0, |i| i + 1);
@@ -286,6 +292,7 @@ fn builds_a_process_command(body: &str) -> bool {
             path.rsplit("::").next(),
             Some("Command") | Some("StdCommand")
         )
+        .then_some(at)
     })
 }
 
@@ -477,6 +484,117 @@ fn env_clear_never_follows_the_hardening_recipe() {
         "clear the environment *first*, then apply the recipe — \
          `apply_clean_git_config(Command::new(git).env_clear())`, not \
          `apply_clean_git_config(&mut Command::new(git)).env_clear()`.\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// The source with whole-line comments blanked rather than removed, so byte
+/// offsets still map to the original line numbers.
+///
+/// [`code_only`] is the right tool when only "does this text contain X?"
+/// matters; a guard that reports a *location* needs the numbering intact.
+fn blank_comment_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The statement containing the expression that starts at `from`: everything up
+/// to the first `;` that is not nested inside brackets opened after `from`.
+///
+/// Builder chains here run to a dozen lines and freely contain `;` inside
+/// closures and nested calls, so "to the end of the line" and "to the next `;`"
+/// are both wrong.
+fn statement_at(text: &str, from: usize) -> &str {
+    let rest = &text[from..];
+    let mut depth = 0i32;
+    for (at, ch) in rest.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ';' if depth <= 0 => return &rest[..at],
+            _ => {}
+        }
+    }
+    rest
+}
+
+/// Every child process is spawned through `writ_core::process_spawn`.
+///
+/// That module's whole purpose is to hold, in one place, the judgement about
+/// *which* spawn failures mean "the child never ran, so retrying re-runs
+/// nothing" — `ETXTBSY`, `EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE` — and how long
+/// each is worth waiting out. A call site that spells `.spawn()`, `.status()`
+/// or `.output()` directly on a `Command` has silently opted out of that
+/// judgement, and does so invisibly: the code looks identical to the hardened
+/// form, and the difference only shows up as a flake on a loaded machine.
+///
+/// It has already cost real time. `broker_vm_runner`'s spawn-latency
+/// calibration ran its freshly-written fake `container` script through a bare
+/// `Command::status()`, and a sibling thread's `fork` holding a writable fd to
+/// that script failed CI with `ExecutableFileBusy` — the one errno the
+/// primitive was written for, at the one call site in the file that bypassed
+/// it. Nothing but a reader's attention connected the two.
+///
+/// The check is per *statement*, not per function: a body that correctly uses
+/// the primitive once and then hand-rolls a second spawn is exactly the case a
+/// body-scoped scan would wave through.
+///
+/// **What this does not catch.** Spawning is only recognised where the
+/// terminator is chained onto the `Command::new(…)` expression itself. A
+/// `Command` stashed in a local and spawned ten lines later reads as a bare
+/// `let` binding here, and passes. That is the same class of blind spot as the
+/// git-recipe guard's name heuristic, and has the same durable answer — a type
+/// that is the only way to obtain a runnable command — so treat this as a
+/// backstop against reintroducing the known pattern, not a proof that the rule
+/// holds everywhere.
+#[test]
+fn every_child_spawn_goes_through_the_retrying_primitive() {
+    /// Terminators that run a built `Command`, as chained method calls.
+    const TERMINATORS: &[&str] = &[".spawn()", ".status()", ".output()"];
+    /// Ways of reaching the primitive, any of which makes a statement fine.
+    /// `run_supervised` spawns through `process_spawn` internally.
+    const HARDENED: &[&str] = &["process_spawn", "run_supervised"];
+
+    let mut hits = Vec::new();
+    for path in workspace_rust_sources() {
+        let rel = relative(&path);
+        if rel == THIS_FILE {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let text = blank_comment_lines(&raw);
+        for at in process_command_sites(&text) {
+            let stmt = statement_at(&text, at);
+            let Some(terminator) = TERMINATORS.iter().find(|t| stmt.contains(**t)) else {
+                continue;
+            };
+            if HARDENED.iter().any(|marker| stmt.contains(marker)) {
+                continue;
+            }
+            let line = text[..at].matches('\n').count() + 1;
+            hits.push(format!("{rel}:{line}: `{terminator}` on a bare Command"));
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    assert!(
+        hits.is_empty(),
+        "spawn through `writ_core::process_spawn` — `spawn` for a `Child`, \
+         `output` to run and collect (note it inherits stdio by default, unlike \
+         `Command::output`), `spawn_async` for tokio — so that a spawn the OS \
+         refused outright is retried rather than reported as a failure. \
+         {} site(s):\n  {}",
+        hits.len(),
         hits.join("\n  ")
     );
 }

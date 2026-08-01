@@ -48,12 +48,10 @@ fn open_rejects_non_bare_repo() {
     // whose top-level layout includes `.git/` rather than the
     // bare layout. The validation must reject pointing at either
     // the worktree root or the inner `.git` dir.
-    let status = Command::new("git")
-        .arg("init")
-        .arg("--quiet")
-        .arg(&path)
-        .status()
-        .unwrap();
+    let status =
+        writ_core::process_spawn::output(Command::new("git").arg("init").arg("--quiet").arg(&path))
+            .unwrap()
+            .status;
     assert!(status.success());
     let err = NotesRepo::open(&path).unwrap_err();
     // Top-level: no HEAD file at the worktree root.
@@ -125,13 +123,15 @@ fn open_rejects_repo_with_commondir_marker() {
 fn open_rejects_repo_with_sha256_object_format() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sha256-repo");
-    let status = Command::new("git")
-        .arg("init")
-        .arg("--bare")
-        .arg("--object-format=sha256")
-        .arg("--quiet")
-        .arg(&path)
-        .status();
+    let status = writ_core::process_spawn::output(
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg("--object-format=sha256")
+            .arg("--quiet")
+            .arg(&path),
+    )
+    .map(|out| out.status);
     match status {
         Ok(s) if s.success() => {}
         // Older Git builds without sha256 support can't run this
@@ -265,12 +265,14 @@ fn init_or_open_does_not_mutate_existing_non_bare_repo() {
     // mismatch as an open error.
     let tmp = TempDir::new().unwrap();
     let worktree = tmp.path().join("wt");
-    let status = Command::new("git")
-        .arg("init")
-        .arg("--quiet")
-        .arg(&worktree)
-        .status()
-        .unwrap();
+    let status = writ_core::process_spawn::output(
+        Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&worktree),
+    )
+    .unwrap()
+    .status;
     assert!(status.success());
     let git_dir = worktree.join(".git");
     // Capture HEAD + config before the call so we can confirm

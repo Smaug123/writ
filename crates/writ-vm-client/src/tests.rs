@@ -192,10 +192,14 @@ fn required_test_tool(name: &str) -> PathBuf {
 /// environment: every raw `Command::new(git)` in this file was one of these, and
 /// each was hardened-adjacent enough to read as fine.
 fn run_test_git_stdout(git: &Path, args: &[&str]) -> String {
-    let output = apply_clean_git_config(&mut Command::new(git))
-        .args(args)
-        .output()
-        .unwrap();
+    let output = writ_core::process_spawn::output(
+        apply_clean_git_config(&mut Command::new(git))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "git {args:?} failed with {}: {}",
@@ -206,10 +210,14 @@ fn run_test_git_stdout(git: &Path, args: &[&str]) -> String {
 }
 
 fn run_test_git(git: &Path, args: &[&str]) {
-    let output = apply_clean_git_config(&mut Command::new(git))
-        .args(args)
-        .output()
-        .unwrap();
+    let output = writ_core::process_spawn::output(
+        apply_clean_git_config(&mut Command::new(git))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "git {args:?} failed with {}: {}",

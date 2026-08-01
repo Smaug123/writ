@@ -17,23 +17,25 @@ fn guest_nix_setup_script_writes_configured_trusted_public_keys() {
     let trusted_public_keys =
         format!("{TEST_NIX_CACHE_PUBLIC_KEY} {SECOND_TEST_NIX_CACHE_PUBLIC_KEY}");
 
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(nix_conf_prologue_script_for_test())
-        .arg("writ-agent-vm-nix-setup")
-        .arg("true")
-        .env("HOME", &home)
-        .env("WRIT_BROKER_TOKEN", "writ-vm-token")
-        .env(
-            "WRIT_NIX_CACHE_URL",
-            "http://192.168.252.1:51375/v1/nix/cache",
-        )
-        .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
-        .env("WRIT_NIX_NETRC", &netrc)
-        .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, &trusted_public_keys)
-        .env("NIX_CONF_DIR", &nix_conf_dir)
-        .status()
-        .unwrap();
+    let status = writ_core::process_spawn::output(
+        Command::new("sh")
+            .arg("-c")
+            .arg(nix_conf_prologue_script_for_test())
+            .arg("writ-agent-vm-nix-setup")
+            .arg("true")
+            .env("HOME", &home)
+            .env("WRIT_BROKER_TOKEN", "writ-vm-token")
+            .env(
+                "WRIT_NIX_CACHE_URL",
+                "http://192.168.252.1:51375/v1/nix/cache",
+            )
+            .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
+            .env("WRIT_NIX_NETRC", &netrc)
+            .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, &trusted_public_keys)
+            .env("NIX_CONF_DIR", &nix_conf_dir),
+    )
+    .unwrap()
+    .status;
 
     assert!(status.success());
     let nix_conf = fs::read_to_string(nix_conf_dir.join("nix.conf")).unwrap();
@@ -52,23 +54,25 @@ fn guest_nix_setup_script_writes_claude_default_settings() {
     let nix_conf_dir = dir.path().join("nix-conf");
     let home = dir.path().join("home");
 
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(nix_conf_prologue_script_for_test())
-        .arg("writ-agent-vm-nix-setup")
-        .arg("true")
-        .env("HOME", &home)
-        .env("WRIT_BROKER_TOKEN", "writ-vm-token")
-        .env(
-            "WRIT_NIX_CACHE_URL",
-            "http://192.168.252.1:51375/v1/nix/cache",
-        )
-        .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
-        .env("WRIT_NIX_NETRC", &netrc)
-        .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, "")
-        .env("NIX_CONF_DIR", &nix_conf_dir)
-        .status()
-        .unwrap();
+    let status = writ_core::process_spawn::output(
+        Command::new("sh")
+            .arg("-c")
+            .arg(nix_conf_prologue_script_for_test())
+            .arg("writ-agent-vm-nix-setup")
+            .arg("true")
+            .env("HOME", &home)
+            .env("WRIT_BROKER_TOKEN", "writ-vm-token")
+            .env(
+                "WRIT_NIX_CACHE_URL",
+                "http://192.168.252.1:51375/v1/nix/cache",
+            )
+            .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
+            .env("WRIT_NIX_NETRC", &netrc)
+            .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, "")
+            .env("NIX_CONF_DIR", &nix_conf_dir),
+    )
+    .unwrap()
+    .status;
 
     assert!(status.success());
     let settings_path = home.join(".claude").join("settings.json");
@@ -103,23 +107,25 @@ fn guest_nix_conf_disables_build_users_group_for_single_user_root_store() {
     let nix_conf_dir = dir.path().join("nix-conf");
     let home = dir.path().join("home");
 
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(nix_conf_prologue_script_for_test())
-        .arg("writ-agent-vm-nix-setup")
-        .arg("true")
-        .env("HOME", &home)
-        .env("WRIT_BROKER_TOKEN", "writ-vm-token")
-        .env(
-            "WRIT_NIX_CACHE_URL",
-            "http://192.168.252.1:51375/v1/nix/cache",
-        )
-        .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
-        .env("WRIT_NIX_NETRC", &netrc)
-        .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, "")
-        .env("NIX_CONF_DIR", &nix_conf_dir)
-        .status()
-        .unwrap();
+    let status = writ_core::process_spawn::output(
+        Command::new("sh")
+            .arg("-c")
+            .arg(nix_conf_prologue_script_for_test())
+            .arg("writ-agent-vm-nix-setup")
+            .arg("true")
+            .env("HOME", &home)
+            .env("WRIT_BROKER_TOKEN", "writ-vm-token")
+            .env(
+                "WRIT_NIX_CACHE_URL",
+                "http://192.168.252.1:51375/v1/nix/cache",
+            )
+            .env("WRIT_NIX_BASIC_LOGIN", VM_NIX_BASIC_LOGIN)
+            .env("WRIT_NIX_NETRC", &netrc)
+            .env(AGENT_VM_NIX_TRUSTED_PUBLIC_KEYS_ENV, "")
+            .env("NIX_CONF_DIR", &nix_conf_dir),
+    )
+    .unwrap()
+    .status;
 
     assert!(status.success());
     let nix_conf = fs::read_to_string(nix_conf_dir.join("nix.conf")).unwrap();
