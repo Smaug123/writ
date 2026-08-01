@@ -163,6 +163,7 @@ async fn run_host_daemon(
         run_agent,
         agent_run_log_root,
         max_concurrent_agent_runs,
+        max_pending_agent_runs,
     } = config;
 
     let socket_path = default_paths::SOCKET.or_resolve(socket.or(socket_path))?;
@@ -233,6 +234,7 @@ async fn run_host_daemon(
         secret_store.as_ref(),
         run_agent.as_ref(),
         max_concurrent_agent_runs,
+        max_pending_agent_runs,
     )
     .map_err(|errors| errors.to_string())?;
     // Validated in the preflight above alongside every other section, so an

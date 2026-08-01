@@ -1672,8 +1672,11 @@ async fn workspace_bootstrap_wait_preserves_tail_of_large_failure() {
 fn state_with_one_run_slot(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
     let mut state = make_state_with_audit(audit);
     let inner = Arc::get_mut(&mut state).expect("fresh state Arc is unshared");
-    inner.agent_run_slots =
-        crate::server::AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+    inner.agent_run_slots = crate::server::AgentRunSlots::new(
+        std::num::NonZeroUsize::new(1).unwrap(),
+        crate::server::DEFAULT_MAX_PENDING_AGENT_RUNS,
+    )
+    .unwrap();
     state
 }
 

@@ -315,6 +315,13 @@ pub enum AgentVmDaemonError {
          `max_concurrent_agent_runs` to allow more."
     )]
     AgentRunsAtCapacity { limit: usize, waited: Duration },
+    /// Refused before queueing — see [`AgentRunQueueFull`] for why this is a
+    /// different fact from [`Self::AgentRunsAtCapacity`] and not a duplicate of
+    /// it.
+    ///
+    /// [`AgentRunQueueFull`]: crate::server::AgentRunQueueFull
+    #[error(transparent)]
+    AgentRunQueueFull(#[from] crate::server::AgentRunQueueFull),
     #[error(
         "broker_placement = vm runtime config is incomplete (missing {0}); this is a writd wiring \
          bug — the daemon should carry it for vm placement"

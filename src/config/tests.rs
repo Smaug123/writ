@@ -1000,6 +1000,7 @@ fn daemon_config_rejects_relative_agent_run_log_root() {
             None,
             None,
             None,
+            None,
         )),
         DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Relative(path))
             if path.as_os_str() == "agent-runs"
@@ -1013,7 +1014,7 @@ fn daemon_config_rejects_unwritable_agent_run_log_root() {
     std::fs::write(&path, b"file").unwrap();
 
     assert!(matches!(
-        sole_error(check_daemon_sections(None, None, Some(&path), None, None, None)),
+        sole_error(check_daemon_sections(None, None, Some(&path), None, None, None, None)),
         DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Create {
             path: failed,
             ..
@@ -1029,7 +1030,7 @@ fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
     let root = temp.path().join("named-explicitly");
     assert!(!root.exists());
 
-    let checked = check_daemon_sections(None, None, Some(&root), None, None, None).unwrap();
+    let checked = check_daemon_sections(None, None, Some(&root), None, None, None, None).unwrap();
 
     assert_eq!(checked.agent_run_log_root.as_path(), root);
     assert!(root.is_dir(), "the root must exist after checking");
@@ -1056,7 +1057,7 @@ fn the_preflight_resolves_the_environment_derived_defaults() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("agent-runs");
 
-    let checked = check_daemon_sections(None, None, Some(&root), None, None, None).unwrap();
+    let checked = check_daemon_sections(None, None, Some(&root), None, None, None, None).unwrap();
     assert!(
         matches!(&checked.secret_store, SecretStoreConfig::File { path }
             if *path == default_secret_store_path().unwrap()),
@@ -1078,7 +1079,8 @@ fn the_preflight_resolves_the_environment_derived_defaults() {
         service: "writ".to_string(),
     };
     let checked =
-        check_daemon_sections(None, None, Some(&root), Some(&configured), None, None).unwrap();
+        check_daemon_sections(None, None, Some(&root), Some(&configured), None, None, None)
+            .unwrap();
     assert!(matches!(
         checked.secret_store,
         SecretStoreConfig::Keyring { .. }
@@ -1102,7 +1104,7 @@ fn the_preflight_resolves_the_notes_repo_path() {
     let run_agent: RunAgentDaemonConfig = serde_json::from_str(json).unwrap();
 
     let checked =
-        check_daemon_sections(None, None, Some(&root), None, Some(&run_agent), None).unwrap();
+        check_daemon_sections(None, None, Some(&root), None, Some(&run_agent), None, None).unwrap();
 
     assert_eq!(
         checked.notes_repo_path,
@@ -1122,7 +1124,7 @@ fn the_preflight_resolves_the_ui_http_bearer_path() {
     };
 
     let checked =
-        check_daemon_sections(None, Some(&ui_http), Some(&root), None, None, None).unwrap();
+        check_daemon_sections(None, Some(&ui_http), Some(&root), None, None, None, None).unwrap();
 
     assert_eq!(
         checked.ui_http_bearer_path,
@@ -1277,8 +1279,16 @@ fn a_log_root_nested_under_an_uncreated_work_root_leaves_both_usable() {
         vm_http,
     };
 
-    let checked = check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None, None)
-        .expect("a log root beneath an uncreated work root must be accepted");
+    let checked = check_daemon_sections(
+        Some(&agent_vm),
+        None,
+        Some(&log_root),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("a log root beneath an uncreated work root must be accepted");
 
     assert_eq!(checked.agent_run_log_root.as_path(), log_root);
     assert!(log_root.is_dir());
@@ -1309,9 +1319,15 @@ fn a_broken_agent_run_log_root_does_not_hide_a_broken_push_staging_root() {
         vm_http,
     };
 
-    let Err(errors) =
-        check_daemon_sections(Some(&agent_vm), None, Some(&log_root), None, None, None)
-    else {
+    let Err(errors) = check_daemon_sections(
+        Some(&agent_vm),
+        None,
+        Some(&log_root),
+        None,
+        None,
+        None,
+        None,
+    ) else {
         panic!("expected the config to be rejected");
     };
     let rendered = errors.to_string();
@@ -2461,6 +2477,7 @@ fn a_bad_ui_http_section_creates_no_agent_vm_directories() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_err();
     assert!(
@@ -2536,6 +2553,46 @@ fn max_concurrent_agent_runs_is_absent_by_default_and_parses_when_given() {
     assert_eq!(
         configured.max_concurrent_agent_runs.map(|n| n.get()),
         Some(7)
+    );
+
+    // The queue-depth bound is the same shape: optional here, defaulted by
+    // writd. Silence must not mean "queue without limit" any more than it means
+    // "run without limit" above — that is precisely the state this key exists to
+    // leave behind.
+    assert!(
+        silent.max_pending_agent_runs.is_none(),
+        "an unset key must stay unset here; writd is what supplies the default"
+    );
+    let configured: DaemonConfig =
+        serde_json::from_str(&format!("{base}, \"max_pending_agent_runs\": 9 }}")).unwrap();
+    assert_eq!(configured.max_pending_agent_runs.map(|n| n.get()), Some(9));
+}
+
+/// A queue depth of zero is refused by the parser.
+///
+/// Zero here would not be a bound but a mode switch: every run that could not
+/// start instantly would be refused, turning a daemon that queues into one that
+/// does not. An operator is far likelier to reach that by mistake than on
+/// purpose, so the parser refuses it and names the field.
+#[test]
+fn a_zero_pending_limit_is_refused_at_parse_time() {
+    let json = r#"{
+        "github_apps": {
+            "claude": {
+                "app_id": 1,
+                "installation_id": 2,
+                "installation_owner": "o",
+                "private_key_secret": "pk"
+            }
+        },
+        "policy": { "default_ttl": 600, "writable_repos": [] },
+        "max_pending_agent_runs": 0
+    }"#;
+    let err = serde_json::from_str::<DaemonConfig>(json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_pending_agent_runs") || msg.contains("zero"),
+        "the error must point at the offending key or say what was wrong; got {msg:?}"
     );
 }
 
