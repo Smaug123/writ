@@ -820,15 +820,20 @@ fn start_agent_run(
         prompt,
         correlation_id,
     };
-    match call_with_timeout(socket_path, &msg, AGENT_VM_WORKSPACE_CALL_TIMEOUT)? {
-        ServerMessage::AgentRunStarted {
-            session_id,
-            run_id,
-            broker_url,
-        } => {
+    // The ordinary call cap, not the workspace one: writd answers this from the
+    // accept, which does no network, no Nix prefetch and no VM boot. The
+    // 30-minute budget was sized for a reply that waited on the bootstrap, and
+    // keeping it here would mean a wedged daemon held this CLI for half an hour
+    // to deliver an answer it never spends more than milliseconds computing.
+    match call_with_timeout(socket_path, &msg, AGENT_VM_CALL_TIMEOUT)? {
+        ServerMessage::AgentRunAccepted { session_id, run_id } => {
             println!("session_id={session_id}");
             println!("run_id={run_id}");
-            println!("broker_url={broker_url}");
+            // Deliberately said out loud. The two ids above used to mean "this
+            // is running"; they now mean "this is writd's to start, and yours
+            // to stop". A caller that looked them up immediately and found
+            // nothing would otherwise read that as a failure.
+            println!("accepted: queued to start; stop it with `writ agent-vm stop {session_id}`");
             Ok(())
         }
         ServerMessage::Error { message } => Err(message.into()),

@@ -16,7 +16,6 @@
 
 use super::*;
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 /// Total wall-clock budget the VM dispatch arm gives a per-run VM
 /// agent to complete and POST its outcome to writd. Implementer runs
@@ -276,24 +275,6 @@ pub(crate) struct AgentRunQueuePlace {
 }
 
 impl AgentRunQueuePlace {
-    /// Wait for a slot on the caller's terms.
-    ///
-    /// The error carries the budget that expired, so a caller reporting "no slot
-    /// came free within X" cannot name a different X from the one it actually
-    /// waited. Only a bounded caller can fail, and only by exhausting its own
-    /// budget. See [`AgentRunQueueing`] for why the budget is per-caller.
-    pub(crate) async fn wait_for_slot_with(
-        self,
-        queueing: AgentRunQueueing,
-    ) -> Result<AgentRunSlot, Duration> {
-        match queueing {
-            AgentRunQueueing::UntilASlotFrees => Ok(self.wait_for_slot().await),
-            AgentRunQueueing::UpTo(budget) => tokio::time::timeout(budget, self.wait_for_slot())
-                .await
-                .map_err(|_elapsed| budget),
-        }
-    }
-
     /// Wait for a slot however long it takes, then hold both it and the
     /// admission until the returned guard is dropped.
     ///
@@ -343,13 +324,12 @@ pub enum AgentRunSlotsError {
 
 /// Why an agent run was not queued: writd is already holding as many as it will.
 ///
-/// Distinct from [`AgentVmDaemonError::AgentRunsAtCapacity`](crate::agent_vm_daemon::AgentVmDaemonError::AgentRunsAtCapacity),
-/// which is a different fact about a different caller. That one means "you
-/// waited your whole budget and no slot came free" — the request was queued and
-/// lost patience. This one means writd never queued the request at all, so
-/// nothing was started, nothing was recorded, and retrying later is exactly the
-/// right response. Two facts, two errors: collapsing them would leave a caller
-/// unable to tell "I was too impatient" from "you were too busy to take this".
+/// The one thing a caller can be told about capacity, and deliberately the only
+/// one. Once accepted, a run waits for as long as it takes — no caller sets a
+/// start deadline any more, because none of them stay to watch. So "writd would
+/// not take this" is a complete account of refusal: it is decided immediately,
+/// before any ids are handed out, and it means nothing was started and nothing
+/// recorded. Retrying later is exactly the right response.
 #[derive(Debug, thiserror::Error, Eq, PartialEq, Clone, Copy)]
 #[error(
     "writd will not queue this agent run: it is already running up to {limit} \
@@ -361,28 +341,6 @@ pub enum AgentRunSlotsError {
 pub struct AgentRunQueueFull {
     limit: NonZeroUsize,
     queue_limit: NonZeroUsize,
-}
-
-/// How long a caller is willing to wait for a slot.
-///
-/// Caller-specific because the callers differ in one way that matters: whether
-/// anyone is still listening when the wait ends.
-///
-/// `StartAgentRun` answers over a socket whose client has its own deadline, so a
-/// slot granted after that deadline boots a VM whose session id reaches nobody.
-/// `RunAgent`'s VM arm holds its caller for the whole run — bailiff's client sets
-/// no start deadline and stops the VM when it is done — so waiting is exactly
-/// what its caller asked for, and refusing it would break the queueing the
-/// configuration promises.
-///
-/// An enum rather than an `Option<Duration>`, so neither arm can be read as "no
-/// timeout configured yet".
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AgentRunQueueing {
-    /// Wait for as long as it takes. For callers that will still be there.
-    UntilASlotFrees,
-    /// Give up after this long, and answer at-capacity instead.
-    UpTo(Duration),
 }
 
 /// One in-flight agent run's claim on *both* bounds. Releases both on drop, so
@@ -962,11 +920,6 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
                 correlation_id: None,
                 purpose: Some(purpose),
             },
-            // Bailiff's client holds this connection for the whole run and sets
-            // no start deadline, so waiting is what it asked for: refusing a
-            // surplus workflow after five minutes would break the queueing the
-            // configuration promises.
-            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
     {

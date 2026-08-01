@@ -1737,14 +1737,13 @@ fn every_path_that_starts_an_agent_run_takes_a_slot() {
     );
 
     let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
-    let session_start = body_of(daemon, "pub async fn start_agent_run_session<");
-    // Any form of the wait counts here; *which* one each caller chooses is
-    // asserted by `only_the_vm_path_bounds_how_long_it_will_queue`. This guard is
-    // about the slot being taken at all.
+    let accept = body_of(daemon, "pub fn accept_agent_run_session<");
     assert!(
-        session_start.contains(".enqueue()"),
-        "every VM agent run starts here — `RunAgent`'s VM arm and `StartAgentRun` \
-         both — so this is the one place that can bound them"
+        accept.contains(".enqueue()"),
+        "every VM agent run is admitted here — `RunAgent`'s VM arm and \
+         `StartAgentRun` both — so this is the one place that can bound them. It \
+         is also the last place that can *refuse* one: past this point the run \
+         has a name its caller may already be holding"
     );
 }
 
@@ -1786,45 +1785,41 @@ fn a_limit_above_the_semaphores_ceiling_is_refused() {
     assert!(AgentRunSlots::new(one_below, NON_ZERO_ONE).is_ok());
 }
 
-/// A bounded wait gives up rather than hanging, and returns nothing when it does.
+/// A queue place abandoned mid-wait takes nothing with it.
 ///
-/// The distinction that matters: a caller that times out must not end up holding
-/// a slot it does not know about, because the work it would unblock is work
-/// nobody is waiting for.
-#[tokio::test(start_paused = true)]
-async fn a_bounded_wait_gives_up_when_no_slot_frees() {
-    let slots = spacious_queue(std::num::NonZeroUsize::new(1).unwrap());
-    let held = slots.enqueue().unwrap().wait_for_slot().await;
-    assert_eq!(slots.available(), 0);
+/// The property cancellation rests on. A run stopped while it queues is
+/// abandoned exactly this way — `complete_agent_run_session` drops its place and
+/// returns — so if a dropped place kept either count, every cancelled run would
+/// shrink the bound by one, permanently, with nothing to show for it. The
+/// stronger half is the slot: the place is *waiting* for a slot when it is
+/// dropped, so a wait that took its slot on the way out would hand capacity to
+/// nobody.
+#[tokio::test]
+async fn an_abandoned_queue_place_gives_back_its_admission_and_takes_no_slot() {
+    let slots = AgentRunSlots::new(NON_ZERO_ONE, NON_ZERO_ONE).unwrap();
+    let running = slots.enqueue().unwrap().wait_for_slot().await;
+    assert_eq!(slots.available(), 0, "precondition: the one slot is taken");
 
-    let refused = slots
-        .enqueue()
-        .unwrap()
-        .wait_for_slot_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
-        .await;
-    assert_eq!(
-        refused.err(),
-        Some(std::time::Duration::from_secs(30)),
-        "with the only slot held, a bounded wait must expire rather than hang — \
-         and report back the budget it actually spent"
+    let waiting = slots.enqueue().expect("the queue holds one more");
+    assert!(
+        slots.enqueue().is_err(),
+        "precondition: one running plus one waiting is the whole admission bound"
     );
+
+    drop(waiting);
+
     assert_eq!(
         slots.available(),
         0,
-        "a wait that gave up must not have taken anything with it"
+        "the abandoned place was waiting for a slot, not holding one; it must not \
+         have taken one on its way out"
     );
-
-    drop(held);
-    let granted = slots
-        .enqueue()
-        .unwrap()
-        .wait_for_slot_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
-        .await;
     assert!(
-        granted.is_ok(),
-        "once a slot frees, the same bounded wait must succeed — this is a queue \
-         with a deadline, not a refusal dressed up as one"
+        slots.enqueue().is_ok(),
+        "abandoning a place must give its admission straight back — otherwise a \
+         stopped run goes on counting against the bound that refuses new ones"
     );
+    drop(running);
 }
 
 /// Slots with the concurrency bound under test and a queue too deep to be the
@@ -1993,45 +1988,40 @@ fn limits_that_are_individually_fine_but_sum_too_high_are_refused() {
 
 const NON_ZERO_ONE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(1).unwrap();
 
-/// Only the VM path bounds its wait; the host arm still queues indefinitely.
+/// Every wait for a slot is unbounded, and that is now the whole story.
 ///
-/// The asymmetry is the point, so it is pinned rather than left to a reader
-/// comparing two files. A VM run's slot is released by a human stopping the
-/// session, and its caller is a CLI holding a socket open with its own deadline,
-/// so an unbounded wait there strands a VM nobody can name. A host run ends by
-/// itself, so its queue drains unattended and a caller that waits is waiting for
-/// something that will actually happen.
+/// It used to be the asymmetry that needed pinning: the VM path gave up after
+/// five minutes because its client had a deadline and writd never saw its EOF,
+/// so a slot granted later booted a VM nobody could name. `StartAgentRun`
+/// answering before it starts removes the caller with the deadline, and with it
+/// the reason to ever refuse a run writd has already accepted. What replaced the
+/// deadline is the admission bound in front of the queue (refuse early, or wait
+/// as long as it takes) and the ability to stop a queued run by name.
+///
+/// A timeout reintroduced anywhere on this path would be a silent regression:
+/// the run would be dropped after a wait, with its ids already in a caller's
+/// hands and nothing recorded to say why nothing happened. So the absence is
+/// asserted rather than assumed.
 #[test]
-fn only_the_vm_path_bounds_how_long_it_will_queue() {
-    let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
-    assert!(
-        daemon.contains("wait_for_slot_with(queueing)"),
-        "the VM session start must take its wait policy from the caller: the two \
-         callers differ in whether anyone is still listening when it ends"
-    );
-
-    // And the callers must choose the policy that matches their own shape.
-    let start_agent_run = include_str!("../server.rs");
-    assert!(
-        start_agent_run.contains("AgentRunQueueing::UpTo("),
-        "`StartAgentRun` answers a client with its own deadline, so its wait must \
-         be bounded — otherwise a slot granted later boots a VM whose id reaches \
-         nobody"
-    );
-
-    let dispatch = include_str!("run_agent.rs");
-    assert!(
-        dispatch.contains("AgentRunQueueing::UntilASlotFrees"),
-        "`RunAgent`'s VM arm holds its caller for the whole run, so it must queue \
-         rather than refuse a surplus workflow"
-    );
-    assert!(
-        dispatch.contains("place.wait_for_slot().await"),
-        "the host arm keeps the unbounded wait: its runs end without \
-         intervention, so its queue drains on its own. The queue-depth bound in \
-         front of it changed whether that wait can be *joined*, not how long a \
-         place in it is worth holding"
-    );
+fn no_wait_for_an_agent_run_slot_is_bounded() {
+    for (name, source) in [
+        ("run_agent.rs", include_str!("run_agent.rs")),
+        (
+            "daemon_impl.rs",
+            include_str!("../agent_vm_daemon/daemon_impl.rs"),
+        ),
+    ] {
+        for (line_no, line) in source.lines().enumerate() {
+            assert!(
+                !(line.contains("wait_for_slot") && line.contains("timeout")),
+                "{name}:{} bounds a wait for a run slot ({line:?}). An accepted \
+                 run has already been named to its caller; giving up on it later \
+                 strands that name with nothing behind it. Refuse at `enqueue` \
+                 instead, which happens before any ids are handed out.",
+                line_no + 1,
+            );
+        }
+    }
 }
 
 /// A session closed *while a run is queued* is reported as closed, not as a
