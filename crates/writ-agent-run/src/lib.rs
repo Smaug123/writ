@@ -1752,13 +1752,16 @@ mod process_runner {
         /// asks whether the process could be signalled, which is exactly the
         /// question. A reaped child answers no.
         fn is_running(pid: u32) -> bool {
-            Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .expect("kill(1) is available")
-                .success()
+            writ_core::process_spawn::output(
+                Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .expect("kill(1) is available")
+            .status
+            .success()
         }
 
         /// Block until `pid` has exited, leaving it unreaped so its exit status
@@ -1803,12 +1806,13 @@ mod process_runner {
         fn an_agent_that_beat_the_deadline_kill_reports_its_own_exit() {
             use super::{AgentExit, AgentRunEnd};
 
-            let child = Command::new("true")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("true(1) is available");
+            let child = writ_core::process_spawn::spawn(
+                Command::new("true")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .expect("true(1) is available");
             let pid = child.id();
             let mut guard = ChildGuard(Some(child));
             // Unreaped but exited — a zombie — which is exactly what the loop
@@ -1849,12 +1853,13 @@ mod process_runner {
         /// exactly the state those three causes produce.
         #[test]
         fn a_probe_that_finds_the_pid_gone_disarms_the_guard() {
-            let mut child = Command::new("true")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("true(1) is available");
+            let mut child = writ_core::process_spawn::spawn(
+                Command::new("true")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .expect("true(1) is available");
             let pid = child.id();
             // Reap it here, releasing the pid — the guard is about to look for
             // a child that no longer exists.
@@ -1889,23 +1894,25 @@ mod process_runner {
         fn an_agent_killed_by_another_signal_is_not_recorded_as_a_timeout() {
             use super::{AgentExit, AgentRunEnd};
 
-            let child = Command::new("sleep")
-                .arg("300")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("sleep(1) is available");
+            let child = writ_core::process_spawn::spawn(
+                Command::new("sleep")
+                    .arg("300")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .expect("sleep(1) is available");
             let pid = child.id();
             let guard = ChildGuard(Some(child));
 
             // Somebody else ends it, with a signal that is not writ's.
             assert!(
-                Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status()
-                    .expect("kill(1) is available")
-                    .success()
+                writ_core::process_spawn::output(
+                    Command::new("kill").args(["-TERM", &pid.to_string()]),
+                )
+                .expect("kill(1) is available")
+                .status
+                .success()
             );
             wait_for_exit_without_reaping(pid);
 
@@ -1938,13 +1945,14 @@ mod process_runner {
         /// having finished.
         #[test]
         fn dropping_the_guard_kills_and_reaps_the_agent() {
-            let child = Command::new("sleep")
-                .arg("300")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("sleep(1) is available");
+            let child = writ_core::process_spawn::spawn(
+                Command::new("sleep")
+                    .arg("300")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .expect("sleep(1) is available");
             let pid = child.id();
             let guard = ChildGuard(Some(child));
             assert!(
@@ -1973,12 +1981,13 @@ mod process_runner {
         /// — rather than a method only this test calls.
         #[test]
         fn an_unbounded_wait_leaves_the_agent_unreaped() {
-            let child = Command::new("true")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("true(1) is available");
+            let child = writ_core::process_spawn::spawn(
+                Command::new("true")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .expect("true(1) is available");
             let mut guard = ChildGuard(Some(child));
 
             let exit = guard.wait_to_deadline(None).expect("wait must succeed");
@@ -2016,12 +2025,13 @@ mod process_runner {
         /// explicit code is what regresses silently.
         #[test]
         fn an_unbounded_wait_that_finds_the_pid_gone_disarms_the_guard() {
-            let mut child = Command::new("true")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("true(1) is available");
+            let mut child = writ_core::process_spawn::spawn(
+                Command::new("true")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .expect("true(1) is available");
             let pid = child.id();
             // Reaped out from under the guard, which is the state an ignored
             // `SIGCHLD` or an outer reaper produces.

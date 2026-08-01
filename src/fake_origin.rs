@@ -232,7 +232,7 @@ pub(crate) fn maybe_git() -> Option<PathBuf> {
 /// `git -C <repo> <args>` under the hardened, identity-pinned env the
 /// walker tests use; SHAs stay deterministic across runs and machines.
 fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output =
+    let output = writ_core::process_spawn::output(
         apply_clean_git_config(Command::new(git).arg("-C").arg(repo).args(args).env_clear())
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
@@ -240,8 +240,11 @@ fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
             .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
-            .output()
-            .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
     assert!(
         output.status.success(),
         "git -C {} {args:?} failed with {}: stdout={:?} stderr={}",

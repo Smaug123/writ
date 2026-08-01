@@ -48,12 +48,10 @@ fn open_rejects_non_bare_repo() {
     // whose top-level layout includes `.git/` rather than the
     // bare layout. The validation must reject pointing at either
     // the worktree root or the inner `.git` dir.
-    let status = Command::new("git")
-        .arg("init")
-        .arg("--quiet")
-        .arg(&path)
-        .status()
-        .unwrap();
+    let status =
+        writ_core::process_spawn::output(Command::new("git").arg("init").arg("--quiet").arg(&path))
+            .unwrap()
+            .status;
     assert!(status.success());
     let err = NotesRepo::open(&path).unwrap_err();
     // Top-level: no HEAD file at the worktree root.
@@ -125,13 +123,15 @@ fn open_rejects_repo_with_commondir_marker() {
 fn open_rejects_repo_with_sha256_object_format() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sha256-repo");
-    let status = Command::new("git")
-        .arg("init")
-        .arg("--bare")
-        .arg("--object-format=sha256")
-        .arg("--quiet")
-        .arg(&path)
-        .status();
+    let status = writ_core::process_spawn::output(
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg("--object-format=sha256")
+            .arg("--quiet")
+            .arg(&path),
+    )
+    .map(|out| out.status);
     match status {
         Ok(s) if s.success() => {}
         // Older Git builds without sha256 support can't run this
@@ -265,12 +265,14 @@ fn init_or_open_does_not_mutate_existing_non_bare_repo() {
     // mismatch as an open error.
     let tmp = TempDir::new().unwrap();
     let worktree = tmp.path().join("wt");
-    let status = Command::new("git")
-        .arg("init")
-        .arg("--quiet")
-        .arg(&worktree)
-        .status()
-        .unwrap();
+    let status = writ_core::process_spawn::output(
+        Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&worktree),
+    )
+    .unwrap()
+    .status;
     assert!(status.success());
     let git_dir = worktree.join(".git");
     // Capture HEAD + config before the call so we can confirm
@@ -1346,7 +1348,13 @@ fn loose_objects_on_disk(repo: &Path) -> usize {
 fn raw_git(repo: &Path, args: &[&str]) -> String {
     let mut command = prepare_git_command(repo, &InheritedEnv::from_process());
     command.args(args);
-    let out = command.output().unwrap();
+    let out = writ_core::process_spawn::output(
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap();
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -1358,7 +1366,15 @@ fn raw_git(repo: &Path, args: &[&str]) -> String {
 fn object_exists(repo: &Path, oid: &GitObjectId) -> bool {
     let mut command = prepare_git_command(repo, &InheritedEnv::from_process());
     command.args(["cat-file", "-e", oid.as_str()]);
-    command.output().unwrap().status.success()
+    writ_core::process_spawn::output(
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap()
+    .status
+    .success()
 }
 
 fn always_compact() -> CompactionThreshold {

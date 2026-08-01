@@ -416,7 +416,8 @@ mod tests {
                 .env("GIT_COMMITTER_DATE", "1700000000 +0000")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped());
-            let mut child = command.spawn().expect("git must be spawnable");
+            let mut child =
+                crate::process_spawn::spawn(&mut command).expect("git must be spawnable");
             {
                 use std::io::Write;
                 let mut sink = child.stdin.take().expect("piped stdin");
@@ -472,14 +473,18 @@ mod tests {
         // it deciding to repack.
         let mut fetch = std::process::Command::new(&git);
         apply_clean_git_config(&mut fetch);
-        let output = fetch
-            .arg(format!("--git-dir={}", destination.display()))
-            .args(["fetch", "--no-tags", "-q"])
-            .arg(&source)
-            .arg("+refs/heads/*:refs/remotes/s/*")
-            .env("GIT_TRACE", "1")
-            .output()
-            .expect("git fetch must run");
+        let output = crate::process_spawn::output(
+            fetch
+                .arg(format!("--git-dir={}", destination.display()))
+                .args(["fetch", "--no-tags", "-q"])
+                .arg(&source)
+                .arg("+refs/heads/*:refs/remotes/s/*")
+                .env("GIT_TRACE", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .expect("git fetch must run");
         let trace = String::from_utf8_lossy(&output.stderr).into_owned();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
@@ -555,9 +560,13 @@ mod tests {
         }
         apply_clean_git_config(&mut command);
 
-        let output = command
-            .output()
-            .expect("git config must be runnable once located on PATH");
+        let output = crate::process_spawn::output(
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .expect("git config must be runnable once located on PATH");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             !stdout.contains("INJECTED"),
@@ -575,7 +584,13 @@ mod tests {
             let mut probe = std::process::Command::new(&git);
             probe.args(["config", "--get", name]);
             apply_clean_git_config(&mut probe);
-            let got = probe.output().expect("git config must run");
+            let got = crate::process_spawn::output(
+                probe
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped()),
+            )
+            .expect("git config must run");
             assert_eq!(
                 String::from_utf8_lossy(&got.stdout).trim(),
                 value,

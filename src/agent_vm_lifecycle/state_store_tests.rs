@@ -1049,13 +1049,14 @@ fn state_store_lock_blocks_another_process() {
     let marker = dir.path().join("child-ready");
     let store = AgentVmSessionStateStore::new(dir.path());
     let lock = store.lock_store().unwrap();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("state_store_child_lock_probe")
-        .arg("--ignored")
-        .env("WRIT_LOCK_PROBE_STATE_DIR", dir.path())
-        .env("WRIT_LOCK_PROBE_MARKER", &marker)
-        .spawn()
-        .unwrap();
+    let mut child = writ_core::process_spawn::spawn(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("state_store_child_lock_probe")
+            .arg("--ignored")
+            .env("WRIT_LOCK_PROBE_STATE_DIR", dir.path())
+            .env("WRIT_LOCK_PROBE_MARKER", &marker),
+    )
+    .unwrap();
 
     wait_for_path(&marker);
     std::thread::sleep(std::time::Duration::from_millis(100));

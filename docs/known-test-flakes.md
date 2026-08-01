@@ -290,6 +290,24 @@ Three remedies, applied according to what each test actually needed to prove:
    behaviour would take, lest a wildly loaded host inflate the bound until the
    assertion distinguishes nothing.
 
+The third remedy then furnished a small lesson of its own. The calibration must
+spawn the fake `container` script in order to time it — and that script the test
+had itself written moments before, so that a sibling thread's `fork`, holding
+still an inheritable writable descriptor to it, could procure from `execve` the
+answer `ETXTBSY`. The remedy for *that* had existed all along in
+`writ_core::process_spawn`, which retries precisely the refusals that mean the
+child never ran; the calibration had simply spelt `Command::status()` and
+thereby opted out of it, indistinguishably to the eye from the hardened form.
+CI paid for the distinction. It is now spelt by the machine rather than by the
+reader: `every_child_spawn_goes_through_the_retrying_primitive`, in
+`tests/shared_hardening_helpers.rs`, fails upon any spawn terminator chained
+onto a bare `Command` — and, since a `Command` may as easily be put in a local
+and spawned ten lines later, upon any such terminator whatever in a file that
+builds one. That second half was not there at first: the gap was written down as
+a blind spot and left, whereupon it transpired that three fixtures were already
+standing in it. A hole with occupants is not a caveat but a miss. Thirty-seven
+call sites in all were found to have drifted out; all are now within.
+
 A fourth measure, worth more than any of them where it can be had, is to arrange
 the *fixture* so that the ordering under test is a fact rather than a race:
 `launch_notices_readiness_even_while_inspect_is_slow` no longer publishes its

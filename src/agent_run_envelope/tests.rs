@@ -519,10 +519,10 @@ async fn a_stream_path_that_is_not_a_regular_file_is_refused() {
     // Swap the file for a FIFO, exactly as a departing agent could.
     let stdout_path = &outcome.outcome.stdout.path;
     fs::remove_file(stdout_path).unwrap();
-    let mkfifo = std::process::Command::new("mkfifo")
-        .arg(stdout_path)
-        .status()
-        .expect("mkfifo(1) is available");
+    let mkfifo =
+        writ_core::process_spawn::output(std::process::Command::new("mkfifo").arg(stdout_path))
+            .expect("mkfifo(1) is available")
+            .status;
     assert!(mkfifo.success(), "could not create the FIFO under test");
 
     let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();

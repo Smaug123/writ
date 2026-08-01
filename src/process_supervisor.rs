@@ -1948,13 +1948,14 @@ mod blocking_tests {
     #[test]
     fn an_empty_process_group_is_tolerated_only_when_the_caller_says_so() {
         use std::os::unix::process::CommandExt as _;
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("exit 0")
-            // Its own group, exactly as the supervisor spawns children.
-            .process_group(0)
-            .spawn()
-            .expect("spawn");
+        let mut child = writ_core::process_spawn::spawn(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                // Its own group, exactly as the supervisor spawns children.
+                .process_group(0),
+        )
+        .expect("spawn");
         let pid = child.id();
         let pgid = pid as libc::pid_t;
 
@@ -1998,12 +1999,13 @@ mod blocking_tests {
     #[test]
     fn the_repeated_sweep_reports_the_first_kills_verdict() {
         use std::os::unix::process::CommandExt as _;
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("exit 0")
-            .process_group(0)
-            .spawn()
-            .expect("spawn");
+        let mut child = writ_core::process_spawn::spawn(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .process_group(0),
+        )
+        .expect("spawn");
         let pid = child.id();
         let pgid = pid as libc::pid_t;
 
@@ -2068,11 +2070,12 @@ mod blocking_tests {
         let marker = dir.path().join("the-child-ran");
         // Touch the marker, then die by SIGKILL — the child's own doing, so no
         // supervisor involvement is needed to reach the signature.
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!(": > {} && kill -9 $$", marker.display()))
-            .spawn()
-            .expect("spawn the marker child");
+        let mut child = writ_core::process_spawn::spawn(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(": > {} && kill -9 $$", marker.display())),
+        )
+        .expect("spawn the marker child");
         let pid = child.id();
 
         // Wait for it *without reaping*, exactly as the supervisor does, so the

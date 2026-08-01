@@ -165,12 +165,16 @@ fn required_test_tool(name: &str) -> PathBuf {
 }
 
 fn git_check_ref_format_branch_accepts(raw: &str) -> bool {
-    apply_clean_git_config(&mut Command::new(required_test_tool("git")))
-        .args(["check-ref-format", "--branch", raw])
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run git check-ref-format: {err}"))
-        .status
-        .success()
+    writ_core::process_spawn::output(
+        apply_clean_git_config(&mut Command::new(required_test_tool("git")))
+            .args(["check-ref-format", "--branch", raw])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap_or_else(|err| panic!("failed to run git check-ref-format: {err}"))
+    .status
+    .success()
 }
 
 proptest! {

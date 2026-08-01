@@ -572,12 +572,19 @@ exit 0
         for _ in 0..CALIBRATION_SPAWNS {
             // Every fake tool ignores an unrecognised subcommand (it only special-cases
             // `inspect`/`logs`), so this costs exactly one spawn and nothing else.
-            std::process::Command::new(tool)
-                .arg("calibrate")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("the fake container tool must be runnable");
+            //
+            // Through `process_spawn` because `tool` is a script this test wrote
+            // moments ago: a sibling thread's `fork` can still hold a writable fd
+            // to it, and `execve` answers `ETXTBSY`. A bare `Command::status()`
+            // here failed CI on exactly that.
+            writ_core::process_spawn::output(
+                std::process::Command::new(tool)
+                    .arg("calibrate")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+            )
+            .expect("the fake container tool must be runnable");
         }
         let per_spawn = start.elapsed() / CALIBRATION_SPAWNS;
         (per_spawn * spawns * SLACK)

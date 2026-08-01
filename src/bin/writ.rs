@@ -893,12 +893,14 @@ fn nix_build_and_load_oci_image(flake_ref: &str) -> Result<(), Box<dyn std::erro
         .into());
     }
     eprintln!("building {flake_ref}");
-    let nix_output = std::process::Command::new("nix")
-        .args(["build", "--no-link", "--print-out-paths", flake_ref])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|e| format!("failed to spawn nix: {e}"))?;
+    let nix_output = writ_core::process_spawn::output(
+        std::process::Command::new("nix")
+            .args(["build", "--no-link", "--print-out-paths", flake_ref])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit()),
+    )
+    .map_err(|e| format!("failed to spawn nix: {e}"))?;
     if !nix_output.status.success() {
         return Err(format!(
             "nix build {flake_ref} failed with status {}",
@@ -914,10 +916,15 @@ fn nix_build_and_load_oci_image(flake_ref: &str) -> Result<(), Box<dyn std::erro
         return Err("nix build printed no store path".into());
     }
     eprintln!("loading {archive} into Apple container store");
-    let load_status = std::process::Command::new("container")
-        .args(["image", "load", "--input", archive.as_str()])
-        .status()
-        .map_err(|e| format!("failed to spawn `container`: {e}"))?;
+    let load_status =
+        writ_core::process_spawn::output(std::process::Command::new("container").args([
+            "image",
+            "load",
+            "--input",
+            archive.as_str(),
+        ]))
+        .map_err(|e| format!("failed to spawn `container`: {e}"))?
+        .status;
     if !load_status.success() {
         return Err(format!("container image load failed with status {load_status}").into());
     }
