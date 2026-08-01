@@ -563,6 +563,24 @@ impl AgentVmDaemon {
         // kill — and the teardown below, which reports `NotFound` for a session
         // it has never heard of, would turn a stop that did exactly what was
         // asked into an error.
+        //
+        // What this does *not* do is wait for the cancelled start to notice.
+        // Taking the entry drops the sender, which wakes the queued wait, but
+        // the queue place — and so the admission permit counted by
+        // `AgentRunQueueFull` — belongs to that future and is released when it
+        // is next polled. Between this returning and that poll, a replacement
+        // run submitted immediately can be refused for capacity the operator
+        // was just told they had freed. Transient (one scheduler tick, already
+        // scheduled by the wake above), self-correcting, and the refusal itself
+        // says to retry.
+        //
+        // The two ways to close it are both worse. A handshake — drop the
+        // sender, then await an acknowledgement — deadlocks: a start that has
+        // already taken its slot is blocked on the session lock this call
+        // holds, so it can never acknowledge. Moving the admission permit into
+        // the registry so this could drop it directly would split one run's
+        // claim across two owners, which is exactly the invariant
+        // `AgentRunSlot` exists to keep whole.
         if self.accepted_agent_runs.take(session_id) {
             tracing::info!(
                 session_id = %session_id,

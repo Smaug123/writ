@@ -381,18 +381,27 @@ before any ids are handed out, so a rejected start leaves nothing behind.
 
 **`StartAgentRun` is accept-then-start.** `accept_agent_run_session` is not
 `async`: it validates, mints the session and run ids, takes a place in the queue,
-and returns. The dispatcher answers `AgentRunAccepted { session_id, run_id }`
-from that and runs `complete_agent_run_session` — wait for a slot, open the audit
-session, write the workspace-bootstrap and `agent_run` rows, boot the VM — on a
-spawned task. The guarantee is:
+and returns. Dispatch answers `AgentRunAccepted { session_id, run_id }` from that
+and returns the rest of the start as *data* — `Dispatched::after_reply`, an inert
+description the socket loop performs by calling `begin_deferred_work` **after**
+`write_all` has succeeded. `complete_agent_run_session` then waits for a slot,
+opens the audit session, writes the workspace-bootstrap and `agent_run` rows, and
+boots the VM, on a spawned task. The guarantee is:
 
-> The caller holds the name of everything writd will start, before writd starts
-> it.
+> writd starts nothing until it has sent the name of what it is starting.
 
-Which is what makes the previous failure unrepresentable rather than unlikely:
-writd sits inside `dispatch` for the whole handler and never sees the client's
-EOF, so a start completed after the client gave up left a live, slot-holding VM
-findable only through `writ agent-vm list`.
+Enforced by ownership, not discipline: the work is unreachable except through
+`begin_deferred_work`, and a failed write drops the whole `Dispatched` — queue
+place, registry entry and all — having started nothing.
+
+That is what the previous shape could not offer. writd sits inside `dispatch` for
+the whole handler and never sees the client's EOF, so a start completed after the
+client gave up left a live, slot-holding VM findable only through `writ agent-vm
+list`. Note the guarantee is about *sending*, not receipt: a successful
+`write_all` puts bytes in the kernel, and no local mechanism can do better
+without an acknowledgement round trip nobody has asked for. What it does close is
+the case that actually happens — a client killed before writd answers now leaves
+no VM at all.
 
 Two consequences worth stating, because both are load-bearing:
 
@@ -413,8 +422,12 @@ Two consequences worth stating, because both are load-bearing:
   the whole stop for such a session: there is no state record, no audit session
   and no VM, so it returns success rather than falling through to a teardown that
   would report `NotFound`. Dropping the registration also wakes the queued start,
-  so a stopped run gives its admission back at once rather than when some
-  unrelated run happens to finish.
+  so a stopped run gives its admission back on the next poll rather than when
+  some unrelated run happens to finish — the stop does not wait for that poll, so
+  a replacement submitted in the same breath can still be refused for capacity
+  that is about to free. One scheduler tick, already scheduled, and the refusal
+  says to retry; the two ways to close it are worse, and `stop_session_locked`
+  records why.
 
 Failures after the accept have nobody to return to, so they must be legible
 afterwards: an error-level log line, plus — for anything downstream of the audit

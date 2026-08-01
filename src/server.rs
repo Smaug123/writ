@@ -9,6 +9,12 @@
 //! and shared broker state, and returns a [`ServerMessage`]. Socket I/O
 //! lives in `handle_connection` and only calls [`dispatch_message`].
 //! All tests exercise [`dispatch_message`] directly.
+//!
+//! One message — `StartAgentRun` — answers before its work is done, so
+//! dispatch cannot both answer it and do it. [`Dispatched`] is how that
+//! splits: the reply, plus an inert description of what the reply has
+//! promised. `handle_connection` writes the reply and only then begins the
+//! work, so writd never starts something it has failed to name.
 
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -222,32 +228,161 @@ impl std::fmt::Debug for CapabilityOutcome {
     }
 }
 
+/// One dispatched message: the reply to send, and any work that must not begin
+/// until that reply has been sent.
+///
+/// Exists for exactly one message. `StartAgentRun` answers before the run it
+/// describes has started, so the start has to be *described* by dispatch and
+/// *performed* by the socket loop, in that order — otherwise writd can boot a VM
+/// whose name it then fails to deliver, which is the orphan the early reply is
+/// meant to abolish. Dispatch computes what to do; the shell does it once it has
+/// held up its end.
+///
+/// The ordering is enforced by ownership rather than by discipline: the work is
+/// unreachable except through [`Self::begin_deferred_work`], and dropping this
+/// instead — which is what a failed write does — starts nothing and gives back
+/// everything the accept took.
+#[must_use]
+pub struct Dispatched<S: SecretStore> {
+    reply: ServerMessage,
+    after_reply: Option<AfterReply<S>>,
+}
+
+/// Work a reply has promised and the socket loop must carry out.
+///
+/// Inert data with one variant rather than a boxed future, so what dispatch has
+/// committed writd to is readable at the point it is constructed, and so this
+/// list stays enumerable as it grows.
+enum AfterReply<S: SecretStore> {
+    /// Start the run whose ids the reply just carried.
+    StartAcceptedAgentRun {
+        agent_vm: Arc<AgentVmDaemon>,
+        state: Arc<BrokerState<S>>,
+        accepted: crate::agent_vm_daemon::AcceptedAgentRun,
+    },
+}
+
+impl<S: SecretStore + Send + Sync + 'static> Dispatched<S> {
+    fn reply_only(reply: ServerMessage) -> Self {
+        Self {
+            reply,
+            after_reply: None,
+        }
+    }
+
+    /// What to send back. Sending it is the caller's job, and must happen before
+    /// [`Self::begin_deferred_work`].
+    pub fn reply(&self) -> &ServerMessage {
+        &self.reply
+    }
+
+    /// Whether anything is owed once the reply is out. Test-facing: the
+    /// difference between "writd answered" and "writd answered and committed
+    /// itself to something" is otherwise invisible.
+    #[cfg(test)]
+    pub(crate) fn owes_deferred_work(&self) -> bool {
+        self.after_reply.is_some()
+    }
+
+    /// Begin whatever the reply promised.
+    ///
+    /// MUST NOT be called until the reply has been handed to the client: the
+    /// whole point is that nothing starts before its name has been sent.
+    pub fn begin_deferred_work(self) {
+        match self.after_reply {
+            None => {}
+            Some(AfterReply::StartAcceptedAgentRun {
+                agent_vm,
+                state,
+                accepted,
+            }) => {
+                let session_id = accepted.session_id();
+                let run_id = accepted.run_id();
+                tokio::spawn(async move {
+                    // Nobody is waiting on this result, so it has to be legible
+                    // where an operator will look: the log line here, and — for
+                    // every failure downstream of the audit session being
+                    // opened — a closed session with an unpaired `agent_run`
+                    // row.
+                    match agent_vm.complete_agent_run_session(state, accepted).await {
+                        Ok(_started) => {}
+                        // Not a failure: somebody asked for this, and
+                        // `stop_session` has already recorded that they did.
+                        // Logging it as an error would make the one outcome an
+                        // operator deliberately caused the loudest thing in the
+                        // file.
+                        Err(
+                            crate::agent_vm_daemon::AgentVmDaemonError::AgentRunStoppedBeforeStart {
+                                ..
+                            },
+                        ) => {}
+                        Err(err) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                run_id = %run_id,
+                                error = %err,
+                                "accepted agent run did not start",
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// The reply, throwing away any deferred work unstarted.
+    ///
+    /// For callers that only want to know what writd would answer. Named at
+    /// length because discarding the work silently is precisely the mistake
+    /// [`Self::begin_deferred_work`] exists to prevent.
+    pub fn into_reply_discarding_deferred_work(self) -> ServerMessage {
+        self.reply
+    }
+}
+
 /// Evaluate one [`ClientMessage`] and produce a [`ServerMessage`].
 /// This is the only function that touches business logic; the socket
 /// loop calls it once per line without knowing what it does.
+///
+/// Returns the reply alone, because without an agent-VM runtime nothing writd
+/// does outlives its reply: the only message that defers work is
+/// `StartAgentRun`, which needs a daemon and refuses without one.
 pub async fn dispatch_message<S: SecretStore + Send + Sync + 'static>(
     msg: ClientMessage,
     state: &Arc<BrokerState<S>>,
 ) -> ServerMessage {
-    dispatch_message_with_agent_vm(msg, state, None).await
+    let dispatched = dispatch_message_with_agent_vm(msg, state, None).await;
+    debug_assert!(
+        dispatched.after_reply.is_none(),
+        "no message can defer work without an agent-VM runtime to defer it to"
+    );
+    dispatched.into_reply_discarding_deferred_work()
 }
 
 /// Evaluate one message with an optional daemon-managed agent VM controller.
 /// Use this entry point when `writd` was configured with agent-VM support; the
 /// simpler [`dispatch_message`] wrapper delegates here with no controller.
+///
+/// Returns a [`Dispatched`], because one message answers before its work is
+/// done. Callers own the ordering that makes that safe: send the reply, then
+/// call [`Dispatched::begin_deferred_work`].
 pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'static>(
     msg: ClientMessage,
     state: &Arc<BrokerState<S>>,
     agent_vm: Option<&Arc<AgentVmDaemon>>,
-) -> ServerMessage {
-    match msg {
+) -> Dispatched<S> {
+    // Set by the one arm whose work outlives its reply, and read once below.
+    // A local rather than a second return path, so every other arm goes on
+    // evaluating to the reply it always did.
+    let mut after_reply: Option<AfterReply<S>> = None;
+    let reply = match msg {
         ClientMessage::OpenSession {
             label,
             agent_kind,
             agent_model,
         } => {
             if agent_kind.is_none() {
-                return missing_agent_kind_for_registry_response();
+                return Dispatched::reply_only(missing_agent_kind_for_registry_response());
             }
             let session_id = SessionId::new();
             let record = SessionRecord {
@@ -289,7 +424,7 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             guest_command,
         } => {
             if agent_kind.is_none() {
-                return missing_agent_kind_for_registry_response();
+                return Dispatched::reply_only(missing_agent_kind_for_registry_response());
             }
             match agent_vm {
                 Some(agent_vm) => match agent_vm
@@ -331,14 +466,13 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                             .expect("agent prompt byte limit fits in u64"),
                     "AgentPrompt validates prompt size before dispatch"
                 );
-                // Accept, answer, and start in the background. The client that
+                // Accept and answer; the start is deferred to the socket loop,
+                // which begins it only once this reply is out. The client that
                 // sent this has its own deadline and writd never sees its EOF,
-                // so anything awaited here is time in which the run's ids might
-                // stop being deliverable — and a start completed after that
-                // leaves a live VM the operator can only find by listing.
-                // Answering from the accept removes that state by construction:
-                // the caller holds the name of everything writd will start,
-                // before writd starts it.
+                // so anything writd starts before answering is something it may
+                // fail to name — and an unnamed live VM is findable only by
+                // listing. Deferring puts the naming first: writd starts nothing
+                // until it has told someone what it would be called.
                 match agent_vm.accept_agent_run_session(
                     state,
                     label,
@@ -358,35 +492,10 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                     Ok(accepted) => {
                         let session_id = accepted.session_id();
                         let run_id = accepted.run_id();
-                        let agent_vm = Arc::clone(agent_vm);
-                        let state = Arc::clone(state);
-                        tokio::spawn(async move {
-                            // Nobody is waiting on this result, so it has to be
-                            // legible where an operator will look: the log line
-                            // here, and — for every failure downstream of the
-                            // audit session being opened — a closed session with
-                            // an unpaired `agent_run` row.
-                            match agent_vm.complete_agent_run_session(state, accepted).await {
-                                Ok(_started) => {}
-                                // Not a failure: somebody asked for this, and
-                                // `stop_session` has already recorded that they
-                                // did. Logging it as an error would make the one
-                                // outcome an operator deliberately caused the
-                                // loudest thing in the file.
-                                Err(
-                                    crate::agent_vm_daemon::AgentVmDaemonError::AgentRunStoppedBeforeStart {
-                                        ..
-                                    },
-                                ) => {}
-                                Err(err) => {
-                                    tracing::error!(
-                                        session_id = %session_id,
-                                        run_id = %run_id,
-                                        error = %err,
-                                        "accepted agent run did not start",
-                                    );
-                                }
-                            }
+                        after_reply = Some(AfterReply::StartAcceptedAgentRun {
+                            agent_vm: Arc::clone(agent_vm),
+                            state: Arc::clone(state),
+                            accepted,
                         });
                         ServerMessage::AgentRunAccepted { session_id, run_id }
                     }
@@ -469,7 +578,8 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
             signed_metadata,
             signature,
         } => run_agent::verify_agent_run(state, &signed_metadata, &signature).await,
-    }
+    };
+    Dispatched { reply, after_reply }
 }
 
 /// Per-stream byte cap for stdout/stderr capture in [`run_agent`].
@@ -746,15 +856,22 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
             }
             Ok(Err(e)) => return Err(e),
         };
-        let response = match serde_json::from_slice::<ClientMessage>(&bytes) {
-            Err(e) => ServerMessage::Error {
+        let dispatched = match serde_json::from_slice::<ClientMessage>(&bytes) {
+            Err(e) => Dispatched::reply_only(ServerMessage::Error {
                 message: format!("invalid request: {e}"),
-            },
+            }),
             Ok(msg) => dispatch_message_with_agent_vm(msg, &state, agent_vm.as_ref()).await,
         };
-        let mut json = serde_json::to_string(&response).expect("ServerMessage always serializes");
+        let mut json =
+            serde_json::to_string(dispatched.reply()).expect("ServerMessage always serializes");
         json.push('\n');
+        // Write first, then start. The `?` is what makes the ordering mean
+        // something: a write that fails takes `dispatched` — and with it the
+        // accepted run, its queue place and its registry entry — out of scope
+        // unstarted. So a client that has already gone gets no VM booted in its
+        // name, rather than one it will never hear about.
         writer.write_all(json.as_bytes()).await?;
+        dispatched.begin_deferred_work();
     }
 }
 

@@ -2114,7 +2114,7 @@ async fn start_agent_run_answers_while_the_run_is_still_queued() {
         .await;
     assert_eq!(state.agent_run_slots.available(), 0, "precondition");
 
-    let reply = tokio::time::timeout(
+    let dispatched = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         crate::server::dispatch_message_with_agent_vm(
             crate::protocol::ClientMessage::StartAgentRun {
@@ -2138,10 +2138,18 @@ async fn start_agent_run_answers_while_the_run_is_still_queued() {
     let crate::protocol::ServerMessage::AgentRunAccepted {
         session_id,
         run_id: _,
-    } = reply
+    } = *dispatched.reply()
     else {
-        panic!("expected AgentRunAccepted, got {reply:?}");
+        panic!("expected AgentRunAccepted, got {:?}", dispatched.reply());
     };
+    assert!(
+        dispatched.owes_deferred_work(),
+        "the reply must arrive owing the start, not having done it — that owed \
+         work is what the socket loop begins once the reply is out"
+    );
+
+    // What the socket loop does once the reply has been written.
+    dispatched.begin_deferred_work();
 
     assert!(
         !args_log.exists(),
@@ -2234,4 +2242,105 @@ async fn dropping_an_accepted_run_gives_back_everything_it_took() {
         "a dropped accept must give its admission back"
     );
     drop(occupied);
+}
+
+/// A reply that never reaches the client starts nothing.
+///
+/// The ordering the whole accept/start split rests on, and the one a reader
+/// cannot see by looking at either half alone. Dispatch *describes* the start;
+/// the socket loop performs it, and only after `write_all` has succeeded. So a
+/// write that fails drops the description instead of running it, and a client
+/// that has already gone gets no VM booted in its name — the very orphan the
+/// early reply exists to abolish, which would otherwise be recreated in the
+/// microseconds between accepting and answering.
+///
+/// Both halves are here on purpose. The negative one alone would pass just as
+/// well if `begin_deferred_work` had stopped starting anything at all.
+#[tokio::test]
+async fn a_dispatched_start_boots_a_vm_only_once_its_reply_is_begun() {
+    async fn dispatch_a_start(
+        daemon: &Arc<AgentVmDaemon>,
+        state: &Arc<BrokerState<InMemStore>>,
+    ) -> crate::server::Dispatched<InMemStore> {
+        crate::server::dispatch_message_with_agent_vm(
+            crate::protocol::ClientMessage::StartAgentRun {
+                label: Some("deferred".into()),
+                agent_kind: AgentKind::Claude,
+                agent_model: "claude-test".into(),
+                workspace: AgentVmWorkspaceBootstrap {
+                    repo: "owner/repo".parse().unwrap(),
+                    destination: None,
+                    warm: WorkspaceWarmMode::Sources,
+                },
+                prompt: crate::agent_run::AgentPrompt::new("do it"),
+                correlation_id: None,
+            },
+            state,
+            Some(daemon),
+        )
+        .await
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool =
+        write_fake_workspace_success_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = Arc::new(AgentVmDaemon::new(config));
+    let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    // Undelivered: the reply is dropped rather than begun, exactly as a failed
+    // `write_all` drops it.
+    let undelivered = dispatch_a_start(&daemon, &state).await;
+    assert!(
+        undelivered.owes_deferred_work(),
+        "precondition: this reply is one writd owes a start on"
+    );
+    drop(undelivered);
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !args_log.exists(),
+        "a reply that was never delivered must start nothing: writd would be \
+         booting a VM under a name it failed to hand out"
+    );
+    assert_eq!(
+        state.agent_run_slots.available(),
+        1,
+        "and it must give back what accepting took"
+    );
+    assert_eq!(
+        daemon.accepted_agent_run_count(),
+        0,
+        "and leave no registration for a run nobody asked for any more"
+    );
+
+    // Delivered: the same dispatch, begun the way the socket loop begins it.
+    let delivered = dispatch_a_start(&daemon, &state).await;
+    let crate::protocol::ServerMessage::AgentRunAccepted { session_id, .. } = *delivered.reply()
+    else {
+        panic!("expected AgentRunAccepted, got {:?}", delivered.reply());
+    };
+    delivered.begin_deferred_work();
+
+    let booted = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !args_log.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        booted.is_ok(),
+        "begun work must actually start the run — otherwise the negative half \
+         above proves nothing"
+    );
+
+    daemon
+        .stop_session(&state, session_id)
+        .await
+        .expect("stopping the run this test started");
 }
