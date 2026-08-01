@@ -194,7 +194,8 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     })
     .await
     .unwrap()
-    .expect("write_plan_note must succeed under the trusted-signer keyring");
+    .expect("write_plan_note must succeed under the trusted-signer keyring")
+    .target_oid;
 
     // --- Read back the plan note from bailiff's repo ------------
     let bailiff_for_read = Arc::clone(&bailiff);
@@ -351,7 +352,8 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
     })
     .await
     .unwrap()
-    .expect("write_review_note must succeed under the trusted-signer keyring");
+    .expect("write_review_note must succeed under the trusted-signer keyring")
+    .target_oid;
 
     // --- Read back the review note from bailiff's repo ----------
     let bailiff_for_read = Arc::clone(&bailiff);
@@ -507,7 +509,8 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
     })
     .await
     .unwrap()
-    .expect("write_implement_note must succeed under the trusted-signer keyring");
+    .expect("write_implement_note must succeed under the trusted-signer keyring")
+    .target_oid;
 
     // --- Read back the implement note from bailiff's repo -------
     let bailiff_for_read = Arc::clone(&bailiff);

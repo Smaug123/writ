@@ -1394,10 +1394,21 @@ imposes `--cruft` alongside the prune date. Those two are where imposition stops
 can make a `gc` slower or looser without breaking a guarantee, and chasing every
 knob would be re-implementing git's configuration in argv.
 
-Two things still open. Bailiff's own repo accumulates one pack per
-`fetch_from_remote` and nothing yet calls `compact_if_needed` for it, so the pack
-half of git's auto policy (`gc.autoPackLimit`) has no live trigger and is
-deliberately not implemented. And a plain `gc` rewrites all packs, so its cost
+Bailiff now compacts too: `write_stage_note` and `write_decision_note` call
+`compact_if_needed` after the note write and return the outcome beside the OID
+(`NoteWritten`), the same shape and for the same reason as `sign_and_store_run`
+— the note is durable by then, so a failure to pack must not turn a recorded
+decision into a failed command. Deliberately after a *note write* and not after
+a bare fetch, which is where the remaining gap is: the threshold counts loose
+objects, and bailiff's repo grows chiefly by whole packs, one per
+`fetch_from_remote`. So the trigger that exists fires on bailiff's own notes,
+while the pack half of git's auto policy (`gc.autoPackLimit`) still has none and
+remains unimplemented — `CompactionThreshold` would need a second dimension, and
+`parse_count_objects_verbose` would need to read the `packs:` value it currently
+only tolerates. Wiring the call in is what makes that half possible, not a
+substitute for it.
+
+One thing still open besides. A plain `gc` rewrites all packs, so its cost
 grows with total history while the threshold that fires it counts only the recent
 backlog; a large enough repo may never finish inside `NOTES_GIT_TIMEOUT`. Raising
 that deadline is not obviously right, because the mutex is held throughout, so a
