@@ -102,7 +102,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use self::compaction::{CompactionDecision, CompactionThreshold, LooseObjectCount};
 use crate::core::{NotesRef, NotesRefError};
@@ -767,17 +767,13 @@ impl NotesRepo {
 
         // Read once, under the lock, so the decision and the state it is recorded
         // against cannot disagree.
-        let now = Instant::now();
+        let now = SystemTime::now();
 
         // Before any git runs, not after measuring: `count-objects` is itself an
         // invocation that can be the thing failing (a slow or damaged object
         // directory can hold it to the deadline), and a gate consulted after it
         // would leave exactly that cost on every request.
-        if let Some(retry_in) = state
-            .compaction_retry_after
-            // `None` once the deadline has passed — the gate is open again.
-            .and_then(|until| until.checked_duration_since(now))
-        {
+        if let Some(retry_in) = state.compaction_retry_in(&self.canonical_path, now) {
             return Ok(CompactionOutcome::Deferred { retry_in });
         }
 
@@ -796,13 +792,13 @@ impl NotesRepo {
                 loose_objects_before,
                 loose_objects_after,
             }) if !compaction::made_progress(*loose_objects_before, *loose_objects_after) => {
-                state.compaction_retry_after = Some(now + COMPACTION_RETRY_BACKOFF);
+                state.hold_off_compaction(&self.canonical_path, now);
             }
             // Cleared rather than left to expire: a repo that is packing
             // successfully must go on packing at whatever rate its loose-object
             // count demands.
-            Ok(_) => state.compaction_retry_after = None,
-            Err(_) => state.compaction_retry_after = Some(now + COMPACTION_RETRY_BACKOFF),
+            Ok(_) => state.allow_compaction(&self.canonical_path),
+            Err(_) => state.hold_off_compaction(&self.canonical_path, now),
         }
 
         outcome
@@ -1477,13 +1473,79 @@ fn hash_object_stdin(
 /// its own gate, whereas the lock is deliberately keyed on the canonical path so
 /// that two handles on one repo share it. State that gates a repo-wide operation
 /// has to be shared the same way.
-#[derive(Debug, Default)]
-struct NotesRepoState {
-    /// When the pause bought by a failed compaction expires.
+/// The compaction retry gate's deadline, in the repo it applies to.
+///
+/// A plain file of decimal milliseconds since the Unix epoch. In a bare repo
+/// git ignores names it does not know, and the leading dot keeps it out of the
+/// way of anything listing the layout.
+const COMPACTION_RETRY_FILE: &str = ".writ-compaction-retry-after";
+
+/// Holding this is the permission to touch the compaction retry gate.
+///
+/// The gate itself is *durable* — a file in the repo — because the process it
+/// bounds is not always long-lived. It began as an `Instant` in this struct,
+/// which was correct for `writd` and quietly useless for bailiff: bailiff is a
+/// one-shot CLI, so the gate was born empty on every `plan submit`/`review`/
+/// `implement`/`decide` and discarded at exit. A repo in the failing state then
+/// paid a full `NOTES_GIT_TIMEOUT` twice per command, under a held lock, instead
+/// of once an hour — precisely the unbounded degradation the gate exists to
+/// prevent. (The same held for `writd` across a restart, which is why the
+/// documented "one attempt per hour" was already stronger than the mechanism.)
+///
+/// It stays *behind* this struct, reachable only through `&self`/`&mut self`,
+/// so consulting or moving the gate without holding the notes-write lock remains
+/// unwriteable. That property is why the field became methods rather than a free
+/// function taking a path.
+#[derive(Debug)]
+struct NotesRepoState;
+
+impl NotesRepoState {
+    /// How long the caller must wait, or `None` if the gate is open.
     ///
-    /// `None` when no compaction has failed, or when a later one succeeded. See
-    /// `COMPACTION_RETRY_BACKOFF`.
-    compaction_retry_after: Option<Instant>,
+    /// Fails *open* on anything unreadable or unparseable: a corrupt gate that
+    /// disabled compaction for ever would be a worse failure than one extra
+    /// attempt, and there is nothing to distinguish a truncated write from a
+    /// hostile one here anyway.
+    ///
+    /// A deadline further out than `COMPACTION_RETRY_BACKOFF` is treated as
+    /// expired. Wall clocks move — that is the price of durability over
+    /// `Instant` — and a backwards jump would otherwise strand the gate closed
+    /// for however long the clock was wrong.
+    fn compaction_retry_in(&self, repo: &Path, now: SystemTime) -> Option<Duration> {
+        let raw = std::fs::read_to_string(repo.join(COMPACTION_RETRY_FILE)).ok()?;
+        let millis: u64 = raw.trim().parse().ok()?;
+        let until = SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(millis))?;
+        let remaining = until.duration_since(now).ok()?;
+        (remaining <= COMPACTION_RETRY_BACKOFF).then_some(remaining)
+    }
+
+    /// Close the gate for `COMPACTION_RETRY_BACKOFF` from `now`.
+    ///
+    /// Best-effort: a repo whose gate cannot be written is one where compaction
+    /// will simply be attempted again, which is the behaviour writ had before
+    /// the gate existed. Failing the caller's operation — whose note is already
+    /// durable — over housekeeping bookkeeping would be the wrong trade.
+    fn hold_off_compaction(&mut self, repo: &Path, now: SystemTime) {
+        let until = now + COMPACTION_RETRY_BACKOFF;
+        let Ok(since_epoch) = until.duration_since(SystemTime::UNIX_EPOCH) else {
+            return;
+        };
+        if let Err(err) = std::fs::write(
+            repo.join(COMPACTION_RETRY_FILE),
+            since_epoch.as_millis().to_string(),
+        ) {
+            tracing::warn!(%err, "could not record the compaction retry gate");
+        }
+    }
+
+    /// Open the gate. Absence is the open state, so removal is the whole job.
+    fn allow_compaction(&mut self, repo: &Path) {
+        match std::fs::remove_file(repo.join(COMPACTION_RETRY_FILE)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(%err, "could not clear the compaction retry gate"),
+        }
+    }
 }
 
 fn lock_notes_write(canonical_path: &Path) -> MutexGuard<'static, NotesRepoState> {
@@ -1503,7 +1565,7 @@ fn lock_notes_write(canonical_path: &Path) -> MutexGuard<'static, NotesRepoState
             // bounded by deployment shape (one per daemon today,
             // perhaps a handful in tests) so the leak is negligible.
             let leaked: &'static Mutex<NotesRepoState> =
-                Box::leak(Box::new(Mutex::new(NotesRepoState::default())));
+                Box::leak(Box::new(Mutex::new(NotesRepoState)));
             guard.insert(canonical_path.to_path_buf(), leaked);
             leaked
         }

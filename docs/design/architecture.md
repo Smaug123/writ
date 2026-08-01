@@ -1372,10 +1372,26 @@ be a permanent tax on every agent run — and the worst case is self-sustaining,
 loose count above the threshold for the next request to retry from scratch. A
 per-repo retry gate (`COMPACTION_RETRY_BACKOFF`, one hour) bounds that to one
 attempt per window, so the fallback is "no compaction" — what writ did before —
-rather than "no compaction plus a deadline's delay on everything". The gate lives
-inside the notes-write mutex's payload rather than beside it, which makes
-consulting it without holding that lock unwriteable, and shares it between
-handles on one repo exactly as the lock is shared.
+rather than "no compaction plus a deadline's delay on everything".
+
+The gate is **durable** — a wall-clock deadline in `<repo>/.writ-compaction-retry-after`
+— because the process it bounds is not always long-lived. It began as an
+`Instant` in the notes-write mutex's payload, which was right for `writd` and
+useless for bailiff: bailiff is a one-shot CLI, so the gate was born empty on
+every `plan submit`/`review`/`implement`/`decide` and discarded at exit, and a
+repo in the failing state paid a full `NOTES_GIT_TIMEOUT` twice per command
+under a held lock instead of once an hour. `writd` had a weaker version of the
+same hole across a restart, so "one attempt per hour" was already a stronger
+claim than the mechanism supported.
+
+It stays *behind* the mutex's payload — reachable only through `&self`/`&mut
+self` on `NotesRepoState` — so consulting or moving it without holding the
+notes-write lock is still unwriteable. Two consequences of wall-clock follow.
+Reads fail *open* on anything missing or unparseable, because a corrupt gate
+that disabled compaction for ever is worse than one extra attempt. And a
+deadline further out than `COMPACTION_RETRY_BACKOFF` is treated as expired,
+since the backoff is the only deadline this code can produce, so anything beyond
+it means the clock moved.
 
 The gate covers the whole attempt. It is consulted *before* `count-objects`,
 because measuring is itself an invocation against the object directory and can be

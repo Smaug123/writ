@@ -1927,3 +1927,123 @@ fn the_compaction_argv_carries_no_pruning_aggression_or_lock_override() {
         );
     }
 }
+
+/// A retry gate left behind by a *different process* is honoured.
+///
+/// This is the whole reason the gate is a file rather than an `Instant`. It was
+/// process-local first, which was right for `writd` and useless for bailiff: a
+/// one-shot CLI is born with an empty gate on every invocation, so a repo whose
+/// `gc` kept failing paid the full deadline on every `plan submit`, under a held
+/// lock, instead of once an hour.
+///
+/// Writing the file directly is exactly what "another process closed the gate"
+/// looks like from here, and asserting the attempt *count* rather than the
+/// outcome is what stops an implementation that returns `Deferred` while still
+/// shelling out to `gc` from passing.
+#[test]
+fn a_retry_gate_written_by_another_process_defers_compaction() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let handle = handle_with_env(
+        &repo,
+        counting_git_env(&tmp.path().join("bin"), &attempts, FakeGc::Succeeds),
+    );
+
+    write_retry_gate(
+        repo.path(),
+        SystemTime::now() + Duration::from_secs(30 * 60),
+    );
+
+    let outcome = handle
+        .compact_if_needed_with(always_compact())
+        .expect("a deferred compaction is not an error");
+    assert!(
+        matches!(outcome, CompactionOutcome::Deferred { .. }),
+        "a gate this process never set must still be honoured; got {outcome:?}"
+    );
+    assert_eq!(
+        attempt_count(&attempts),
+        0,
+        "the gate must be consulted before anything is spawned"
+    );
+}
+
+/// A gate further out than the backoff could ever put it is treated as expired.
+///
+/// Durability costs the monotonic clock: `Instant` could not be written to a
+/// file, so the deadline is wall-clock, and wall clocks move. Without this, a
+/// backwards jump — or a garbled write — would strand compaction closed for
+/// however long the clock was wrong, which is unbounded. The backoff is the only
+/// deadline the code can legitimately produce, so anything beyond it did not
+/// come from here.
+#[test]
+fn a_gate_beyond_the_backoff_is_treated_as_expired() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let handle = handle_with_env(
+        &repo,
+        counting_git_env(&tmp.path().join("bin"), &attempts, FakeGc::Succeeds),
+    );
+
+    write_retry_gate(
+        repo.path(),
+        SystemTime::now() + COMPACTION_RETRY_BACKOFF * 10,
+    );
+
+    handle
+        .compact_if_needed_with(always_compact())
+        .expect("an implausible gate must not stop compaction");
+    assert_eq!(
+        attempt_count(&attempts),
+        1,
+        "a deadline the backoff cannot have produced must not hold the gate shut"
+    );
+}
+
+/// A compaction that worked leaves no gate behind.
+///
+/// Absence *is* the open state, so a stale file would silently cost the next
+/// hour's compaction — and, being durable now, would outlive the process that
+/// wrote it rather than dying with it.
+#[test]
+fn a_successful_compaction_clears_the_durable_gate() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let attempts = tmp.path().join("gc-attempts");
+    let handle = handle_with_env(
+        &repo,
+        counting_git_env(&tmp.path().join("bin"), &attempts, FakeGc::Fails),
+    );
+
+    handle
+        .compact_if_needed_with(always_compact())
+        .expect_err("the fake gc exits non-zero");
+    assert!(
+        repo.path().join(COMPACTION_RETRY_FILE).is_file(),
+        "a failed compaction must leave the gate closed on disk"
+    );
+
+    let succeeding = handle_with_env(
+        &repo,
+        counting_git_env(&tmp.path().join("bin2"), &attempts, FakeGc::Succeeds),
+    );
+    write_retry_gate(repo.path(), SystemTime::now());
+    succeeding
+        .compact_if_needed_with(always_compact())
+        .expect("an expired gate lets the next compaction through");
+    assert!(
+        !repo.path().join(COMPACTION_RETRY_FILE).exists(),
+        "a compaction that succeeded must not leave the next one waiting an hour"
+    );
+}
+
+/// Close the gate at `until`, as a previous process would have left it.
+fn write_retry_gate(repo: &Path, until: SystemTime) {
+    let millis = until
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("test deadlines are after the epoch")
+        .as_millis();
+    fs::write(repo.join(COMPACTION_RETRY_FILE), millis.to_string()).unwrap();
+}
