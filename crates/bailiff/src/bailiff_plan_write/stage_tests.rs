@@ -113,7 +113,8 @@ fn happy_path_round_trips_for_every_stage() {
             purpose.clone(),
             &completed,
         )
-        .unwrap_or_else(|e| panic!("{stage} happy path must succeed: {e}"));
+        .unwrap_or_else(|e| panic!("{stage} happy path must succeed: {e}"))
+        .target_oid;
 
         let body = bailiff
             .read_note(&plan_notes_ref(plan_id), &returned_oid)
@@ -163,7 +164,9 @@ fn a_second_write_is_refused_and_the_first_body_survives() {
             )
         };
 
-        let first_oid = write("first").unwrap_or_else(|e| panic!("{stage} first write: {e}"));
+        let first_oid = write("first")
+            .unwrap_or_else(|e| panic!("{stage} first write: {e}"))
+            .target_oid;
         // A different `purpose` on the second call, so a silent
         // overwrite would surface as a body mismatch below rather than
         // passing as a no-op.
@@ -335,6 +338,7 @@ fn distinct_plans_are_independent_for_every_stage() {
                 &completed,
             )
             .unwrap_or_else(|e| panic!("{stage} write for {plan_id}: {e}"))
+            .target_oid
         };
         let oid_a = write(a, "first-plan");
         let oid_b = write(b, "second-plan");
@@ -403,7 +407,8 @@ fn all_four_notes_coexist_under_one_ref() {
                 format!("plan-{stage}"),
                 &completed,
             )
-            .unwrap_or_else(|e| panic!("{stage} must write alongside the other notes: {e}"));
+            .unwrap_or_else(|e| panic!("{stage} must write alongside the other notes: {e}"))
+            .target_oid;
             (stage, oid)
         })
         .collect();
@@ -501,7 +506,8 @@ fn several_implementer_attempts_coexist_on_one_plan() {
                 format!("attempt-{attempt}"),
                 &completed,
             )
-            .unwrap_or_else(|e| panic!("attempt {attempt} must write: {e}"));
+            .unwrap_or_else(|e| panic!("attempt {attempt} must write: {e}"))
+            .target_oid;
             (attempt, oid)
         })
         .collect();

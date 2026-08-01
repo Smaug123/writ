@@ -605,7 +605,7 @@ pub async fn run_under_owned_session(
         })
         .await;
     let note_oid = match write_outcome {
-        Ok(Ok(note_oid)) => note_oid,
+        Ok(Ok(written)) => written.target_oid,
         Ok(Err(source)) => {
             let _ = client.close_session(session_id).await;
             return Err(OwnedSessionRunError::WriteNote { session_id, source });
@@ -722,7 +722,8 @@ pub async fn run_under_broker_session(
         })
         .await
         .map_err(|source| BrokerSessionRunError::WriteTaskFailed { session_id, source })?
-        .map_err(|source| BrokerSessionRunError::WriteNote { session_id, source })?;
+        .map_err(|source| BrokerSessionRunError::WriteNote { session_id, source })?
+        .target_oid;
 
     Ok(StageRun {
         note_oid,

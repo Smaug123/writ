@@ -49,7 +49,7 @@ use crate::bailiff_plan_note::{
 use crate::bailiff_repo_guard::lock_repo_mutations;
 use crate::bailiff_stage::{AgentStage, StageNoteSlot};
 use writ::core::NotesRef;
-use writ::notes_repo::{NotesRepo, NotesRepoError, WriteOutcome};
+use writ::notes_repo::{CompactionOutcome, NotesRepo, NotesRepoError, WriteOutcome};
 use writ::run_envelope::SignedRunEnvelope;
 use writ::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
 use writ::vm_git::GitObjectId;
@@ -98,6 +98,44 @@ fn fetch_and_verify(
 
     verify_run_envelope(&envelope, allowed_signers).map_err(FetchVerifyError::Verify)?;
     Ok(envelope)
+}
+
+/// A bailiff note write, and the housekeeping that followed it.
+///
+/// The compaction travels *beside* the outcome rather than replacing it, and as
+/// a `Result` rather than folded into the verb's error, because the note is
+/// already durable by the time compaction runs: a failure to pack must not turn
+/// a recorded decision into a failed command. This is the shape writ uses in
+/// `sign_and_store_run` for the same reason.
+#[derive(Debug)]
+pub struct NoteWritten {
+    /// The bailiff-side OID the note is attached at.
+    pub target_oid: GitObjectId,
+    /// What [`NotesRepo::compact_if_needed`] did, or why it could not.
+    pub compaction: Result<CompactionOutcome, NotesRepoError>,
+}
+
+/// Pack bailiff's repo if it has accumulated enough loose objects.
+///
+/// Called after a note write, never before and never after a bare fetch. Writ
+/// suppresses git's background auto-maintenance in every repo it owns
+/// (`architecture.md` §5.1), so nothing else will ever pack this one; but by the
+/// time this runs the note is durable, so the caller reports the outcome and
+/// carries on.
+///
+/// **What this does not yet cover.** `compact_if_needed`'s threshold counts
+/// *loose objects* only, and bailiff's repo grows chiefly by whole packs — one
+/// per `fetch_from_remote`. So this fires on bailiff's own note writes and not
+/// on the fetches, which is the half of git's auto policy (`gc.autoPackLimit`)
+/// that has no live trigger here yet. Wiring this up is what makes adding that
+/// half possible, not a substitute for it.
+fn compact_after_note_write(bailiff_repo: &NotesRepo) -> Result<CompactionOutcome, NotesRepoError> {
+    let outcome = bailiff_repo.compact_if_needed();
+    match &outcome {
+        Ok(done) => tracing::debug!(?done, "compacted bailiff's notes repo"),
+        Err(err) => tracing::warn!(%err, "compacting bailiff's notes repo failed"),
+    }
+    outcome
 }
 
 /// Tagged failure modes of `fetch_and_verify` — the fetch→read→
@@ -179,7 +217,7 @@ pub enum FetchVerifyError {
 pub fn write_decision_note(
     bailiff_repo: &NotesRepo,
     decision_note: &DecisionNote,
-) -> Result<GitObjectId, WriteDecisionNoteError> {
+) -> Result<NoteWritten, WriteDecisionNoteError> {
     // Decision notes do not fetch, but a `git notes add` still races
     // another *process*'s fetch or note write for a different plan;
     // per-plan flocks do not cover that. See `lock_repo_mutations`.
@@ -192,7 +230,10 @@ pub fn write_decision_note(
         .write_note_if_absent(&plan_ref, &seed, &body)
         .map_err(WriteDecisionNoteError::WriteDecisionNote)?
     {
-        WriteOutcome::Written(oid) => Ok(oid),
+        WriteOutcome::Written(target_oid) => Ok(NoteWritten {
+            target_oid,
+            compaction: compact_after_note_write(bailiff_repo),
+        }),
         WriteOutcome::AlreadyPresent(target_oid) => {
             Err(WriteDecisionNoteError::DecisionAlreadyRecorded {
                 plan_id,
@@ -266,7 +307,7 @@ pub fn write_stage_note(
     writ_notes_ref: &NotesRef,
     purpose: String,
     completed: &RunAgentCompleted,
-) -> Result<GitObjectId, WriteStageNoteError> {
+) -> Result<NoteWritten, WriteStageNoteError> {
     let StageNoteTarget {
         slot,
         plan_id,
@@ -293,7 +334,10 @@ pub fn write_stage_note(
         .write_note_if_absent(&plan_notes_ref(plan_id), &slot.seed(plan_id), &body)
         .map_err(|source| WriteStageNoteError::Write { stage, source })?
     {
-        WriteOutcome::Written(oid) => Ok(oid),
+        WriteOutcome::Written(target_oid) => Ok(NoteWritten {
+            target_oid,
+            compaction: compact_after_note_write(bailiff_repo),
+        }),
         WriteOutcome::AlreadyPresent(target_oid) => Err(WriteStageNoteError::AlreadyRecorded {
             stage,
             plan_id,
@@ -565,7 +609,7 @@ mod spec {
             };
             let returned_oid = write_stage_note(
                 &bailiff, &target, &writ_notes_ref(), purpose.clone(), &completed,
-            ).expect("a trusted-signer write must succeed");
+            ).expect("a trusted-signer write must succeed").target_oid;
 
             prop_assert!(!stage.first_slot().seed(plan_id).is_empty());
             let body = bailiff
@@ -678,7 +722,7 @@ mod spec {
             let write = || write_stage_note(
                 &bailiff, &target, &writ_notes_ref(), "spec".into(), &completed,
             );
-            let first = write().expect("first write succeeds");
+            let first = write().expect("first write succeeds").target_oid;
             let err = write().unwrap_err();
             match err {
                 WriteStageNoteError::AlreadyRecorded { stage: got, plan_id: pid, target_oid } => {

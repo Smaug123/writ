@@ -23,6 +23,39 @@ fn sample_decision_note(plan_id: PlanId, outcome: Decision) -> DecisionNote {
     }
 }
 
+/// A note write leaves bailiff's repo compacted-if-needed, not merely written.
+///
+/// Writ suppresses git's background auto-maintenance in every repo it owns, so
+/// nothing else will ever pack this one; before this, nothing called
+/// `compact_if_needed` for bailiff at all. What is asserted is the *wiring* —
+/// that the repo was measured — rather than a repack, because a fixture repo
+/// holds a handful of objects and git's own `gc.auto` threshold is 6700, so the
+/// honest outcome here is `Skipped`.
+///
+/// The count must be non-zero: a `Skipped { loose_objects: 0 }` would be what a
+/// measurement of the *wrong repo* looks like, and would pass a bare
+/// `matches!(.., Skipped { .. })`.
+#[test]
+fn writing_a_decision_note_compacts_the_repo_if_needed() {
+    let tmp = TempDir::new().unwrap();
+    let bailiff = bailiff_repo(&tmp);
+    let note = sample_decision_note(PlanId::new(), Decision::Accepted);
+
+    let written = write_decision_note(&bailiff, &note).expect("the decision must be recorded");
+
+    match written
+        .compaction
+        .expect("compaction must have been attempted")
+    {
+        CompactionOutcome::Skipped { loose_objects } => assert!(
+            loose_objects.get() > 0,
+            "the note write leaves loose objects behind, so a zero count means \
+             the measurement did not see this repo"
+        ),
+        other => panic!("a fixture repo is far under git's threshold, got {other:?}"),
+    }
+}
+
 /// Happy path: first decision for a plan writes a note whose body
 /// decodes back to the same `DecisionNote` the caller submitted,
 /// attached at the deterministic decision-seed OID.
@@ -33,7 +66,9 @@ fn write_decision_note_writes_then_reads_back() {
     let plan_id = PlanId::new();
     let note = sample_decision_note(plan_id, Decision::Accepted);
 
-    let returned_oid = write_decision_note(&bailiff, &note).expect("first decision must succeed");
+    let returned_oid = write_decision_note(&bailiff, &note)
+        .expect("first decision must succeed")
+        .target_oid;
 
     // The returned OID must be the deterministic decision-seed
     // OID for this plan id — readers recompute it from the plan
@@ -68,7 +103,7 @@ fn write_decision_note_returns_already_recorded_on_second_call() {
     let bailiff = bailiff_repo(&tmp);
     let plan_id = PlanId::new();
     let first = sample_decision_note(plan_id, Decision::Accepted);
-    let returned_oid = write_decision_note(&bailiff, &first).unwrap();
+    let returned_oid = write_decision_note(&bailiff, &first).unwrap().target_oid;
 
     let mut second = sample_decision_note(plan_id, Decision::Rejected);
     second.decider = Decider::try_new("cli:bob").unwrap();
@@ -105,8 +140,8 @@ fn write_decision_note_supports_distinct_plans_independently() {
     let note1 = sample_decision_note(p1, Decision::Accepted);
     let note2 = sample_decision_note(p2, Decision::Rejected);
 
-    let oid1 = write_decision_note(&bailiff, &note1).unwrap();
-    let oid2 = write_decision_note(&bailiff, &note2).unwrap();
+    let oid1 = write_decision_note(&bailiff, &note1).unwrap().target_oid;
+    let oid2 = write_decision_note(&bailiff, &note2).unwrap().target_oid;
     assert_ne!(oid1, oid2, "distinct plans must seed distinct targets");
 
     let body1 = bailiff.read_note(&plan_notes_ref(p1), &oid1).unwrap();
@@ -141,8 +176,9 @@ fn write_decision_note_coexists_with_existing_submission_under_same_ref() {
         .expect("submission write must succeed");
 
     let decision = sample_decision_note(plan_id, Decision::Accepted);
-    let decision_target =
-        write_decision_note(&bailiff, &decision).expect("decision write must succeed");
+    let decision_target = write_decision_note(&bailiff, &decision)
+        .expect("decision write must succeed")
+        .target_oid;
 
     assert_ne!(
         submission_target, decision_target,
@@ -173,7 +209,8 @@ fn write_decision_note_does_not_require_pre_existing_submission() {
     let note = sample_decision_note(plan_id, Decision::Rejected);
 
     let oid = write_decision_note(&bailiff, &note)
-        .expect("decision write must succeed without a prior submission note");
+        .expect("decision write must succeed without a prior submission note")
+        .target_oid;
     let body = bailiff.read_note(&plan_notes_ref(plan_id), &oid).unwrap();
     assert_eq!(DecisionNote::from_canonical_bytes(&body).unwrap(), note);
 }
@@ -207,9 +244,10 @@ fn write_decision_note_takes_the_repo_mutation_lock() {
     let note = sample_decision_note(plan_id, Decision::Accepted);
     match write_decision_note(&bailiff, &note) {
         Err(WriteDecisionNoteError::RepoLock(_)) => {}
-        Ok(oid) => {
-            panic!("write_decision_note wrote at {oid} without taking the repo mutation lock",)
-        }
+        Ok(written) => panic!(
+            "write_decision_note wrote at {oid} without taking the repo mutation lock",
+            oid = written.target_oid
+        ),
         Err(other) => panic!("expected RepoLock, got: {other:?}"),
     }
 
