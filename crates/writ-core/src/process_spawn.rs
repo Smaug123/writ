@@ -10,9 +10,14 @@
 //! `EAGAIN` under the very pressure named below, and a thread that failed to
 //! start did nothing. That matters because [`wait_collecting`] needs a reader
 //! thread when both output streams are piped, and *by then the child has already
-//! run* — so an un-retried refusal there is worse than a refused spawn, turning
-//! a command that took effect into an error the caller cannot distinguish from
-//! one that did not.
+//! run* — so a refusal there is worse than a refused spawn, turning a command
+//! that took effect into an error indistinguishable from one that did not.
+//!
+//! Retrying alone does not settle it, because at `RLIMIT_NPROC` the causes are
+//! circular: the limit counts threads *and* processes against one UID, so the
+//! child itself can hold the slot `pthread_create` wants, and nothing frees it
+//! until the child is collected. Hence a refusal that outlasts the deadline
+//! falls back to a collector that needs no thread at all.
 //!
 //! Two flavours of refusal occur in practice. One classifier
 //! recognises both — but they get *different deadlines*, because they clear on
@@ -201,13 +206,33 @@ pub fn output(command: &mut std::process::Command) -> io::Result<std::process::O
 /// `RLIMIT_NPROC` cannot fail an otherwise valid command.
 ///
 /// When both *are* piped, the reader thread's creation is retried on the same
-/// terms as a refused spawn (see `spawn_pipe_reader`), so a tight
-/// `RLIMIT_NPROC` cannot fail one of those either. Note that this differs from
-/// `Command::output`, which drains both pipes with `poll` on the calling thread
-/// and so never needed the retry — a difference worth knowing when converting a
-/// call site, since it is the one respect in which the shared collector asks
-/// more of a loaded host than the thing it replaces.
-pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::process::Output> {
+/// terms as a refused spawn — and, if it stays refused past the deadline, the
+/// pipes go back to the child and `Child::wait_with_output` collects them,
+/// draining both with `poll` on this thread. That fallback matters because the
+/// retry cannot always win: `RLIMIT_NPROC` counts threads and processes against
+/// one UID, so the child can be holding the slot the thread needs.
+///
+/// The upshot is that this asks no more of a loaded host than `Command::output`,
+/// whose collector the fallback is. The one case where it still gives ground is
+/// compound — thread exhaustion *and* a failing pipe read — where
+/// `wait_with_output` returns without waiting and the child may outlive the
+/// call. That is preferred to the alternative, which is losing a command that
+/// already happened.
+pub fn wait_collecting(child: std::process::Child) -> io::Result<std::process::Output> {
+    wait_collecting_with(child, DEFAULT_RETRY, |job| {
+        std::thread::Builder::new().spawn(job)
+    })
+}
+
+/// [`wait_collecting`] with the retry schedule and thread-start operation
+/// injected, so the thread-exhaustion fallback can be tested. Real thread
+/// exhaustion cannot be provoked on demand, and an untested fallback is one
+/// nobody finds out about until the day it is needed.
+fn wait_collecting_with(
+    mut child: std::process::Child,
+    config: RetryConfig,
+    start: impl FnMut(ReadJob) -> io::Result<PipeReader>,
+) -> io::Result<std::process::Output> {
     // Drop any piped stdin before waiting, exactly as `Child::wait_with_output`
     // does: a child that reads to EOF would otherwise block forever on the
     // parent-held writer, hanging the wait.
@@ -223,24 +248,36 @@ pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::proces
         // Two live pipes: drain one on a thread while draining the other inline.
         // `thread::spawn` *panics* under thread exhaustion, so use
         // `thread::Builder::spawn`, which surfaces the failure.
-        match spawn_pipe_reader(stderr_pipe) {
+        match spawn_pipe_reader_with(stderr_pipe, config, start) {
             Ok(stderr_reader) => {
                 let stdout = read_pipe(stdout_pipe);
                 let status = child.wait();
                 let stderr = stderr_reader.join().unwrap_or_else(|_| Ok(Vec::new()));
                 (stdout, stderr, status)
             }
-            Err(err) => {
-                // Report the collection failure — don't fabricate a command
-                // result. Closing the stderr reader can `SIGPIPE`-kill the child,
-                // so its exit status here may be collector-induced. Still reap the
-                // child (no leak) without deadlocking: its stderr read end is
-                // already closed by the failed spawn, and draining stdout inline
-                // keeps it from blocking on a full pipe. No PID-based kill (which
-                // could hit a recycled PID under an auto/external reaper).
-                let _ = read_pipe(stdout_pipe);
-                let _ = child.wait();
-                return Err(err);
+            Err((_refusal, returned_stderr)) => {
+                // Refused past the deadline — and retrying cannot always fix this
+                // one, because the causes are circular: `RLIMIT_NPROC` counts
+                // threads *and* processes against one UID, so our own live child
+                // holds the slot `pthread_create` wants, and nothing frees it
+                // until we collect. Reporting the refusal would mean calling a
+                // command that *ran*, with whatever side effects it had, a spawn
+                // failure.
+                //
+                // So give the pipes back and let `Child::wait_with_output` do it:
+                // std drains both with `poll` on this thread, needing no thread at
+                // all. That is the collector `Command::output` uses — exactly what
+                // the migrated call sites had before — so the fallback cannot be
+                // worse for them than not having migrated at all.
+                //
+                // The one thing given up is this function's stronger promise:
+                // `wait_with_output` returns on a *pipe read* error without
+                // waiting, so in that compound case (thread exhaustion *and* a
+                // failing pipe) the child may outlive the call. Preferred to the
+                // alternative, which loses a command that already happened.
+                child.stdout = stdout_pipe;
+                child.stderr = returned_stderr;
+                return child.wait_with_output();
             }
         }
     } else {
@@ -267,28 +304,6 @@ fn read_pipe<R: std::io::Read>(pipe: Option<R>) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Spawn a thread that drains `pipe` to end-of-file. Uses `thread::Builder` so
-/// thread-creation failure surfaces as an `io::Error` rather than a panic — and
-/// retries that failure on the same terms as a refused process spawn.
-///
-/// `pthread_create` answers `EAGAIN` when the process or thread limit is
-/// momentarily full: the same condition, the same errno, and the same
-/// all-or-nothing property as a refused `fork` — the thread did not start, so
-/// retrying repeats nothing. Leaving it un-retried would have been a hole
-/// exactly where this module claims to be useful, and a worse one than a refused
-/// spawn, because by this point the *child has already run*: a mutating command
-/// would have taken effect and the caller would still see an error.
-///
-/// The pipe is held in a cell rather than moved into the closure because
-/// `thread::Builder::spawn` drops the closure — and with it the pipe, closing
-/// the read end — when thread creation fails. Only the attempt that actually
-/// starts takes the pipe out.
-fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> io::Result<PipeReader> {
-    spawn_pipe_reader_with(pipe, DEFAULT_RETRY, |job| {
-        std::thread::Builder::new().spawn(job)
-    })
-}
-
 /// The thread draining one of a child's pipes, and its result.
 type PipeReader = std::thread::JoinHandle<io::Result<Vec<u8>>>;
 
@@ -296,28 +311,47 @@ type PipeReader = std::thread::JoinHandle<io::Result<Vec<u8>>>;
 /// thread can be substituted in tests.
 type ReadJob = Box<dyn FnOnce() -> io::Result<Vec<u8>> + Send + 'static>;
 
-/// [`spawn_pipe_reader`] with the retry schedule and the thread-start operation
-/// injected, so a test can produce the failure a real `RLIMIT_NPROC` ceiling
-/// would — a condition that by construction cannot be provoked on demand.
+/// Start a thread that drains `pipe` to end-of-file, retrying a refused start on
+/// the same terms as a refused process spawn, and handing `pipe` back if it
+/// stays refused.
 ///
-/// The seam is the *start*, and deliberately not a hook that runs before it. A
-/// pre-attempt hook would return without a job ever being built, so the failure
-/// mode that actually matters — `Builder::spawn` dropping a job that owns the
-/// pipe — would never occur, and the test would pass over an implementation that
-/// took the pipe eagerly and lost it. Taking the job by value means an injected
-/// failure drops it exactly as the real call does.
+/// `pthread_create` answers `EAGAIN` when the process or thread limit is
+/// momentarily full: the same condition, the same errno, and the same
+/// all-or-nothing property as a refused `fork` — the thread did not start, so
+/// retrying repeats nothing.
+///
+/// The pipe is held in a cell rather than moved into the job because
+/// `thread::Builder::spawn` drops the job — and with it the pipe, closing the
+/// read end — when thread creation fails. Only the attempt that actually starts
+/// takes the pipe out, which is also what leaves it intact to return on the
+/// error path, so the caller can fall back to a thread-free collector.
+///
+/// `start` is injected so a test can produce the failure a real `RLIMIT_NPROC`
+/// ceiling would — a condition that by construction cannot be provoked on
+/// demand. The seam is the *start*, and deliberately not a hook that runs before
+/// it: a pre-attempt hook would return without a job ever being built, so the
+/// failure mode that actually matters — `Builder::spawn` dropping a job that
+/// owns the pipe — would never occur, and the test would pass over an
+/// implementation that took the pipe eagerly and lost it. Taking the job by
+/// value means an injected failure drops it exactly as the real call does.
 fn spawn_pipe_reader_with<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
     config: RetryConfig,
     mut start: impl FnMut(ReadJob) -> io::Result<PipeReader>,
-) -> io::Result<PipeReader> {
+) -> Result<PipeReader, (io::Error, Option<R>)> {
     let cell = std::sync::Arc::new(std::sync::Mutex::new(pipe));
-    retry_sync_with(config, || {
+    let started = retry_sync_with(config, || {
         let cell = std::sync::Arc::clone(&cell);
         start(Box::new(move || {
             let pipe = cell.lock().expect("pipe cell mutex poisoned").take();
             read_pipe(pipe)
         }))
+    });
+    started.map_err(|err| {
+        // No attempt started, so the cell still holds the pipe: hand it back so
+        // the caller can collect without a thread rather than lose the stream.
+        let pipe = cell.lock().expect("pipe cell mutex poisoned").take();
+        (err, pipe)
     })
 }
 
@@ -545,6 +579,41 @@ mod tests {
             "expected at least one retry, got {}",
             calls.get()
         );
+    }
+
+    /// A command that *ran* is never reported as a spawn failure just because no
+    /// reader thread could be had.
+    ///
+    /// Retrying is not enough on its own here, and the reason is circular:
+    /// `RLIMIT_NPROC` counts threads and processes against the same UID, so when
+    /// the child itself takes the last slot, no amount of waiting frees the one
+    /// `pthread_create` wants — nothing will, until the child is collected, which
+    /// is the very thing blocked. Left there, a `git commit` that had already
+    /// written its object would come back as `EAGAIN`.
+    ///
+    /// So a persistent refusal falls back to `Child::wait_with_output`, which
+    /// drains both pipes with `poll` on this thread. This asserts the whole of
+    /// that: both streams arrive intact, and the exit status with them.
+    #[test]
+    fn a_command_that_ran_is_collected_even_when_no_thread_can_be_had() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf out; printf err 1>&2; exit 3")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = spawn(&mut command).unwrap();
+
+        let output = wait_collecting_with(child, fast_config(), |job| {
+            // Every attempt refused, exactly as a saturated process table would.
+            drop(job);
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        })
+        .expect("a command that ran must be collected, not reported as refused");
+
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+        assert_eq!(output.status.code(), Some(3));
     }
 
     /// A reader thread the OS refused is retried, and the pipe survives the
