@@ -53,11 +53,11 @@ mod staged_push;
 /// Run-agent orchestration (the `RunAgent` handler and its VM-dispatch
 /// path), split out of this file to keep the dispatcher readable.
 mod run_agent;
-pub(crate) use run_agent::AgentRunSlot;
 pub use run_agent::{
-    AgentRunQueueFull, AgentRunQueueing, AgentRunSlots, AgentRunSlotsError,
-    DEFAULT_MAX_CONCURRENT_AGENT_RUNS, DEFAULT_MAX_PENDING_AGENT_RUNS,
+    AgentRunQueueFull, AgentRunSlots, AgentRunSlotsError, DEFAULT_MAX_CONCURRENT_AGENT_RUNS,
+    DEFAULT_MAX_PENDING_AGENT_RUNS,
 };
+pub(crate) use run_agent::{AgentRunQueuePlace, AgentRunSlot};
 
 /// Boot-time description of the child process that produces an agent
 /// run's streams, and where those streams are kept. Pure data —
@@ -331,36 +331,65 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                             .expect("agent prompt byte limit fits in u64"),
                     "AgentPrompt validates prompt size before dispatch"
                 );
-                match agent_vm
-                    .start_agent_run_session(
-                        Arc::clone(state),
-                        label,
-                        agent_kind,
-                        agent_model,
-                        workspace,
-                        prompt,
-                        // `StartAgentRun` has no `purpose` field, and is not
-                        // getting one speculatively: a run started this way is
-                        // permanently `purpose: None` on the audit row, which is
-                        // the truth about what the caller supplied.
-                        crate::agent_vm_daemon::AgentRunTags {
-                            correlation_id,
-                            purpose: None,
-                        },
-                        // The CLI that sent this has its own deadline and will
-                        // stop listening; a slot granted afterwards would boot a
-                        // VM whose session id reaches nobody.
-                        crate::server::AgentRunQueueing::UpTo(
-                            crate::agent_vm_daemon::AGENT_RUN_QUEUE_WAIT,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(started) => ServerMessage::AgentRunStarted {
-                        session_id: started.session_id(),
-                        run_id: started.run_id(),
-                        broker_url: started.broker_url().to_string(),
+                // Accept, answer, and start in the background. The client that
+                // sent this has its own deadline and writd never sees its EOF,
+                // so anything awaited here is time in which the run's ids might
+                // stop being deliverable — and a start completed after that
+                // leaves a live VM the operator can only find by listing.
+                // Answering from the accept removes that state by construction:
+                // the caller holds the name of everything writd will start,
+                // before writd starts it.
+                match agent_vm.accept_agent_run_session(
+                    state,
+                    label,
+                    agent_kind,
+                    agent_model,
+                    workspace,
+                    prompt,
+                    // `StartAgentRun` has no `purpose` field, and is not
+                    // getting one speculatively: a run started this way is
+                    // permanently `purpose: None` on the audit row, which is
+                    // the truth about what the caller supplied.
+                    crate::agent_vm_daemon::AgentRunTags {
+                        correlation_id,
+                        purpose: None,
                     },
+                ) {
+                    Ok(accepted) => {
+                        let session_id = accepted.session_id();
+                        let run_id = accepted.run_id();
+                        let agent_vm = Arc::clone(agent_vm);
+                        let state = Arc::clone(state);
+                        tokio::spawn(async move {
+                            // Nobody is waiting on this result, so it has to be
+                            // legible where an operator will look: the log line
+                            // here, and — for every failure downstream of the
+                            // audit session being opened — a closed session with
+                            // an unpaired `agent_run` row.
+                            match agent_vm.complete_agent_run_session(state, accepted).await {
+                                Ok(_started) => {}
+                                // Not a failure: somebody asked for this, and
+                                // `stop_session` has already recorded that they
+                                // did. Logging it as an error would make the one
+                                // outcome an operator deliberately caused the
+                                // loudest thing in the file.
+                                Err(
+                                    crate::agent_vm_daemon::AgentVmDaemonError::AgentRunStoppedBeforeStart {
+                                        ..
+                                    },
+                                ) => {}
+                                Err(err) => {
+                                    tracing::error!(
+                                        session_id = %session_id,
+                                        run_id = %run_id,
+                                        error = %err,
+                                        "accepted agent run did not start",
+                                    );
+                                }
+                            }
+                        });
+                        ServerMessage::AgentRunAccepted { session_id, run_id }
+                    }
                     Err(err) => ServerMessage::Error {
                         message: err.to_string(),
                     },

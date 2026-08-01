@@ -18,6 +18,7 @@ impl AgentVmDaemon {
             running: Mutex::new(HashMap::new()),
             subnet_allocation_lock: Mutex::new(()),
             session_locks: Mutex::new(HashMap::new()),
+            accepted_agent_runs: Arc::new(AcceptedAgentRunRegistry::default()),
             network_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
             health_monitor: std::sync::Mutex::new(None),
             vm_broker_attached: Mutex::new(HashMap::new()),
@@ -146,21 +147,44 @@ impl AgentVmDaemon {
         outcome
     }
 
+    /// Accept an agent run: mint its ids, answer everything answerable without
+    /// waiting, and take a place in the queue.
+    ///
+    /// Deliberately not `async`. Nothing here awaits, so a caller can have the
+    /// run's ids without writd having done anything slow — which is the whole
+    /// contract `StartAgentRun` now offers, and a property worth being able to
+    /// read off the signature rather than trusting a comment.
+    ///
+    /// > An accepted run has been *named*, not started. Nothing is recorded
+    /// > about it, no VM exists, and it holds no slot: only a place in the
+    /// > admission queue.
+    ///
+    /// Nothing recorded is the deliberate part, and it is where this departs
+    /// from the obvious design (open the audit session here, so the ids the
+    /// caller holds are durable immediately). Opening it here would leave an
+    /// open audit session with no VM behind it for the whole queue wait, and
+    /// boot reconciliation is driven by the lifecycle state store — which a
+    /// queued run has no record in — so a crash while queued would strand that
+    /// session open across restarts. Recording nothing keeps the audit log's
+    /// claim true: a session row means writd started something. What the caller
+    /// holds is the name of everything writd could start, which is what makes
+    /// [`AgentVmDaemon::stop_session`] reachable for a run that has not started.
+    ///
+    /// Accepting imposes no obligation: the returned value owns its queue place
+    /// and its registry entry, so dropping it instead of handing it to
+    /// [`AgentVmDaemon::complete_agent_run_session`] gives both back rather than
+    /// leaving either behind.
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_agent_run_session<S: SecretStore + Send + Sync + 'static>(
+    pub fn accept_agent_run_session<S: SecretStore + Send + Sync + 'static>(
         &self,
-        state: Arc<BrokerState<S>>,
+        state: &BrokerState<S>,
         label: Option<String>,
         agent_kind: AgentKind,
         agent_model: String,
         workspace: AgentVmWorkspaceBootstrap,
         prompt: AgentPrompt,
         tags: AgentRunTags,
-        // How long this caller will wait for a slot. Not a property of the
-        // daemon: `StartAgentRun`'s client has a deadline and goes away,
-        // `RunAgent`'s holds the connection for the whole run.
-        queueing: crate::server::AgentRunQueueing,
-    ) -> Result<AgentRunStarted, AgentVmDaemonError> {
+    ) -> Result<AcceptedAgentRun, AgentVmDaemonError> {
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
         // Everything that can refuse this request happens before the per-session
@@ -191,39 +215,96 @@ impl AgentVmDaemon {
             }
         })?;
 
-        // Before the audit session is opened, and before any VM work: a queued
-        // run has not started, and an open session with no VM behind it would
-        // claim otherwise. `StartAgentRun` answers as soon as the VM is up, so
-        // this slot cannot live in this function's scope — it is handed to the
-        // running session below and released when that session is torn down.
-        //
-        // The queue place comes first and is refused synchronously: a run writd
-        // will not queue should learn so now, in the same breath as the
-        // malformed-request answers above, rather than after a wait.
+        // The last thing that can refuse this request, and the reason it happens
+        // here rather than alongside the wait it guards: past this line the run
+        // has a name, and a name its caller may already be acting on. So the
+        // admission bound is consulted synchronously, in the same breath as the
+        // malformed-request answers above — a run writd will not queue learns so
+        // now, before it is told what it would have been called.
         let place = state
             .agent_run_slots
             .enqueue()
             .map_err(AgentVmDaemonError::AgentRunQueueFull)?;
 
-        // Whether this wait is bounded is the caller's call, not ours — see
-        // `AgentRunQueueing`. Both kinds of caller reach this one function, and
-        // they differ in whether anyone is still listening when the wait ends.
-        let run_slot = match place.wait_for_slot_with(queueing).await {
-            Ok(slot) => slot,
-            // The budget comes back from the wait itself rather than being named
-            // again here, so this cannot report a duration the caller did not
-            // actually wait.
-            Err(waited) => {
-                return Err(AgentVmDaemonError::AgentRunsAtCapacity {
-                    limit: state.agent_run_slots.limit().get(),
-                    waited,
-                });
+        let registration = self.register_accepted_agent_run(session_id);
+        Ok(AcceptedAgentRun {
+            session_id,
+            run_id,
+            label,
+            agent_kind,
+            agent_model,
+            workspace,
+            prompt,
+            tags,
+            place,
+            registration,
+        })
+    }
+
+    /// Start an accepted run: wait for a slot, record it, and boot its VM.
+    ///
+    /// This is the slow half, and the half nobody is necessarily listening to —
+    /// `StartAgentRun` answers from [`Self::accept_agent_run_session`] and runs
+    /// this in the background. A failure here therefore has to be legible
+    /// *afterwards*, not just returned: it leaves the audit session closed with
+    /// an unpaired `agent_run` row, which is this codebase's established reading
+    /// of "this run did not complete", plus an error-level log line.
+    ///
+    /// Waits for a slot however long it takes. There is no per-caller budget
+    /// because there is no longer a caller with a deadline: the socket client
+    /// has already been answered, and `RunAgent`'s VM arm holds its connection
+    /// for the whole run by design. What a queued run can no longer do is
+    /// outlive the operator's patience unnoticed — it is stoppable by name from
+    /// the moment it is accepted.
+    pub async fn complete_agent_run_session<S: SecretStore + Send + Sync + 'static>(
+        &self,
+        state: Arc<BrokerState<S>>,
+        accepted: AcceptedAgentRun,
+    ) -> Result<AgentRunStarted, AgentVmDaemonError> {
+        let AcceptedAgentRun {
+            session_id,
+            run_id,
+            label,
+            agent_kind,
+            agent_model,
+            workspace,
+            prompt,
+            tags,
+            place,
+            mut registration,
+        } = accepted;
+
+        // Two ways to learn this run was stopped while it queued, and both are
+        // needed. This one wakes the wait, so a stop does not leave the run
+        // sitting in the queue — holding admission that the refusal message in
+        // `AgentRunQueueFull` counts — until some unrelated run happens to
+        // finish. The check under the session lock below is the one that makes
+        // it *correct*; this one makes it prompt.
+        let run_slot = tokio::select! {
+            slot = place.wait_for_slot() => slot,
+            // `Infallible` payload: the only way this resolves is the sender
+            // being dropped, so there is no "received a value" case to handle.
+            _ = &mut registration.stopped => {
+                return Err(AgentVmDaemonError::AgentRunStoppedBeforeStart { session_id });
             }
         };
 
         let session_lock = self.session_lock_handle(session_id).await;
         let outcome = async {
             let _session_guard = session_lock.lock().await;
+
+            // The decisive check, and the reason it is here rather than before
+            // the lock: `stop_session` clears this registration while holding
+            // the same lock. So either this claim wins, and the stop that
+            // follows blocks until the start finishes and then tears down a
+            // real session; or the stop wins, and this finds nothing and
+            // abandons before recording anything. There is no ordering in which
+            // a stopped run still boots a VM, which is the property the early
+            // reply is worth having.
+            if !self.accepted_agent_runs.take(session_id) {
+                return Err(AgentVmDaemonError::AgentRunStoppedBeforeStart { session_id });
+            }
+
             state.audit.open_session(&SessionRecord {
                 session_id,
                 label,
@@ -286,6 +367,60 @@ impl AgentVmDaemon {
         drop(session_lock);
         self.drop_idle_session_lock(session_id).await;
         outcome
+    }
+
+    /// Accept a run and start it, as one await.
+    ///
+    /// For callers that hold their client for the whole run and so have nothing
+    /// to do with the ids any earlier. `StartAgentRun` deliberately does not use
+    /// this: it answers from the accept and completes in the background.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_agent_run_session<S: SecretStore + Send + Sync + 'static>(
+        &self,
+        state: Arc<BrokerState<S>>,
+        label: Option<String>,
+        agent_kind: AgentKind,
+        agent_model: String,
+        workspace: AgentVmWorkspaceBootstrap,
+        prompt: AgentPrompt,
+        tags: AgentRunTags,
+    ) -> Result<AgentRunStarted, AgentVmDaemonError> {
+        let accepted = self.accept_agent_run_session(
+            &state,
+            label,
+            agent_kind,
+            agent_model,
+            workspace,
+            prompt,
+            tags,
+        )?;
+        self.complete_agent_run_session(state, accepted).await
+    }
+
+    /// Register an accepted-but-unstarted run.
+    ///
+    /// The returned value owns the entry: whatever becomes of the
+    /// [`AcceptedAgentRun`] holding it — started, stopped, or simply dropped —
+    /// the registry is left with nothing to collect.
+    fn register_accepted_agent_run(&self, session_id: SessionId) -> AcceptedAgentRunRegistration {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let displaced = self.accepted_agent_runs.entries().insert(session_id, stop);
+        debug_assert!(
+            displaced.is_none(),
+            "session ids are fresh UUIDs, so an accepted run can never displace another"
+        );
+        AcceptedAgentRunRegistration {
+            session_id,
+            registry: Arc::clone(&self.accepted_agent_runs),
+            stopped,
+        }
+    }
+
+    /// How many runs are accepted and not yet started or stopped. Test-facing:
+    /// a registration that outlives its run is a leak nothing else would show.
+    #[cfg(test)]
+    pub(crate) fn accepted_agent_run_count(&self) -> usize {
+        self.accepted_agent_runs.entries().len()
     }
 
     pub async fn stop_session<S: SecretStore + Send + Sync + 'static>(
@@ -417,6 +552,25 @@ impl AgentVmDaemon {
         state: &Arc<BrokerState<S>>,
         session_id: SessionId,
     ) -> Result<(), AgentVmDaemonError> {
+        // A session id can name a run that has been accepted but not started —
+        // `StartAgentRun` hands the id back before the VM exists, precisely so
+        // that this call is reachable that early. Cancelling it *is* the stop,
+        // and it is the whole stop: taking the registration is what makes
+        // `complete_agent_run_session` abandon, and it can only still be here if
+        // that start has not passed the same point under the same session lock,
+        // which is the point before it records or boots anything. So there is no
+        // state record to tear down, no audit session to close, and no VM to
+        // kill — and the teardown below, which reports `NotFound` for a session
+        // it has never heard of, would turn a stop that did exactly what was
+        // asked into an error.
+        if self.accepted_agent_runs.take(session_id) {
+            tracing::info!(
+                session_id = %session_id,
+                "stopped an agent run that had been accepted but had not started",
+            );
+            return Ok(());
+        }
+
         // Classify the session using the state store only (bounded — no container/PF
         // commands): a genuinely absent record (`NotFound`) is an unrelated/ordinary
         // broker session that was never an agent VM and must NOT have its audit row

@@ -77,7 +77,6 @@ async fn vm_broker_placement_rejects_agent_run_sessions() {
             },
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
-            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
         .unwrap_err();
@@ -1716,7 +1715,6 @@ async fn a_failed_agent_run_start_returns_its_slot() {
             },
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
-            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
         .expect_err("the fake tooling fails network creation during startup");
@@ -1769,7 +1767,6 @@ async fn a_running_agent_run_session_holds_its_slot_until_it_is_stopped() {
             },
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
-            crate::server::AgentRunQueueing::UntilASlotFrees,
         )
         .await
         .expect("the fake container tooling completes a session start");
@@ -1831,7 +1828,6 @@ async fn a_refused_agent_run_start_registers_no_session_lock() {
                 },
                 crate::agent_run::AgentPrompt::new("do it"),
                 crate::agent_vm_daemon::AgentRunTags::default(),
-                crate::server::AgentRunQueueing::UntilASlotFrees,
             )
             .await
             .expect_err("agent runs are unsupported under a VM broker");
@@ -1843,4 +1839,399 @@ async fn a_refused_agent_run_start_registers_no_session_lock() {
          were {}",
         daemon.session_lock_count().await
     );
+}
+
+/// A state whose whole admission bound is two: one running, one waiting.
+///
+/// Small on purpose. Both counts are then unambiguous — a third `enqueue` is
+/// refused — so a test can say "the cancelled run gave its admission back" and
+/// mean it, rather than observing a number 64 away from anything that matters.
+fn state_with_one_run_slot_and_one_queue_place(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
+    let mut state = make_state_with_audit(audit);
+    let inner = Arc::get_mut(&mut state).expect("fresh state Arc is unshared");
+    inner.agent_run_slots = crate::server::AgentRunSlots::new(
+        std::num::NonZeroUsize::new(1).unwrap(),
+        std::num::NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    state
+}
+
+/// The bootstrap every agent-run test in this section starts a run with.
+fn a_workspace() -> AgentVmWorkspaceBootstrap {
+    AgentVmWorkspaceBootstrap {
+        repo: "owner/repo".parse().unwrap(),
+        destination: None,
+        warm: WorkspaceWarmMode::None,
+    }
+}
+
+/// Accepting a run names it and does nothing else.
+///
+/// The whole contract `StartAgentRun` now offers, asserted as the conjunction it
+/// is: the caller gets both ids, and at that moment writd has booted nothing,
+/// recorded nothing, and taken no slot. Each half matters separately. If
+/// accepting started something, the reply would be as slow as the thing it
+/// started, which is the failure this replaced. If accepting recorded something,
+/// the audit log would claim a session that has not begun — and, because boot
+/// reconciliation reads the lifecycle state store rather than the audit log,
+/// would go on claiming it after a crash with nothing to close it.
+#[tokio::test]
+async fn accepting_an_agent_run_names_it_without_starting_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    let accepted = daemon
+        .accept_agent_run_session(
+            &state,
+            Some("named".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            a_workspace(),
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .expect("a well-formed run under a free bound is accepted");
+
+    assert!(
+        !args_log.exists(),
+        "accepting must run no container command: the caller is being answered \
+         *before* the slow part, and a VM booted here would put it back"
+    );
+    assert_eq!(
+        state.agent_run_slots.available(),
+        1,
+        "an accepted run holds a place in the queue, not a slot; counting it as \
+         running would let the bound refuse work that is not being done"
+    );
+    assert_eq!(
+        state
+            .audit
+            .agent_run_for_session(accepted.session_id())
+            .expect("querying the audit log"),
+        None,
+        "nothing may be recorded under a run that has not started — an
+         `agent_run` row is writd saying it began one"
+    );
+    assert_ne!(
+        accepted.session_id().to_string(),
+        accepted.run_id().to_string(),
+        "the two ids the caller is given are distinct handles: one names the \
+         audit session, the other the run inside it"
+    );
+}
+
+/// A run stopped while it queues never starts, and says so promptly.
+///
+/// The hazard the early reply creates and must answer for. Before it, nobody
+/// could stop a run that had not started, because nobody knew its name until it
+/// had; now the name arrives first, so `stop_session` has to mean something the
+/// whole time the run is queued. If it did not, an operator would be told the
+/// run was stopped and then get a VM anyway — the orphan the early reply exists
+/// to abolish, restored by the fix for it.
+///
+/// The slot stays held for the entire test. That is the sharp part: the stop
+/// must reach a run that is *waiting*, and reach it without waiting for the
+/// queue to move. A cancellation noticed only once a slot came free would pass a
+/// weaker version of this test and hang this one.
+#[tokio::test]
+async fn stopping_an_accepted_run_before_it_starts_prevents_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = Arc::new(AgentVmDaemon::new(config));
+    let state = state_with_one_run_slot_and_one_queue_place(
+        AuditLog::open(dir.path().join("audit.db")).unwrap(),
+    );
+
+    // Occupy the only slot, so the accepted run below can do nothing but queue.
+    let occupied = state
+        .agent_run_slots
+        .enqueue()
+        .expect("the bound is free")
+        .wait_for_slot()
+        .await;
+    assert_eq!(state.agent_run_slots.available(), 0, "precondition");
+
+    let accepted = daemon
+        .accept_agent_run_session(
+            &state,
+            Some("queued".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            a_workspace(),
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .expect("the queue has room for one");
+    let session_id = accepted.session_id();
+
+    let starting = tokio::spawn({
+        let daemon = Arc::clone(&daemon);
+        let state = Arc::clone(&state);
+        async move { daemon.complete_agent_run_session(state, accepted).await }
+    });
+
+    daemon.stop_session(&state, session_id).await.expect(
+        "stopping a run that has not started is an ordinary stop: there \
+                 is no VM to fail to tear down",
+    );
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), starting)
+        .await
+        .expect(
+            "the stop must wake the queued start, not leave it waiting for a \
+                 slot that is still held",
+        )
+        .expect("the start task must not panic");
+
+    match outcome {
+        Err(AgentVmDaemonError::AgentRunStoppedBeforeStart {
+            session_id: reported,
+        }) => {
+            assert_eq!(
+                reported, session_id,
+                "the error must name the run it abandoned"
+            );
+        }
+        other => panic!("expected AgentRunStoppedBeforeStart, got {other:?}"),
+    }
+
+    assert!(
+        !args_log.exists(),
+        "a stopped run must boot nothing; a container command here is the orphan \
+         VM this whole contract exists to prevent"
+    );
+    assert_eq!(
+        state
+            .audit
+            .agent_run_for_session(session_id)
+            .expect("querying the audit log"),
+        None,
+        "an abandoned run records nothing: it never opened its audit session"
+    );
+    assert_eq!(
+        daemon.accepted_agent_run_count(),
+        0,
+        "the registration must go with the run, or the daemon accumulates one \
+         entry per stopped run for its lifetime"
+    );
+
+    drop(occupied);
+    assert!(
+        state.agent_run_slots.enqueue().is_ok(),
+        "the cancelled run must have given its admission back, or the bound that \
+         refuses new runs goes on counting one that will never run"
+    );
+}
+
+/// A run that starts leaves no accepted-run registration behind.
+///
+/// The other end of the same bookkeeping. `complete_agent_run_session` claims
+/// the registration to decide it may proceed; if it claimed without removing,
+/// every started run would leave an entry, and a later stop would find a
+/// registration for a session that had long since booted — reading "not started
+/// yet" off a live VM.
+#[tokio::test]
+async fn a_started_agent_run_leaves_no_accepted_run_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool =
+        write_fake_workspace_success_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    let started = daemon
+        .start_agent_run_session(
+            Arc::clone(&state),
+            Some("started".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::Sources,
+            },
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .await
+        .expect("the fake container tooling completes a session start");
+
+    assert_eq!(
+        daemon.accepted_agent_run_count(),
+        0,
+        "a started run is no longer an accepted-but-unstarted one"
+    );
+
+    daemon
+        .stop_session(&state, started.session_id())
+        .await
+        .expect("stopping a started session");
+}
+
+/// `StartAgentRun` answers while the run is still queued.
+///
+/// The end-to-end statement of what this contract is for, and the one test that
+/// fails if the dispatch arm goes back to awaiting the start. The slot is held
+/// throughout, so the run cannot possibly have begun when the reply arrives; a
+/// handler that waited for the start would still be waiting when the timeout
+/// below fires.
+///
+/// Why it matters that the reply is early rather than merely fast: writd is
+/// inside `dispatch` for the whole handler and never observes the client's EOF.
+/// A CLI with a 30-minute deadline can therefore be gone by the time a slow
+/// start finishes, leaving a live VM whose session id reached nobody —
+/// findable only by listing, stoppable only by an operator who thinks to look.
+#[tokio::test]
+async fn start_agent_run_answers_while_the_run_is_still_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = Arc::new(AgentVmDaemon::new(config));
+    let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    let occupied = state
+        .agent_run_slots
+        .enqueue()
+        .expect("the bound is free")
+        .wait_for_slot()
+        .await;
+    assert_eq!(state.agent_run_slots.available(), 0, "precondition");
+
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        crate::server::dispatch_message_with_agent_vm(
+            crate::protocol::ClientMessage::StartAgentRun {
+                label: Some("queued".into()),
+                agent_kind: AgentKind::Claude,
+                agent_model: "claude-test".into(),
+                workspace: a_workspace(),
+                prompt: crate::agent_run::AgentPrompt::new("do it"),
+                correlation_id: None,
+            },
+            &state,
+            Some(&daemon),
+        ),
+    )
+    .await
+    .expect(
+        "the reply must not wait for a slot: with the only one held, a handler \
+         that awaited the start would hang here for as long as the run lasted",
+    );
+
+    let crate::protocol::ServerMessage::AgentRunAccepted {
+        session_id,
+        run_id: _,
+    } = reply
+    else {
+        panic!("expected AgentRunAccepted, got {reply:?}");
+    };
+
+    assert!(
+        !args_log.exists(),
+        "the caller has been answered and the run has not started — that is the \
+         whole point; a booted VM here would mean the reply waited for it"
+    );
+    assert_eq!(
+        state
+            .audit
+            .agent_run_for_session(session_id)
+            .expect("querying the audit log"),
+        None,
+        "a queued run has recorded nothing yet; the ids the caller holds name \
+         what writd will start, not what it has"
+    );
+
+    // And the caller can act on what it was given, immediately: stopping by the
+    // id it just received must reach the run before the run reaches a slot.
+    daemon
+        .stop_session(&state, session_id)
+        .await
+        .expect("the session id from an accept is a name `stop` already answers to");
+    drop(occupied);
+}
+
+/// An accepted run that is simply dropped leaves nothing behind.
+///
+/// Accepting hands out a value that owns a queue place and a registry entry, so
+/// the obvious hazard is an obligation: call `complete_agent_run_session` or
+/// leak. There is no such obligation, and this is what says so. The leak it
+/// forecloses is quiet and permanent — a registry entry is a run writd still
+/// believes it might start, and an unreturned place counts against the bound
+/// that refuses new runs.
+///
+/// Unreachable from the dispatcher today, which never drops an accepted run.
+/// That is exactly why it is worth making structural rather than remembering:
+/// the natural next change here — noticing a client's EOF and abandoning its
+/// request — would otherwise start leaking silently.
+#[tokio::test]
+async fn dropping_an_accepted_run_gives_back_everything_it_took() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
+    let daemon = AgentVmDaemon::new(config);
+    let state = state_with_one_run_slot_and_one_queue_place(
+        AuditLog::open(dir.path().join("audit.db")).unwrap(),
+    );
+
+    let occupied = state
+        .agent_run_slots
+        .enqueue()
+        .expect("the bound is free")
+        .wait_for_slot()
+        .await;
+
+    let accepted = daemon
+        .accept_agent_run_session(
+            &state,
+            Some("abandoned".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            a_workspace(),
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .expect("the queue has room for one");
+    assert_eq!(
+        daemon.accepted_agent_run_count(),
+        1,
+        "precondition: the accept registered this run"
+    );
+    assert!(
+        state.agent_run_slots.enqueue().is_err(),
+        "precondition: one running plus this one is the whole admission bound"
+    );
+
+    drop(accepted);
+
+    assert_eq!(
+        daemon.accepted_agent_run_count(),
+        0,
+        "a dropped accept must take its registration with it, or the daemon goes \
+         on believing it might start a run nobody is holding"
+    );
+    assert!(
+        state.agent_run_slots.enqueue().is_ok(),
+        "a dropped accept must give its admission back"
+    );
+    drop(occupied);
 }

@@ -363,24 +363,63 @@ wrong way round.
 
 The slot's *lifetime* differs by path, and that is the load-bearing part. A host
 run ends when its handler returns, so a function-scoped permit is the run's
-lifetime. A VM run does not: `StartAgentRun` answers as soon as the VM is up, so
-`start_agent_run_session` hands the permit to the running session, where it lives
-inside the `running` map's value and is released when the session is removed —
-by construction rather than by remembering, since a missed release is permanent
-and shrinks the bound for the daemon's lifetime.
+lifetime. A VM run does not: `StartAgentRun` has answered before the VM even
+exists, so `complete_agent_run_session` hands the permit to the running session,
+where it lives inside the `running` map's value and is released when the session
+is removed — by construction rather than by remembering, since a missed release
+is permanent and shrinks the bound for the daemon's lifetime.
 
-*How long* a caller admitted to the queue then waits is also per-path
-(`AgentRunQueueing`), for one reason: whether anyone is still listening when the
-wait ends. `RunAgent` (both arms) queues indefinitely — its caller holds the
-connection for the whole run, and a host run ends by itself so the queue drains
-unattended. `StartAgentRun` waits at most `AGENT_RUN_QUEUE_WAIT` and then answers
-`AgentRunsAtCapacity`, because its CLI has a 30-minute deadline of which the
-bootstrap may take 20; a permit granted after that would boot a VM whose session
-id reaches nobody. That is a third, distinct answer from the two above and is
-kept distinct on purpose: `AgentRunQueueFull` means writd never queued the
-request, `AgentRunsAtCapacity` means it did and the caller's own budget ran out.
-Refusals of either kind happen before the per-session lock is registered, so a
-rejected start leaves nothing behind.
+*How long* a caller admitted to the queue then waits is unbounded, on every
+path, and `AgentRunQueueFull` is the only thing writd will ever say about
+capacity. It used to be per-path: `StartAgentRun` gave up after five minutes,
+because its CLI has a 30-minute deadline of which the bootstrap may take 20, and
+a permit granted after that would boot a VM whose session id reached nobody.
+Answering that RPC *before* the start (below) removes the caller with the
+deadline, and with it the reason to abandon a run writd has already named.
+Refusals happen at `enqueue`, before the per-session lock is registered and
+before any ids are handed out, so a rejected start leaves nothing behind.
+
+**`StartAgentRun` is accept-then-start.** `accept_agent_run_session` is not
+`async`: it validates, mints the session and run ids, takes a place in the queue,
+and returns. The dispatcher answers `AgentRunAccepted { session_id, run_id }`
+from that and runs `complete_agent_run_session` — wait for a slot, open the audit
+session, write the workspace-bootstrap and `agent_run` rows, boot the VM — on a
+spawned task. The guarantee is:
+
+> The caller holds the name of everything writd will start, before writd starts
+> it.
+
+Which is what makes the previous failure unrepresentable rather than unlikely:
+writd sits inside `dispatch` for the whole handler and never sees the client's
+EOF, so a start completed after the client gave up left a live, slot-holding VM
+findable only through `writ agent-vm list`.
+
+Two consequences worth stating, because both are load-bearing:
+
+* **Nothing is recorded at accept time**, so a lookup by the returned
+  `session_id` finds nothing until the run actually starts. The obvious
+  alternative — open the audit session early, so the caller's ids are durable
+  immediately — would leave an open audit session with no VM behind it for the
+  whole queue wait, and boot reconciliation is driven by the lifecycle state
+  store (which a queued run has no record in), so a crash while queued would
+  strand it open across restarts. Recording nothing keeps the audit log's claim
+  true: a session row means writd started something.
+* **A queued run is stoppable by name.** `stop_session` takes the accepted-run
+  registration under the per-session lock, and `complete_agent_run_session` takes
+  that same registration under that same lock before recording or booting
+  anything. So either the start claims it — and the stop then blocks on the lock
+  and tears down a real session — or the stop claims it and the start abandons.
+  There is no ordering in which a stopped run still boots a VM. Cancelling *is*
+  the whole stop for such a session: there is no state record, no audit session
+  and no VM, so it returns success rather than falling through to a teardown that
+  would report `NotFound`. Dropping the registration also wakes the queued start,
+  so a stopped run gives its admission back at once rather than when some
+  unrelated run happens to finish.
+
+Failures after the accept have nobody to return to, so they must be legible
+afterwards: an error-level log line, plus — for anything downstream of the audit
+session being opened — a closed session with an unpaired `agent_run` row, which
+is this codebase's established reading of "this run did not complete".
 
 A restart does not carry slots over, because it does not carry sessions over:
 boot reconciliation tears down every persisted agent VM before writd serves.

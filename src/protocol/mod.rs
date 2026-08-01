@@ -345,13 +345,19 @@ pub enum ServerMessage {
         session_id: SessionId,
         broker_url: String,
     },
-    /// A product-level agent run was started. The prompt itself is not
-    /// returned; `run_id` is the stable handle used by the VM prompt/log
-    /// contract.
-    AgentRunStarted {
+    /// A product-level agent run was accepted. It is *not* running yet: writd
+    /// answers here so that the caller holds the run's names before the slow
+    /// part — queueing, workspace bootstrap, VM boot — begins, and can therefore
+    /// stop it whatever happens next. Nothing is recorded under `session_id`
+    /// until the run actually starts, so a lookup that finds nothing means "not
+    /// started yet", not "lost".
+    ///
+    /// The prompt itself is not returned; `run_id` is the stable handle used by
+    /// the VM prompt/log contract. No `broker_url`, unlike
+    /// [`Self::AgentVmStarted`]: there is no VM yet to have one.
+    AgentRunAccepted {
         session_id: SessionId,
         run_id: AgentRunId,
-        broker_url: String,
     },
     /// Acknowledges [`ClientMessage::StopAgentVm`].
     AgentVmStopped,
@@ -489,15 +495,10 @@ impl std::fmt::Debug for ServerMessage {
                 .field("session_id", session_id)
                 .field("broker_url", broker_url)
                 .finish(),
-            Self::AgentRunStarted {
-                session_id,
-                run_id,
-                broker_url,
-            } => f
-                .debug_struct("AgentRunStarted")
+            Self::AgentRunAccepted { session_id, run_id } => f
+                .debug_struct("AgentRunAccepted")
                 .field("session_id", session_id)
                 .field("run_id", run_id)
-                .field("broker_url", broker_url)
                 .finish(),
             Self::AgentVmStopped => write!(f, "AgentVmStopped"),
             Self::AgentVmSessions { sessions } => f

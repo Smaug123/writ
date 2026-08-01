@@ -658,11 +658,10 @@ fn agent_vm_started_roundtrips() {
 }
 
 #[test]
-fn agent_run_started_roundtrips() {
-    let msg = ServerMessage::AgentRunStarted {
+fn agent_run_accepted_roundtrips() {
+    let msg = ServerMessage::AgentRunAccepted {
         session_id: fixed_session_id(),
         run_id: "00000000-0000-0000-0000-000000000777".parse().unwrap(),
-        broker_url: "http://192.168.252.1:51375/".into(),
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
@@ -1305,13 +1304,12 @@ fn agent_vm_type_tags() {
     .unwrap();
     assert_eq!(run["type"], "start_agent_run");
 
-    let run_started: serde_json::Value = serde_json::to_value(ServerMessage::AgentRunStarted {
+    let run_accepted: serde_json::Value = serde_json::to_value(ServerMessage::AgentRunAccepted {
         session_id: fixed_session_id(),
         run_id: "00000000-0000-0000-0000-000000000777".parse().unwrap(),
-        broker_url: "http://192.168.252.1:51375/".into(),
     })
     .unwrap();
-    assert_eq!(run_started["type"], "agent_run_started");
+    assert_eq!(run_accepted["type"], "agent_run_accepted");
 
     let list: serde_json::Value = serde_json::to_value(ClientMessage::ListAgentVms {}).unwrap();
     assert_eq!(list["type"], "list_agent_vms");

@@ -196,24 +196,6 @@ struct RunningAgentVm {
     _slot: Option<crate::server::AgentRunSlot>,
 }
 
-/// How long a `StartAgentRun` will wait for a concurrency slot before answering
-/// "at capacity".
-///
-/// Bounded by the caller's patience, not by ours. The CLI gives a workspace
-/// start 30 minutes end to end (`AGENT_VM_WORKSPACE_CALL_TIMEOUT`), and the
-/// bootstrap it then waits on is itself allowed 20, so only about ten minutes of
-/// that budget can be spent queueing before the client stops listening. Five
-/// leaves room for the boot to finish inside the budget and still be reported.
-///
-/// Waiting longer would not be more generous, it would be worse: writd is inside
-/// `dispatch`, never sees the client's EOF, and would go on to boot a VM whose
-/// session id reaches nobody. The operator would be left with a running agent
-/// they cannot name, only findable through `writ agent-vm list`.
-///
-/// The synchronous host arm deliberately has no such bound — its runs end by
-/// themselves, so its queue drains without anyone intervening.
-pub(crate) const AGENT_RUN_QUEUE_WAIT: Duration = Duration::from_secs(5 * 60);
-
 pub struct AgentVmDaemon {
     config: AgentVmDaemonRuntimeConfig,
     running: Mutex<HashMap<SessionId, RunningAgentVm>>,
@@ -227,6 +209,9 @@ pub struct AgentVmDaemon {
     /// the *same* session serialise here; unrelated sessions don't. Entries
     /// are evicted once no other task holds a handle.
     session_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
+    /// Agent runs that have been accepted — their ids returned to a caller —
+    /// but have not yet started.
+    accepted_agent_runs: Arc<AcceptedAgentRunRegistry>,
     /// Host-observed broker reachability per running session, published by the
     /// network-health monitor and read by [`Self::list_sessions`]. Transient
     /// runtime state — deliberately not persisted to the lifecycle record.
@@ -254,6 +239,112 @@ pub struct AgentRunStarted {
     session_id: SessionId,
     run_id: AgentRunId,
     broker_url: String,
+}
+
+/// An agent run writd has named but not yet started.
+///
+/// The value that makes the two halves of a start separable:
+/// [`AgentVmDaemon::accept_agent_run_session`] produces one without awaiting
+/// anything, and [`AgentVmDaemon::complete_agent_run_session`] consumes it. In
+/// between, a caller can be told what its run is called.
+///
+/// Opaque by construction. It carries a queue place and a stop registration
+/// whose invariants only the daemon can keep, so the fields stay private and
+/// the only thing a holder can do with it — beyond reading the two ids — is
+/// hand it back.
+#[derive(Debug)]
+pub struct AcceptedAgentRun {
+    session_id: SessionId,
+    run_id: AgentRunId,
+    label: Option<String>,
+    agent_kind: AgentKind,
+    agent_model: String,
+    workspace: AgentVmWorkspaceBootstrap,
+    prompt: AgentPrompt,
+    tags: AgentRunTags,
+    /// This run's claim on the admission bound, taken at accept time so that a
+    /// run writd will not queue is refused *before* its ids are handed out.
+    place: crate::server::AgentRunQueuePlace,
+    /// This run's entry in the daemon's accepted-run registry, which is also how
+    /// it learns it has been stopped.
+    registration: AcceptedAgentRunRegistration,
+}
+
+impl AcceptedAgentRun {
+    /// The audit session this run will open when it starts, and the name
+    /// `stop_session` already answers to.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// The stable handle the VM prompt/log contract uses. No `agent_run` row
+    /// bears it yet — that is written when the run starts.
+    pub fn run_id(&self) -> AgentRunId {
+        self.run_id
+    }
+}
+
+/// Which runs have been accepted and not yet started or stopped.
+///
+/// Each entry is one sender whose *only* use is being dropped: removing it both
+/// answers "is this run still going to start?" and wakes the start that is
+/// waiting for a slot. One fact in one place, so the two cannot disagree.
+///
+/// A `std::sync::Mutex` rather than a `tokio` one, so that
+/// [`AgentVmDaemon::accept_agent_run_session`] can stay a non-`async` fn — the
+/// point of accepting is that a caller gets its ids without writd awaiting
+/// anything. The lock is only ever held across a `HashMap` insert, remove or
+/// `len`, none of which can unwind, so it cannot in fact be poisoned; the
+/// accessors take the inner value on a poison result rather than adding an
+/// error case for a state that cannot arise.
+#[derive(Debug, Default)]
+struct AcceptedAgentRunRegistry(
+    std::sync::Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<std::convert::Infallible>>>,
+);
+
+impl AcceptedAgentRunRegistry {
+    fn entries(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        HashMap<SessionId, tokio::sync::oneshot::Sender<std::convert::Infallible>>,
+    > {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Take a run's registration, whether to start it or to stop it.
+    ///
+    /// One primitive for both, because they are the same act: whoever removes
+    /// the entry decides this run's fate, and the loser finds nothing. Callers
+    /// racing for that decision must hold the run's session lock, which is what
+    /// makes it a race with a winner rather than two half-effects.
+    fn take(&self, session_id: SessionId) -> bool {
+        self.entries().remove(&session_id).is_some()
+    }
+}
+
+/// One run's entry in [`AcceptedAgentRunRegistry`], removed when this is
+/// dropped — completed, cancelled, or abandoned by a caller that simply let its
+/// [`AcceptedAgentRun`] go.
+///
+/// The registration is tied to the value rather than to a call, so accepting a
+/// run imposes no obligation on whoever accepted it. Session ids are fresh
+/// UUIDs no later request reuses, so a late removal can never take an entry
+/// belonging to a different run.
+#[derive(Debug)]
+struct AcceptedAgentRunRegistration {
+    session_id: SessionId,
+    registry: Arc<AcceptedAgentRunRegistry>,
+    /// Resolves when this run's entry is taken by someone else, i.e. when
+    /// `stop_session` cancels it. `Infallible`, so cancellation is the only
+    /// thing that can happen to it.
+    stopped: tokio::sync::oneshot::Receiver<std::convert::Infallible>,
+}
+
+impl Drop for AcceptedAgentRunRegistration {
+    fn drop(&mut self) {
+        self.registry.take(self.session_id);
+    }
 }
 
 /// The opaque caller-supplied tags recorded on an `agent_run` row.
@@ -307,17 +398,21 @@ pub enum AgentVmDaemonError {
          clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
     )]
     AgentRunUnsupportedForVmBroker,
+    /// The run was stopped while it was still queued.
+    ///
+    /// Reachable only because `StartAgentRun` returns a session id before the
+    /// start completes: the operator can name — and so stop — a run that has not
+    /// booted anything yet. Says "nothing was recorded" rather than reporting a
+    /// failed start, because that is the truth: the run never got as far as
+    /// opening its audit session.
     #[error(
-        "writd is already running its maximum of {limit} concurrent agent runs, and no slot came \
-         free within {waited:?}. The bound is shared with host-spawned runs, which finish on \
-         their own and appear in no VM listing; VM sessions hold their slot until stopped, and \
-         `writ agent-vm list` shows those (`writ agent-vm stop <session-id>` returns one). Raise \
-         `max_concurrent_agent_runs` to allow more."
+        "agent run session {session_id} was stopped while it was still waiting for a slot, so it \
+         never started: no VM was booted and nothing was recorded under it. This is the requested \
+         outcome of a `writ agent-vm stop` that arrived before the run did."
     )]
-    AgentRunsAtCapacity { limit: usize, waited: Duration },
-    /// Refused before queueing — see [`AgentRunQueueFull`] for why this is a
-    /// different fact from [`Self::AgentRunsAtCapacity`] and not a duplicate of
-    /// it.
+    AgentRunStoppedBeforeStart { session_id: SessionId },
+    /// Refused before queueing — see [`AgentRunQueueFull`] for what it means
+    /// and why it is not a failure of the run.
     ///
     /// [`AgentRunQueueFull`]: crate::server::AgentRunQueueFull
     #[error(transparent)]
