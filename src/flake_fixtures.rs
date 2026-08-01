@@ -114,18 +114,28 @@ fn fixture_git_command(program: &Path, args: &[&str], cwd: &Path) -> std::proces
 }
 
 pub(crate) fn git(program: &Path, args: &[&str], cwd: &Path) {
-    let out = fixture_git_command(program, args, cwd)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@e")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@e")
-        .output()
-        .unwrap();
+    let out = writ_core::process_spawn::output(
+        fixture_git_command(program, args, cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap();
     assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
 }
 
 pub(crate) fn git_stdout(program: &Path, args: &[&str], cwd: &Path) -> String {
-    let out = fixture_git_command(program, args, cwd).output().unwrap();
+    let out = writ_core::process_spawn::output(
+        fixture_git_command(program, args, cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap();
     assert!(out.status.success(), "{}", git_failure(args, cwd, &out));
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
@@ -247,14 +257,18 @@ mod tests {
         std::fs::write(repo.join("f"), "x").unwrap();
         git(&git_program, &["add", "."], &repo);
 
-        let out = fixture_git_command(&git_program, &["commit", "-qm", "m"], &repo)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@e")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@e")
-            .env("GIT_TRACE", "1")
-            .output()
-            .unwrap();
+        let out = writ_core::process_spawn::output(
+            fixture_git_command(&git_program, &["commit", "-qm", "m"], &repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .env("GIT_TRACE", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+        .unwrap();
         assert!(
             out.status.success(),
             "{}",

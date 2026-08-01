@@ -31,12 +31,12 @@
 //! Anything that spawns a child goes through here — and that is checked, not
 //! merely asked for: `every_child_spawn_goes_through_the_retrying_primitive` in
 //! `tests/shared_hardening_helpers.rs` fails on a `.spawn()`/`.status()`/
-//! `.output()` chained onto a bare `Command`. The sentence used to be an
-//! aspiration while 27 call sites — including the fixture spawn that had already
-//! failed CI on `ETXTBSY` — quietly disagreed with it. Note the guard's stated
-//! blind spot: it only sees terminators chained onto the `Command::new(…)`
-//! expression, so a command stashed in a local and spawned later still relies on
-//! the author.
+//! `.output()` chained onto a bare `Command`, and on any such terminator at all
+//! in a file that builds one. The sentence used to be an aspiration while 37
+//! call sites — including the fixture spawn that had already failed CI on
+//! `ETXTBSY` — quietly disagreed with it. What the guard still cannot see is a
+//! file that never *constructs* a `Command` but receives one and spawns it;
+//! nothing does that today.
 //!
 //! One migration note for callers: [`output`] does **not** inherit
 //! `Command::output`'s stdio defaults. It leaves stdin/stdout/stderr inherited,

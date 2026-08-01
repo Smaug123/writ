@@ -1348,7 +1348,13 @@ fn loose_objects_on_disk(repo: &Path) -> usize {
 fn raw_git(repo: &Path, args: &[&str]) -> String {
     let mut command = prepare_git_command(repo, &InheritedEnv::from_process());
     command.args(args);
-    let out = command.output().unwrap();
+    let out = writ_core::process_spawn::output(
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap();
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -1360,7 +1366,15 @@ fn raw_git(repo: &Path, args: &[&str]) -> String {
 fn object_exists(repo: &Path, oid: &GitObjectId) -> bool {
     let mut command = prepare_git_command(repo, &InheritedEnv::from_process());
     command.args(["cat-file", "-e", oid.as_str()]);
-    command.output().unwrap().status.success()
+    writ_core::process_spawn::output(
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .unwrap()
+    .status
+    .success()
 }
 
 fn always_compact() -> CompactionThreshold {

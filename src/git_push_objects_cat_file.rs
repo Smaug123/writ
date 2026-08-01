@@ -673,7 +673,12 @@ mod tests {
             cmd.env("GIT_COMMITTER_NAME", "Committer Person");
             cmd.env("GIT_COMMITTER_EMAIL", "committer@example.invalid");
             cmd.env("GIT_COMMITTER_DATE", "1700000000 +0100");
-            let out = cmd.output().expect("commit-tree");
+            let out = writ_core::process_spawn::output(
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped()),
+            )
+            .expect("commit-tree");
             assert!(
                 out.status.success(),
                 "stderr={:?}",

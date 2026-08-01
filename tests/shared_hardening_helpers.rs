@@ -547,14 +547,22 @@ fn statement_at(text: &str, from: usize) -> &str {
 /// the primitive once and then hand-rolls a second spawn is exactly the case a
 /// body-scoped scan would wave through.
 ///
-/// **What this does not catch.** Spawning is only recognised where the
-/// terminator is chained onto the `Command::new(…)` expression itself. A
-/// `Command` stashed in a local and spawned ten lines later reads as a bare
-/// `let` binding here, and passes. That is the same class of blind spot as the
-/// git-recipe guard's name heuristic, and has the same durable answer — a type
-/// that is the only way to obtain a runnable command — so treat this as a
-/// backstop against reintroducing the known pattern, not a proof that the rule
-/// holds everywhere.
+/// **Indirect spawns count.** An earlier version of this guard only looked at
+/// terminators chained onto the `Command::new(…)` expression, and recorded the
+/// gap — a `Command` stashed in a local and spawned ten lines later — as a
+/// documented blind spot. The gap was *already occupied*: `command.spawn()` in
+/// `git_env`'s fixtures, `fixture_git_command(…).output()` in `flake_fixtures`,
+/// and `command.output()` in `notes_repo`'s tests all sat in it. Documenting a
+/// hole that real code is standing in is not a caveat, it is a miss, so the
+/// scan now covers any terminator in a file that builds a process `Command` at
+/// all — and those sites were migrated.
+///
+/// **What this still does not catch.** A file that never *constructs* a
+/// `Command` but receives one as a parameter and spawns it. Nothing in the
+/// workspace does that today; if something does later, this guard will not say
+/// so. The durable answer remains a type that is the only way to obtain a
+/// runnable command, applying the retry by construction rather than by the
+/// author remembering; until that exists, treat this as a backstop.
 #[test]
 fn every_child_spawn_goes_through_the_retrying_primitive() {
     /// Terminators that run a built `Command`, as chained method calls.
@@ -562,17 +570,45 @@ fn every_child_spawn_goes_through_the_retrying_primitive() {
     /// Ways of reaching the primitive, any of which makes a statement fine.
     /// `run_supervised` spawns through `process_spawn` internally.
     const HARDENED: &[&str] = &["process_spawn", "run_supervised"];
+    /// The module that *defines* the retry: its own `command.spawn()` calls are
+    /// the thing every other site is required to route through.
+    const DEFINES_THE_PRIMITIVE: &str = "crates/writ-core/src/process_spawn.rs";
+    /// Receiver names that are known not to be process `Command`s, in files
+    /// that do build `Command`s elsewhere. Listed by name rather than by file so
+    /// that adding one is a deliberate, reviewable act — the same trade the
+    /// git-recipe guard makes.
+    ///
+    /// `self` is here on a *structural* ground rather than a naming convention:
+    /// `Command` is a foreign type, so the orphan rule means no `impl` in this
+    /// workspace can ever have `self: Command`. `ProcessInvocation::output` is
+    /// the receiver in practice, and it spawns through the primitive.
+    ///
+    /// The rest are conventional: `response`/`resp` are `reqwest::Response`,
+    /// `prepared` is a `PreparedVmHttpSession` (whose `spawn` starts a tokio
+    /// task, not a process), and `running`/`starting` are `AgentVmSessionState`.
+    const NON_COMMAND_RECEIVERS: &[&str] = &[
+        "self", "response", "resp", "prepared", "running", "starting",
+    ];
+    /// `file::function` pairs whose terminator has a receiver this scan cannot
+    /// name — a call rather than a binding — and which is not a `Command`.
+    const EXEMPT: &[&str] = &[
+        // `reqwest::Client::new().get(…).send().await.unwrap().status()` — the
+        // HTTP status of a path-traversal probe, not a child process. The file
+        // builds git `Command`s elsewhere, which is why it is in scope at all.
+        "src/fake_origin.rs::origin_serves_info_refs_for_the_prereq",
+    ];
 
     let mut hits = Vec::new();
     for path in workspace_rust_sources() {
         let rel = relative(&path);
-        if rel == THIS_FILE {
+        if rel == THIS_FILE || rel == DEFINES_THE_PRIMITIVE {
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
         let text = blank_comment_lines(&raw);
+        // Direct: a terminator chained onto `Command::new(…)` itself.
         for at in process_command_sites(&text) {
             let stmt = statement_at(&text, at);
             let Some(terminator) = TERMINATORS.iter().find(|t| stmt.contains(**t)) else {
@@ -583,6 +619,36 @@ fn every_child_spawn_goes_through_the_retrying_primitive() {
             }
             let line = text[..at].matches('\n').count() + 1;
             hits.push(format!("{rel}:{line}: `{terminator}` on a bare Command"));
+        }
+        // Indirect: any terminator at all, in a file that builds `Command`s.
+        // Scoping to such files is what keeps the ~40 `response.status()` calls
+        // on HTTP responses out of the report.
+        if !builds_a_process_command(&text) {
+            continue;
+        }
+        for terminator in TERMINATORS {
+            for (at, _) in text.match_indices(terminator) {
+                if statement_containing(&text, at)
+                    .is_some_and(|stmt| HARDENED.iter().any(|m| stmt.contains(m)))
+                {
+                    continue;
+                }
+                match receiver_before(&text, at) {
+                    // A named binding we have already accounted for.
+                    Some(name) if NON_COMMAND_RECEIVERS.contains(&name) => continue,
+                    Some(_) => {}
+                    // The receiver is a call or other expression, so the name
+                    // allowlist cannot speak to it; fall through to `EXEMPT`.
+                    None => {}
+                }
+                let line = text[..at].matches('\n').count() + 1;
+                if let Some(function) = enclosing_fn(&text, at)
+                    && EXEMPT.contains(&format!("{rel}::{function}").as_str())
+                {
+                    continue;
+                }
+                hits.push(format!("{rel}:{line}: `{terminator}` on a Command"));
+            }
         }
     }
     hits.sort();
@@ -597,4 +663,38 @@ fn every_child_spawn_goes_through_the_retrying_primitive() {
         hits.len(),
         hits.join("\n  ")
     );
+}
+
+/// The identifier a method call at `at` is invoked on, if the receiver is a
+/// plain binding rather than a call or a longer expression.
+///
+/// `None` where the receiver is `…)` — a call, an `unwrap`, an `await` — since
+/// a name allowlist can say nothing useful about those.
+fn receiver_before(text: &str, at: usize) -> Option<&str> {
+    let before = &text[..at];
+    let start = before.rfind(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    let name = &before[start + 1..];
+    // A `.` immediately before the name means it is itself a field or method
+    // result (`self.command.spawn()`), not a binding this list can vouch for.
+    (!name.is_empty() && before[..=start].ends_with(|c: char| c != '.')).then_some(name)
+}
+
+/// The statement containing byte offset `at`, scanning back to the previous
+/// `;` or block boundary.
+fn statement_containing(text: &str, at: usize) -> Option<&str> {
+    let start = text[..at]
+        .rfind([';', '{', '}'])
+        .map_or(0, |found| found + 1);
+    Some(&text[start..at])
+}
+
+/// The name of the `fn` whose body contains `at`, by taking the nearest
+/// preceding `fn` declaration. A heuristic, and only used to key `EXEMPT`
+/// entries, where being wrong means a stale allowlist line rather than a
+/// missed spawn.
+fn enclosing_fn(text: &str, at: usize) -> Option<&str> {
+    let before = &text[..at];
+    let start = before.rfind("fn ")? + 3;
+    let name_len = text[start..].find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+    Some(&text[start..start + name_len])
 }
