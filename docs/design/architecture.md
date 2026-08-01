@@ -333,22 +333,33 @@ cannot size. `AgentRunQueuePlace` makes this structural rather than remembered:
 obtained from `enqueue`, and a future caller that forgets the bound has nothing to
 call.
 
-**Admission takes a slot first, and a queue place only if there was none.**
-`enqueue` tries the `slots` semaphore with a non-blocking `try_acquire`; only
-when that fails does it spend queue depth. So a run is either running or queued
-from admission onward, never in a limbo between the two, and **a run that could
-start at once is never refused** — exactly, not merely when quiescent, because
-`try_acquire` is one atomic step on the same semaphore the running runs hold.
+**The two are counted as one admission, not as two populations.** The bound that
+refuses is `limit + queue_limit` held together, from `enqueue` until the run ends
+— execution included — and the concurrency limit then decides how many of the
+admitted may run at a time. `AgentRunSlot` carries both permits so there is no way
+to release one and forget the other. (Because the semaphore holds the sum, it is
+the sum that is range-checked at preflight, not each field alone.)
 
-Two earlier shapes both refused requests the machine could have served, and both
-are worth knowing about because both look right. Counting waiters separately and
-vacating the place once a slot was granted meant a run passing through an *idle*
-slot still occupied depth while in transit. Counting running and waiting as one
-`limit + queue_limit` admission fixed that but left a subtler version: admitted
-runs that had not yet reached `wait_for_slot` held admission without holding the
-slots they were about to take, so a concurrent burst could exhaust admission with
-slot permits still free. Reserving the slot *inside* admission removes the gap
-instead of narrowing it. Both were found by Codex review, on successive rounds.
+The guarantee this buys is narrow, and stating it exactly matters because two
+stronger-sounding versions are false: **writd refuses a run exactly when it is
+already holding `limit + queue_limit` of them.** One `try_acquire` on one
+semaphore, so no interleaving of concurrent callers can produce a refusal writd's
+own accounting does not justify. It is *not* the claim that a free slot permit
+implies a free admission — admitted runs that have not yet reached
+`wait_for_slot` hold admission without yet holding the slots they are about to
+take, so the slot count can read non-zero at the instant of a refusal. Those
+slots are spoken for.
+
+Two alternatives were tried, in successive rounds of Codex review, and both split
+the decision into two steps that are not atomic together. Counting waiters in
+their own semaphore and vacating the place once a slot was granted meant a run
+passing through an *idle* slot still occupied depth in transit. Reserving the slot
+inside admission (`try_acquire` the slot, fall back to a queue place) makes the
+stronger claim instantaneously true in the quiet case, but with limits 1 and 1 two
+requests can both find the slot full, the running run can then finish, the first
+takes the sole queue place, and the second is refused with a slot now free.
+Trading an exact guarantee for a stronger-sounding one a race can break is the
+wrong way round.
 
 The slot's *lifetime* differs by path, and that is the load-bearing part. A host
 run ends when its handler returns, so a function-scoped permit is the run's
