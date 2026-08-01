@@ -1779,11 +1779,9 @@ fn a_limit_above_the_semaphores_ceiling_is_refused() {
     );
 
     // The boundary itself is representable, so the check refuses only what it
-    // must — and the boundary is on the *sum*, since that is what the admission
-    // semaphore holds.
-    let one_below =
-        std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS - 1).expect("non-zero");
-    assert!(AgentRunSlots::new(one_below, NON_ZERO_ONE).is_ok());
+    // must — and each limit sizes its own semaphore, so both may sit on it at
+    // once with no sum to overflow.
+    assert!(AgentRunSlots::new(at_ceiling, at_ceiling).is_ok());
 }
 
 /// A bounded wait gives up rather than hanging, and returns nothing when it does.
@@ -1860,16 +1858,20 @@ async fn a_run_over_the_admission_bound_is_refused_rather_than_queued() {
 
     let running = slots.enqueue().unwrap().wait_for_slot().await;
     assert_eq!(
-        slots.admission_available(),
+        slots.available(),
+        0,
+        "the only slot is taken, so every later run is a waiter"
+    );
+    assert_eq!(
+        slots.queue_available(),
         2,
-        "a run that is executing is still an admitted run: dropping its claim \
-         when it started running would let the daemon hold more than the two \
-         numbers add up to"
+        "and the run that got the slot spent no queue depth doing it: charging \
+         it both would make the configured depth mean less than it says"
     );
 
-    let first = slots.enqueue().expect("one of the two spare admissions");
+    let first = slots.enqueue().expect("one of the two queue places");
     let second = slots.enqueue().expect("the other");
-    assert_eq!(slots.admission_available(), 0);
+    assert_eq!(slots.queue_available(), 0);
 
     let refused = slots
         .enqueue()
@@ -1891,27 +1893,32 @@ async fn a_run_over_the_admission_bound_is_refused_rather_than_queued() {
     drop(first);
     slots
         .enqueue()
-        .expect("a departed run must give its admission back");
+        .expect("a departed run must give its place back");
 
     drop(second);
     drop(running);
 }
 
-/// A run that could start immediately is never refused.
+/// A run that could start immediately is never refused — including when nothing
+/// has yet awaited anything.
 ///
-/// Codex found this on the first version, which counted waiters in their own
-/// semaphore and vacated a place when its slot was granted. A request passing
-/// through an *idle* slot still held queue depth for the instant it was in
-/// transit, so with a small `max_pending_agent_runs` a concurrent request could
-/// be refused while execution capacity sat unused — a refusal caused by timing
-/// rather than by load, which is exactly what an explicit "try again later" must
-/// never mean.
+/// Two Codex findings converge here, and the second is the reason this test is
+/// shaped the way it is. The first implementation counted waiters separately and
+/// vacated a place when a slot was granted, so a run passing through an *idle*
+/// slot still held queue depth in transit. The second counted running and
+/// waiting as one admission, which fixed that but left a subtler version:
+/// admitted runs that had not yet reached `wait_for_slot` held admission without
+/// holding the slots they were about to take, so a concurrent burst could
+/// exhaust admission with slot permits still showing free.
 ///
-/// Counting running and waiting as one admission makes it arithmetic rather than
-/// timing: exhausted admission means `running + waiting == limit + queue_limit`
-/// and `waiting <= queue_limit`, so `running >= limit`. Asserted here over the
-/// small shapes where the old bug reproduced, in the form the property is
-/// actually stated: **whenever `enqueue` refuses, no slot was free**.
+/// Both are refusals caused by *timing* rather than by load, which is exactly
+/// what an explicit "try again later" must never mean. Taking the slot inside
+/// admission removes the gap instead of narrowing it.
+///
+/// So this test deliberately never awaits between admissions — the shape that
+/// only the current implementation survives. It admits `limit + queue_limit`
+/// runs with nothing polled, then asserts that the refusal which follows
+/// coincides with a genuinely empty slot semaphore.
 #[tokio::test(start_paused = true)]
 async fn a_run_that_could_start_at_once_is_never_refused() {
     for (limit, queue_limit) in [(2, 1), (1, 1), (3, 1), (2, 2)] {
@@ -1921,57 +1928,69 @@ async fn a_run_that_could_start_at_once_is_never_refused() {
         )
         .unwrap();
 
-        // Fill the whole admission, granting slots to as many as will take them
-        // — the state the old implementation could reach with idle slots.
-        let mut running = Vec::new();
-        let mut waiting = Vec::new();
-        for _ in 0..limit {
-            running.push(slots.enqueue().unwrap().wait_for_slot().await);
-        }
-        for _ in 0..queue_limit {
-            waiting.push(slots.enqueue().expect("still inside the admission bound"));
+        // No `wait_for_slot` anywhere in this loop: every admission is a bare
+        // `enqueue`, exactly as a burst of concurrent requests would reach it
+        // before any of them was polled.
+        let mut admitted = Vec::new();
+        for taken in 0..(limit + queue_limit) {
+            assert_eq!(
+                slots.available(),
+                limit.saturating_sub(taken),
+                "admission must take a free slot where there is one, so the slot \
+                 count falls with the first {limit} runs and not later \
+                 (limit {limit}, queue {queue_limit})"
+            );
+            admitted.push(slots.enqueue().expect("inside running-plus-waiting"));
         }
 
         assert!(
             slots.enqueue().is_err(),
-            "with {limit}+{queue_limit} runs held, admission must be exhausted"
+            "with {limit}+{queue_limit} runs held, both bounds must be full"
         );
         assert_eq!(
             slots.available(),
             0,
-            "and a refusal must mean every slot is busy: refusing a run that \
-             could have started at once is the bug this shape exists to catch \
-             (limit {limit}, queue {queue_limit})"
+            "and a refusal must coincide with every slot being taken: refusing a \
+             run that could have started at once is the bug this shape exists to \
+             catch (limit {limit}, queue {queue_limit})"
         );
 
-        // The converse, on the way back down: give one slot back and the next
-        // request is admitted rather than refused.
-        running.pop();
+        // The converse, on the way back down: give one back and the next request
+        // is admitted rather than refused.
+        admitted.pop();
         assert!(
             slots.enqueue().is_ok(),
-            "a freed slot must be reachable again (limit {limit}, queue {queue_limit})"
+            "freed capacity must be reachable again (limit {limit}, queue {queue_limit})"
         );
     }
 }
 
-/// Two representable limits whose *sum* is not are refused, not wrapped.
+/// A queued run gives its depth back when it gets a slot.
 ///
-/// The admission semaphore holds the sum, so the sum is what must fit. `usize`
-/// addition would wrap to something small and silently install a bound far
-/// tighter than either configured number — the opposite failure to the one an
-/// operator setting a large limit is trying to avoid.
-#[test]
-fn limits_that_are_individually_fine_but_sum_too_high_are_refused() {
-    let half = std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS / 2 + 1).unwrap();
-    let err = AgentRunSlots::new(half, half).expect_err("their sum is over the ceiling");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("max_concurrent_agent_runs")
-            && msg.contains("max_pending_agent_runs")
-            && msg.contains("sum"),
-        "the error must name both fields and say it is their sum at fault, since \
-         neither one alone is wrong; got {msg:?}"
+/// The other half of "a run holds one or the other, never both". If a waiter
+/// kept its place after being granted a slot, `max_pending_agent_runs` would
+/// silently shrink by one for every run that ever had to wait — and only under
+/// load, which is when it matters.
+#[tokio::test(start_paused = true)]
+async fn a_queued_run_gives_its_place_back_when_it_gets_a_slot() {
+    let slots = AgentRunSlots::new(NON_ZERO_ONE, NON_ZERO_ONE).unwrap();
+
+    let running = slots.enqueue().unwrap().wait_for_slot().await;
+    let queued = slots.enqueue().expect("the one queue place");
+    assert_eq!(slots.queue_available(), 0);
+
+    // Free the slot and let the waiter take it.
+    drop(running);
+    let promoted = queued.wait_for_slot().await;
+
+    assert_eq!(slots.available(), 0, "the promoted run is now executing");
+    assert_eq!(
+        slots.queue_available(),
+        1,
+        "and it is no longer waiting, so the depth it held is back"
     );
+
+    drop(promoted);
 }
 
 const NON_ZERO_ONE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(1).unwrap();
@@ -2153,7 +2172,7 @@ async fn a_run_agent_caller_over_the_queue_bound_is_refused_while_still_connecte
         .await;
     let held_place = state.agent_run_slots.enqueue().unwrap();
     assert_eq!(state.agent_run_slots.available(), 0);
-    assert_eq!(state.agent_run_slots.admission_available(), 0);
+    assert_eq!(state.agent_run_slots.queue_available(), 0);
 
     let started = std::time::Instant::now();
     let answer = dispatch_message(

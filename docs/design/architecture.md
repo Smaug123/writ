@@ -333,20 +333,22 @@ cannot size. `AgentRunQueuePlace` makes this structural rather than remembered:
 obtained from `enqueue`, and a future caller that forgets the bound has nothing to
 call.
 
-**The two are counted as one admission, not as two populations.** The bound that
-refuses is `limit + queue_limit` held together, from `enqueue` until the run ends
-— execution included — and the concurrency limit then decides how many of the
-admitted may run at a time. `AgentRunSlot` carries both permits so there is no way
-to release one and forget the other. Counting waiters separately and vacating a
-place when its slot was granted gives the same total but refuses the wrong
-requests: a run passing through an *idle* slot still occupies depth for the
-instant it is in transit, so a small `max_pending_agent_runs` could refuse a
-concurrent request while execution capacity sat unused. Under one admission the
-guarantee is arithmetic rather than timing — exhausted admission means
-`running + waiting == limit + queue_limit` and `waiting <= queue_limit`, so
-`running >= limit`. **A free slot implies an available admission**, so a refusal
-always means the machine is genuinely full. (Because the semaphore holds the sum,
-it is the sum that is range-checked at preflight, not each field alone.)
+**Admission takes a slot first, and a queue place only if there was none.**
+`enqueue` tries the `slots` semaphore with a non-blocking `try_acquire`; only
+when that fails does it spend queue depth. So a run is either running or queued
+from admission onward, never in a limbo between the two, and **a run that could
+start at once is never refused** — exactly, not merely when quiescent, because
+`try_acquire` is one atomic step on the same semaphore the running runs hold.
+
+Two earlier shapes both refused requests the machine could have served, and both
+are worth knowing about because both look right. Counting waiters separately and
+vacating the place once a slot was granted meant a run passing through an *idle*
+slot still occupied depth while in transit. Counting running and waiting as one
+`limit + queue_limit` admission fixed that but left a subtler version: admitted
+runs that had not yet reached `wait_for_slot` held admission without holding the
+slots they were about to take, so a concurrent burst could exhaust admission with
+slot permits still free. Reserving the slot *inside* admission removes the gap
+instead of narrowing it. Both were found by Codex review, on successive rounds.
 
 The slot's *lifetime* differs by path, and that is the load-bearing part. A host
 run ends when its handler returns, so a function-scoped permit is the run's
