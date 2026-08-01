@@ -348,9 +348,17 @@ pub enum ServerMessage {
     /// A product-level agent run was accepted. It is *not* running yet: writd
     /// answers here so that the caller holds the run's names before the slow
     /// part — queueing, workspace bootstrap, VM boot — begins, and can therefore
-    /// stop it whatever happens next. Nothing is recorded under `session_id`
-    /// until the run actually starts, so a lookup that finds nothing means "not
-    /// started yet", not "lost".
+    /// stop it whatever happens next.
+    ///
+    /// Nothing is recorded under `session_id` until the run actually starts, so
+    /// while writd is up a lookup that finds nothing means "not started yet".
+    /// That is *not* a durability promise, and the difference matters: an
+    /// accepted run lives only in the daemon's memory until it starts, so a
+    /// writd that exits while it is queued discards it, and both ids then name
+    /// nothing at all. Consistent with what a restart does to runs that *had*
+    /// started — boot reconciliation tears every persisted agent VM down — but
+    /// it means a caller cannot read "not found" as "still coming" across a
+    /// daemon it did not watch stay up.
     ///
     /// The prompt itself is not returned; `run_id` is the stable handle used by
     /// the VM prompt/log contract. No `broker_url`, unlike

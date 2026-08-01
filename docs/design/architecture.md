@@ -413,6 +413,18 @@ Two consequences worth stating, because both are load-bearing:
   store (which a queued run has no record in), so a crash while queued would
   strand it open across restarts. Recording nothing keeps the audit log's claim
   true: a session row means writd started something.
+
+  The price is that an accepted run is **not durable**. It lives in the daemon's
+  memory — the spawned task and the accepted-run registry — until it starts, so a
+  writd that exits while it is queued discards it, and the ids its caller holds
+  then name nothing. That is consistent with what a restart does to runs that had
+  already started (reconciliation tears every persisted agent VM down, below), so
+  a restart loses queued and running runs alike rather than treating them
+  differently. But it does mean "not found" cannot be read as "still coming"
+  across a restart. Making an accepted run recoverable is a separate decision —
+  it needs somewhere durable to put the prompt and both ids, and an answer to
+  whether boot should *resume* such a run, which would be the first thing
+  reconciliation ever started rather than destroyed.
 * **A queued run is stoppable by name.** `stop_session` takes the accepted-run
   registration under the per-session lock, and `complete_agent_run_session` takes
   that same registration under that same lock before recording or booting
