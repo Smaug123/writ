@@ -331,9 +331,22 @@ it is promised, so past it writd fails a request rather than making a promise it
 cannot size. `AgentRunQueuePlace` makes this structural rather than remembered:
 `AgentRunSlots` exposes no way to wait, so the only route to a slot is a place
 obtained from `enqueue`, and a future caller that forgets the bound has nothing to
-call. A place is vacated the moment the slot is granted, so an executing run
-counts against the concurrency bound only and the configured depth means what it
-says.
+call.
+
+**The two are counted as one admission, not as two populations.** The bound that
+refuses is `limit + queue_limit` held together, from `enqueue` until the run ends
+— execution included — and the concurrency limit then decides how many of the
+admitted may run at a time. `AgentRunSlot` carries both permits so there is no way
+to release one and forget the other. Counting waiters separately and vacating a
+place when its slot was granted gives the same total but refuses the wrong
+requests: a run passing through an *idle* slot still occupies depth for the
+instant it is in transit, so a small `max_pending_agent_runs` could refuse a
+concurrent request while execution capacity sat unused. Under one admission the
+guarantee is arithmetic rather than timing — exhausted admission means
+`running + waiting == limit + queue_limit` and `waiting <= queue_limit`, so
+`running >= limit`. **A free slot implies an available admission**, so a refusal
+always means the machine is genuinely full. (Because the semaphore holds the sum,
+it is the sum that is range-checked at preflight, not each field alone.)
 
 The slot's *lifetime* differs by path, and that is the load-bearing part. A host
 run ends when its handler returns, so a function-scoped permit is the run's
