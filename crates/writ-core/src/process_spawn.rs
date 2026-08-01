@@ -201,7 +201,7 @@ pub fn output(command: &mut std::process::Command) -> io::Result<std::process::O
 /// `RLIMIT_NPROC` cannot fail an otherwise valid command.
 ///
 /// When both *are* piped, the reader thread's creation is retried on the same
-/// terms as a refused spawn (see [`spawn_pipe_reader`]), so a tight
+/// terms as a refused spawn (see `spawn_pipe_reader`), so a tight
 /// `RLIMIT_NPROC` cannot fail one of those either. Note that this differs from
 /// `Command::output`, which drains both pipes with `poll` on the calling thread
 /// and so never needed the retry — a difference worth knowing when converting a
