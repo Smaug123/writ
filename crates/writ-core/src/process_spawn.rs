@@ -283,29 +283,41 @@ fn read_pipe<R: std::io::Read>(pipe: Option<R>) -> io::Result<Vec<u8>> {
 /// `thread::Builder::spawn` drops the closure — and with it the pipe, closing
 /// the read end — when thread creation fails. Only the attempt that actually
 /// starts takes the pipe out.
-fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
-    pipe: Option<R>,
-) -> io::Result<std::thread::JoinHandle<io::Result<Vec<u8>>>> {
-    spawn_pipe_reader_with(pipe, DEFAULT_RETRY, || Ok(()))
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> io::Result<PipeReader> {
+    spawn_pipe_reader_with(pipe, DEFAULT_RETRY, |job| {
+        std::thread::Builder::new().spawn(job)
+    })
 }
 
-/// [`spawn_pipe_reader`] with the retry schedule and a pre-attempt hook
-/// injected, so a test can produce the thread-creation failure that a real
-/// `RLIMIT_NPROC` ceiling would — the condition being, by construction, one that
-/// cannot be provoked on demand.
+/// The thread draining one of a child's pipes, and its result.
+type PipeReader = std::thread::JoinHandle<io::Result<Vec<u8>>>;
+
+/// The work handed to a would-be reader thread. Boxed so the *starting* of the
+/// thread can be substituted in tests.
+type ReadJob = Box<dyn FnOnce() -> io::Result<Vec<u8>> + Send + 'static>;
+
+/// [`spawn_pipe_reader`] with the retry schedule and the thread-start operation
+/// injected, so a test can produce the failure a real `RLIMIT_NPROC` ceiling
+/// would — a condition that by construction cannot be provoked on demand.
+///
+/// The seam is the *start*, and deliberately not a hook that runs before it. A
+/// pre-attempt hook would return without a job ever being built, so the failure
+/// mode that actually matters — `Builder::spawn` dropping a job that owns the
+/// pipe — would never occur, and the test would pass over an implementation that
+/// took the pipe eagerly and lost it. Taking the job by value means an injected
+/// failure drops it exactly as the real call does.
 fn spawn_pipe_reader_with<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
     config: RetryConfig,
-    mut before_attempt: impl FnMut() -> io::Result<()>,
-) -> io::Result<std::thread::JoinHandle<io::Result<Vec<u8>>>> {
+    mut start: impl FnMut(ReadJob) -> io::Result<PipeReader>,
+) -> io::Result<PipeReader> {
     let cell = std::sync::Arc::new(std::sync::Mutex::new(pipe));
     retry_sync_with(config, || {
-        before_attempt()?;
         let cell = std::sync::Arc::clone(&cell);
-        std::thread::Builder::new().spawn(move || {
+        start(Box::new(move || {
             let pipe = cell.lock().expect("pipe cell mutex poisoned").take();
             read_pipe(pipe)
-        })
+        }))
     })
 }
 
@@ -560,12 +572,17 @@ mod tests {
         let pipe = child.stdout.take();
 
         let refusals = Cell::new(0);
-        let reader = spawn_pipe_reader_with(pipe, fast_config(), || {
+        let reader = spawn_pipe_reader_with(pipe, fast_config(), |job| {
             if refusals.get() < 2 {
                 refusals.set(refusals.get() + 1);
+                // Drop the job, which is precisely what `Builder::spawn` does
+                // with the closure when thread creation fails. Injecting the
+                // failure *before* the job exists would leave the invariant
+                // under test untouched.
+                drop(job);
                 return Err(io::Error::from_raw_os_error(libc::EAGAIN));
             }
-            Ok(())
+            std::thread::Builder::new().spawn(job)
         })
         .expect("a transient thread-creation refusal must be retried");
 
