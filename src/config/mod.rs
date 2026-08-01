@@ -183,6 +183,34 @@ pub struct DaemonConfig {
     /// than discovered at runtime.
     #[serde(default)]
     pub max_concurrent_agent_runs: Option<std::num::NonZeroUsize>,
+    /// How many agent runs may be *waiting* for a slot before writd stops
+    /// accepting more. Defaults to
+    /// [`DEFAULT_MAX_PENDING_AGENT_RUNS`](crate::server::DEFAULT_MAX_PENDING_AGENT_RUNS).
+    ///
+    /// This is the other half of [`Self::max_concurrent_agent_runs`], and the
+    /// two answer different questions: that one is how many runs the machine
+    /// will do at once, this one is how far ahead of itself writd will accept
+    /// work. So the most runs writd holds at all is their sum.
+    ///
+    /// Requests over *this* bound are **refused**, immediately and with an
+    /// error saying so — the opposite of the queueing behaviour above, and
+    /// deliberately. Queueing is a delay, which is the right answer for a
+    /// minutes-long job; but a queue nothing bounds stops being a delay, and a
+    /// caller parked in one cannot tell being scheduled from being forgotten.
+    /// Past this depth writd would rather fail a request than make a promise it
+    /// cannot size, so the caller gets a failure it can retry.
+    ///
+    /// Raising this trades memory and descriptors for tolerance of bursts:
+    /// every waiting run holds a connection and its prompt (up to 1 MiB). Set it
+    /// low and a burst is refused early; set it high and writd absorbs the burst
+    /// but the runs at the back of the queue wait proportionally longer.
+    ///
+    /// `NonZeroUsize` because a zero would refuse every run that could not start
+    /// instantly, which is not a queue bound but an accidental "no queueing"
+    /// switch — and one an operator would much more likely reach by mistake than
+    /// on purpose.
+    #[serde(default)]
+    pub max_pending_agent_runs: Option<std::num::NonZeroUsize>,
 }
 
 /// Configuration for the read-only UI HTTP transport. Distinct from
@@ -720,8 +748,9 @@ pub enum AgentVmHttpConfigError {
 #[derive(Debug)]
 pub struct CheckedDaemonSections {
     pub agent_vm: Option<AgentVmDaemonRuntimeConfig>,
-    /// The broker-wide agent-run bound, built from
-    /// [`DaemonConfig::max_concurrent_agent_runs`] or its default.
+    /// The broker-wide agent-run bounds, built from
+    /// [`DaemonConfig::max_concurrent_agent_runs`] and
+    /// [`DaemonConfig::max_pending_agent_runs`], each against its default.
     ///
     /// Built during the preflight rather than at the point of use so that an
     /// unrepresentable limit joins the same error report as every other config
@@ -777,6 +806,7 @@ pub fn check_daemon_sections(
     secret_store: Option<&SecretStoreConfig>,
     run_agent: Option<&RunAgentDaemonConfig>,
     max_concurrent_agent_runs: Option<std::num::NonZeroUsize>,
+    max_pending_agent_runs: Option<std::num::NonZeroUsize>,
 ) -> Result<CheckedDaemonSections, Errors<DaemonConfigError>> {
     let mut errors = Accumulator::new();
     // Recorded rather than returned early, so an operator with both an
@@ -786,6 +816,7 @@ pub fn check_daemon_sections(
     let agent_run_slots = errors.record_from(
         crate::server::AgentRunSlots::new(
             max_concurrent_agent_runs.unwrap_or(crate::server::DEFAULT_MAX_CONCURRENT_AGENT_RUNS),
+            max_pending_agent_runs.unwrap_or(crate::server::DEFAULT_MAX_PENDING_AGENT_RUNS),
         )
         .map_err(DaemonConfigError::from),
     );

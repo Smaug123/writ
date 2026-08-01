@@ -55,7 +55,8 @@ mod staged_push;
 mod run_agent;
 pub(crate) use run_agent::AgentRunSlot;
 pub use run_agent::{
-    AgentRunQueueing, AgentRunSlots, AgentRunSlotsError, DEFAULT_MAX_CONCURRENT_AGENT_RUNS,
+    AgentRunQueueFull, AgentRunQueueing, AgentRunSlots, AgentRunSlotsError,
+    DEFAULT_MAX_CONCURRENT_AGENT_RUNS, DEFAULT_MAX_PENDING_AGENT_RUNS,
 };
 
 /// Boot-time description of the child process that produces an agent

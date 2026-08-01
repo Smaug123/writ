@@ -1606,8 +1606,10 @@ async fn concurrent_runs_are_bounded_and_the_surplus_queues() {
     const LIMIT: usize = 2;
     {
         let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
-        inner.agent_run_slots =
-            AgentRunSlots::new(std::num::NonZeroUsize::new(LIMIT).unwrap()).unwrap();
+        // The queue is deliberately not the thing under test here: this test is
+        // about the surplus *queueing*, so it needs a depth the burst cannot
+        // reach.
+        inner.agent_run_slots = spacious_queue(std::num::NonZeroUsize::new(LIMIT).unwrap());
     }
     let state = &fixture.state;
     let limit = LIMIT;
@@ -1722,12 +1724,13 @@ fn every_path_that_starts_an_agent_run_takes_a_slot() {
 
     let dispatch = include_str!("run_agent.rs");
     assert!(
-        body_of(dispatch, "pub(super) async fn run_agent<").contains("agent_run_slots.acquire()"),
+        body_of(dispatch, "pub(super) async fn run_agent<").contains("agent_run_slots.enqueue()"),
         "the host arm runs the agent inside its own handler, so it must hold a \
-         slot for that handler's lifetime"
+         slot for that handler's lifetime — and the only route to one is through \
+         the queue-depth bound"
     );
     assert!(
-        !body_of(dispatch, "async fn run_agent_in_vm<").contains("agent_run_slots.acquire()"),
+        !body_of(dispatch, "async fn run_agent_in_vm<").contains("agent_run_slots.enqueue()"),
         "the VM arm must not take a slot of its own: it starts its run through \
          `start_agent_run_session`, which takes one, and two slots for one run \
          would deadlock at the default limit"
@@ -1739,7 +1742,7 @@ fn every_path_that_starts_an_agent_run_takes_a_slot() {
     // asserted by `only_the_vm_path_bounds_how_long_it_will_queue`. This guard is
     // about the slot being taken at all.
     assert!(
-        session_start.contains(".acquire_with(") || session_start.contains(".acquire()"),
+        session_start.contains(".enqueue()"),
         "every VM agent run starts here — `RunAgent`'s VM arm and `StartAgentRun` \
          both — so this is the one place that can bound them"
     );
@@ -1754,17 +1757,29 @@ fn every_path_that_starts_an_agent_run_takes_a_slot() {
 fn a_limit_above_the_semaphores_ceiling_is_refused() {
     let too_many =
         std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).expect("non-zero");
-    let err = AgentRunSlots::new(too_many).expect_err("above MAX_PERMITS must not be accepted");
+    let at_ceiling =
+        std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).expect("non-zero");
+
+    // Each field is checked, and the message must name the one that is wrong: an
+    // error that could describe either sends an operator to edit the wrong line.
+    let err = AgentRunSlots::new(too_many, at_ceiling)
+        .expect_err("above MAX_PERMITS must not be accepted");
     let msg = err.to_string();
     assert!(
         msg.contains("max_concurrent_agent_runs"),
         "the error must name the config field an operator would have to edit; got {msg:?}"
     );
 
+    let err = AgentRunSlots::new(at_ceiling, too_many)
+        .expect_err("the queue bound is operator input too, and can crash the same way");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_pending_agent_runs"),
+        "the error must name the config field an operator would have to edit; got {msg:?}"
+    );
+
     // The boundary itself is representable, so the check refuses only what it must.
-    let at_ceiling =
-        std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).expect("non-zero");
-    assert!(AgentRunSlots::new(at_ceiling).is_ok());
+    assert!(AgentRunSlots::new(at_ceiling, at_ceiling).is_ok());
 }
 
 /// A bounded wait gives up rather than hanging, and returns nothing when it does.
@@ -1774,12 +1789,14 @@ fn a_limit_above_the_semaphores_ceiling_is_refused() {
 /// nobody is waiting for.
 #[tokio::test(start_paused = true)]
 async fn a_bounded_wait_gives_up_when_no_slot_frees() {
-    let slots = AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
-    let held = slots.acquire().await;
+    let slots = spacious_queue(std::num::NonZeroUsize::new(1).unwrap());
+    let held = slots.enqueue().unwrap().wait_for_slot().await;
     assert_eq!(slots.available(), 0);
 
     let refused = slots
-        .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
+        .enqueue()
+        .unwrap()
+        .wait_for_slot_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
         .await;
     assert_eq!(
         refused.err(),
@@ -1795,7 +1812,9 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
 
     drop(held);
     let granted = slots
-        .acquire_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
+        .enqueue()
+        .unwrap()
+        .wait_for_slot_with(AgentRunQueueing::UpTo(std::time::Duration::from_secs(30)))
         .await;
     assert!(
         granted.is_ok(),
@@ -1803,6 +1822,110 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
          with a deadline, not a refusal dressed up as one"
     );
 }
+
+/// Slots with the concurrency bound under test and a queue too deep to be the
+/// thing under test. Used by the tests about *waiting*, so that a change to the
+/// queue default cannot silently turn one of them into a test about admission.
+fn spacious_queue(limit: std::num::NonZeroUsize) -> AgentRunSlots {
+    AgentRunSlots::new(limit, std::num::NonZeroUsize::new(1024).unwrap()).unwrap()
+}
+
+/// The shipped default queue depth is 64.
+///
+/// Pinned separately from the mechanism, for the same reason as
+/// [`the_default_concurrency_bound_is_two`]: "the queue is bounded" and "the
+/// bound is 64" are different claims, and only the second can catch a careless
+/// edit to the number.
+#[test]
+fn the_default_pending_bound_is_sixty_four() {
+    assert_eq!(DEFAULT_MAX_PENDING_AGENT_RUNS.get(), 64);
+}
+
+/// Over the queue bound, a run is refused at once rather than queued.
+///
+/// The property the owner asked for, stated as a test: a caller that writd
+/// cannot promise to serve gets an answer *now*. The two halves both matter —
+/// that the refusal happens (rather than an unbounded wait), and that it happens
+/// without blocking, which is why this test would hang rather than fail if
+/// `enqueue` ever became async.
+#[tokio::test(start_paused = true)]
+async fn a_run_over_the_queue_bound_is_refused_rather_than_queued() {
+    let slots = AgentRunSlots::new(NON_ZERO_ONE, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+
+    // One place per pending run, and the executing run's place is given back
+    // when its slot is granted — so this queue holds two *waiters*, not two runs.
+    let running = slots.enqueue().unwrap().wait_for_slot().await;
+    assert_eq!(
+        slots.queue_available(),
+        2,
+        "a run that is executing occupies the concurrency bound, not the queue: \
+         holding both would make the configured depth mean half what it says"
+    );
+
+    let first = slots.enqueue().expect("the queue is empty");
+    let second = slots.enqueue().expect("the queue has room for two");
+    assert_eq!(slots.queue_available(), 0);
+
+    let refused = slots
+        .enqueue()
+        .expect_err("a third waiter is over the configured depth");
+    let msg = refused.to_string();
+    for expected in [
+        "max_pending_agent_runs",
+        "max_concurrent_agent_runs",
+        "retry",
+    ] {
+        assert!(
+            msg.contains(expected),
+            "the refusal must say what happened and what to do about it, naming \
+             the fields an operator would raise; {expected:?} missing from {msg:?}"
+        );
+    }
+
+    // And it is a refusal, not a delay: room reappears only when a waiter leaves.
+    drop(first);
+    slots
+        .enqueue()
+        .expect("a departed waiter must give its place back");
+
+    drop(second);
+    drop(running);
+}
+
+/// A granted slot gives the queue place back, so a long run does not hold queue
+/// depth for its whole lifetime.
+///
+/// Worth its own test because getting this wrong is invisible in normal
+/// operation and halves the configured depth under load: if the place were held
+/// for the run's lifetime, `max_pending` would silently mean "pending *plus*
+/// running".
+#[tokio::test(start_paused = true)]
+async fn holding_a_slot_does_not_hold_a_queue_place() {
+    let slots = AgentRunSlots::new(
+        std::num::NonZeroUsize::new(2).unwrap(),
+        std::num::NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+
+    let first = slots.enqueue().unwrap().wait_for_slot().await;
+    let second = slots
+        .enqueue()
+        .expect("the first run's place was returned when its slot was granted")
+        .wait_for_slot()
+        .await;
+
+    assert_eq!(slots.available(), 0, "both runs are executing");
+    assert_eq!(
+        slots.queue_available(),
+        1,
+        "and neither is waiting, so the whole queue is free"
+    );
+
+    drop(first);
+    drop(second);
+}
+
+const NON_ZERO_ONE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(1).unwrap();
 
 /// Only the VM path bounds its wait; the host arm still queues indefinitely.
 ///
@@ -1816,7 +1939,7 @@ async fn a_bounded_wait_gives_up_when_no_slot_frees() {
 fn only_the_vm_path_bounds_how_long_it_will_queue() {
     let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
     assert!(
-        daemon.contains("acquire_with(queueing)"),
+        daemon.contains("wait_for_slot_with(queueing)"),
         "the VM session start must take its wait policy from the caller: the two \
          callers differ in whether anyone is still listening when it ends"
     );
@@ -1837,9 +1960,11 @@ fn only_the_vm_path_bounds_how_long_it_will_queue() {
          rather than refuse a surplus workflow"
     );
     assert!(
-        dispatch.contains("agent_run_slots.acquire().await"),
+        dispatch.contains("place.wait_for_slot().await"),
         "the host arm keeps the unbounded wait: its runs end without \
-         intervention, so its queue drains on its own"
+         intervention, so its queue drains on its own. The queue-depth bound in \
+         front of it changed whether that wait can be *joined*, not how long a \
+         place in it is worth holding"
     );
 }
 
@@ -1868,8 +1993,7 @@ async fn a_session_closed_while_queued_is_reported_as_closed() {
     let mut fixture = make_run_agent_state(&server, agent, Vec::new());
     {
         let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
-        inner.agent_run_slots =
-            AgentRunSlots::new(std::num::NonZeroUsize::new(1).unwrap()).unwrap();
+        inner.agent_run_slots = spacious_queue(std::num::NonZeroUsize::new(1).unwrap());
     }
     let state = &fixture.state;
     let session_id = open_session(state).await;
@@ -1877,7 +2001,12 @@ async fn a_session_closed_while_queued_is_reported_as_closed() {
     // Held here rather than by another run: the test controls exactly when the
     // queued request is allowed to proceed, so the window it is parked in is not
     // a matter of scheduling luck.
-    let held = state.agent_run_slots.acquire().await;
+    let held = state
+        .agent_run_slots
+        .enqueue()
+        .unwrap()
+        .wait_for_slot()
+        .await;
     assert_eq!(state.agent_run_slots.available(), 0);
 
     let queued = tokio::spawn({
@@ -1931,4 +2060,94 @@ async fn a_session_closed_while_queued_is_reported_as_closed() {
         "a session closed during the queue must come back as ClosedSession, not \
          as an opaque failure; got {answer:?}"
     );
+}
+
+/// A `RunAgent` caller past the queue bound is told so, immediately, over the
+/// wire it is already holding.
+///
+/// The end-to-end half of the queue bound: the unit tests above pin the
+/// mechanism, and this pins that the *dispatcher* consults it and that the
+/// refusal reaches a client rather than becoming another kind of wait. The
+/// distinction the owner asked for is the one asserted last — the caller learns
+/// its request failed while it is still connected, instead of being parked
+/// indefinitely with no way to tell scheduled from forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_agent_caller_over_the_queue_bound_is_refused_while_still_connected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("ledger");
+    let agent = overlap_recording_agent(tmp.path(), &ledger);
+
+    let server = MockServer::start().await;
+    let mut fixture = make_run_agent_state(&server, agent, Vec::new());
+    {
+        let inner = Arc::get_mut(&mut fixture.state).expect("fresh fixture Arc is unshared");
+        // One running, one waiting, and nothing else admitted: the smallest
+        // configuration in which "the queue is full" is a state the dispatcher
+        // can actually reach.
+        inner.agent_run_slots = AgentRunSlots::new(
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+    }
+    let state = &fixture.state;
+    let session_id = open_session(state).await;
+
+    // The test holds the only slot and the only queue place, so the request
+    // below cannot be admitted — and cannot merely be *slow* to be admitted,
+    // which is what would make this test pass for the wrong reason.
+    let held_slot = state
+        .agent_run_slots
+        .enqueue()
+        .unwrap()
+        .wait_for_slot()
+        .await;
+    let held_place = state.agent_run_slots.enqueue().unwrap();
+    assert_eq!(state.agent_run_slots.available(), 0);
+    assert_eq!(state.agent_run_slots.queue_available(), 0);
+
+    let started = std::time::Instant::now();
+    let answer = dispatch_message(
+        ClientMessage::RunAgent {
+            prompt: crate::agent_run::AgentPrompt::new("over the bound"),
+            capabilities: Vec::new(),
+            purpose: "queue-full".parse().unwrap(),
+            output_ref: crate::core::NotesRef::try_new("refs/notes/writ/v1/agent-outputs").unwrap(),
+            session_id: Some(session_id),
+            workspace: None,
+            agent_kind: None,
+            agent_model: None,
+        },
+        state,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let ServerMessage::Error { message } = &answer else {
+        panic!("a run over the queue bound must be refused, got {answer:?}");
+    };
+    assert!(
+        message.contains("max_pending_agent_runs") && message.contains("retry"),
+        "the refusal must say what happened and that retrying later is the right \
+         response, not merely that something went wrong; got {message:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the refusal must be immediate — a caller over the bound is refused \
+         precisely so it does not wait; took {elapsed:?}"
+    );
+
+    // Nothing was recorded, which is the other half of "this request failed":
+    // a refused run must not leave a row claiming writd was asked to do it.
+    assert_eq!(
+        state
+            .audit
+            .agent_run_for_session(session_id)
+            .expect("audit read"),
+        None,
+        "a run writd refused to queue must leave no agent_run row behind"
+    );
+
+    drop(held_place);
+    drop(held_slot);
 }

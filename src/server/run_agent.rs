@@ -42,8 +42,26 @@ const RUN_AGENT_VM_POLL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// key precisely so the number can move without a release.
 pub const DEFAULT_MAX_CONCURRENT_AGENT_RUNS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
+/// How many agent runs may be *waiting* for a slot before writd stops queueing
+/// them, when configuration is silent.
+///
+/// Generous on purpose: this is not a tuning knob for throughput, it is the
+/// depth past which a queue has stopped being a delay and become somewhere
+/// requests go to be forgotten. Two readings put it here.
+///
+/// What a waiting run costs. Each holds a tokio task, an open connection, and
+/// its prompt — up to [`MAX_AGENT_PROMPT_BYTES`](crate::agent_run::MAX_AGENT_PROMPT_BYTES),
+/// 1 MiB. Sixty-four of them is bounded by roughly 64 MiB and 64 descriptors,
+/// which no host writd can run on would notice.
+///
+/// What a waiting run means. At the default of two concurrent runs, sixty-four
+/// queued minutes-long jobs is already many hours of backlog — long past the
+/// point where the caller wanted a delay rather than an answer. So the bound is
+/// set where it stops describing patience and starts describing a pile-up.
+pub const DEFAULT_MAX_PENDING_AGENT_RUNS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
 /// The bound on how many agent runs may be in flight at once, across *both*
-/// dispatch arms.
+/// dispatch arms — and, separately, on how many more may be waiting to be.
 ///
 /// One bound rather than one per arm. The arms differ in what a run costs — the
 /// host arm holds a tokio blocking-pool thread (of 512, shared with notes writes
@@ -52,42 +70,78 @@ pub const DEFAULT_MAX_CONCURRENT_AGENT_RUNS: NonZeroUsize = NonZeroUsize::new(2)
 /// differ in *whose* machine pays, and a per-arm bound would let twice the
 /// configured number run.
 ///
-/// Waiting, not refusing: a caller over the limit queues. That is the operator's
-/// decision recorded, and it suits the shape of the traffic — an agent run is a
-/// minutes-long job dispatched by a workflow tool, so a queue is a delay where a
-/// refusal would be a failed workflow step needing its own retry logic.
+/// **Two bounds, because there are two things to bound.** The concurrency limit
+/// says how many runs execute; a caller over it queues, which is the right
+/// answer for an agent run — a minutes-long job dispatched by a workflow tool,
+/// where a delay beats a failure the caller must build retry logic around.
 /// [`tokio::sync::Semaphore`] hands permits out in FIFO order, so "queue" is
 /// what waiting on it already means, and a burst cannot starve its own tail.
+///
+/// But queueing is only a delay while the queue is finite. Nothing bounded the
+/// waiters themselves, so a submission rate above throughput grew tasks,
+/// connections and buffered prompts without limit, and each caller's wait grew
+/// with it — the failure mode being not an error but an unbounded silence. The
+/// queue-depth bound is what makes the promise "you will be served" checkable
+/// before it is made: over it, `enqueue` refuses **at once**,
+/// saying so, rather than admitting a caller to a queue it cannot promise to
+/// drain.
+///
+/// So the most runs this daemon will hold at all is `limit + queue_limit`, and
+/// the two numbers mean different things: the first is what the machine will
+/// do, the second is how far ahead it will accept work for.
 #[derive(Clone, Debug)]
 pub struct AgentRunSlots {
     slots: Arc<tokio::sync::Semaphore>,
     limit: NonZeroUsize,
+    /// Admission to the wait for `slots`. A permit here is held only while a
+    /// run is *queued*: [`AgentRunQueuePlace::wait_for_slot`] gives it up the
+    /// moment the run slot is in hand, so an executing run occupies one bound
+    /// and not the other.
+    queue: Arc<tokio::sync::Semaphore>,
+    queue_limit: NonZeroUsize,
 }
 
 impl AgentRunSlots {
-    /// Build a bound, refusing a limit the underlying semaphore cannot hold.
+    /// Build the two bounds, refusing either limit the underlying semaphore
+    /// cannot hold.
     ///
     /// Fallible only because of that ceiling: [`tokio::sync::Semaphore::new`]
     /// *panics* above [`tokio::sync::Semaphore::MAX_PERMITS`], and a limit is
     /// operator input, so the failure would land as a daemon crash during
     /// startup rather than as a message naming the bad field. No configuration
     /// value should be able to do that.
-    pub fn new(limit: NonZeroUsize) -> Result<Self, AgentRunSlotsError> {
-        if limit.get() > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(AgentRunSlotsError::AboveMaxPermits {
-                limit,
-                max: tokio::sync::Semaphore::MAX_PERMITS,
-            });
+    pub fn new(limit: NonZeroUsize, queue_limit: NonZeroUsize) -> Result<Self, AgentRunSlotsError> {
+        // Both are checked, and the error names *which* field is out of range:
+        // one message that could describe either would send an operator to edit
+        // the wrong line.
+        for (field, value) in [
+            ("max_concurrent_agent_runs", limit),
+            ("max_pending_agent_runs", queue_limit),
+        ] {
+            if value.get() > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(AgentRunSlotsError::AboveMaxPermits {
+                    field,
+                    limit: value,
+                    max: tokio::sync::Semaphore::MAX_PERMITS,
+                });
+            }
         }
         Ok(Self {
             slots: Arc::new(tokio::sync::Semaphore::new(limit.get())),
             limit,
+            queue: Arc::new(tokio::sync::Semaphore::new(queue_limit.get())),
+            queue_limit,
         })
     }
 
-    /// The configured bound, for tests and operator-facing reporting.
+    /// The configured concurrency bound, for tests and operator-facing reporting.
     pub fn limit(&self) -> NonZeroUsize {
         self.limit
+    }
+
+    /// The configured queue-depth bound, for tests and operator-facing reporting.
+    pub fn queue_limit(&self) -> NonZeroUsize {
+        self.queue_limit
     }
 
     /// How many runs could start right now without waiting.
@@ -102,32 +156,98 @@ impl AgentRunSlots {
         self.slots.available_permits()
     }
 
+    /// How many more runs writd would admit to the queue right now. The same
+    /// momentary reading as [`Self::available`], for the other bound: tests need
+    /// it to check that a place is *released* when the slot is granted, which is
+    /// what stops an executing run from occupying queue depth for its lifetime.
+    pub fn queue_available(&self) -> usize {
+        self.queue.available_permits()
+    }
+
+    /// Take a place in the pending queue, or refuse this run outright.
+    ///
+    /// Synchronous and immediate by design: the whole point of the bound is that
+    /// a caller over it gets an answer now. Refusing is the only thing this
+    /// returns that a caller can act on — the alternative writd used to offer
+    /// was an unbounded wait, which is indistinguishable from being forgotten.
+    ///
+    /// Callers must enqueue *after* validating the request: taking a place only
+    /// to answer "that request was malformed" would spend queue depth on a run
+    /// that was never going to happen. Each arm's preconditions differ, so this
+    /// is not something the dispatcher can do once on their behalf.
+    pub(crate) fn enqueue(&self) -> Result<AgentRunQueuePlace, AgentRunQueueFull> {
+        match Arc::clone(&self.queue).try_acquire_owned() {
+            Ok(place) => Ok(AgentRunQueuePlace {
+                _place: place,
+                slots: Arc::clone(&self.slots),
+            }),
+            Err(tokio::sync::TryAcquireError::NoPermits) => Err(AgentRunQueueFull {
+                limit: self.limit,
+                queue_limit: self.queue_limit,
+            }),
+            // Owned by `BrokerState` and never closed, exactly like `slots`.
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                unreachable!("the agent-run queue semaphore is never closed")
+            }
+        }
+    }
+}
+
+impl Default for AgentRunSlots {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_CONCURRENT_AGENT_RUNS,
+            DEFAULT_MAX_PENDING_AGENT_RUNS,
+        )
+        .expect("the built-in defaults are far below the semaphore's ceiling")
+    }
+}
+
+/// One queued agent run's admission to the wait for a slot.
+///
+/// Exists so that a run slot cannot be acquired without first passing the
+/// queue-depth bound: [`AgentRunSlots`] has no public way to wait, so the only
+/// route to an [`AgentRunSlot`] is through a place obtained from
+/// [`AgentRunSlots::enqueue`]. That is the bound made structural rather than
+/// remembered — a future caller that forgets it has nothing to call.
+#[derive(Debug)]
+pub(crate) struct AgentRunQueuePlace {
+    /// Held for its `Drop` — vacating the queue place is the entire purpose, so
+    /// the permit is never read. Named with a leading underscore rather than
+    /// carrying an `#[expect(dead_code)]`, which the lint does not fire for on a
+    /// field spelled this way.
+    _place: tokio::sync::OwnedSemaphorePermit,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl AgentRunQueuePlace {
     /// Wait for a slot on the caller's terms.
     ///
     /// The error carries the budget that expired, so a caller reporting "no slot
     /// came free within X" cannot name a different X from the one it actually
     /// waited. Only a bounded caller can fail, and only by exhausting its own
     /// budget. See [`AgentRunQueueing`] for why the budget is per-caller.
-    pub(crate) async fn acquire_with(
-        &self,
+    pub(crate) async fn wait_for_slot_with(
+        self,
         queueing: AgentRunQueueing,
     ) -> Result<AgentRunSlot, Duration> {
         match queueing {
-            AgentRunQueueing::UntilASlotFrees => Ok(self.acquire().await),
-            AgentRunQueueing::UpTo(budget) => tokio::time::timeout(budget, self.acquire())
+            AgentRunQueueing::UntilASlotFrees => Ok(self.wait_for_slot().await),
+            AgentRunQueueing::UpTo(budget) => tokio::time::timeout(budget, self.wait_for_slot())
                 .await
                 .map_err(|_elapsed| budget),
         }
     }
 
-    /// Wait for a slot, then hold it until the returned guard is dropped.
+    /// Wait for a slot however long it takes, then hold it until the returned
+    /// guard is dropped.
     ///
-    /// Callers must acquire *after* validating the request and *before* starting
-    /// the run: queueing behind minutes-long runs only to answer "that request
-    /// was malformed" would be a worse answer than refusing outright, and each
-    /// arm's preconditions differ, so this is not something the dispatcher can
-    /// do once on their behalf.
-    pub(crate) async fn acquire(&self) -> AgentRunSlot {
+    /// Consumes the place, so the queue depth this run occupied is returned the
+    /// moment it stops waiting — and on the bounded path above, the timeout
+    /// dropping this future drops the place with it. An executing run therefore
+    /// counts against the concurrency bound only, which is what makes the two
+    /// numbers independently meaningful.
+    pub(crate) async fn wait_for_slot(self) -> AgentRunSlot {
         AgentRunSlot(
             Arc::clone(&self.slots)
                 .acquire_owned()
@@ -139,21 +259,40 @@ impl AgentRunSlots {
     }
 }
 
-impl Default for AgentRunSlots {
-    fn default() -> Self {
-        Self::new(DEFAULT_MAX_CONCURRENT_AGENT_RUNS)
-            .expect("the built-in default is far below the semaphore's ceiling")
-    }
-}
-
-/// Why a configured concurrency limit was refused.
+/// Why a configured limit was refused.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum AgentRunSlotsError {
     #[error(
-        "max_concurrent_agent_runs is {limit}, above the maximum this daemon can \
+        "{field} is {limit}, above the maximum this daemon can \
          represent ({max}); a limit that large is not a bound in any case"
     )]
-    AboveMaxPermits { limit: NonZeroUsize, max: usize },
+    AboveMaxPermits {
+        field: &'static str,
+        limit: NonZeroUsize,
+        max: usize,
+    },
+}
+
+/// Why an agent run was not queued: writd is already holding as many as it will.
+///
+/// Distinct from [`AgentVmDaemonError::AgentRunsAtCapacity`](crate::agent_vm_daemon::AgentVmDaemonError::AgentRunsAtCapacity),
+/// which is a different fact about a different caller. That one means "you
+/// waited your whole budget and no slot came free" — the request was queued and
+/// lost patience. This one means writd never queued the request at all, so
+/// nothing was started, nothing was recorded, and retrying later is exactly the
+/// right response. Two facts, two errors: collapsing them would leave a caller
+/// unable to tell "I was too impatient" from "you were too busy to take this".
+#[derive(Debug, thiserror::Error, Eq, PartialEq, Clone, Copy)]
+#[error(
+    "writd will not queue this agent run: it is already running up to {limit} \
+     and holding {queue_limit} more waiting, which is the configured maximum \
+     (max_concurrent_agent_runs = {limit}, max_pending_agent_runs = \
+     {queue_limit}). Nothing was started and nothing was recorded — this request \
+     failed outright, so retry it later rather than waiting on it."
+)]
+pub struct AgentRunQueueFull {
+    limit: NonZeroUsize,
+    queue_limit: NonZeroUsize,
 }
 
 /// How long a caller is willing to wait for a slot.
@@ -383,13 +522,31 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     };
 
     // Every precondition is settled, so from here the run is going to happen and
-    // the only question is when. Wait for a slot before the audit row rather than
-    // after: a row recorded now would claim a run that has not started, and
-    // `requested_at` would date the request rather than the run.
+    // the only question is when — unless writd is holding as many runs as it
+    // will, in which case the answer is that it will not happen, delivered now.
+    // This caller can afford to be told: it is holding a connection open, so an
+    // error reaches it, where a place in an unbounded queue would not.
+    let place = match state.agent_run_slots.enqueue() {
+        Ok(place) => place,
+        Err(full) => {
+            return ServerMessage::Error {
+                message: format!("RunAgent: {full}"),
+            };
+        }
+    };
+
+    // Wait for a slot before the audit row rather than after: a row recorded now
+    // would claim a run that has not started, and `requested_at` would date the
+    // request rather than the run.
+    //
+    // Unbounded, and that is still right with a queue bound in front of it: a
+    // host run ends by itself, so the queue this caller joined drains without
+    // anyone intervening. What the bound changed is whether it could be joined,
+    // not how long a place in it is worth waiting on.
     //
     // Held until this function returns, which is when the child has exited and
     // its note is written.
-    let _slot = state.agent_run_slots.acquire().await;
+    let _slot = place.wait_for_slot().await;
 
     // The session was open when this request arrived. That wait has no bound, so
     // by now another connection may have closed it — and the caller deserves to

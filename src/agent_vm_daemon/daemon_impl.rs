@@ -197,10 +197,18 @@ impl AgentVmDaemon {
         // this slot cannot live in this function's scope — it is handed to the
         // running session below and released when that session is torn down.
         //
+        // The queue place comes first and is refused synchronously: a run writd
+        // will not queue should learn so now, in the same breath as the
+        // malformed-request answers above, rather than after a wait.
+        let place = state
+            .agent_run_slots
+            .enqueue()
+            .map_err(AgentVmDaemonError::AgentRunQueueFull)?;
+
         // Whether this wait is bounded is the caller's call, not ours — see
         // `AgentRunQueueing`. Both kinds of caller reach this one function, and
         // they differ in whether anyone is still listening when the wait ends.
-        let run_slot = match state.agent_run_slots.acquire_with(queueing).await {
+        let run_slot = match place.wait_for_slot_with(queueing).await {
             Ok(slot) => slot,
             // The budget comes back from the wait itself rather than being named
             // again here, so this cannot report a duration the caller did not
