@@ -6,6 +6,14 @@
 //! merely hopeful — a spawn that *succeeded* and then exited non-zero is a
 //! command result, never routed through here.
 //!
+//! `pthread_create` is held to the same rule for the same reason: it answers
+//! `EAGAIN` under the very pressure named below, and a thread that failed to
+//! start did nothing. That matters because [`wait_collecting`] needs a reader
+//! thread when both output streams are piped, and *by then the child has already
+//! run* — so an un-retried refusal there is worse than a refused spawn, turning
+//! a command that took effect into an error the caller cannot distinguish from
+//! one that did not.
+//!
 //! Two flavours of refusal occur in practice. One classifier
 //! recognises both — but they get *different deadlines*, because they clear on
 //! timescales four orders of magnitude apart:
@@ -191,6 +199,14 @@ pub fn output(command: &mut std::process::Command) -> io::Result<std::process::O
 /// the common case for inherited/null stdio, and for calls that pipe only
 /// stderr — everything drains inline, so no thread is spawned and a tight
 /// `RLIMIT_NPROC` cannot fail an otherwise valid command.
+///
+/// When both *are* piped, the reader thread's creation is retried on the same
+/// terms as a refused spawn (see [`spawn_pipe_reader`]), so a tight
+/// `RLIMIT_NPROC` cannot fail one of those either. Note that this differs from
+/// `Command::output`, which drains both pipes with `poll` on the calling thread
+/// and so never needed the retry — a difference worth knowing when converting a
+/// call site, since it is the one respect in which the shared collector asks
+/// more of a loaded host than the thing it replaces.
 pub fn wait_collecting(mut child: std::process::Child) -> io::Result<std::process::Output> {
     // Drop any piped stdin before waiting, exactly as `Child::wait_with_output`
     // does: a child that reads to EOF would otherwise block forever on the
@@ -252,11 +268,45 @@ fn read_pipe<R: std::io::Read>(pipe: Option<R>) -> io::Result<Vec<u8>> {
 }
 
 /// Spawn a thread that drains `pipe` to end-of-file. Uses `thread::Builder` so
-/// thread-creation failure surfaces as an `io::Error` rather than a panic.
+/// thread-creation failure surfaces as an `io::Error` rather than a panic — and
+/// retries that failure on the same terms as a refused process spawn.
+///
+/// `pthread_create` answers `EAGAIN` when the process or thread limit is
+/// momentarily full: the same condition, the same errno, and the same
+/// all-or-nothing property as a refused `fork` — the thread did not start, so
+/// retrying repeats nothing. Leaving it un-retried would have been a hole
+/// exactly where this module claims to be useful, and a worse one than a refused
+/// spawn, because by this point the *child has already run*: a mutating command
+/// would have taken effect and the caller would still see an error.
+///
+/// The pipe is held in a cell rather than moved into the closure because
+/// `thread::Builder::spawn` drops the closure — and with it the pipe, closing
+/// the read end — when thread creation fails. Only the attempt that actually
+/// starts takes the pipe out.
 fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
 ) -> io::Result<std::thread::JoinHandle<io::Result<Vec<u8>>>> {
-    std::thread::Builder::new().spawn(move || read_pipe(pipe))
+    spawn_pipe_reader_with(pipe, DEFAULT_RETRY, || Ok(()))
+}
+
+/// [`spawn_pipe_reader`] with the retry schedule and a pre-attempt hook
+/// injected, so a test can produce the thread-creation failure that a real
+/// `RLIMIT_NPROC` ceiling would — the condition being, by construction, one that
+/// cannot be provoked on demand.
+fn spawn_pipe_reader_with<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    config: RetryConfig,
+    mut before_attempt: impl FnMut() -> io::Result<()>,
+) -> io::Result<std::thread::JoinHandle<io::Result<Vec<u8>>>> {
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(pipe));
+    retry_sync_with(config, || {
+        before_attempt()?;
+        let cell = std::sync::Arc::clone(&cell);
+        std::thread::Builder::new().spawn(move || {
+            let pipe = cell.lock().expect("pipe cell mutex poisoned").take();
+            read_pipe(pipe)
+        })
+    })
 }
 
 /// Async twin of [`spawn`]: identical classification and backoff schedule, but
@@ -483,6 +533,50 @@ mod tests {
             "expected at least one retry, got {}",
             calls.get()
         );
+    }
+
+    /// A reader thread the OS refused is retried, and the pipe survives the
+    /// refusal.
+    ///
+    /// Both halves matter, and the second is the subtle one:
+    /// `thread::Builder::spawn` drops the closure when creation fails, so a
+    /// naive retry loop would drop the pipe with it and every later attempt
+    /// would read from a closed descriptor — succeeding, and returning empty
+    /// output, which is worse than the error it replaced. Holding the pipe
+    /// outside the closure is what makes the retry sound; this pins it by
+    /// asserting the *content* still arrives after two refusals.
+    ///
+    /// `EAGAIN` because that is what `pthread_create` answers when the thread
+    /// or process limit is momentarily full — the same errno, and the same
+    /// all-or-nothing property, as a refused `fork`.
+    #[test]
+    fn a_refused_reader_thread_is_retried_without_losing_the_pipe() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf hello")
+            .stdout(std::process::Stdio::piped());
+        let mut child = spawn(&mut command).unwrap();
+        let pipe = child.stdout.take();
+
+        let refusals = Cell::new(0);
+        let reader = spawn_pipe_reader_with(pipe, fast_config(), || {
+            if refusals.get() < 2 {
+                refusals.set(refusals.get() + 1);
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            Ok(())
+        })
+        .expect("a transient thread-creation refusal must be retried");
+
+        assert_eq!(refusals.get(), 2, "the hook must have refused twice");
+        assert_eq!(
+            reader.join().unwrap().unwrap(),
+            b"hello",
+            "the pipe must survive the refused attempts, not be closed with the \
+             dropped closure"
+        );
+        let _ = child.wait();
     }
 
     #[cfg(unix)]
