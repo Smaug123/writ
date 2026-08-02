@@ -38,6 +38,25 @@ CREATE TABLE mint_denied (
     reason     TEXT NOT NULL CHECK (reason != '')
 );
 
+-- Index `grant_log` by the column the view joins on.
+--
+-- Load-bearing, not housekeeping. `grant_log`'s primary key is `jti` and its
+-- only other index is `(session_id, issued_at)`, so before this every query
+-- against `mint_outcome` — the exclusion triggers below, which fire on *every*
+-- mint outcome, and the boot scan's `LEFT JOIN` — would full-scan `grant_log`.
+-- In an append-only table that grows for the life of the broker, that makes the
+-- cost of recording the n-th outcome O(n), and the cumulative cost quadratic.
+-- The backfill's `NOT EXISTS` below has the same problem, so this comes first.
+--
+-- UNIQUE rather than a plain index, because that is the invariant: one request
+-- carries one decision and admits one mint, and the triggers below now enforce
+-- it going forward. Making the index unique states the same thing about rows
+-- already on disk. No shipped writ can have written a duplicate — a request id
+-- is minted per call and `record_grant` runs once per request — so a database
+-- where this fails has been edited by hand, and refusing to open it is the
+-- correct answer under correctness-over-availability.
+CREATE UNIQUE INDEX idx_grant_log_request ON grant_log(request_id);
+
 -- The mint's logical outcome table: one row per request that reached an
 -- ending, whichever ending it was. This is what makes the pair expressible as
 -- a single `(request_table, outcome_table, join_column)` triple — the shape the

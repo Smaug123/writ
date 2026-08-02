@@ -456,6 +456,98 @@ mod tests {
             names("view").contains("mint_outcome"),
             "missing view: mint_outcome",
         );
+
+        // Not housekeeping: every insert into any of the three mint-outcome
+        // tables runs its exclusion trigger against `mint_outcome`, and
+        // `grant_log` is keyed by `jti`. Without this index that predicate
+        // full-scans an append-only table, making the n-th mint cost O(n).
+        assert!(
+            names("index").contains("idx_grant_log_request"),
+            "missing index: idx_grant_log_request",
+        );
+    }
+
+    /// Two grants for one request were storable before schema 11 — `grant_log`
+    /// is keyed by `jti`, and the old pairwise triggers only looked at the
+    /// *other* outcome table. One request carries one decision and admits one
+    /// mint, so the second row was always nonsense; the unique index makes that
+    /// statement about rows already on disk, not just future ones.
+    ///
+    /// No shipped writ can have written such a pair, so refusing to open is the
+    /// correct answer under correctness-over-availability — but it is a refusal,
+    /// so it is pinned here rather than left to be discovered in the field.
+    #[test]
+    fn migration_11_refuses_a_database_with_two_grants_for_one_request() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            for migration in MIGRATIONS.iter().take_while(|m| m.version < 11) {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                tx.execute_batch(migration.sql).unwrap();
+                tx.execute(
+                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, 1_i64],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute(
+                "INSERT INTO session (session_id, opened_at, agent_kind) \
+                 VALUES (?1, 1, 'claude')",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO request \
+                 (request_id, session_id, received_at, request_json, decision_json) \
+                 VALUES (?1, ?2, 10, '{}', ?3)",
+                params![
+                    request_id.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                    r#"{"result":"grant","scope":{},"ttl":300}"#,
+                ],
+            )
+            .unwrap();
+            // Two grants, same request. The v10 schema permits this; nothing in
+            // writ produces it.
+            for _ in 0..2 {
+                conn.execute(
+                    "INSERT INTO grant_log \
+                     (jti, request_id, session_id, scope_json, issued_at, expires_at) \
+                     VALUES (?1, ?2, ?3, '{}', 12, 1012)",
+                    params![
+                        Jti::new().as_uuid().to_string(),
+                        request_id.as_uuid().to_string(),
+                        session_id.as_uuid().to_string(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let err = AuditLog::open(db.path()).unwrap_err();
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected a sqlite UNIQUE failure, got: {err:?}");
+        };
+        assert!(
+            e.to_string().to_lowercase().contains("unique"),
+            "expected UNIQUE constraint failure, got: {e}"
+        );
+
+        // The migration ran in one transaction, so the DB is untouched at v10
+        // rather than half-upgraded.
+        let current = Connection::open(db.path())
+            .unwrap()
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get::<_, i32>(0)
+            })
+            .unwrap();
+        assert_eq!(current, 10);
     }
 
     /// A v1 DB that already carried a `decision = 'approved'` row

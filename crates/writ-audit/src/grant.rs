@@ -105,7 +105,7 @@ impl HostMintOutcome<'_> {
 /// effect should follow: keep one precise table per ending, and union them into
 /// a view whose only obligation is to expose the join column. The guard, the
 /// boot-time unpaired-row scan, and the Stage-0 oracle then need to know nothing
-/// about the fan-out — see `docs/design/architecture.md` §4.3.
+/// about the fan-out — see `docs/design/architecture.md` §5.4.
 ///
 /// Unlike the tables that predate it, the request row here is written by
 /// `begin_effect` *and the decision is already in it*: `decision_json` is
@@ -329,6 +329,14 @@ fn insert_mint_failure_row(
 /// row against a request whose recorded decision was `Grant` is just as much
 /// nonsense as a mint failure against a `Deny`, and the log would then hold two
 /// mutually contradictory statements about the same request.
+///
+/// The *reason* is checked too, against the one already in `decision_json`.
+/// [`insert_grant_row`] verifies its outcome against the recorded decision
+/// rather than trusting the caller, and a denial is no different: the row's
+/// whole content is that sentence, so a caller that recorded a different one
+/// would leave the log holding two incompatible accounts of the same refusal —
+/// with nothing to say which the agent was actually given. Reading it back out
+/// of the DB is what makes this an invariant rather than a convention.
 fn insert_mint_denied_row(
     conn: &Connection,
     request_id: RequestId,
@@ -339,7 +347,13 @@ fn insert_mint_denied_row(
         return Err(AuditError::Invariant("denial reason must not be empty"));
     }
     match recorded_decision(conn, request_id, "no pre-mint request row for this denial")? {
-        PolicyDecision::Deny { .. } => {}
+        PolicyDecision::Deny {
+            reason: decided_reason,
+        } => {
+            if decided_reason != reason {
+                return Err(AuditError::Invariant("denial reason != decision reason"));
+            }
+        }
         PolicyDecision::Grant { .. } => {
             return Err(AuditError::Invariant(
                 "cannot record a denial for a Grant decision",
@@ -1427,6 +1441,79 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)));
+    }
+
+    /// **A denial's reason must be the reason the decision recorded.**
+    ///
+    /// The whole content of a `mint_denied` row is that sentence, and the
+    /// `request` row already holds one. If they were allowed to differ the log
+    /// would permanently carry two incompatible accounts of the same refusal,
+    /// with nothing to say which the agent was actually given — so the DAO
+    /// re-reads the recorded decision rather than trusting the caller, exactly
+    /// as the grant path re-reads it to check scope and TTL.
+    ///
+    /// The three-outcome shape makes this a *new* way to be wrong, which is why
+    /// it gets its own test: a grant's disagreement with its decision is
+    /// structural (wrong scope, over-long lifetime), while a denial's is one
+    /// string against another.
+    #[test]
+    fn a_denial_must_carry_the_reason_the_decision_recorded() {
+        let log = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let req = sample_request();
+        let decision = PolicyDecision::Deny {
+            reason: "write access to o/n is not on the writable-repos allowlist".into(),
+        };
+        let begin = |request_id| {
+            log.begin_effect::<HostMintAuditTable>(&PreMintRecord {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                request: &req,
+                decision: &decision,
+            })
+            .unwrap()
+        };
+
+        // A different sentence — even a plausible-looking summary of the same
+        // refusal — is refused.
+        let mismatched = RequestId::new();
+        let err = begin(mismatched)
+            .complete(&HostMintOutcome::Denied {
+                request_id: mismatched,
+                denied_at: UnixMillis::from_millis(1_700_000_110),
+                reason: "not on the allowlist",
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("denial reason != decision reason")
+            ),
+            "got: {err:?}",
+        );
+        assert!(
+            log.list_mint_denials_for_session(s.session_id)
+                .unwrap()
+                .is_empty(),
+        );
+
+        // Non-vacuity: the very same shape, with the recorded reason, lands.
+        let matching = RequestId::new();
+        begin(matching)
+            .complete(&HostMintOutcome::Denied {
+                request_id: matching,
+                denied_at: UnixMillis::from_millis(1_700_000_110),
+                reason: "write access to o/n is not on the writable-repos allowlist",
+            })
+            .unwrap();
+        assert_eq!(
+            log.list_mint_denials_for_session(s.session_id)
+                .unwrap()
+                .len(),
+            1,
+        );
     }
 
     /// An empty mint-failure message is not a legitimate audit row —
