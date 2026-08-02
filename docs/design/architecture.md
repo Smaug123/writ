@@ -1424,14 +1424,38 @@ remains unimplemented — `CompactionThreshold` would need a second dimension, a
 only tolerates. Wiring the call in is what makes that half possible, not a
 substitute for it.
 
-One thing still open besides. A plain `gc` rewrites all packs, so its cost
-grows with total history while the threshold that fires it counts only the recent
-backlog; a large enough repo may never finish inside `NOTES_GIT_TIMEOUT`. Raising
-that deadline is not obviously right, because the mutex is held throughout, so a
-longer deadline stalls every note write; the likelier answer is an operation
-whose cost matches its trigger (`git repack -d` packs loose objects without
-rewriting existing packs), at the price of the `gc.pid` exclusion above. That
-trade is unresolved rather than decided.
+**The repack gets its own deadline.** A plain `gc` rewrites all packs, so its
+cost grows with total history while the threshold that fires it counts only the
+recent backlog. It is the only command in the module with that mismatch —
+everything else is O(one operation) — so bounding it like a `notes add` was what
+let a repo grow large enough that no attempt could ever finish, at which point
+compaction stops working permanently. `COMPACTION_GIT_TIMEOUT` (ten minutes)
+replaces `NOTES_GIT_TIMEOUT` (two minutes) for the `gc` alone; `count-objects`
+keeps the ordinary bound, being a walk of the 256 fanout directories with no such
+growth.
+
+The number is not sized to a legitimate repack but to sit past all of them, so
+its job is catching a *wedged* git rather than a busy one. Measured on git 2.54,
+a 3000-commit bare repo with 320 loose objects packs in 0.158s, which puts two
+minutes somewhere around two to three million notes and ten minutes at roughly
+ten times that. No fixed deadline survives unbounded growth — that is inherent —
+but this moves the cliff past any plausible notes repo. The cost is paid only in
+the state that trips it: the mutex is held throughout, so a killed repack stalls
+note writes for its deadline, which `COMPACTION_RETRY_BACKOFF` then caps at ten
+minutes per hour rather than per request.
+
+Making the operation cheaper instead was investigated and does not work, which is
+recorded so it is not re-proposed. `git repack -d` looks like the answer — pack
+the loose objects without rewriting existing packs — but writ needs `--cruft`,
+and git-repack(1) defines `--cruft` as "same as `-a`": a `repack -d --cruft` runs
+`pack-objects --all --reflog --indexed-objects`, a full repack costing what the
+`gc` costs (0.100s against 0.158s on the repo above, the difference being `gc`'s
+cheap extra steps rather than the repack). And `--cruft` cannot be dropped,
+because every note leaves one permanently unreachable seed blob, so a plain
+`repack -d` leaves those loose — measured, 320 loose objects becomes 20, exactly
+the unreachable ones — giving the repo a loose-object floor equal to the number
+of notes ever written. That trades expensive-and-correct for
+cheap-and-permanently-ineffective.
 
 ### 5.9 Run provenance — envelopes & verification
 

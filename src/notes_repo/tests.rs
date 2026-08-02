@@ -1708,6 +1708,97 @@ fn a_successful_compaction_leaves_the_gate_open_for_the_next_one() {
     }
 }
 
+/// The repack is bounded by the deadline *it* is given, not by whatever bound
+/// the surrounding module uses for ordinary commands.
+///
+/// This is the mechanism half of "compaction gets its own deadline". The policy
+/// half — that the deadline it gets is the longer one — is the test below; that
+/// one is a statement about which constant, and this one is a statement that the
+/// constant reaches the child at all. Neither alone is the guarantee.
+///
+/// Note what this makes possible: `counting_git_env`'s docstring records that a
+/// `gc` killed at the invocation deadline "cannot be provoked in a test without
+/// waiting out that deadline". Once the bound is a parameter, it can.
+#[test]
+fn the_repack_is_killed_at_the_deadline_compaction_was_given() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let hanging = handle_with_env(
+        &repo,
+        hanging_gc_git_env(&tmp.path().join("bin"), &tmp.path().join("gc-attempts")),
+    );
+
+    let started = std::time::Instant::now();
+    let err = hanging
+        .compact_if_needed_with_limits(
+            always_compact(),
+            GitLimits {
+                timeout: Duration::from_millis(300),
+                stdout_cap: 64 * 1024,
+            },
+        )
+        .expect_err("a gc that never exits must be killed at the deadline");
+    assert!(
+        matches!(err, NotesRepoError::GitTimedOut { .. }),
+        "expected GitTimedOut, got {err:?}"
+    );
+    // The load-bearing assertion. An `attempt_compaction` that ignored its
+    // `limits` and reached for `GitLimits::production()` would still fail this
+    // call — but only after the generic 120s bound, so the elapsed check is what
+    // separates "bounded by the deadline we chose" from "bounded by some
+    // deadline". Generous enough to survive a loaded CI host.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the repack must be cut at the deadline compaction supplied, not at the \
+         module-wide one; took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Compaction's deadline is strictly longer than an ordinary notes command's.
+///
+/// This is the decision itself, as a compile-time-adjacent fact rather than a
+/// comment. A plain `gc` rewrites all packs, so its legitimate cost grows with
+/// total history, while every other command here is O(one operation) — bounding
+/// them alike is what made a large enough repo permanently uncompactable.
+///
+/// Asserted as an inequality rather than against a literal: the guarantee is the
+/// ordering, and pinning the number would make every future tuning of it look
+/// like a behaviour change.
+#[test]
+fn compaction_gets_a_longer_deadline_than_an_ordinary_notes_command() {
+    assert!(
+        GitLimits::compaction().timeout > GitLimits::production().timeout,
+        "compaction must not inherit the generic bound: {:?} vs {:?}",
+        GitLimits::compaction().timeout,
+        GitLimits::production().timeout,
+    );
+}
+
+/// A `git` whose `count-objects` reports plenty of loose objects and whose `gc`
+/// never exits, so the only way out is the deadline.
+fn hanging_gc_git_env(bin: &Path, attempts: &Path) -> InheritedEnv {
+    fs::create_dir_all(bin).unwrap();
+    // `sleep` by absolute path: `fake_git_env` puts only its own directory on
+    // `PATH`, so a bare `sleep` would not resolve. Same constraint the
+    // builtins-only note on `counting_git_env` describes.
+    fake_git_env(
+        bin,
+        &format!(
+            r#"for a in "$@"; do
+  case "$a" in -*) continue ;; *) sub="$a"; break ;; esac
+done
+case "$sub" in
+  count-objects) echo "count: 9000"; echo "packs: 0"; exit 0 ;;
+  gc) echo attempt >> '{attempts}'; exec '{sleep}' 600 ;;
+  *) exit 0 ;;
+esac"#,
+            attempts = attempts.display(),
+            sleep = sleep_program().display(),
+        ),
+    )
+}
+
 #[test]
 fn a_measurement_that_fails_also_buys_a_pause() {
     // The gate has to sit in front of `count-objects`, not just in front of `gc`.
