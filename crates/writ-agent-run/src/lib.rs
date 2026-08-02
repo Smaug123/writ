@@ -1460,7 +1460,15 @@ mod process_runner {
     > {
         thread::Builder::new()
             .name(format!("writ-agent-{stream}"))
-            .spawn(move || capture_stream_to_deadline(reader, path, max_capture_bytes, &deadline))
+            .spawn(move || {
+                capture_stream_to_deadline(
+                    reader,
+                    path,
+                    max_capture_bytes,
+                    &deadline,
+                    DRAIN_POST_DEADLINE_ALLOWANCE,
+                )
+            })
             .map_err(|source| AgentProcessRunError::StreamThreadSpawn { stream, source })
     }
 
@@ -1573,6 +1581,7 @@ mod process_runner {
         path: PathBuf,
         max_capture_bytes: u64,
         deadline: &DrainDeadline,
+        post_deadline_allowance: u64,
     ) -> Result<AgentRunStreamCapture, AgentProcessRunError> {
         let fd = reader.as_raw_fd();
         set_nonblocking(fd).map_err(|source| AgentProcessRunError::StreamCapture {
@@ -1582,6 +1591,10 @@ mod process_runner {
         let mut accumulator = StreamAccumulator::new(path, max_capture_bytes)?;
         let mut buffer = [0u8; 8192];
         let mut drained_past_deadline = 0u64;
+        // Once the write end is gone the remainder is whatever the pipe already
+        // holds — finite, and nobody's to steer — so the allowance stops
+        // applying and the drain runs to EOF.
+        let mut writer_gone = false;
         loop {
             // **Read first; let the deadline stop only the waiting.**
             //
@@ -1608,43 +1621,55 @@ mod process_runner {
                     // for as long as it cares to keep writing. Draining past the
                     // deadline is therefore allowed but *bounded* — enough to
                     // empty what a pipe can hold, not enough to be steered.
-                    if expired {
+                    if expired && !writer_gone {
                         drained_past_deadline = drained_past_deadline.saturating_add(read as u64);
-                        if drained_past_deadline >= DRAIN_POST_DEADLINE_ALLOWANCE {
-                            // One more read before calling it cut. Exhausting
-                            // the allowance means the backlog was *large*, not
-                            // that it was unfinished — a complete stream whose
-                            // last bytes happen to land on the boundary (an
-                            // enlarged Linux pipe, a thread descheduled while it
-                            // filled) would otherwise be marked a prefix and
-                            // signed as one. EOF here costs one syscall and is
-                            // the difference between "we stopped" and "it
-                            // ended".
-                            return match reader.read(&mut buffer) {
-                                Ok(0) => accumulator.finish(StreamEnd::ReachedEof),
-                                // Still producing: keep what this read returned
-                                // rather than dropping it on the way out, then
-                                // stop — that is what the allowance is for.
-                                Ok(read) => {
-                                    accumulator.push(&buffer[..read])?;
-                                    accumulator.finish(StreamEnd::StoppedAtDeadline)
-                                }
-                                // Nothing more *right now*, and past the
-                                // deadline writ does not wait to find out.
-                                Err(err)
-                                    if matches!(
-                                        err.kind(),
-                                        std::io::ErrorKind::WouldBlock
-                                            | std::io::ErrorKind::Interrupted
-                                    ) =>
-                                {
-                                    accumulator.finish(StreamEnd::StoppedAtDeadline)
-                                }
-                                Err(source) => Err(AgentProcessRunError::StreamCapture {
+                        if drained_past_deadline >= post_deadline_allowance {
+                            // The allowance bounds an *active* writer. If the
+                            // write end is already gone, there is nobody left to
+                            // steer the drain and what remains is whatever the
+                            // pipe happens to hold — finite by construction — so
+                            // the bound stops applying and the stream is drained
+                            // to its real end. Latched: once gone, always gone,
+                            // and the check is not repeated per block.
+                            writer_gone = hangup(fd).map_err(|source| {
+                                AgentProcessRunError::StreamCapture {
                                     path: accumulator.path.clone(),
                                     source,
-                                }),
-                            };
+                                }
+                            })?;
+                            if !writer_gone {
+                                // Still attached — but "attached" is not the
+                                // same as "still writing". One more read
+                                // separates a stream that merely *ended* on the
+                                // allowance boundary from one that is going on
+                                // past it, which is the difference between "it
+                                // ended" and "we stopped".
+                                return match reader.read(&mut buffer) {
+                                    Ok(0) => accumulator.finish(StreamEnd::ReachedEof),
+                                    // Still producing: keep what this read
+                                    // returned rather than dropping it on the
+                                    // way out, then stop.
+                                    Ok(read) => {
+                                        accumulator.push(&buffer[..read])?;
+                                        accumulator.finish(StreamEnd::StoppedAtDeadline)
+                                    }
+                                    // Nothing more right now, and past the
+                                    // deadline writ does not wait to find out.
+                                    Err(err)
+                                        if matches!(
+                                            err.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::Interrupted
+                                        ) =>
+                                    {
+                                        accumulator.finish(StreamEnd::StoppedAtDeadline)
+                                    }
+                                    Err(source) => Err(AgentProcessRunError::StreamCapture {
+                                        path: accumulator.path.clone(),
+                                        source,
+                                    }),
+                                };
+                            }
                         }
                     }
                 }
@@ -1671,6 +1696,33 @@ mod process_runner {
                 }
             }
         }
+    }
+
+    /// Has every write end of `fd` been closed?
+    ///
+    /// `POLLHUP` is the kernel telling us no more data can ever arrive, which is
+    /// what distinguishes a source that has *finished* from one that is merely
+    /// between writes. A regular file never reports it — there is no writer to
+    /// hang up — so this answers `false` there and the caller falls back to
+    /// probing for EOF, which a file gives immediately.
+    #[cfg(unix)]
+    fn hangup(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Zero timeout: this asks about the state now, and the caller is already
+        // past a deadline that says not to wait.
+        let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(pollfd.revents & libc::POLLHUP != 0)
     }
 
     /// Wait for `fd` to be readable, for at most `timeout`. `Ok(false)` is "not
@@ -3248,6 +3300,7 @@ mod tests {
             dir.path().join("stdout.log"),
             4096,
             &deadline,
+            process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
         )
         .expect("the drain succeeds");
         let elapsed = started.elapsed();
@@ -3301,6 +3354,7 @@ mod tests {
             dir.path().join("stdout.log"),
             u64::MAX,
             &deadline,
+            process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
         )
         .expect("the drain succeeds");
 
@@ -3313,6 +3367,67 @@ mod tests {
             capture.full_byte_len,
             source.len() as u64,
             "and every byte of it must be accounted for"
+        );
+    }
+
+    /// A closed writer's backlog is drained to EOF however far past the
+    /// allowance it runs.
+    ///
+    /// Raised in review, as the general case of the test above. Exhausting the
+    /// allowance triggers an EOF probe, but a *large* finished backlog answers
+    /// that probe with data rather than `Ok(0)` — so the stream would be called
+    /// cut on the grounds that it was big. Reachable wherever the buffer can
+    /// hold more than the allowance (a Linux pipe enlarged past it) with the
+    /// capture thread descheduled while it filled.
+    ///
+    /// The fix is to ask *who is still there*: the allowance exists to stop an
+    /// active writer steering the drain, and once the write end is closed there
+    /// is nobody to steer it and what remains is finite by construction. So the
+    /// bound lifts and the drain finishes the stream.
+    ///
+    /// A real pipe, a writer that exits, and an allowance small enough that the
+    /// backlog dwarfs it — the parameter exists so this is provable at bytes
+    /// rather than at megabytes, and so the case does not depend on a platform
+    /// whose pipe buffer happens to be large.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_closed_writers_backlog_is_finished_however_far_past_the_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![b'q'; 16 * 1024];
+        let mut child = writ_core::process_spawn::spawn(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf 'q%.0s' $(seq 1 {})", payload.len()))
+                .stdout(std::process::Stdio::piped()),
+        )
+        .expect("spawn a writer");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        // Reaped first, so every write end is closed before the drain starts and
+        // the hangup is unambiguous rather than racing the reader.
+        child.wait().expect("the writer exits");
+
+        let deadline = process_runner::DrainDeadline::default();
+        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+
+        let capture = process_runner::capture_stream_to_deadline(
+            stdout,
+            dir.path().join("stdout.log"),
+            u64::MAX,
+            &deadline,
+            // Far below the backlog: without the hangup check the drain would
+            // stop here and call a finished stream a prefix.
+            64,
+        )
+        .expect("the drain succeeds");
+
+        assert!(
+            !capture.stopped_at_deadline,
+            "the writer had already closed, so the stream ended rather than being cut"
+        );
+        assert_eq!(
+            capture.full_byte_len,
+            payload.len() as u64,
+            "and the whole backlog must be accounted for, not just the allowance"
         );
     }
 
@@ -3354,6 +3469,7 @@ mod tests {
             dir.path().join("stdout.log"),
             1024,
             &deadline,
+            process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
         )
         .expect("the drain succeeds");
 
