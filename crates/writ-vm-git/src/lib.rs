@@ -40,7 +40,7 @@ use writ_core::core::{
 /// This is the guest-side sibling of `writ::broker_protocol::BROKER_PROTOCOL_VERSION`,
 /// which guards the host↔broker-VM axis. A guest-visible change generally moves
 /// both: one forces the broker image to be rebuilt, the other the guest image.
-pub const VM_HTTP_CONTRACT_VERSION: u32 = 4;
+pub const VM_HTTP_CONTRACT_VERSION: u32 = 5;
 
 /// The command an operator runs to rebuild the guest image, quoted back to them
 /// whenever the broker refuses a stale one.

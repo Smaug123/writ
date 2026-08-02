@@ -200,6 +200,22 @@ const GUEST_CONTRACT_HISTORY: &[GuestContractRow] = &[
         route_digest: "b82730d9647e75dd51d317f8185bf00c6df1d254b65af4a500eeceb9b94dad04",
         broker_protocol_version: 6,
     },
+    GuestContractRow {
+        // v5 — the agent-run outcome upload gains `stopped_at_deadline`: whether
+        // the guest's own capture stopped at its drain deadline rather than at
+        // EOF. No route moved, which is why the digest repeats v4's — this is
+        // one of the request-shape changes the note above says a repeat has to
+        // stay legal for.
+        //
+        // It needs a bump precisely *because* Serde would not complain. A new
+        // guest sending the field to an old broker has it silently ignored, and
+        // the broker then signs a partial stream as the run's complete output;
+        // an old guest against a new broker reports `false` while still running
+        // the unbounded drain. Both are quiet wrong answers, so the handshake
+        // has to refuse the pairing instead.
+        route_digest: "b82730d9647e75dd51d317f8185bf00c6df1d254b65af4a500eeceb9b94dad04",
+        broker_protocol_version: 7,
+    },
 ];
 
 struct GuestContractRow {
@@ -343,7 +359,7 @@ fn broker_contract_fingerprint_is_pinned() {
     assert_eq!(
         fingerprint,
         "broker-cli-flags: --config --session-spec --bearer-token-file\n\
-         ready-doc: {\"protocol_version\":6,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
+         ready-doc: {\"protocol_version\":7,\"broker_port\":18080,\"writd_build\":\"pinned\"}",
         "the host↔broker contract changed. Update this snapshot AND bump \
          BROKER_PROTOCOL_VERSION (and rebuild the broker image)."
     );

@@ -1611,7 +1611,40 @@ mod process_runner {
                     if expired {
                         drained_past_deadline = drained_past_deadline.saturating_add(read as u64);
                         if drained_past_deadline >= DRAIN_POST_DEADLINE_ALLOWANCE {
-                            return accumulator.finish(StreamEnd::StoppedAtDeadline);
+                            // One more read before calling it cut. Exhausting
+                            // the allowance means the backlog was *large*, not
+                            // that it was unfinished — a complete stream whose
+                            // last bytes happen to land on the boundary (an
+                            // enlarged Linux pipe, a thread descheduled while it
+                            // filled) would otherwise be marked a prefix and
+                            // signed as one. EOF here costs one syscall and is
+                            // the difference between "we stopped" and "it
+                            // ended".
+                            return match reader.read(&mut buffer) {
+                                Ok(0) => accumulator.finish(StreamEnd::ReachedEof),
+                                // Still producing: keep what this read returned
+                                // rather than dropping it on the way out, then
+                                // stop — that is what the allowance is for.
+                                Ok(read) => {
+                                    accumulator.push(&buffer[..read])?;
+                                    accumulator.finish(StreamEnd::StoppedAtDeadline)
+                                }
+                                // Nothing more *right now*, and past the
+                                // deadline writ does not wait to find out.
+                                Err(err)
+                                    if matches!(
+                                        err.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::Interrupted
+                                    ) =>
+                                {
+                                    accumulator.finish(StreamEnd::StoppedAtDeadline)
+                                }
+                                Err(source) => Err(AgentProcessRunError::StreamCapture {
+                                    path: accumulator.path.clone(),
+                                    source,
+                                }),
+                            };
                         }
                     }
                 }
@@ -3233,6 +3266,53 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(30),
             "the drain must end on writ's schedule, not the source's: took {elapsed:?}"
+        );
+    }
+
+    /// A *complete* stream whose backlog exhausts the allowance is complete, not
+    /// cut.
+    ///
+    /// Raised in review. Exhausting `DRAIN_POST_DEADLINE_ALLOWANCE` means the
+    /// backlog was large, which is not the same as unfinished — a finished
+    /// stream whose last bytes happen to land on the boundary would otherwise be
+    /// flagged a prefix and *signed* as one. Reachable in practice: Linux pipes
+    /// can be enlarged past the 64 KiB default, and a capture thread descheduled
+    /// while one fills wakes to exactly this.
+    ///
+    /// A regular file stands in for the pipe, because what is under test is the
+    /// classification at the boundary and a file gives it deterministically: the
+    /// whole stream is there, ends, and the deadline is already past.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_complete_stream_that_exhausts_the_allowance_is_not_called_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.bin");
+        // Exactly the allowance: the smallest input that reaches the boundary,
+        // so a classification that fires *at* it is caught rather than skipped.
+        let source = vec![b'z'; process_runner::DRAIN_POST_DEADLINE_ALLOWANCE as usize];
+        fs::write(&source_path, &source).unwrap();
+        let handle = fs::File::open(&source_path).expect("source opens");
+
+        let deadline = process_runner::DrainDeadline::default();
+        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+
+        let capture = process_runner::capture_stream_to_deadline(
+            handle,
+            dir.path().join("stdout.log"),
+            u64::MAX,
+            &deadline,
+        )
+        .expect("the drain succeeds");
+
+        assert!(
+            !capture.stopped_at_deadline,
+            "the stream ended, so exhausting the allowance must not be read as writ \
+             having stopped early"
+        );
+        assert_eq!(
+            capture.full_byte_len,
+            source.len() as u64,
+            "and every byte of it must be accounted for"
         );
     }
 
