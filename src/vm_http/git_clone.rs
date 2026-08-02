@@ -927,6 +927,71 @@ mod tests {
         assert_eq!(body.error(), VmGitCloneErrorCode::CloneFailed);
         assert_eq!(body.message(), "credential request failed");
         assert!(!body.message().contains("/private/tmp/secret"));
+
+        // The failed mint is the clone's audit outcome, and it is recorded: the
+        // backend refusing is one of the three endings the pair admits, not an
+        // absence of one.
+        assert_eq!(state.audit.table_row_count_for_test("mint_failure"), 1);
+        state
+            .audit
+            .assert_effect_audit_pairs_complete("request", "mint_outcome", "request_id");
+    }
+
+    /// **A clone's audit *is* the host mint's `(request, mint_outcome)` pair.**
+    ///
+    /// `POST /v1/git/clone` performs a real credential-using effect but has no
+    /// audit table of its own — its authority is the installation token the
+    /// host mints for it, so the mint's pair is the whole record. For as long
+    /// as a policy denial had no outcome row, that pair could not be stated as
+    /// an `EffectAuditTable` at all, and the route sat in `PlainRoute`
+    /// (nominally "records nothing") with a comment explaining that it did in
+    /// fact record something, elsewhere.
+    ///
+    /// This pins the replacement end to end: drive the granted path, and the
+    /// same one-pair query every other capability answers to comes back clean.
+    #[tokio::test]
+    async fn a_granted_clone_records_the_mints_pair() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        open_audit_session(&state, session.session_id());
+        Mock::given(method("POST"))
+            .and(path("/app/installations/999/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_vm_token",
+                "expires_at": expiry_str_from_now(3600),
+                "permissions": {"contents": "read", "metadata": "read"},
+                "repository_selection": "selected",
+                "repositories": [{"full_name": "o/n"}]
+            })))
+            .expect(1)
+            .mount(&github)
+            .await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
+        let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
+        let body = serde_json::to_vec(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
+
+        let response = handle_git_clone_request(&session, &body, service).await;
+        assert_eq!(response.status, VmHttpStatus::Ok);
+
+        // Non-vacuity, on both halves: the drive really reached the mint, and
+        // the ending it reached was the *granted* one rather than a failure.
+        assert_eq!(state.audit.table_row_count_for_test("request"), 1);
+        assert_eq!(
+            state
+                .audit
+                .list_grants_for_session(session.session_id())
+                .unwrap()
+                .len(),
+            1,
+        );
+        assert_eq!(state.audit.table_row_count_for_test("mint_failure"), 0);
+        assert_eq!(state.audit.table_row_count_for_test("mint_denied"), 0);
+        state
+            .audit
+            .assert_effect_audit_pairs_complete("request", "mint_outcome", "request_id");
     }
 
     #[tokio::test]

@@ -42,14 +42,25 @@ pub struct EffectAuditPair {
 /// was rejected and may be retried — see
 /// [`AbandonableEffect`](crate::AbandonableEffect) on that table), not a lost
 /// write; scanning it would false-positive on every live run. Its reconciliation
-/// is a concern of the agent-run lifecycle. The host mint (`request` /
-/// `grant_log`) is likewise not a simple `(request, outcome)` pair and is out of
-/// scope.
+/// is a concern of the agent-run lifecycle.
+///
+/// The host mint *is* in scope, and only became so once a policy denial gained
+/// an outcome row of its own (`mint_denied`, schema 11). Before that, "a request
+/// row with no outcome" meant either "denied" — the routine case — or "we
+/// stopped mid-mint", and scanning it would have buried the second under the
+/// first. Its outcome side is the `mint_outcome` *view*, not a table; see
+/// [`crate::HostMintAuditTable`].
 ///
 /// Keep this list in step with the schema's `*_request` / `*_outcome` pairs; the
 /// `effect_audit_pairs_match_the_schema` test fails if a pair is added to the
 /// schema without being listed here (or vice versa).
 pub const EFFECT_AUDIT_PAIRS: &[EffectAuditPair] = &[
+    EffectAuditPair {
+        label: "Host mint",
+        request_table: "request",
+        outcome_table: "mint_outcome",
+        join_column: "request_id",
+    },
     EffectAuditPair {
         label: "Claude proxy",
         request_table: "claude_proxy_request",
@@ -237,6 +248,14 @@ mod tests {
         );
     }
 
+    /// The one pair whose tables predate the `<x>_request` / `<x>_outcome`
+    /// convention: the host mint's request table is the bare `request`, and its
+    /// outcome side is the `mint_outcome` *view* over three differently-shaped
+    /// tables. Named explicitly so the convention check below excludes it
+    /// deliberately rather than passing over it in silence — and so a second
+    /// non-conventional pair has to be added here to be accepted.
+    const NON_CONVENTIONAL_PAIRS: &[(&str, &str)] = &[("request", "mint_outcome")];
+
     /// The hard-coded [`EFFECT_AUDIT_PAIRS`] list must match exactly the schema's
     /// `<x>_request` / `<x>_outcome` table pairs, so a new effect pair added to
     /// the schema without being listed here (or a removed/renamed table) fails the
@@ -246,9 +265,13 @@ mod tests {
     #[test]
     fn effect_audit_pairs_match_the_schema() {
         let log = AuditLog::open_in_memory().unwrap();
-        let table_names: BTreeSet<String> = log
+        // Views count: `mint_outcome` is the mint's outcome side, and a scan
+        // that only knew about tables would report it as missing from the
+        // schema.
+        let relation_names: BTreeSet<String> = log
             .with_conn(|c| {
-                let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+                let mut stmt =
+                    c.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")?;
                 let names = stmt
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<Result<BTreeSet<_>, _>>()?;
@@ -258,18 +281,26 @@ mod tests {
 
         // The schema's `(request, outcome)` pairs, by the `<x>_request` +
         // `<x>_outcome` naming convention.
-        let schema_pairs: BTreeSet<&str> = table_names
+        let schema_pairs: BTreeSet<&str> = relation_names
             .iter()
             .filter_map(|name| name.strip_suffix("_request"))
-            .filter(|stem| table_names.contains(&format!("{stem}_outcome")))
+            .filter(|stem| relation_names.contains(&format!("{stem}_outcome")))
             .collect();
 
-        let listed_stems: BTreeSet<&str> = EFFECT_AUDIT_PAIRS
+        // Split the listed pairs by whether they follow the convention. The
+        // non-conventional ones are compared against their own list, so neither
+        // side of the check can be quietly widened by the other.
+        let (conventional, exceptional): (Vec<&EffectAuditPair>, Vec<&EffectAuditPair>) =
+            EFFECT_AUDIT_PAIRS
+                .iter()
+                .partition(|pair| pair.request_table.ends_with("_request"));
+
+        let listed_stems: BTreeSet<&str> = conventional
             .iter()
             .map(|pair| {
                 pair.request_table
                     .strip_suffix("_request")
-                    .expect("request_table ends in _request")
+                    .expect("partitioned on this suffix")
             })
             .collect();
 
@@ -278,12 +309,24 @@ mod tests {
             "EFFECT_AUDIT_PAIRS is out of step with the schema's request/outcome table pairs",
         );
 
-        // Every listed pair's tables and join column really exist.
+        let listed_exceptions: BTreeSet<(&str, &str)> = exceptional
+            .iter()
+            .map(|pair| (pair.request_table, pair.outcome_table))
+            .collect();
+        assert_eq!(
+            listed_exceptions,
+            NON_CONVENTIONAL_PAIRS.iter().copied().collect(),
+            "a pair that does not follow the `<x>_request` / `<x>_outcome` naming must be \
+             listed in NON_CONVENTIONAL_PAIRS, so that the convention check above is known \
+             to cover everything else",
+        );
+
+        // Every listed pair's relations and join column really exist.
         for pair in EFFECT_AUDIT_PAIRS {
             for table in [pair.request_table, pair.outcome_table] {
                 assert!(
-                    table_names.contains(table),
-                    "{} names a table {table:?} that is not in the schema",
+                    relation_names.contains(table),
+                    "{} names a table or view {table:?} that is not in the schema",
                     pair.label,
                 );
             }

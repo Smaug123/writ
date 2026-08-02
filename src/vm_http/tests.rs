@@ -170,7 +170,7 @@ pub(super) fn record_contents_read_grant(
     session_id: SessionId,
     repo: crate::core::RepoRef,
 ) {
-    use crate::audit::PreMintRecord;
+    use crate::audit::{HostMintAuditTable, HostMintOutcome, PreMintRecord};
     use crate::core::{
         CapabilityRequest, CredentialGrant, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
         GitHubRequest, GrantedScope, Jti, MetadataAccess, PolicyDecision, RequestId,
@@ -195,27 +195,31 @@ pub(super) fn record_contents_read_grant(
     };
     let request_id = RequestId::new();
     let issued_at = UnixMillis::from_millis(1_700_000_000);
+    // Through the guard, exactly as `request_capability` does it: the mint's
+    // half-pair writers are not reachable from this crate, which is the whole
+    // point of the port. Seeding a *complete* pair also keeps this fixture from
+    // leaving a dangling `request` row that the audit-pair oracle would then
+    // attribute to whatever handler the test goes on to drive.
+    let grant = CredentialGrant {
+        jti: Jti::new(),
+        request_id,
+        session_id,
+        github_app_id: Some(42),
+        scope,
+        issued_at,
+        expires_at: UnixMillis::from_millis(1_700_003_600),
+    };
     state
         .audit
-        .record_pre_mint(&PreMintRecord {
+        .begin_effect::<HostMintAuditTable>(&PreMintRecord {
             request_id,
             session_id,
             received_at: issued_at,
             request: &request,
             decision: &decision,
         })
-        .unwrap();
-    state
-        .audit
-        .record_grant(&CredentialGrant {
-            jti: Jti::new(),
-            request_id,
-            session_id,
-            github_app_id: Some(42),
-            scope,
-            issued_at,
-            expires_at: UnixMillis::from_millis(1_700_003_600),
-        })
+        .unwrap()
+        .complete(&HostMintOutcome::Granted(&grant))
         .unwrap();
 }
 
@@ -1494,8 +1498,13 @@ mod brokered_route_audit_oracle {
                 "request_id",
             ),
             "AgentRunOutcome" => ("agent_run", "agent_run_outcome", "run_id"),
+            // The host-minted route. Its outcome side is the `mint_outcome`
+            // *view*, which is what lets the mint's three physical endings —
+            // granted, backend failure, policy denial — be checked by the same
+            // one-pair query as everything else.
+            "GitClone" => ("request", "mint_outcome", "request_id"),
             other => panic!(
-                "brokered route `{other}` has no audit pair listed here: every brokered route \
+                "audited route `{other}` has no audit pair listed here: every audited route \
                  records a (request, outcome) pair, so name its tables and drive it below",
             ),
         }
@@ -1590,8 +1599,35 @@ mod brokered_route_audit_oracle {
                 })
                 .unwrap();
 
+            // The host-minted route: a fake `git` that fabricates a bundle, and
+            // the installation-token endpoint the mint calls.
+            //
+            // The oracle below only asks whether a *pair* was recorded, and the
+            // mint records one either way — a `mint_failure` row is as complete
+            // a pair as a `grant_log` one. So which ending this fixture reaches
+            // is not pinned here; `a_granted_clone_records_the_mints_pair` and
+            // `git_clone_route_hides_host_mint_errors_from_vm_response` in
+            // `git_clone.rs` pin the two endings individually.
+            let git_clone = Some(VmHttpGitCloneService::new(
+                Arc::clone(&state),
+                git_clone_config_for_test(&temp, write_fake_git(temp.path())),
+            ));
+            Mock::given(method("POST"))
+                .and(path("/app/installations/999/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": "ghs_oracle_token",
+                    "expires_at": (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                    "permissions": {"contents": "read", "metadata": "read"},
+                    "repository_selection": "selected",
+                    "repositories": [{"full_name": "o/n"}]
+                })))
+                .mount(&github)
+                .await;
+
             let services = TestVmHttpServices {
-                git_clone: None,
+                git_clone,
                 nix_cache: Some(VmHttpNixCacheService::new(
                     Arc::clone(&state),
                     nix_cache_config_for_test(),
@@ -1675,8 +1711,19 @@ mod brokered_route_audit_oracle {
         }
     }
 
+    /// Every route that records an audit pair, whichever driver holds its
+    /// guard. Generated from the two enums, so a new capability on either side
+    /// of the split fails the oracle below until it is driven.
+    fn audited_routes() -> Vec<&'static str> {
+        BrokeredRoute::ALL_NAMES
+            .iter()
+            .chain(HostMintedRoute::ALL_NAMES)
+            .copied()
+            .collect()
+    }
+
     #[tokio::test]
-    async fn every_brokered_route_records_a_complete_audit_pair() {
+    async fn every_audited_route_records_a_complete_audit_pair() {
         // Bound whole, never destructured: the fixture's `_temp` / `_upstreams`
         // fields keep the staging dir and the mock upstreams alive, and a
         // by-value destructure with `..` would drop them right here.
@@ -1690,7 +1737,7 @@ mod brokered_route_audit_oracle {
             broker.run_id,
         );
 
-        for route in BrokeredRoute::ALL_NAMES {
+        for route in audited_routes() {
             let (request_table, outcome_table, join_column) = audit_pair_for(route);
             // Non-vacuity is measured on the *outcome* table, uniformly: it is
             // the half every drive must add. (A two-phase route adds both rows;
@@ -1740,7 +1787,7 @@ mod brokered_route_audit_oracle {
     async fn a_guest_that_declares_no_contract_records_nothing_on_a_required_route() {
         let broker = AuditOracleBroker::build().await;
 
-        for route in BrokeredRoute::ALL_NAMES {
+        for route in audited_routes() {
             let (request, body) = drive_for(route, &broker.repo, &broker.rev, broker.run_id);
             if VmHttpRoute::resolve(&request).contract_check() != ContractCheck::Required {
                 continue;
@@ -1855,8 +1902,16 @@ mod brokered_route_audit_oracle {
                     .unwrap(),
                 )
             }
+            "GitClone" => post(
+                VM_GIT_CLONE_PATH,
+                serde_json::to_vec(&crate::vm_git::VmGitCloneRequest::new(
+                    GitCloneRepo::new(repo.clone()).unwrap(),
+                    None,
+                ))
+                .unwrap(),
+            ),
             other => panic!(
-                "brokered route `{other}` is not driven by the audit-pair oracle: add a request \
+                "audited route `{other}` is not driven by the audit-pair oracle: add a request \
                  that exercises its effect, or the route escapes the invariant check",
             ),
         }

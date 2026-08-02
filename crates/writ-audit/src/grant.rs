@@ -1,9 +1,10 @@
 //! Credential grant audit DAOs: pre-mint request rows, mint failures,
 //! and the `grant_log` rows that capture successful mints.
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+use super::effect_table::{EffectAuditTable, sealed};
 use super::{AuditError, AuditLog};
 use writ_core::core::{
     CapabilityRequest, CredentialGrant, GitHubGrantedScope, GitHubRequest, GrantedScope, Jti,
@@ -18,6 +19,19 @@ use writ_core::core::{
 /// check. Anything larger here would start to hide real disagreement
 /// between the decision and the grant.
 const AUDIT_TTL_SKEW_TOLERANCE_MILLIS: i64 = 60_000;
+
+/// One `mint_denied` row, read back.
+///
+/// The reason is a plain column rather than a JSON payload (unlike
+/// [`MintFailureRecord`]): it is a single sentence with no structure to
+/// preserve, and wrapping it would make the log harder to read by hand for no
+/// gain in fidelity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MintDenialRecord {
+    pub request_id: RequestId,
+    pub denied_at: UnixMillis,
+    pub reason: String,
+}
 
 /// JSON payload stored in the `mint_failure` table.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,63 +53,373 @@ pub struct PreMintRecord<'a> {
     pub decision: &'a PolicyDecision,
 }
 
-impl AuditLog {
-    /// Persist a request and its policy decision. Call this *before* the
-    /// backend mint step is invoked (or, for a Deny decision, in place of
-    /// it). Once this transaction commits, the broker has a durable audit
-    /// row for the request regardless of what happens next — crash, kill,
-    /// CloseSession, or backend failure. The matching mint outcome, if
-    /// any, is appended later via [`AuditLog::record_grant`] or
-    /// [`AuditLog::record_mint_failure`].
-    pub fn record_pre_mint(&self, r: &PreMintRecord<'_>) -> Result<(), AuditError> {
-        // Before we even touch the DB, make sure the decision's scope is
-        // one the request could justify. Without this check a caller who
-        // wires the wrong decision to the wrong request would persist an
-        // audit row claiming authority the agent never asked for — e.g. a
-        // Metadata request paired with a Grant of contents:write on a
-        // different repo.
-        if let PolicyDecision::Grant { scope, .. } = r.decision
-            && !scope_authorised_by_request(r.request, scope)
-        {
+/// One ending of a host capability mint, as it is written to the log.
+///
+/// The mint is the one brokered effect whose outcome lives in more than one
+/// physical table — a granted credential, a backend refusal, and a policy denial
+/// carry genuinely different columns — so the DU is what lets the single
+/// [`EffectAuditTable`] outcome slot describe all three. The `mint_outcome` view
+/// is the reading half of the same idea.
+///
+/// Every variant is *truthful about a completed effect*, which is what keeps the
+/// mint out of [`AbandonableEffect`](crate::AbandonableEffect) territory: there
+/// is no ending here that has to be left dangling.
+#[derive(Clone, Debug)]
+pub enum HostMintOutcome<'a> {
+    /// Policy refused the request; no mint was attempted. The `reason` is the
+    /// same sentence the agent is told.
+    Denied {
+        request_id: RequestId,
+        denied_at: UnixMillis,
+        reason: &'a str,
+    },
+    /// Policy allowed the request and the backend mint failed. `error` is the
+    /// full `Display` + source chain, which is deliberately richer than what the
+    /// agent is shown.
+    Failed {
+        request_id: RequestId,
+        failed_at: UnixMillis,
+        error: &'a str,
+    },
+    /// A credential was minted. Carries the whole grant, because the row records
+    /// the authority that was actually issued rather than the one requested.
+    Granted(&'a CredentialGrant),
+}
+
+impl HostMintOutcome<'_> {
+    /// The request this outcome belongs to.
+    pub fn request_id(&self) -> RequestId {
+        match self {
+            Self::Denied { request_id, .. } | Self::Failed { request_id, .. } => *request_id,
+            Self::Granted(grant) => grant.request_id,
+        }
+    }
+}
+
+/// The host capability mint's `(request, outcome)` audit pair: the `request`
+/// table, and the `mint_outcome` view over `grant_log` / `mint_failure` /
+/// `mint_denied`.
+///
+/// This is the effect that made the guard's `OUTCOME_TABLE` a *logical* name
+/// rather than a physical one, and it is the pattern any future multi-outcome
+/// effect should follow: keep one precise table per ending, and union them into
+/// a view whose only obligation is to expose the join column. The guard, the
+/// boot-time unpaired-row scan, and the Stage-0 oracle then need to know nothing
+/// about the fan-out — see `docs/design/architecture.md` §5.4.
+///
+/// Unlike the tables that predate it, the request row here is written by
+/// `begin_effect` *and the decision is already in it*: `decision_json` is
+/// recorded before the mint is attempted, so a grant row that disagrees with the
+/// decision is refused by reading the DB rather than by trusting the caller.
+pub struct HostMintAuditTable;
+
+impl sealed::Sealed for HostMintAuditTable {}
+
+impl EffectAuditTable for HostMintAuditTable {
+    type RequestRow<'a> = PreMintRecord<'a>;
+    type OutcomeRow<'a> = HostMintOutcome<'a>;
+    type Key = RequestId;
+
+    const REQUEST_TABLE: &'static str = "request";
+    const OUTCOME_TABLE: &'static str = "mint_outcome";
+    const LABEL: &'static str = "Host mint";
+
+    fn insert_request(conn: &Connection, row: &PreMintRecord<'_>) -> Result<(), AuditError> {
+        insert_pre_mint_row(conn, row)
+    }
+
+    fn insert_outcome(conn: &Connection, row: &HostMintOutcome<'_>) -> Result<(), AuditError> {
+        match row {
+            HostMintOutcome::Denied {
+                request_id,
+                denied_at,
+                reason,
+            } => insert_mint_denied_row(conn, *request_id, *denied_at, reason),
+            HostMintOutcome::Failed {
+                request_id,
+                failed_at,
+                error,
+            } => insert_mint_failure_row(conn, *request_id, *failed_at, error),
+            HostMintOutcome::Granted(grant) => insert_grant_row(conn, grant),
+        }
+    }
+
+    fn session_id(row: &PreMintRecord<'_>) -> SessionId {
+        row.session_id
+    }
+
+    fn request_key(row: &PreMintRecord<'_>) -> RequestId {
+        row.request_id
+    }
+
+    fn outcome_key(row: &HostMintOutcome<'_>) -> RequestId {
+        row.request_id()
+    }
+}
+
+/// Insert one `request` row. Runs inside the caller's transaction; the
+/// session-open check belongs to the caller (the guard performs it before
+/// calling this).
+fn insert_pre_mint_row(conn: &Connection, r: &PreMintRecord<'_>) -> Result<(), AuditError> {
+    // Before we even touch the DB, make sure the decision's scope is
+    // one the request could justify. Without this check a caller who
+    // wires the wrong decision to the wrong request would persist an
+    // audit row claiming authority the agent never asked for — e.g. a
+    // Metadata request paired with a Grant of contents:write on a
+    // different repo.
+    if let PolicyDecision::Grant { scope, .. } = r.decision
+        && !scope_authorised_by_request(r.request, scope)
+    {
+        return Err(AuditError::Invariant(
+            "decision scope is not authorised by the request",
+        ));
+    }
+
+    let request_json = serde_json::to_string(r.request)?;
+    let decision_json = serde_json::to_string(r.decision)?;
+
+    conn.execute(
+        "INSERT INTO request (
+             request_id,
+             session_id,
+             received_at,
+             request_json,
+             decision_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            r.request_id.as_uuid().to_string(),
+            r.session_id.as_uuid().to_string(),
+            r.received_at.as_millis(),
+            request_json,
+            decision_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one `grant_log` row, verified against the decision the `request` row
+/// already holds. Runs inside the caller's transaction.
+fn insert_grant_row(conn: &Connection, grant: &CredentialGrant) -> Result<(), AuditError> {
+    let grant_scope_json = serde_json::to_string(&grant.scope)?;
+    let github_app_id = grant
+        .github_app_id
+        .ok_or(AuditError::Invariant("grant.github_app_id is missing"))?;
+    let github_app_id = i64::try_from(github_app_id)
+        .map_err(|_| AuditError::Invariant("grant.github_app_id exceeds SQLite integer"))?;
+
+    // Load the pre-mint decision so we can verify the grant
+    // agrees with it. This couples audit integrity to what the
+    // DB actually holds rather than trusting the caller — a
+    // lying caller can't produce a row that disagrees with the
+    // recorded decision.
+    let recorded: Option<(String, String)> = conn
+        .query_row(
+            "SELECT session_id, decision_json FROM request WHERE request_id = ?1",
+            params![grant.request_id.as_uuid().to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (session_id_str, decision_json) = recorded.ok_or(AuditError::Invariant(
+        "no pre-mint request row for this grant",
+    ))?;
+
+    if grant.session_id.as_uuid().to_string() != session_id_str {
+        return Err(AuditError::Invariant(
+            "grant.session_id != request.session_id",
+        ));
+    }
+
+    let decision: PolicyDecision = serde_json::from_str(&decision_json)?;
+    let (decision_scope, decision_ttl) = match decision {
+        PolicyDecision::Grant { scope, ttl } => (scope, ttl),
+        PolicyDecision::Deny { .. } => {
             return Err(AuditError::Invariant(
-                "decision scope is not authorised by the request",
+                "cannot record a grant for a Deny decision",
             ));
         }
+    };
 
-        let request_json = serde_json::to_string(r.request)?;
-        let decision_json = serde_json::to_string(r.decision)?;
+    // Decision and grant are both authority claims about the same
+    // request, so they must agree on what that authority is.
+    if grant.scope != decision_scope {
+        return Err(AuditError::Invariant("grant.scope != decision.scope"));
+    }
+    // An inverted expiry (expires before issued) would silently
+    // pass the TTL-ceiling comparison below because saturating_sub
+    // of a negative gap is a negative lifetime, trivially less
+    // than any positive ceiling. Reject explicitly.
+    if grant.expires_at < grant.issued_at {
+        return Err(AuditError::Invariant("grant expires before it was issued"));
+    }
+    let lifetime_millis = grant
+        .expires_at
+        .as_millis()
+        .saturating_sub(grant.issued_at.as_millis());
+    let max_millis = decision_ttl
+        .as_i64()
+        .saturating_mul(1000)
+        .saturating_add(AUDIT_TTL_SKEW_TOLERANCE_MILLIS);
+    if lifetime_millis > max_millis {
+        return Err(AuditError::Invariant("grant lifetime exceeds decision ttl"));
+    }
 
+    conn.execute(
+        "INSERT INTO grant_log (jti, request_id, session_id, github_app_id, scope_json, issued_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            grant.jti.as_uuid().to_string(),
+            grant.request_id.as_uuid().to_string(),
+            grant.session_id.as_uuid().to_string(),
+            github_app_id,
+            grant_scope_json,
+            grant.issued_at.as_millis(),
+            grant.expires_at.as_millis(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one `mint_failure` row. Runs inside the caller's transaction.
+fn insert_mint_failure_row(
+    conn: &Connection,
+    request_id: RequestId,
+    failed_at: UnixMillis,
+    error: &str,
+) -> Result<(), AuditError> {
+    if error.is_empty() {
+        return Err(AuditError::Invariant(
+            "mint failure message must not be empty",
+        ));
+    }
+    let failure_json = serde_json::to_string(&MintFailureRecord {
+        error: error.to_string(),
+    })?;
+
+    // Refuse to record a mint failure against a request whose
+    // decision was Deny — such a row would be nonsense (a denied
+    // request never reaches the mint step).
+    match recorded_decision(
+        conn,
+        request_id,
+        "no pre-mint request row for this mint failure",
+    )? {
+        PolicyDecision::Grant { .. } => {}
+        PolicyDecision::Deny { .. } => {
+            return Err(AuditError::Invariant(
+                "cannot record a mint failure for a Deny decision",
+            ));
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO mint_failure (request_id, failed_at, failure_json) \
+         VALUES (?1, ?2, ?3)",
+        params![
+            request_id.as_uuid().to_string(),
+            failed_at.as_millis(),
+            failure_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert one `mint_denied` row. Runs inside the caller's transaction.
+///
+/// The mirror image of [`insert_mint_failure_row`]'s decision check: a denial
+/// row against a request whose recorded decision was `Grant` is just as much
+/// nonsense as a mint failure against a `Deny`, and the log would then hold two
+/// mutually contradictory statements about the same request.
+///
+/// The *reason* is checked too, against the one already in `decision_json`.
+/// [`insert_grant_row`] verifies its outcome against the recorded decision
+/// rather than trusting the caller, and a denial is no different: the row's
+/// whole content is that sentence, so a caller that recorded a different one
+/// would leave the log holding two incompatible accounts of the same refusal —
+/// with nothing to say which the agent was actually given. Reading it back out
+/// of the DB is what makes this an invariant rather than a convention.
+fn insert_mint_denied_row(
+    conn: &Connection,
+    request_id: RequestId,
+    denied_at: UnixMillis,
+    reason: &str,
+) -> Result<(), AuditError> {
+    if reason.is_empty() {
+        return Err(AuditError::Invariant("denial reason must not be empty"));
+    }
+    match recorded_decision(conn, request_id, "no pre-mint request row for this denial")? {
+        PolicyDecision::Deny {
+            reason: decided_reason,
+        } => {
+            if decided_reason != reason {
+                return Err(AuditError::Invariant("denial reason != decision reason"));
+            }
+        }
+        PolicyDecision::Grant { .. } => {
+            return Err(AuditError::Invariant(
+                "cannot record a denial for a Grant decision",
+            ));
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO mint_denied (request_id, denied_at, reason) VALUES (?1, ?2, ?3)",
+        params![
+            request_id.as_uuid().to_string(),
+            denied_at.as_millis(),
+            reason,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The decision recorded on `request_id`'s pre-mint row. `missing` is the
+/// invariant message for "there is no such row", so the error names the write
+/// that would have been orphaned rather than the read that noticed.
+fn recorded_decision(
+    conn: &Connection,
+    request_id: RequestId,
+    missing: &'static str,
+) -> Result<PolicyDecision, AuditError> {
+    let decision_json: Option<String> = conn
+        .query_row(
+            "SELECT decision_json FROM request WHERE request_id = ?1",
+            params![request_id.as_uuid().to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let decision_json = decision_json.ok_or(AuditError::Invariant(missing))?;
+    Ok(serde_json::from_str::<PolicyDecision>(&decision_json)?)
+}
+
+/// Half-pair writers, for testing the mint DAO's own invariants.
+///
+/// **There is no production caller.** The only way to write these rows in a
+/// shipped build is [`AuditLog::begin_effect`] with [`HostMintAuditTable`],
+/// which hands back a guard that must be discharged with one of the three
+/// [`HostMintOutcome`] endings — that is what makes the mint's pair complete by
+/// construction rather than by the shell remembering to append an outcome.
+///
+/// They exist because the invariants below (scope authorisation, grant/decision
+/// agreement, the TTL-divergence ceiling, "no mint failure for a Deny") are
+/// properties of *one row*, and asserting them through the guard's sequencing
+/// would test the sequencing over again at every one. `#[cfg(test)]` rather
+/// than merely private, so a future production caller is a compile error rather
+/// than a review question.
+#[cfg(test)]
+impl AuditLog {
+    /// Persist a request and its policy decision, in its own transaction.
+    ///
+    /// The session-open check lives inside the same transaction as the INSERT.
+    /// Without it, a client could CloseSession and then see audit rows land
+    /// after the session's own `closed_at` — which would silently strip
+    /// `closed_at` of its meaning as an activity-window bound. The existing FK
+    /// covers "session exists"; it cannot express "session is open". The
+    /// BEFORE-INSERT trigger on `request` is braces to this belt.
+    pub(crate) fn record_pre_mint(&self, r: &PreMintRecord<'_>) -> Result<(), AuditError> {
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-
-            // A request can only be audited against an open session.
-            // `dispatch_capability` also checks this before the mint, but
-            // the authoritative check lives here, inside the same tx as
-            // the INSERT. Without it, a client could CloseSession and
-            // then see audit rows land after the session's own
-            // `closed_at` — which would silently strip `closed_at` of its
-            // meaning as an activity-window bound. The existing FK covers
-            // "session exists"; it cannot express "session is open",
-            // which is why this check exists at all. The BEFORE-INSERT
-            // trigger on `request` is braces to this belt.
             crate::validation::check_session_open(&tx, r.session_id)?;
-
-            tx.execute(
-                "INSERT INTO request (
-                     request_id,
-                     session_id,
-                     received_at,
-                     request_json,
-                     decision_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    r.request_id.as_uuid().to_string(),
-                    r.session_id.as_uuid().to_string(),
-                    r.received_at.as_millis(),
-                    request_json,
-                    decision_json,
-                ],
-            )?;
+            insert_pre_mint_row(&tx, r)?;
             tx.commit()?;
             Ok(())
         })
@@ -111,86 +435,10 @@ impl AuditLog {
     /// that is *not* an error. The authority to mint was established at
     /// pre-mint time, so the resulting grant is still a legitimate
     /// audit row even if the session has since gone quiet on paper.
-    pub fn record_grant(&self, grant: &CredentialGrant) -> Result<(), AuditError> {
-        let grant_scope_json = serde_json::to_string(&grant.scope)?;
-        let github_app_id = grant
-            .github_app_id
-            .ok_or(AuditError::Invariant("grant.github_app_id is missing"))?;
-        let github_app_id = i64::try_from(github_app_id)
-            .map_err(|_| AuditError::Invariant("grant.github_app_id exceeds SQLite integer"))?;
-
+    pub(crate) fn record_grant(&self, grant: &CredentialGrant) -> Result<(), AuditError> {
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-
-            // Load the pre-mint decision so we can verify the grant
-            // agrees with it. This couples audit integrity to what the
-            // DB actually holds rather than trusting the caller — a
-            // lying caller can't produce a row that disagrees with the
-            // recorded decision.
-            let recorded: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT session_id, decision_json FROM request WHERE request_id = ?1",
-                    params![grant.request_id.as_uuid().to_string()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            let (session_id_str, decision_json) = recorded.ok_or(AuditError::Invariant(
-                "no pre-mint request row for this grant",
-            ))?;
-
-            if grant.session_id.as_uuid().to_string() != session_id_str {
-                return Err(AuditError::Invariant(
-                    "grant.session_id != request.session_id",
-                ));
-            }
-
-            let decision: PolicyDecision = serde_json::from_str(&decision_json)?;
-            let (decision_scope, decision_ttl) = match decision {
-                PolicyDecision::Grant { scope, ttl } => (scope, ttl),
-                PolicyDecision::Deny { .. } => {
-                    return Err(AuditError::Invariant(
-                        "cannot record a grant for a Deny decision",
-                    ));
-                }
-            };
-
-            // Decision and grant are both authority claims about the same
-            // request, so they must agree on what that authority is.
-            if grant.scope != decision_scope {
-                return Err(AuditError::Invariant("grant.scope != decision.scope"));
-            }
-            // An inverted expiry (expires before issued) would silently
-            // pass the TTL-ceiling comparison below because saturating_sub
-            // of a negative gap is a negative lifetime, trivially less
-            // than any positive ceiling. Reject explicitly.
-            if grant.expires_at < grant.issued_at {
-                return Err(AuditError::Invariant("grant expires before it was issued"));
-            }
-            let lifetime_millis = grant
-                .expires_at
-                .as_millis()
-                .saturating_sub(grant.issued_at.as_millis());
-            let max_millis = decision_ttl
-                .as_i64()
-                .saturating_mul(1000)
-                .saturating_add(AUDIT_TTL_SKEW_TOLERANCE_MILLIS);
-            if lifetime_millis > max_millis {
-                return Err(AuditError::Invariant("grant lifetime exceeds decision ttl"));
-            }
-
-            tx.execute(
-                "INSERT INTO grant_log (jti, request_id, session_id, github_app_id, scope_json, issued_at, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    grant.jti.as_uuid().to_string(),
-                    grant.request_id.as_uuid().to_string(),
-                    grant.session_id.as_uuid().to_string(),
-                    github_app_id,
-                    grant_scope_json,
-                    grant.issued_at.as_millis(),
-                    grant.expires_at.as_millis(),
-                ],
-            )?;
+            insert_grant_row(&tx, grant)?;
             tx.commit()?;
             Ok(())
         })
@@ -201,60 +449,22 @@ impl AuditLog {
     /// session has since been closed: the request was accepted while the
     /// session was open, and the failure is the honest outcome of that
     /// acceptance.
-    pub fn record_mint_failure(
+    pub(crate) fn record_mint_failure(
         &self,
         request_id: RequestId,
         failed_at: UnixMillis,
         error: &str,
     ) -> Result<(), AuditError> {
-        if error.is_empty() {
-            return Err(AuditError::Invariant(
-                "mint failure message must not be empty",
-            ));
-        }
-        let failure_json = serde_json::to_string(&MintFailureRecord {
-            error: error.to_string(),
-        })?;
-
         self.with_conn_mut(|c| {
             let tx = c.transaction()?;
-
-            // Refuse to record a mint failure against a request whose
-            // decision was Deny — such a row would be nonsense (a denied
-            // request never reaches the mint step).
-            let decision_json: Option<String> = tx
-                .query_row(
-                    "SELECT decision_json FROM request WHERE request_id = ?1",
-                    params![request_id.as_uuid().to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            let decision_json = decision_json.ok_or(AuditError::Invariant(
-                "no pre-mint request row for this mint failure",
-            ))?;
-            match serde_json::from_str::<PolicyDecision>(&decision_json)? {
-                PolicyDecision::Grant { .. } => {}
-                PolicyDecision::Deny { .. } => {
-                    return Err(AuditError::Invariant(
-                        "cannot record a mint failure for a Deny decision",
-                    ));
-                }
-            }
-
-            tx.execute(
-                "INSERT INTO mint_failure (request_id, failed_at, failure_json) \
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    request_id.as_uuid().to_string(),
-                    failed_at.as_millis(),
-                    failure_json,
-                ],
-            )?;
+            insert_mint_failure_row(&tx, request_id, failed_at, error)?;
             tx.commit()?;
             Ok(())
         })
     }
+}
 
+impl AuditLog {
     pub fn list_grants_for_session(
         &self,
         id: SessionId,
@@ -272,6 +482,50 @@ impl AuditLog {
                 .query_map(params![id.as_uuid().to_string()], grant_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Every policy denial recorded against `id`, oldest first.
+    ///
+    /// The counterpart to [`AuditLog::list_grants_for_session`], and the read
+    /// half of the `mint_denied` row: a log that can record a denial but not
+    /// read one back is only half a record. `mint_denied` has no `session_id`
+    /// of its own — the `request` row it references already carries one, and
+    /// duplicating it would create a second place for the two to disagree — so
+    /// this joins rather than filtering directly.
+    ///
+    /// Secondary sort on rowid for the same reason as the grant listing: two
+    /// denials in the same millisecond must still come back in insert order.
+    pub fn list_mint_denials_for_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Vec<MintDenialRecord>, AuditError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT d.request_id, d.denied_at, d.reason \
+                 FROM mint_denied d JOIN request r ON r.request_id = d.request_id \
+                 WHERE r.session_id = ?1 ORDER BY d.denied_at ASC, d.rowid ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![id.as_uuid().to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(request_id, denied_at, reason)| {
+                    let request_id = uuid::Uuid::parse_str(&request_id)
+                        .map_err(|_| AuditError::Invariant("denial row: request_id not a uuid"))?;
+                    Ok(MintDenialRecord {
+                        request_id: RequestId::from_uuid(request_id),
+                        denied_at: UnixMillis::from_millis(denied_at),
+                        reason,
+                    })
+                })
+                .collect()
         })
     }
 
@@ -1187,6 +1441,79 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)));
+    }
+
+    /// **A denial's reason must be the reason the decision recorded.**
+    ///
+    /// The whole content of a `mint_denied` row is that sentence, and the
+    /// `request` row already holds one. If they were allowed to differ the log
+    /// would permanently carry two incompatible accounts of the same refusal,
+    /// with nothing to say which the agent was actually given — so the DAO
+    /// re-reads the recorded decision rather than trusting the caller, exactly
+    /// as the grant path re-reads it to check scope and TTL.
+    ///
+    /// The three-outcome shape makes this a *new* way to be wrong, which is why
+    /// it gets its own test: a grant's disagreement with its decision is
+    /// structural (wrong scope, over-long lifetime), while a denial's is one
+    /// string against another.
+    #[test]
+    fn a_denial_must_carry_the_reason_the_decision_recorded() {
+        let log = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
+        let s = sample_session();
+        log.open_session(&s).unwrap();
+        let req = sample_request();
+        let decision = PolicyDecision::Deny {
+            reason: "write access to o/n is not on the writable-repos allowlist".into(),
+        };
+        let begin = |request_id| {
+            log.begin_effect::<HostMintAuditTable>(&PreMintRecord {
+                request_id,
+                session_id: s.session_id,
+                received_at: UnixMillis::from_millis(1_700_000_100),
+                request: &req,
+                decision: &decision,
+            })
+            .unwrap()
+        };
+
+        // A different sentence — even a plausible-looking summary of the same
+        // refusal — is refused.
+        let mismatched = RequestId::new();
+        let err = begin(mismatched)
+            .complete(&HostMintOutcome::Denied {
+                request_id: mismatched,
+                denied_at: UnixMillis::from_millis(1_700_000_110),
+                reason: "not on the allowlist",
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuditError::Invariant("denial reason != decision reason")
+            ),
+            "got: {err:?}",
+        );
+        assert!(
+            log.list_mint_denials_for_session(s.session_id)
+                .unwrap()
+                .is_empty(),
+        );
+
+        // Non-vacuity: the very same shape, with the recorded reason, lands.
+        let matching = RequestId::new();
+        begin(matching)
+            .complete(&HostMintOutcome::Denied {
+                request_id: matching,
+                denied_at: UnixMillis::from_millis(1_700_000_110),
+                reason: "write access to o/n is not on the writable-repos allowlist",
+            })
+            .unwrap();
+        assert_eq!(
+            log.list_mint_denials_for_session(s.session_id)
+                .unwrap()
+                .len(),
+            1,
+        );
     }
 
     /// An empty mint-failure message is not a legitimate audit row —

@@ -41,7 +41,7 @@ pub use openai_proxy::{
     VmHttpOpenAiProxyAuthKind, VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError,
 };
 use proxy_common::{ClaudeBackend, OpenAiBackend, ProxyEffect, ProxyStream};
-use route_table::{BrokeredRoute, ContractCheck, PlainRoute, VmHttpRoute};
+use route_table::{BrokeredRoute, ContractCheck, HostMintedRoute, PlainRoute, VmHttpRoute};
 use writ_core::byte_size::ByteSize;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1419,7 +1419,7 @@ where
             }
             route_agent_run_outcome_request(*run_id, session.session_id(), &body, &service).await
         }
-        VmHttpRoute::Plain(PlainRoute::GitClone) => {
+        VmHttpRoute::HostMinted(HostMintedRoute::GitClone) => {
             let Some(service) = services.git_clone else {
                 return not_found();
             };

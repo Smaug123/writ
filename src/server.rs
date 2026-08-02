@@ -28,7 +28,8 @@ use crate::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
 use crate::agent_vm_daemon::AgentVmDaemon;
 use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, GitPushOutcomeResult, GitPushResolution,
-    GitPushResolutionRecord, PreMintRecord, PromoteMintAudit, ReconciliationTarget, RejectBlocker,
+    GitPushResolutionRecord, HostMintAuditTable, HostMintOutcome, PreMintRecord, PromoteMintAudit,
+    ReconciliationTarget, RejectBlocker,
 };
 use crate::core::{
     ApproveAttemptId, CapabilityRequest, GITHUB_INSTALLATION_TOKEN_MAX_SECONDS, GitHubAccess,
@@ -663,24 +664,64 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
     // credential with no audit trail — a direct violation of the
     // "every request/decision is append-only audited" invariant in
     // docs/design/broker.md. With pre-recording, the request row
-    // commits before any network I/O; the grant or mint-failure is
-    // appended once the mint completes.
-    if let Err(e) = state.audit.record_pre_mint(&PreMintRecord {
-        request_id,
-        session_id,
-        received_at,
-        request: &capability,
-        decision: &decision_record,
-    }) {
-        return CapabilityOutcome::Error {
-            message: format!("request could not be recorded: {e}"),
-        };
-    }
+    // commits before any network I/O; the outcome is appended once the
+    // mint (or the denial) is decided.
+    //
+    // This is the mint's *driver*, in the sense `broker_effect` is the driver
+    // for the VM-HTTP effects: it holds the `RecordedRequest` guard across
+    // the mint and discharges it on every path out. It is a separate function
+    // from that one because `broker_effect` is shaped around a
+    // `VmHttpResponse` and is private to `vm_http`, while this answers on the
+    // host socket; what the two share is the guard, which is the part that
+    // carries the guarantee.
+    let recorded = match state
+        .audit
+        .begin_effect::<HostMintAuditTable>(&PreMintRecord {
+            request_id,
+            session_id,
+            received_at,
+            request: &capability,
+            decision: &decision_record,
+        }) {
+        Ok(recorded) => recorded,
+        Err(e) => {
+            return CapabilityOutcome::Error {
+                message: format!("request could not be recorded: {e}"),
+            };
+        }
+    };
 
     // The `Grant` carries the unforgeable authorization the minter needs;
     // `Deny` short-circuits before any mint.
     let authorization = match decision {
         Decision::Deny { reason } => {
+            if let Err(e) = recorded.complete(&HostMintOutcome::Denied {
+                request_id,
+                denied_at: UnixMillis::now(),
+                reason: &reason,
+            }) {
+                // Alert, but still answer the agent truthfully.
+                //
+                // This is deliberately *unlike* the grant arm below, and the
+                // difference is what the invariant actually says: no
+                // credential is delivered unrecorded. A denial delivers no
+                // credential and performs no effect, so answering "denied"
+                // with the outcome row missing conceals nothing — and the
+                // decision itself is already durable, in `request.decision_json`,
+                // committed above.
+                //
+                // What is left behind is a `request` row with no outcome,
+                // which the boot-time unpaired-row scan flags. Telling the
+                // agent `Error` instead would trade a true answer for a false
+                // one and would not make the log any more complete.
+                tracing::error!(
+                    target: AUDIT_WRITE_FAILURE_TARGET,
+                    kind = "broker_mint_denied",
+                    request_id = %request_id,
+                    error = %e,
+                    "audit write failed: denial not recorded",
+                );
+            }
             return CapabilityOutcome::Denied { reason };
         }
         Decision::Grant(authorization) => authorization,
@@ -695,7 +736,7 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
         Ok(minted) => {
             let expires_at = minted.expires_at();
             let (token, grant) = minted.into_grant_and_token(request_id, session_id);
-            if let Err(e) = state.audit.record_grant(&grant) {
+            if let Err(e) = recorded.complete(&HostMintOutcome::Granted(&grant)) {
                 // The audit log is the system of record. Delivering a token
                 // that isn't recorded would violate the broker's core
                 // invariant ("no unaudited grant"). The minted token is
@@ -729,11 +770,11 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
             // payloads — see `MintError::agent_message`.
             let audit_message = error_with_source_chain(&e);
             let agent_message = e.agent_message();
-            if let Err(ae) =
-                state
-                    .audit
-                    .record_mint_failure(request_id, UnixMillis::now(), &audit_message)
-            {
+            if let Err(ae) = recorded.complete(&HostMintOutcome::Failed {
+                request_id,
+                failed_at: UnixMillis::now(),
+                error: &audit_message,
+            }) {
                 return CapabilityOutcome::Error {
                     message: format!(
                         "mint failed and the failure could not be recorded: {ae} \
