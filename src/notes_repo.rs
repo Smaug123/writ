@@ -196,13 +196,66 @@ const BORN_DEAD_RETRY_ATTEMPTS: usize = 3;
 /// `gc` participates in the lock.
 const GC_ARGV: [&str; 4] = ["gc", "--quiet", GC_PRUNE_GRACE, "--cruft"];
 
+/// Wall-clock bound on the repack in [`NotesRepo::compact_if_needed`], in place
+/// of the [`NOTES_GIT_TIMEOUT`] every other invocation here takes.
+///
+/// Compaction is the one command in this module whose *legitimate* cost grows
+/// with the repo's total history: a plain `gc` rewrites all packs, while the
+/// threshold that fires it counts only the recent backlog. Bounding it like a
+/// `notes add` is what let a repo grow large enough that no attempt could ever
+/// finish, at which point compaction stops working permanently — the retry gate
+/// bounds the waste but cannot make the work fit.
+///
+/// So this deadline is not sized to a legitimate repack; it is sized to be past
+/// any of them, and its job is to catch a *wedged* git (a stuck lock file, a
+/// stalled object directory) rather than a busy one. Measured on git 2.54: a
+/// 3000-commit bare repo with 320 loose objects packs in 0.158s, so at that
+/// shape 120s corresponds to somewhere around two to three million notes and
+/// ten minutes to roughly ten times that. No fixed number survives unbounded
+/// history — that is inherent, not an oversight here — but it moves the cliff
+/// out past any plausible notes repo.
+///
+/// The cost of the larger number is paid only in the state that trips it. This
+/// holds the notes-write mutex throughout, so a repack killed at the deadline
+/// stalls note writes for that long; [`COMPACTION_RETRY_BACKOFF`] then holds off
+/// the next attempt, capping it at ten minutes per hour rather than per request.
+/// A repo compacting normally never reaches this bound at all.
+///
+/// ## Why not make the operation cheaper instead
+///
+/// Because the obvious substitution does not work, which is worth recording so
+/// it is not re-proposed. `git repack -d` looks like the fix — pack the loose
+/// objects without rewriting existing packs, so cost matches trigger — but writ
+/// needs `--cruft`, and git-repack(1) defines `--cruft` as "same as `-a`". A
+/// `repack -d --cruft` therefore runs `pack-objects --all --reflog
+/// --indexed-objects`, which is a full repack costing the same as the `gc`
+/// (measured: 0.100s against `gc`'s 0.158s on the repo above, the difference
+/// being `gc`'s cheap extra steps, not the repack).
+///
+/// And `--cruft` cannot simply be dropped, because [`NotesRepo::write_note`]
+/// persists a seed blob per note that nothing ever references — the note is
+/// keyed on that blob's id, which appears in the notes tree only as a filename —
+/// so every note leaves one permanently unreachable object. A plain `repack -d`
+/// leaves those loose (measured: 320 loose objects becomes 20, exactly the
+/// unreachable ones), giving the repo a loose-object floor equal to the number
+/// of notes ever written. That would make compaction cheap and permanently
+/// ineffective, which is worse than expensive and correct.
+const COMPACTION_GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// How long a failed compaction holds off the next attempt.
 ///
 /// A bound on wasted work, not an estimate of when the cause will clear —
 /// nothing here knows that. The failure worth sizing against is a `gc` killed at
-/// [`NOTES_GIT_TIMEOUT`]: an hour's pause makes that cost at most two minutes an
-/// hour, against two minutes on *every* agent run with no gate at all. A repo
-/// compacting normally never reaches this code, so the pause costs it nothing.
+/// [`COMPACTION_GIT_TIMEOUT`]: an hour's pause makes that cost at most ten
+/// minutes an hour, against ten minutes on *every* agent run with no gate at
+/// all. A repo compacting normally never reaches this code, so the pause costs
+/// it nothing.
+///
+/// The ratio is deliberately not held fixed as the repack deadline grows. This
+/// number bounds how often writ retries something that just failed, which is a
+/// question about the failure, not about how long the attempt was allowed to
+/// take; tying them together would mean a longer deadline silently buying a
+/// longer blind spot.
 const COMPACTION_RETRY_BACKOFF: Duration = Duration::from_secs(60 * 60);
 
 /// The prune date [`GC_ARGV`] imposes: git's own default, spelled out.
@@ -259,6 +312,17 @@ impl GitLimits {
     const fn production() -> Self {
         Self {
             timeout: NOTES_GIT_TIMEOUT,
+            stdout_cap: NOTES_GIT_STDOUT_CAP,
+        }
+    }
+
+    /// The bounds for the repack in [`NotesRepo::compact_if_needed`].
+    ///
+    /// Same output cap — `gc --quiet` prints nothing on success — and a longer
+    /// deadline, for the reason [`COMPACTION_GIT_TIMEOUT`] gives.
+    const fn compaction() -> Self {
+        Self {
+            timeout: COMPACTION_GIT_TIMEOUT,
             stdout_cap: NOTES_GIT_STDOUT_CAP,
         }
     }
@@ -705,11 +769,14 @@ impl NotesRepo {
     ///
     /// ## What this does not guarantee
     ///
-    /// That the repo stays packed. The `gc` inherits `NOTES_GIT_TIMEOUT` like
-    /// every other invocation here, and a plain `gc` rewrites *all* packs, so its
-    /// cost grows with total history while the threshold that triggers it counts
-    /// only the recent backlog. A repo can therefore grow large enough that no
-    /// attempt ever finishes inside the deadline.
+    /// That the repo stays packed. A plain `gc` rewrites *all* packs, so its cost
+    /// grows with total history while the threshold that triggers it counts only
+    /// the recent backlog, and no fixed deadline survives unbounded growth. The
+    /// `gc` gets `COMPACTION_GIT_TIMEOUT` rather than the module's ordinary
+    /// bound precisely because of that mismatch — which moves the point where a
+    /// repo becomes permanently uncompactable out past any plausible notes repo,
+    /// but does not abolish it. That constant records the measurements, and why
+    /// making the operation cheaper instead does not work.
     ///
     /// What is bounded is the damage: `COMPACTION_RETRY_BACKOFF` holds off the
     /// next attempt, so that state costs one killed `gc` per hour rather than one
@@ -723,13 +790,9 @@ impl NotesRepo {
     /// structural rather than remembered: the inner `attempt_compaction` is not
     /// given the state, so no exit of it can fail to record.
     ///
-    /// Raising the deadline instead is not obviously right — this holds
-    /// the notes-write mutex throughout, so a longer deadline is a longer stall
-    /// on every note write — and the better answer is probably to make the
-    /// operation's cost match its trigger (`git repack -d` packs the loose
-    /// objects without rewriting existing packs), which would give up the
-    /// `gc.pid` exclusion above. That trade is unresolved and deliberately not
-    /// guessed at here.
+    /// The stall that buys is real and bounded: this holds the notes-write mutex
+    /// throughout, so a repack killed at the deadline blocks note writes for that
+    /// long, once per `COMPACTION_RETRY_BACKOFF`.
     pub fn compact_if_needed(&self) -> Result<CompactionOutcome, NotesRepoError> {
         self.compact_if_needed_with(CompactionThreshold::GIT_DEFAULT)
     }
@@ -763,6 +826,20 @@ impl NotesRepo {
         &self,
         threshold: CompactionThreshold,
     ) -> Result<CompactionOutcome, NotesRepoError> {
+        self.compact_if_needed_with_limits(threshold, GitLimits::compaction())
+    }
+
+    /// [`Self::compact_if_needed_with`] under caller-chosen bounds on the repack.
+    ///
+    /// Only tests want anything other than [`GitLimits::compaction`], and they
+    /// want it for one reason: the motivating failure is a repack killed at its
+    /// deadline, which cannot otherwise be provoked without waiting that deadline
+    /// out.
+    fn compact_if_needed_with_limits(
+        &self,
+        threshold: CompactionThreshold,
+        limits: GitLimits,
+    ) -> Result<CompactionOutcome, NotesRepoError> {
         let mut state = lock_notes_write(&self.canonical_path);
 
         // Read once, under the lock, so the decision and the state it is recorded
@@ -777,7 +854,7 @@ impl NotesRepo {
             return Ok(CompactionOutcome::Deferred { retry_in });
         }
 
-        let outcome = self.attempt_compaction(threshold);
+        let outcome = self.attempt_compaction(threshold, limits);
 
         // The only place the gate is written. Deliberately not at the exits of
         // the attempt above: this rule has three failure paths to cover — the
@@ -813,7 +890,13 @@ impl NotesRepo {
     fn attempt_compaction(
         &self,
         threshold: CompactionThreshold,
+        limits: GitLimits,
     ) -> Result<CompactionOutcome, NotesRepoError> {
+        // Deliberately *not* under `limits`: the longer deadline is for the
+        // repack, whose legitimate cost grows with total history. Counting loose
+        // objects is a walk of the 256 fanout directories and has no such growth,
+        // so widening its bound would only slow down the discovery that the
+        // object directory is wedged.
         let loose_objects = self.count_loose_objects()?;
 
         match compaction::decide(loose_objects, threshold) {
@@ -821,12 +904,13 @@ impl NotesRepo {
                 Ok(CompactionOutcome::Skipped { loose_objects })
             }
             CompactionDecision::Compact { loose_objects } => {
-                run_git(
+                run_git_with_limits(
                     &self.canonical_path,
                     GC_ARGV,
                     None,
                     CaptureOutput::Discard,
                     &self.inherited_env,
+                    limits,
                     // Convergent, and the one invocation here where that needs
                     // saying carefully. A `gc` killed partway leaves the repo
                     // consistent — it writes a new pack and only then unlinks the
@@ -1121,9 +1205,11 @@ where
         .map(|(stdout, _stderr)| stdout)
 }
 
-/// [`run_git`] under caller-chosen bounds. Only tests need anything other than
-/// [`GitLimits::production`].
-#[cfg(test)]
+/// [`run_git`] under caller-chosen bounds.
+///
+/// One production caller — the repack in [`NotesRepo::compact_if_needed`], which
+/// is the only command here whose legitimate cost grows with the repo's total
+/// history. Everything else takes [`GitLimits::production`].
 fn run_git_with_limits<'a, I>(
     repo: &Path,
     args: I,
