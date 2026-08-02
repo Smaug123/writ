@@ -124,12 +124,36 @@ impl TryFrom<AgentRunTerminalStatus> for GuestReportedRunStatus {
 /// What an agent run's stream looks like **in the audit log**: the bytes that
 /// are actually at `path`, plus whether there were more.
 ///
+/// What an agent run's stream looks like **in the audit log**: the bytes that
+/// are actually at `path`, plus how they came to stop there.
+///
 /// `byte_len` and `sha256_hex` describe the retained bytes — the file — and
 /// nothing else. That is the only reading under which they can be checked
 /// against anything: the row is what survives, and the row's `path` is what an
-/// operator opens. When `truncated`, the stream *was* longer, and how much
-/// longer is deliberately not recorded, because on the VM path that number is
-/// a claim by an untrusted guest.
+/// operator opens.
+///
+/// # The three ways a stream can be incomplete
+///
+/// 1. **Neither flag** — writ drained the stream to EOF and kept all of it. The
+///    file *is* the stream.
+/// 2. **`truncated`** — the stream was longer than the run's capture cap. How
+///    much longer is deliberately not recorded, because on the VM path that
+///    number is a claim by an untrusted guest.
+/// 3. **`stopped_at_deadline`** — writ stopped *reading* at the run's deadline.
+///    The agent, or something it left behind, still held the write end. What it
+///    went on to write is unknown and, unlike (2), unbounded.
+///
+/// Two flags rather than one three-valued field, because they are independent:
+/// a stream can outrun the cap *and* then be cut at the deadline, and a reader
+/// that had to pick one would lose a fact that happened. They answer different
+/// questions — "did writ choose to keep less?" and "did writ stop listening?" —
+/// and only the second leaves an unbounded remainder.
+///
+/// Whichever flags are set, the file at `path` is complete as a *file*: writ
+/// closes it before recording, so `byte_len` and `sha256_hex` never describe
+/// something still being appended to. That is the invariant that makes this row
+/// checkable at all, and it is why a capture cut short is stopped rather than
+/// abandoned.
 ///
 /// A run that has just been captured knows more than this — see
 /// [`AgentRunStreamCapture`], which carries both the retained and the whole
@@ -142,6 +166,12 @@ pub struct AgentRunStreamSummary {
     pub byte_len: u64,
     pub sha256_hex: String,
     pub truncated: bool,
+    /// Writ stopped reading at the deadline; the remainder is unknown and
+    /// unbounded. **Only the host arm can set this**: the guest never gives its
+    /// run a timeout, so a VM-path capture has no deadline to stop at, and the
+    /// broker records `false` by construction rather than believing a claim it
+    /// cannot check.
+    pub stopped_at_deadline: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -158,6 +188,26 @@ pub struct AgentRunStreamUpload {
     pub byte_len: u64,
     pub sha256_hex: String,
     pub truncated: bool,
+    /// The guest's capture stopped at its drain deadline rather than at EOF.
+    ///
+    /// Carried across the boundary even though the broker cannot check it,
+    /// because the alternative is worse: the guest runs the same
+    /// `run_agent_process`, which arms the drain deadline after **every**
+    /// process-group sweep and not only on runs given a timeout, so a guest
+    /// capture genuinely can end this way. Dropping the fact at the boundary
+    /// would have the broker record — and *sign* — a partial stream as
+    /// complete.
+    ///
+    /// Safe to take on trust in the only direction it can move a record. The
+    /// flag can make a stream look *less* complete than it was and never more,
+    /// so a hostile guest gains nothing by setting it; the fields it could
+    /// profit from lying about are `byte_len`/`sha256_hex`, which the broker
+    /// already treats as claims and checks the retained bytes against.
+    ///
+    /// `#[serde(default)]` so a guest binary older than this field decodes to
+    /// `false`, which is what such a guest would have meant.
+    #[serde(default)]
+    pub stopped_at_deadline: bool,
     pub retained_sha256_hex: String,
     pub retained_base64: String,
 }
@@ -712,6 +762,18 @@ mod process_runner {
         pub full_byte_len: u64,
         /// SHA-256 of the whole stream, retained or not.
         pub full_sha256_hex: String,
+        /// Whether writ stopped reading at the run's deadline rather than at the
+        /// stream's end.
+        ///
+        /// Stored, not derived, because nothing in the byte counts implies it:
+        /// a stream cut at the deadline before reaching the cap has
+        /// `full == retained` exactly as a complete short stream does. The two
+        /// are different facts and only this field separates them.
+        ///
+        /// When set, `full_*` describe everything writ *read*, which is no
+        /// longer the same as everything the child emitted — that quantity is
+        /// unknown, and unbounded.
+        pub stopped_at_deadline: bool,
     }
 
     impl AgentRunStreamCapture {
@@ -735,6 +797,7 @@ mod process_runner {
                 byte_len: self.retained_byte_len,
                 sha256_hex: self.retained_sha256_hex.clone(),
                 truncated: self.truncated(),
+                stopped_at_deadline: self.stopped_at_deadline,
             }
         }
     }
@@ -950,8 +1013,31 @@ mod process_runner {
             .expect("stderr was configured as piped before spawn");
         let max_stdout = plan.max_stream_capture_bytes;
         let max_stderr = plan.max_stream_capture_bytes;
+        // Shared with both capture threads and armed after the group sweep
+        // below. Until then it is empty, which means "drain for as long as it
+        // takes" — correct while the agent is legitimately still writing.
+        #[cfg(unix)]
+        let drain_deadline = std::sync::Arc::new(DrainDeadline::default());
+        #[cfg(unix)]
+        let stdout_thread = spawn_capture_thread(
+            "stdout",
+            stdout,
+            stdout_path.clone(),
+            max_stdout,
+            std::sync::Arc::clone(&drain_deadline),
+        )?;
+        #[cfg(unix)]
+        let stderr_thread = spawn_capture_thread(
+            "stderr",
+            stderr,
+            stderr_path.clone(),
+            max_stderr,
+            std::sync::Arc::clone(&drain_deadline),
+        )?;
+        #[cfg(not(unix))]
         let stdout_thread =
             spawn_capture_thread("stdout", stdout, stdout_path.clone(), max_stdout)?;
+        #[cfg(not(unix))]
         let stderr_thread =
             spawn_capture_thread("stderr", stderr, stderr_path.clone(), max_stderr)?;
 
@@ -1002,6 +1088,18 @@ mod process_runner {
         // the capture threads below see no EOF while a descendant holds one,
         // which held a finished run open for a descendant's entire lifetime.
         child.kill_group();
+
+        // Every legitimate writer is now dead, so EOF is imminent — unless
+        // something left the group and kept a write end, which `killpg` cannot
+        // reach. Arming the drain deadline here is what turns that from an
+        // unbounded hang into a bounded, *recorded* one: the captures get
+        // `DRAIN_GRACE` to see EOF, and a stream that does not is closed and
+        // flagged rather than waited on.
+        //
+        // After the sweep rather than before it, because before it a stream
+        // still open is the ordinary case.
+        #[cfg(unix)]
+        drain_deadline.set(std::time::Instant::now() + DRAIN_GRACE);
 
         // The sweep above is the last thing that needs the group addressable, so
         // the leader is released here — `child` had been holding it unreaped
@@ -1349,6 +1447,35 @@ mod process_runner {
     /// unwind past the running agent. The guard would still reap it — that is
     /// what the guard is for — but a daemon that reports "cannot start a
     /// capture thread" is far easier to act on than one whose handler panicked.
+    #[cfg(unix)]
+    fn spawn_capture_thread<R: Read + Send + 'static + std::os::fd::AsRawFd>(
+        stream: &'static str,
+        reader: R,
+        path: PathBuf,
+        max_capture_bytes: u64,
+        deadline: std::sync::Arc<DrainDeadline>,
+    ) -> Result<
+        thread::JoinHandle<Result<AgentRunStreamCapture, AgentProcessRunError>>,
+        AgentProcessRunError,
+    > {
+        thread::Builder::new()
+            .name(format!("writ-agent-{stream}"))
+            .spawn(move || {
+                capture_stream_to_deadline(
+                    reader,
+                    path,
+                    max_capture_bytes,
+                    &deadline,
+                    DRAIN_POST_DEADLINE_ALLOWANCE,
+                )
+            })
+            .map_err(|source| AgentProcessRunError::StreamThreadSpawn { stream, source })
+    }
+
+    /// Off Unix there are no process groups to escape from and no `poll(2)` to
+    /// bound the drain with, so the capture is the plain blocking one and the
+    /// shared deadline has nothing to tell it.
+    #[cfg(not(unix))]
     fn spawn_capture_thread<R: Read + Send + 'static>(
         stream: &'static str,
         reader: R,
@@ -1362,6 +1489,280 @@ mod process_runner {
             .name(format!("writ-agent-{stream}"))
             .spawn(move || capture_stream(reader, path, max_capture_bytes))
             .map_err(|source| AgentProcessRunError::StreamThreadSpawn { stream, source })
+    }
+
+    /// How long a capture keeps draining after the run's process group has been
+    /// swept, before concluding that whatever still holds the write end is not
+    /// going to let go.
+    ///
+    /// Not a guess at how long a descendant might live — it is how long a
+    /// *dying* process may take to have its descriptors closed by the kernel.
+    /// The sweep is the moment every legitimate writer becomes dead, so EOF
+    /// should follow within microseconds; this is slack for a loaded host, and
+    /// the price of setting it too low is a complete run mislabelled as cut
+    /// short. Five seconds is far past process teardown and still bounds the
+    /// call.
+    ///
+    /// Deliberately measured from the sweep rather than from the run's own
+    /// deadline. Tying it to the deadline would mean a run whose agent exited in
+    /// a second but whose deadline was an hour away waited the full hour before
+    /// giving up on an escaped descendant — and would give an *unbounded* run no
+    /// bound at all, when it is exactly as vulnerable.
+    #[cfg(unix)]
+    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long a capture waits in one `poll(2)` before re-reading the shared
+    /// deadline. Bounds how late it can notice a stop, nothing more.
+    #[cfg(unix)]
+    const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// How much a capture may still read *after* its deadline has passed.
+    ///
+    /// The deadline stops writ **waiting** for more output, but bytes already
+    /// sitting in the pipe are not "more output" — they arrived before the
+    /// deadline, and discarding them would make the record worse for no reason.
+    /// So an expired drain keeps reading while data is there.
+    ///
+    /// That alone would hand the bound back to the writer: a descendant
+    /// producing output at least as fast as the drain consumes it never yields
+    /// the `WouldBlock` that the deadline is checked at, and could hold the run
+    /// open indefinitely. This caps how far that can go.
+    ///
+    /// 1 MiB is far more than a pipe can hold — Linux and macOS buffer 64 KiB —
+    /// so it never truncates a genuine backlog; it exists solely to make the
+    /// post-deadline drain finite. A stream that hits it is by definition still
+    /// being written to, so it is recorded as stopped at the deadline, which is
+    /// exactly what it is.
+    #[cfg(unix)]
+    pub(super) const DRAIN_POST_DEADLINE_ALLOWANCE: u64 = 1024 * 1024;
+
+    /// When the capture threads should stop draining, set once by the thread
+    /// that swept the process group.
+    ///
+    /// A shared cell rather than a value passed at spawn time because the
+    /// instant that matters is not known until the sweep happens, and the
+    /// threads are necessarily already running by then — they are what keeps the
+    /// agent from blocking on a full pipe.
+    #[cfg(unix)]
+    #[derive(Debug, Default)]
+    pub(super) struct DrainDeadline(std::sync::Mutex<Option<std::time::Instant>>);
+
+    #[cfg(unix)]
+    impl DrainDeadline {
+        fn get(&self) -> Option<std::time::Instant> {
+            *self.0.lock().expect("drain deadline mutex poisoned")
+        }
+
+        /// Start the clock. Idempotent in effect: the sweep happens once, and a
+        /// second call would only move a deadline the readers may already have
+        /// acted on.
+        pub(super) fn set(&self, at: std::time::Instant) {
+            *self.0.lock().expect("drain deadline mutex poisoned") = Some(at);
+        }
+    }
+
+    /// Drain a pipe like [`capture_stream`], but stop once `deadline` says to.
+    ///
+    /// The reason this cannot simply be `capture_stream` with a timeout wrapped
+    /// around it: a blocking `read(2)` on a pipe nobody will ever close cannot be
+    /// interrupted from outside without closing the descriptor underneath it,
+    /// which races with descriptor reuse. So the pipe is put in non-blocking mode
+    /// and readiness is waited for explicitly, which is also what lets the stop
+    /// be *checked* rather than merely hoped for.
+    ///
+    /// Stopping — rather than abandoning the thread — is the load-bearing part.
+    /// An abandoned reader goes on appending to the file after the run has been
+    /// recorded, so the `byte_len` and `sha256_hex` in the audit row would
+    /// describe something still growing. Here the file is closed and synced
+    /// before the summary is built, so the row stays true of it forever.
+    #[cfg(unix)]
+    pub(super) fn capture_stream_to_deadline<R: Read + std::os::fd::AsRawFd>(
+        mut reader: R,
+        path: PathBuf,
+        max_capture_bytes: u64,
+        deadline: &DrainDeadline,
+        post_deadline_allowance: u64,
+    ) -> Result<AgentRunStreamCapture, AgentProcessRunError> {
+        let fd = reader.as_raw_fd();
+        set_nonblocking(fd).map_err(|source| AgentProcessRunError::StreamCapture {
+            path: path.clone(),
+            source,
+        })?;
+        let mut accumulator = StreamAccumulator::new(path, max_capture_bytes)?;
+        let mut buffer = [0u8; 8192];
+        let mut drained_past_deadline = 0u64;
+        // Once the write end is gone the remainder is whatever the pipe already
+        // holds — finite, and nobody's to steer — so the allowance stops
+        // applying and the drain runs to EOF.
+        let mut writer_gone = false;
+        loop {
+            // **Read first; let the deadline stop only the waiting.**
+            //
+            // The tempting shape — check the deadline, then read — silently
+            // loses data. The grace is five seconds of wall clock, and a thread
+            // on a loaded host can be descheduled past it; waking to find the
+            // deadline gone and returning at once would discard bytes sitting
+            // readable in the pipe, and could step over an EOF already there. A
+            // complete run would then be recorded as cut short on nothing but
+            // scheduling luck. Reading first makes the flag a statement about
+            // the stream rather than about how promptly writ got scheduled.
+            let expired = deadline
+                .get()
+                .is_some_and(|at| std::time::Instant::now() >= at);
+            match reader.read(&mut buffer) {
+                Ok(0) => return accumulator.finish(StreamEnd::ReachedEof),
+                Ok(read) => {
+                    accumulator.push(&buffer[..read])?;
+                    // Reading first is what stops a late wakeup losing data, but
+                    // on its own it hands the bound back to the writer: a
+                    // descendant producing output at least as fast as this
+                    // thread drains it never yields a `WouldBlock`, so the
+                    // deadline below is never consulted and the run is held open
+                    // for as long as it cares to keep writing. Draining past the
+                    // deadline is therefore allowed but *bounded* — enough to
+                    // empty what a pipe can hold, not enough to be steered.
+                    if expired && !writer_gone {
+                        drained_past_deadline = drained_past_deadline.saturating_add(read as u64);
+                        if drained_past_deadline >= post_deadline_allowance {
+                            // The allowance bounds an *active* writer. If the
+                            // write end is already gone, there is nobody left to
+                            // steer the drain and what remains is whatever the
+                            // pipe happens to hold — finite by construction — so
+                            // the bound stops applying and the stream is drained
+                            // to its real end. Latched: once gone, always gone,
+                            // and the check is not repeated per block.
+                            writer_gone = hangup(fd).map_err(|source| {
+                                AgentProcessRunError::StreamCapture {
+                                    path: accumulator.path.clone(),
+                                    source,
+                                }
+                            })?;
+                            if !writer_gone {
+                                // Still attached — but "attached" is not the
+                                // same as "still writing". One more read
+                                // separates a stream that merely *ended* on the
+                                // allowance boundary from one that is going on
+                                // past it, which is the difference between "it
+                                // ended" and "we stopped".
+                                return match reader.read(&mut buffer) {
+                                    Ok(0) => accumulator.finish(StreamEnd::ReachedEof),
+                                    // Still producing: keep what this read
+                                    // returned rather than dropping it on the
+                                    // way out, then stop.
+                                    Ok(read) => {
+                                        accumulator.push(&buffer[..read])?;
+                                        accumulator.finish(StreamEnd::StoppedAtDeadline)
+                                    }
+                                    // Nothing more right now, and past the
+                                    // deadline writ does not wait to find out.
+                                    Err(err)
+                                        if matches!(
+                                            err.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::Interrupted
+                                        ) =>
+                                    {
+                                        accumulator.finish(StreamEnd::StoppedAtDeadline)
+                                    }
+                                    Err(source) => Err(AgentProcessRunError::StreamCapture {
+                                        path: accumulator.path.clone(),
+                                        source,
+                                    }),
+                                };
+                            }
+                        }
+                    }
+                }
+                // Nothing buffered. This is the only point at which writ would
+                // have to *wait*, so it is the only point waiting is refused.
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if expired {
+                        return accumulator.finish(StreamEnd::StoppedAtDeadline);
+                    }
+                    if let Err(source) = wait_readable(fd, DRAIN_POLL_INTERVAL) {
+                        return Err(AgentProcessRunError::StreamCapture {
+                            path: accumulator.path.clone(),
+                            source,
+                        });
+                    }
+                }
+                // No progress made, so not an ending either way.
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) => {
+                    return Err(AgentProcessRunError::StreamCapture {
+                        path: accumulator.path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Has every write end of `fd` been closed?
+    ///
+    /// `POLLHUP` is the kernel telling us no more data can ever arrive, which is
+    /// what distinguishes a source that has *finished* from one that is merely
+    /// between writes. A regular file never reports it — there is no writer to
+    /// hang up — so this answers `false` there and the caller falls back to
+    /// probing for EOF, which a file gives immediately.
+    #[cfg(unix)]
+    fn hangup(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Zero timeout: this asks about the state now, and the caller is already
+        // past a deadline that says not to wait.
+        let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(pollfd.revents & libc::POLLHUP != 0)
+    }
+
+    /// Wait for `fd` to be readable, for at most `timeout`. `Ok(false)` is "not
+    /// readable yet", which includes being interrupted by a signal.
+    #[cfg(unix)]
+    fn wait_readable(
+        fd: std::os::fd::RawFd,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Saturating rather than wrapping: a timeout longer than `c_int` would
+        // otherwise become a short or negative one, and negative means "block
+        // forever" — the single value this function must never pass.
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let ready = unsafe { libc::poll(&raw mut pollfd, 1, millis) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(ready > 0)
+    }
+
+    /// Put `fd` in non-blocking mode, preserving whatever else was set on it.
+    #[cfg(unix)]
+    fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// How long to sleep before checking again, given how much of the deadline
@@ -1535,56 +1936,118 @@ mod process_runner {
     /// `pub(super)` so the crate's tests can drive it over an in-memory reader.
     /// Its contract is about bytes, not processes; pinning it through a shell
     /// script would mostly test the script.
+    /// Used by the non-Unix capture path, and by the crate's tests to pin the
+    /// byte-level contract over an in-memory reader. On Unix the production
+    /// drain is [`capture_stream_to_deadline`].
+    #[cfg(any(not(unix), test))]
     pub(super) fn capture_stream<R: Read>(
         mut reader: R,
         path: PathBuf,
         max_capture_bytes: u64,
     ) -> Result<AgentRunStreamCapture, AgentProcessRunError> {
-        let mut file = create_private_file(&path)?;
-        let mut total = 0u64;
-        let mut captured = 0u64;
+        let mut accumulator = StreamAccumulator::new(path, max_capture_bytes)?;
         let mut buffer = [0u8; 8192];
-        let mut full_hash = super::Sha256Stream::new();
-        let mut retained_hash = super::Sha256Stream::new();
         loop {
             let read =
                 reader
                     .read(&mut buffer)
                     .map_err(|source| AgentProcessRunError::StreamCapture {
-                        path: path.clone(),
+                        path: accumulator.path.clone(),
                         source,
                     })?;
             if read == 0 {
                 break;
             }
-            let chunk = &buffer[..read];
-            full_hash.update(chunk);
-            total = total.saturating_add(read as u64);
-            if captured < max_capture_bytes {
-                let remaining = (max_capture_bytes - captured) as usize;
-                let to_write = remaining.min(read);
-                let kept = &chunk[..to_write];
-                file.write_all(kept)
-                    .map_err(|source| AgentProcessRunError::StreamCapture {
-                        path: path.clone(),
-                        source,
-                    })?;
-                retained_hash.update(kept);
-                captured += to_write as u64;
-            }
+            accumulator.push(&buffer[..read])?;
         }
-        file.sync_all()
-            .map_err(|source| AgentProcessRunError::StreamCapture {
-                path: path.clone(),
-                source,
-            })?;
-        Ok(AgentRunStreamCapture {
-            path,
-            retained_byte_len: captured,
-            retained_sha256_hex: retained_hash.finish_hex(),
-            full_byte_len: total,
-            full_sha256_hex: full_hash.finish_hex(),
-        })
+        accumulator.finish(StreamEnd::ReachedEof)
+    }
+
+    /// Why a capture stopped, which is the only thing the byte counts cannot say
+    /// for themselves.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub(super) enum StreamEnd {
+        /// The write ends all closed and the reader saw EOF. The file is the
+        /// stream (up to the capture cap).
+        ReachedEof,
+        /// Writ stopped reading with the stream still open. Something still held
+        /// a write end — see [`DRAIN_GRACE`].
+        StoppedAtDeadline,
+    }
+
+    /// The accumulating half of a capture: everything that happens to bytes once
+    /// they have been read, with no opinion about how they were read.
+    ///
+    /// Split out because there are two readers — a blocking drain to EOF and a
+    /// deadline-bounded poll loop — and exactly one definition of what "kept",
+    /// "seen", and "hashed" mean. Duplicating that per reader is how the two
+    /// would drift into disagreeing about what `truncated` counts.
+    struct StreamAccumulator {
+        path: PathBuf,
+        file: fs::File,
+        max_capture_bytes: u64,
+        total: u64,
+        captured: u64,
+        full_hash: super::Sha256Stream,
+        retained_hash: super::Sha256Stream,
+    }
+
+    impl StreamAccumulator {
+        fn new(path: PathBuf, max_capture_bytes: u64) -> Result<Self, AgentProcessRunError> {
+            let file = create_private_file(&path)?;
+            Ok(Self {
+                path,
+                file,
+                max_capture_bytes,
+                total: 0,
+                captured: 0,
+                full_hash: super::Sha256Stream::new(),
+                retained_hash: super::Sha256Stream::new(),
+            })
+        }
+
+        /// Account for `chunk`, keeping as much of it as the cap still allows.
+        fn push(&mut self, chunk: &[u8]) -> Result<(), AgentProcessRunError> {
+            self.full_hash.update(chunk);
+            self.total = self.total.saturating_add(chunk.len() as u64);
+            if self.captured >= self.max_capture_bytes {
+                return Ok(());
+            }
+            let remaining = (self.max_capture_bytes - self.captured) as usize;
+            let kept = &chunk[..remaining.min(chunk.len())];
+            self.file
+                .write_all(kept)
+                .map_err(|source| AgentProcessRunError::StreamCapture {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.retained_hash.update(kept);
+            self.captured += kept.len() as u64;
+            Ok(())
+        }
+
+        /// Close the file and describe what is in it.
+        ///
+        /// The `sync_all` is what makes the recorded hash a statement about
+        /// something durable, and it happens on *both* endings — a capture cut
+        /// at the deadline still leaves a complete file, which is the whole
+        /// reason writ stops the drain rather than abandoning it.
+        fn finish(self, end: StreamEnd) -> Result<AgentRunStreamCapture, AgentProcessRunError> {
+            self.file
+                .sync_all()
+                .map_err(|source| AgentProcessRunError::StreamCapture {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            Ok(AgentRunStreamCapture {
+                path: self.path,
+                retained_byte_len: self.captured,
+                retained_sha256_hex: self.retained_hash.finish_hex(),
+                full_byte_len: self.total,
+                full_sha256_hex: self.full_hash.finish_hex(),
+                stopped_at_deadline: end == StreamEnd::StoppedAtDeadline,
+            })
+        }
     }
 
     fn ensure_private_dir(path: &Path) -> Result<(), AgentProcessRunError> {
@@ -2801,6 +3264,330 @@ mod tests {
             elapsed < descendant_lifetime / 2,
             "the run took {elapsed:?}, so the descendant outlived the deadline"
         );
+    }
+
+    /// A reader that is *always* ready must not extend an expired drain without
+    /// limit.
+    ///
+    /// Raised in review against the first version of this drain. Reading before
+    /// consulting the deadline is what stops a late wakeup losing data — but on
+    /// its own it hands the bound straight back to the writer: a source that
+    /// never yields a `WouldBlock` never reaches the point where the deadline is
+    /// checked, so the run stays open for as long as it keeps producing. The
+    /// bound would hold against a descendant that *sleeps* and fail against one
+    /// that is *busy*, which is the wrong way round.
+    ///
+    /// `/dev/zero` rather than a flooding subprocess, deliberately. A real
+    /// writer only reproduces this while it outpaces the drain, and the drain
+    /// hashes twice and writes to a file per block — so a subprocess flood
+    /// yields `WouldBlock` gaps, stops at the deadline for the *other* reason,
+    /// and passes whether or not the allowance exists. Measured: with a `perl`
+    /// flood, removing `DRAIN_POST_DEADLINE_ALLOWANCE` left the test green.
+    /// `/dev/zero` is always readable and never ends, so it is the pathological
+    /// case exactly, with no timing to get lucky with.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn an_always_ready_stream_cannot_extend_an_expired_drain_without_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let zero = fs::File::open("/dev/zero").expect("/dev/zero opens");
+
+        let deadline = process_runner::DrainDeadline::default();
+        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+
+        let started = std::time::Instant::now();
+        let capture = process_runner::capture_stream_to_deadline(
+            zero,
+            dir.path().join("stdout.log"),
+            4096,
+            &deadline,
+            process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
+        )
+        .expect("the drain succeeds");
+        let elapsed = started.elapsed();
+
+        assert!(
+            capture.stopped_at_deadline,
+            "a stream still producing when writ gave up must say it was cut"
+        );
+        // One buffer's slack: the allowance is checked after the read that
+        // crosses it, so the last block may carry the count past the bound.
+        assert!(
+            capture.full_byte_len <= process_runner::DRAIN_POST_DEADLINE_ALLOWANCE + 8192,
+            "the post-deadline drain must be bounded; read {} bytes",
+            capture.full_byte_len
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the drain must end on writ's schedule, not the source's: took {elapsed:?}"
+        );
+    }
+
+    /// A *complete* stream whose backlog exhausts the allowance is complete, not
+    /// cut.
+    ///
+    /// Raised in review. Exhausting `DRAIN_POST_DEADLINE_ALLOWANCE` means the
+    /// backlog was large, which is not the same as unfinished — a finished
+    /// stream whose last bytes happen to land on the boundary would otherwise be
+    /// flagged a prefix and *signed* as one. Reachable in practice: Linux pipes
+    /// can be enlarged past the 64 KiB default, and a capture thread descheduled
+    /// while one fills wakes to exactly this.
+    ///
+    /// A regular file stands in for the pipe, because what is under test is the
+    /// classification at the boundary and a file gives it deterministically: the
+    /// whole stream is there, ends, and the deadline is already past.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_complete_stream_that_exhausts_the_allowance_is_not_called_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.bin");
+        // Exactly the allowance: the smallest input that reaches the boundary,
+        // so a classification that fires *at* it is caught rather than skipped.
+        let source = vec![b'z'; process_runner::DRAIN_POST_DEADLINE_ALLOWANCE as usize];
+        fs::write(&source_path, &source).unwrap();
+        let handle = fs::File::open(&source_path).expect("source opens");
+
+        let deadline = process_runner::DrainDeadline::default();
+        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+
+        let capture = process_runner::capture_stream_to_deadline(
+            handle,
+            dir.path().join("stdout.log"),
+            u64::MAX,
+            &deadline,
+            process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
+        )
+        .expect("the drain succeeds");
+
+        assert!(
+            !capture.stopped_at_deadline,
+            "the stream ended, so exhausting the allowance must not be read as writ \
+             having stopped early"
+        );
+        assert_eq!(
+            capture.full_byte_len,
+            source.len() as u64,
+            "and every byte of it must be accounted for"
+        );
+    }
+
+    /// A closed writer's backlog is drained to EOF however far past the
+    /// allowance it runs.
+    ///
+    /// Raised in review, as the general case of the test above. Exhausting the
+    /// allowance triggers an EOF probe, but a *large* finished backlog answers
+    /// that probe with data rather than `Ok(0)` — so the stream would be called
+    /// cut on the grounds that it was big. Reachable wherever the buffer can
+    /// hold more than the allowance (a Linux pipe enlarged past it) with the
+    /// capture thread descheduled while it filled.
+    ///
+    /// The fix is to ask *who is still there*: the allowance exists to stop an
+    /// active writer steering the drain, and once the write end is closed there
+    /// is nobody to steer it and what remains is finite by construction. So the
+    /// bound lifts and the drain finishes the stream.
+    ///
+    /// A real pipe, a writer that exits, and an allowance small enough that the
+    /// backlog dwarfs it — the parameter exists so this is provable at bytes
+    /// rather than at megabytes, and so the case does not depend on a platform
+    /// whose pipe buffer happens to be large.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_closed_writers_backlog_is_finished_however_far_past_the_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![b'q'; 16 * 1024];
+        let mut child = writ_core::process_spawn::spawn(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf 'q%.0s' $(seq 1 {})", payload.len()))
+                .stdout(std::process::Stdio::piped()),
+        )
+        .expect("spawn a writer");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        // Reaped first, so every write end is closed before the drain starts and
+        // the hangup is unambiguous rather than racing the reader.
+        child.wait().expect("the writer exits");
+
+        let deadline = process_runner::DrainDeadline::default();
+        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+
+        let capture = process_runner::capture_stream_to_deadline(
+            stdout,
+            dir.path().join("stdout.log"),
+            u64::MAX,
+            &deadline,
+            // Far below the backlog: without the hangup check the drain would
+            // stop here and call a finished stream a prefix.
+            64,
+        )
+        .expect("the drain succeeds");
+
+        assert!(
+            !capture.stopped_at_deadline,
+            "the writer had already closed, so the stream ended rather than being cut"
+        );
+        assert_eq!(
+            capture.full_byte_len,
+            payload.len() as u64,
+            "and the whole backlog must be accounted for, not just the allowance"
+        );
+    }
+
+    /// An expired deadline must not cost bytes that were already readable.
+    ///
+    /// This is the invariant behind reading before consulting the deadline. The
+    /// grace is wall-clock, and a capture thread on a loaded host can be
+    /// descheduled straight past it — so the moment it wakes, the deadline is
+    /// already gone. If that were checked first, a run whose output was sitting
+    /// complete in the pipe would be recorded as cut short, with an empty file,
+    /// on nothing but scheduling luck. The flag has to describe the stream, not
+    /// writ's scheduling.
+    ///
+    /// Set up so the deadline is *unambiguously* past — it is in the past
+    /// before the drain is even entered — and the child has exited, so its
+    /// bytes and its EOF are both already waiting. The only correct answer is
+    /// the whole stream, ended by EOF.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_deadline_already_past_still_collects_what_is_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = writ_core::process_spawn::spawn(
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("printf 'buffered before the deadline passed\\n'")
+                .stdout(std::process::Stdio::piped()),
+        )
+        .expect("spawn a writer");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        // Reaped before the drain, so the write end is closed and both the
+        // bytes and the EOF are queued rather than racing the reader.
+        child.wait().expect("the writer exits");
+
+        let deadline = process_runner::DrainDeadline::default();
+        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+
+        let capture = process_runner::capture_stream_to_deadline(
+            stdout,
+            dir.path().join("stdout.log"),
+            1024,
+            &deadline,
+            process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
+        )
+        .expect("the drain succeeds");
+
+        assert_eq!(
+            capture.full_byte_len, 36,
+            "an expired deadline must not discard bytes that were already readable"
+        );
+        assert!(
+            !capture.stopped_at_deadline,
+            "the stream reached EOF, so it is complete however late writ was scheduled"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("stdout.log")).unwrap(),
+            b"buffered before the deadline passed\n"
+        );
+    }
+
+    /// A descendant that **leaves the process group** must not hold the run open
+    /// past its deadline either — and the stream it held must say so.
+    ///
+    /// The two `a_deadline_..._descendant` tests either side of this one both
+    /// rely on the group sweep reaching the descendant. This is the case it
+    /// cannot reach: `setsid(2)` puts the descendant in a new session, so
+    /// `killpg` misses it, it keeps the inherited stdout write end, and the
+    /// capture thread never sees EOF. Before the deadline on the capture itself,
+    /// that hung for the descendant's whole lifetime — the exact failure the
+    /// deadline exists to prevent, one `setsid` away.
+    ///
+    /// Two assertions, because either alone would pass for the wrong reason. The
+    /// wall clock says writ stopped waiting. `stopped_at_deadline` says the
+    /// summary *admits* it: the file at `path` is complete as a file, but the
+    /// stream it came from was still being written, and how much more there was
+    /// is unknown and unbounded. Recording that as an ordinary short stdout
+    /// would be a row that reads as "the agent said this much" when what happened
+    /// is "writ stopped listening".
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_stream_held_by_an_escaped_descendant_is_cut_and_says_so() {
+        // `setsid(2)` has no shell builtin and macOS ships no `setsid(1)`, so the
+        // escape is done in perl. Skip rather than pass vacuously where it is
+        // absent — the `maybe_git` precedent, and the same choice
+        // `an_escaped_descendant_cannot_hold_the_supervisor_past_the_deadline`
+        // makes for the same reason.
+        let Some(perl) = ["/usr/bin/perl", "/bin/perl"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|candidate| candidate.is_file())
+        else {
+            eprintln!("skipping: no perl to call setsid(2) with");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let descendant_lifetime = Duration::from_secs(60);
+        let escaped = dir.path().join("escaped");
+        let fake = write_escaping_fake_agent(dir.path(), &perl, &escaped, descendant_lifetime);
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000309".parse().unwrap();
+        let plan = AgentProcessPlan::new(run_id, fake, [] as [OsString; 0])
+            .unwrap()
+            .with_timeout(AgentRunTimeout::try_new(Duration::from_millis(500)).unwrap());
+
+        let started = std::time::Instant::now();
+        let outcome = run_within(
+            plan,
+            AgentPrompt::new("escape the group and hold my stdout"),
+            dir.path().join("logs"),
+            descendant_lifetime / 2,
+        );
+        let elapsed = started.elapsed();
+
+        // Checked after the run, not before: the helper confirms its escape
+        // before the leader exits, so an absent marker means the escape never
+        // happened and the test would be asserting against an ordinary
+        // descendant the group sweep reaches.
+        if !escaped.exists() {
+            eprintln!("skipping: the helper never confirmed its setsid escape");
+            return;
+        }
+        assert!(
+            elapsed < descendant_lifetime / 2,
+            "the run took {elapsed:?}, so the escaped descendant outlived the deadline"
+        );
+        assert_eq!(outcome.status, AgentRunTerminalStatus::TimedOut);
+        assert!(
+            outcome.stdout.stopped_at_deadline,
+            "the stdout capture was cut at the deadline, so its summary must say so \
+             rather than presenting a partial file as a complete stream"
+        );
+    }
+
+    /// An agent whose descendant calls `setsid(2)` — leaving the process group
+    /// entirely — while keeping the inherited stdout write end.
+    #[cfg(all(feature = "host", unix))]
+    fn write_escaping_fake_agent(
+        dir: &Path,
+        perl: &Path,
+        escaped: &Path,
+        descendant_lifetime: Duration,
+    ) -> std::path::PathBuf {
+        let path = dir.join("escaping-agent.sh");
+        let seconds = descendant_lifetime.as_secs();
+        // The helper must confirm the escape *before* the leader exits, or the
+        // group sweep races it and kills it while it is still in the group —
+        // which would make this test pass for the wrong reason. It does not
+        // redirect stdout, so it inherits and holds the write end, which is what
+        // stops the capture thread ever seeing EOF.
+        let script = format!(
+            "#!/bin/sh\n\
+             {perl} -e 'use POSIX; POSIX::setsid() or exit 3; \
+             open(F, \">\", \"{escaped}\") or exit 4; print F \"escaped\\n\"; close F; \
+             sleep {seconds}' &\n\
+             i=0; while [ ! -f {escaped} ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n\
+             sleep 300\n",
+            perl = perl.display(),
+            escaped = escaped.display(),
+        );
+        fs::write(&path, script).unwrap();
+        make_executable(&path);
+        path
     }
 
     /// The deadline bounds the run even when the agent itself finished long

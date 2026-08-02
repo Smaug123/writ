@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 9;
+pub(super) const SCHEMA_VERSION: i32 = 10;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -105,6 +105,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "0009_agent_run_timed_out",
         sql: include_str!("migrations/0009_agent_run_timed_out.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "0010_agent_run_stream_stopped_at_deadline",
+        sql: include_str!("migrations/0010_agent_run_stream_stopped_at_deadline.sql"),
     },
 ];
 

@@ -381,6 +381,7 @@ async fn upload_agent_run_outcome_posts_stream_metadata_and_retained_bytes() {
             retained_sha256_hex: writ_agent_run::sha256_hex(b"Hello from Claude\n"),
             full_byte_len: 18,
             full_sha256_hex: writ_agent_run::sha256_hex(b"Hello from Claude\n"),
+            stopped_at_deadline: false,
         },
         stderr: AgentRunStreamCapture {
             path: stderr_path,
@@ -388,6 +389,7 @@ async fn upload_agent_run_outcome_posts_stream_metadata_and_retained_bytes() {
             retained_sha256_hex: writ_agent_run::sha256_hex(b""),
             full_byte_len: 0,
             full_sha256_hex: writ_agent_run::sha256_hex(b""),
+            stopped_at_deadline: false,
         },
     };
     let (broker_url, captured) = serve_once(http_response("200 OK", "text/plain", b"ok")).await;
@@ -439,6 +441,7 @@ async fn upload_agent_run_outcome_reports_the_whole_stream_and_sends_only_what_i
             retained_sha256_hex: writ_agent_run::sha256_hex(b"abc"),
             full_byte_len: 6,
             full_sha256_hex: writ_agent_run::sha256_hex(b"abcdef"),
+            stopped_at_deadline: false,
         },
         stderr: AgentRunStreamCapture {
             path: stderr_path,
@@ -446,6 +449,7 @@ async fn upload_agent_run_outcome_reports_the_whole_stream_and_sends_only_what_i
             retained_sha256_hex: writ_agent_run::sha256_hex(b""),
             full_byte_len: 0,
             full_sha256_hex: writ_agent_run::sha256_hex(b""),
+            stopped_at_deadline: false,
         },
     };
     let (broker_url, captured) = serve_once(http_response("200 OK", "text/plain", b"ok")).await;
@@ -2019,6 +2023,7 @@ fn sample_agent_run_outcome(dir: &Path, run_id: AgentRunId) -> AgentRunCapture {
             retained_sha256_hex: writ_agent_run::sha256_hex(b"out"),
             full_byte_len: 3,
             full_sha256_hex: writ_agent_run::sha256_hex(b"out"),
+            stopped_at_deadline: false,
         },
         stderr: AgentRunStreamCapture {
             path: stderr_path,
@@ -2026,6 +2031,7 @@ fn sample_agent_run_outcome(dir: &Path, run_id: AgentRunId) -> AgentRunCapture {
             retained_sha256_hex: writ_agent_run::sha256_hex(b"err"),
             full_byte_len: 3,
             full_sha256_hex: writ_agent_run::sha256_hex(b"err"),
+            stopped_at_deadline: false,
         },
     }
 }

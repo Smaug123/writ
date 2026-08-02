@@ -484,6 +484,29 @@ fn materialize_agent_run_stream(
         retained_sha256_hex: upload.retained_sha256_hex,
         full_byte_len: upload.byte_len,
         full_sha256_hex: upload.sha256_hex,
+        // Taken from the guest, and this one is *not* re-derivable. Every other
+        // field here is either checked against the bytes on disk or narrowed by
+        // `to_summary`; this one is a fact about how the guest's own drain
+        // ended, and nothing that reaches the broker implies it.
+        //
+        // Carried rather than dropped because the guest runs the same
+        // `run_agent_process`, which arms the drain deadline after **every**
+        // process-group sweep — not only on runs given a timeout. A guest agent
+        // that exits while an escaped descendant holds stdout open past the
+        // grace therefore produces exactly this, and hardcoding `false` would
+        // make the broker record, and then *sign*, a partial stream as the
+        // complete output of the run.
+        //
+        // Trusting it is safe in the only direction it moves: the flag can make
+        // a stream look less complete than it was and never more, so a hostile
+        // guest gains nothing by setting it, and a hostile guest that clears it
+        // is in the same position as one lying about `byte_len` — already
+        // treated as a claim, already checked against the retained bytes.
+        //
+        // Not to be confused with the host's `RUN_AGENT_VM_TIMEOUT`, which
+        // fires when no outcome arrives at all and leaves the request unpaired
+        // rather than producing a row to mark.
+        stopped_at_deadline: upload.stopped_at_deadline,
     }
     .to_summary())
 }
@@ -577,6 +600,106 @@ mod tests {
         assert_eq!(second.status, VmHttpStatus::NotFound);
     }
 
+    /// A guest capture that stopped at its drain deadline must reach the audit
+    /// row saying so.
+    ///
+    /// Raised in review. The first version of this hardcoded `false` here, on
+    /// the reasoning that only a run *given* a timeout can stop at a deadline
+    /// and the guest never sets one. That reasoning was wrong: the guest runs
+    /// the same `run_agent_process`, which arms the drain deadline after **every**
+    /// process-group sweep, timeout or no timeout. So a guest agent that exits
+    /// while an escaped descendant holds stdout open past the grace produces
+    /// exactly this — and hardcoding `false` made the broker record, and then
+    /// sign, a partial stream as the run's complete output.
+    ///
+    /// The stream here is deliberately below every cap and `truncated: false`,
+    /// so this flag is the only thing distinguishing a cut stream from a short
+    /// one. Nothing else in the upload implies it, which is why it has to be
+    /// carried rather than re-derived.
+    #[tokio::test]
+    async fn a_guest_stream_cut_at_its_deadline_is_recorded_as_cut() {
+        let github = MockServer::start().await;
+        let state = make_broker_state(&github);
+        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        open_audit_session(&state, session.session_id());
+        let run_id: AgentRunId = "00000000-0000-0000-0000-000000000409".parse().unwrap();
+        state
+            .audit
+            .record_agent_run(&crate::audit::AgentRunAuditRecord {
+                run_id,
+                session_id: session.session_id(),
+                requested_at: UnixMillis::now(),
+                agent_kind: crate::core::AgentKind::Claude,
+                prompt: AgentPrompt::new("prompt").summary(),
+                correlation_id: None,
+                purpose: None,
+            })
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            VmHttpAgentRunService::new(Arc::clone(&state), temp.path().join("agent-runs"));
+        let partial = b"partial before the guest stopped reading\n";
+        let upload = VmAgentRunOutcomeUpload {
+            run_id,
+            status: crate::agent_run::GuestReportedRunStatus::Succeeded,
+            exit_code: 0,
+            stdout: AgentRunStreamUpload {
+                byte_len: partial.len() as u64,
+                sha256_hex: crate::agent_run::sha256_hex(partial),
+                truncated: false,
+                stopped_at_deadline: true,
+                retained_sha256_hex: crate::agent_run::sha256_hex(partial),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(partial),
+            },
+            stderr: AgentRunStreamUpload {
+                byte_len: 0,
+                sha256_hex: crate::agent_run::sha256_hex(b""),
+                truncated: false,
+                stopped_at_deadline: false,
+                retained_sha256_hex: crate::agent_run::sha256_hex(b""),
+                retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+            },
+        };
+        let body = serde_json::to_vec(&upload).unwrap();
+
+        let response =
+            route_agent_run_outcome_request(run_id, session.session_id(), &body, &service)
+                .await
+                .into_buffered();
+
+        assert_eq!(response.status, VmHttpStatus::Ok);
+        let outcome = state.audit.get_agent_run_outcome(run_id).unwrap().unwrap();
+        assert!(
+            outcome.outcome.stdout.stopped_at_deadline,
+            "a guest stream cut at its deadline must not be recorded as complete"
+        );
+        assert!(
+            !outcome.outcome.stdout.truncated,
+            "it did not outrun the cap, so the other flag must stay clear — the two \
+             are different facts and the row has to keep them apart"
+        );
+        assert!(
+            !outcome.outcome.stderr.stopped_at_deadline,
+            "the other stream ended normally and must not inherit the flag"
+        );
+    }
+
+    /// An upload from a guest binary older than `stopped_at_deadline` must still
+    /// decode, as the stream having ended normally — which is what such a guest
+    /// meant, since it had no other ending to report.
+    #[test]
+    fn an_upload_without_the_deadline_flag_decodes_as_not_cut() {
+        let json = serde_json::json!({
+            "byte_len": 6,
+            "sha256_hex": crate::agent_run::sha256_hex(b"Hello\n"),
+            "truncated": false,
+            "retained_sha256_hex": crate::agent_run::sha256_hex(b"Hello\n"),
+            "retained_base64": base64::engine::general_purpose::STANDARD.encode(b"Hello\n"),
+        });
+        let upload: AgentRunStreamUpload = serde_json::from_value(json).expect("decodes");
+        assert!(!upload.stopped_at_deadline);
+    }
+
     #[tokio::test]
     async fn agent_run_outcome_route_records_audit_and_materializes_retained_streams() {
         let github = MockServer::start().await;
@@ -609,6 +732,7 @@ mod tests {
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"Hello\n"),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b"Hello\n"),
+                stopped_at_deadline: false,
             },
             stderr: AgentRunStreamUpload {
                 byte_len: 0,
@@ -616,6 +740,7 @@ mod tests {
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b""),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+                stopped_at_deadline: false,
             },
         };
         let body = serde_json::to_vec(&upload).unwrap();
@@ -693,6 +818,7 @@ mod tests {
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"Attack"),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b"Attack"),
+                stopped_at_deadline: false,
             },
             stderr: AgentRunStreamUpload {
                 byte_len: 0,
@@ -700,6 +826,7 @@ mod tests {
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b""),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+                stopped_at_deadline: false,
             },
         };
         let body = serde_json::to_vec(&upload).unwrap();
@@ -748,6 +875,7 @@ mod tests {
             truncated: false,
             retained_sha256_hex: crate::agent_run::sha256_hex(b""),
             retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+            stopped_at_deadline: false,
         };
         VmAgentRunOutcomeUpload {
             run_id,
@@ -966,6 +1094,7 @@ mod tests {
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b""),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+                stopped_at_deadline: false,
             },
             stderr: AgentRunStreamUpload {
                 byte_len: 0,
@@ -973,6 +1102,7 @@ mod tests {
                 truncated: false,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b""),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+                stopped_at_deadline: false,
             },
         };
         let body = serde_json::to_vec(&upload).unwrap();
@@ -1013,6 +1143,7 @@ mod tests {
             truncated: false,
             retained_sha256_hex: crate::agent_run::sha256_hex(b""),
             retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+            stopped_at_deadline: false,
         };
         let upload = VmAgentRunOutcomeUpload {
             run_id,
@@ -1024,6 +1155,7 @@ mod tests {
                 truncated: true,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"H"),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b"H"),
+                stopped_at_deadline: false,
             },
             stderr: valid_stderr.clone(),
         };
@@ -1045,6 +1177,7 @@ mod tests {
                 truncated: true,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"not-H"),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b"H"),
+                stopped_at_deadline: false,
             },
             stderr: valid_stderr.clone(),
             ..upload
@@ -1066,6 +1199,7 @@ mod tests {
                 truncated: true,
                 retained_sha256_hex: crate::agent_run::sha256_hex(b"H"),
                 retained_base64: base64::engine::general_purpose::STANDARD.encode(b"H"),
+                stopped_at_deadline: false,
             },
             stderr: valid_stderr,
             ..upload
