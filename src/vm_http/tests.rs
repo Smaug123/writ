@@ -1841,6 +1841,7 @@ mod brokered_route_audit_oracle {
                     truncated: false,
                     retained_sha256_hex: crate::agent_run::sha256_hex(b""),
                     retained_base64: base64::engine::general_purpose::STANDARD.encode(b""),
+                    stopped_at_deadline: false,
                 };
                 post(
                     &vm_agent_run_outcome_path(run_id),

@@ -781,6 +781,7 @@ fn agent_run_stream_upload(
         byte_len: capture.full_byte_len,
         sha256_hex: capture.full_sha256_hex.clone(),
         truncated: capture.truncated(),
+        stopped_at_deadline: capture.stopped_at_deadline,
         retained_sha256_hex: writ_agent_run::sha256_hex(&retained),
         retained_base64: base64_standard(&retained),
     })

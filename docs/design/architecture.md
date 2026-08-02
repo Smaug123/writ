@@ -577,10 +577,28 @@ own flag rather than reusing `truncated`:
 
 Two flags rather than one three-valued field, because they are independent — a
 stream can outrun the cap and *then* be cut short — and because the questions
-differ: "did writ choose to keep less?" against "did writ stop listening?". Only
-the host arm can set the second; the guest never gives its run a timeout, so a
-VM-path capture has no deadline to stop at and the broker records `false` by
-construction rather than believing a claim it could not check.
+differ: "did writ choose to keep less?" against "did writ stop listening?".
+
+The drain reads *before* consulting the deadline, so an expired deadline never
+costs bytes that were already sitting readable: the grace is wall clock, and a
+thread descheduled past it must not record a complete run as cut short on
+scheduling luck. That alone would hand the bound back to the writer, though — a
+source that never yields a `WouldBlock` never reaches the check — so draining
+past the deadline is allowed but capped at
+`DRAIN_POST_DEADLINE_ALLOWANCE` (1 MiB, far more than a pipe's 64 KiB buffer).
+A stream that hits that cap is by definition still being written, and is
+recorded as cut.
+
+**Both arms can produce it.** The guest runs the same `run_agent_process`, which
+arms the drain deadline after *every* sweep and not only on runs given a
+timeout, so `AgentRunStreamUpload` carries the flag. The broker cannot re-derive
+it — nothing else in the upload implies it — and takes it on trust, which is
+safe in the only direction it moves: the flag can make a stream look *less*
+complete than it was and never more, so a hostile guest gains nothing by setting
+it, and one that clears it is in the same position as one lying about
+`byte_len`, already treated as a claim and checked against the retained bytes.
+The field is `#[serde(default)]`, so an older guest binary decodes to `false` —
+what such a guest would have meant.
 
 The signed envelope does *not* keep the two apart, and deliberately so. It asks
 one question — are these bytes the whole stream, or a prefix? — and both endings

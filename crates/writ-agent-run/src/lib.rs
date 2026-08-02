@@ -188,6 +188,26 @@ pub struct AgentRunStreamUpload {
     pub byte_len: u64,
     pub sha256_hex: String,
     pub truncated: bool,
+    /// The guest's capture stopped at its drain deadline rather than at EOF.
+    ///
+    /// Carried across the boundary even though the broker cannot check it,
+    /// because the alternative is worse: the guest runs the same
+    /// `run_agent_process`, which arms the drain deadline after **every**
+    /// process-group sweep and not only on runs given a timeout, so a guest
+    /// capture genuinely can end this way. Dropping the fact at the boundary
+    /// would have the broker record — and *sign* — a partial stream as
+    /// complete.
+    ///
+    /// Safe to take on trust in the only direction it can move a record. The
+    /// flag can make a stream look *less* complete than it was and never more,
+    /// so a hostile guest gains nothing by setting it; the fields it could
+    /// profit from lying about are `byte_len`/`sha256_hex`, which the broker
+    /// already treats as claims and checks the retained bytes against.
+    ///
+    /// `#[serde(default)]` so a guest binary older than this field decodes to
+    /// `false`, which is what such a guest would have meant.
+    #[serde(default)]
+    pub stopped_at_deadline: bool,
     pub retained_sha256_hex: String,
     pub retained_base64: String,
 }
@@ -1488,6 +1508,26 @@ mod process_runner {
     #[cfg(unix)]
     const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+    /// How much a capture may still read *after* its deadline has passed.
+    ///
+    /// The deadline stops writ **waiting** for more output, but bytes already
+    /// sitting in the pipe are not "more output" — they arrived before the
+    /// deadline, and discarding them would make the record worse for no reason.
+    /// So an expired drain keeps reading while data is there.
+    ///
+    /// That alone would hand the bound back to the writer: a descendant
+    /// producing output at least as fast as the drain consumes it never yields
+    /// the `WouldBlock` that the deadline is checked at, and could hold the run
+    /// open indefinitely. This caps how far that can go.
+    ///
+    /// 1 MiB is far more than a pipe can hold — Linux and macOS buffer 64 KiB —
+    /// so it never truncates a genuine backlog; it exists solely to make the
+    /// post-deadline drain finite. A stream that hits it is by definition still
+    /// being written to, so it is recorded as stopped at the deadline, which is
+    /// exactly what it is.
+    #[cfg(unix)]
+    pub(super) const DRAIN_POST_DEADLINE_ALLOWANCE: u64 = 1024 * 1024;
+
     /// When the capture threads should stop draining, set once by the thread
     /// that swept the process group.
     ///
@@ -1541,6 +1581,7 @@ mod process_runner {
         })?;
         let mut accumulator = StreamAccumulator::new(path, max_capture_bytes)?;
         let mut buffer = [0u8; 8192];
+        let mut drained_past_deadline = 0u64;
         loop {
             // **Read first; let the deadline stop only the waiting.**
             //
@@ -1552,16 +1593,32 @@ mod process_runner {
             // complete run would then be recorded as cut short on nothing but
             // scheduling luck. Reading first makes the flag a statement about
             // the stream rather than about how promptly writ got scheduled.
+            let expired = deadline
+                .get()
+                .is_some_and(|at| std::time::Instant::now() >= at);
             match reader.read(&mut buffer) {
                 Ok(0) => return accumulator.finish(StreamEnd::ReachedEof),
-                Ok(read) => accumulator.push(&buffer[..read])?,
+                Ok(read) => {
+                    accumulator.push(&buffer[..read])?;
+                    // Reading first is what stops a late wakeup losing data, but
+                    // on its own it hands the bound back to the writer: a
+                    // descendant producing output at least as fast as this
+                    // thread drains it never yields a `WouldBlock`, so the
+                    // deadline below is never consulted and the run is held open
+                    // for as long as it cares to keep writing. Draining past the
+                    // deadline is therefore allowed but *bounded* — enough to
+                    // empty what a pipe can hold, not enough to be steered.
+                    if expired {
+                        drained_past_deadline = drained_past_deadline.saturating_add(read as u64);
+                        if drained_past_deadline >= DRAIN_POST_DEADLINE_ALLOWANCE {
+                            return accumulator.finish(StreamEnd::StoppedAtDeadline);
+                        }
+                    }
+                }
                 // Nothing buffered. This is the only point at which writ would
-                // have to *wait*, so it is the only point the deadline applies.
+                // have to *wait*, so it is the only point waiting is refused.
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if deadline
-                        .get()
-                        .is_some_and(|at| std::time::Instant::now() >= at)
-                    {
+                    if expired {
                         return accumulator.finish(StreamEnd::StoppedAtDeadline);
                     }
                     if let Err(source) = wait_readable(fd, DRAIN_POLL_INTERVAL) {
@@ -3121,6 +3178,61 @@ mod tests {
         assert!(
             elapsed < descendant_lifetime / 2,
             "the run took {elapsed:?}, so the descendant outlived the deadline"
+        );
+    }
+
+    /// A reader that is *always* ready must not extend an expired drain without
+    /// limit.
+    ///
+    /// Raised in review against the first version of this drain. Reading before
+    /// consulting the deadline is what stops a late wakeup losing data — but on
+    /// its own it hands the bound straight back to the writer: a source that
+    /// never yields a `WouldBlock` never reaches the point where the deadline is
+    /// checked, so the run stays open for as long as it keeps producing. The
+    /// bound would hold against a descendant that *sleeps* and fail against one
+    /// that is *busy*, which is the wrong way round.
+    ///
+    /// `/dev/zero` rather than a flooding subprocess, deliberately. A real
+    /// writer only reproduces this while it outpaces the drain, and the drain
+    /// hashes twice and writes to a file per block — so a subprocess flood
+    /// yields `WouldBlock` gaps, stops at the deadline for the *other* reason,
+    /// and passes whether or not the allowance exists. Measured: with a `perl`
+    /// flood, removing `DRAIN_POST_DEADLINE_ALLOWANCE` left the test green.
+    /// `/dev/zero` is always readable and never ends, so it is the pathological
+    /// case exactly, with no timing to get lucky with.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn an_always_ready_stream_cannot_extend_an_expired_drain_without_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let zero = fs::File::open("/dev/zero").expect("/dev/zero opens");
+
+        let deadline = process_runner::DrainDeadline::default();
+        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+
+        let started = std::time::Instant::now();
+        let capture = process_runner::capture_stream_to_deadline(
+            zero,
+            dir.path().join("stdout.log"),
+            4096,
+            &deadline,
+        )
+        .expect("the drain succeeds");
+        let elapsed = started.elapsed();
+
+        assert!(
+            capture.stopped_at_deadline,
+            "a stream still producing when writ gave up must say it was cut"
+        );
+        // One buffer's slack: the allowance is checked after the read that
+        // crosses it, so the last block may carry the count past the bound.
+        assert!(
+            capture.full_byte_len <= process_runner::DRAIN_POST_DEADLINE_ALLOWANCE + 8192,
+            "the post-deadline drain must be bounded; read {} bytes",
+            capture.full_byte_len
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the drain must end on writ's schedule, not the source's: took {elapsed:?}"
         );
     }
 
