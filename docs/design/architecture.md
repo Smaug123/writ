@@ -142,10 +142,12 @@ These hold across subsystems and are the reason to trust the whole:
   because writ is single-operator (§1). There is no peer-credential check, and
   under that threat model there does not need to be one.
 - **Two-phase, append-only audit.** The request row commits *before* any
-  network mint; the outcome row (grant or mint-failure) follows. A minted token
-  whose grant fails to record is never delivered (`server.rs:533`). A DB at a
-  higher/mismatched schema version than the binary is refused, not opened
-  (correctness over availability).
+  network mint; the outcome row follows, and the outcome is *total* — a grant, a
+  mint failure, or a policy denial, all three recorded, so "a request row with no
+  outcome" means one thing only: writ stopped mid-effect, which is what the boot
+  scan reports. A minted token whose grant fails to record is never delivered.
+  A DB at a higher/mismatched schema version than the binary is refused, not
+  opened (correctness over availability).
 - **Re-validation on the guest boundary.** Nothing the guest claims is trusted:
   the broker re-derives object graphs from bundle bytes, re-checks branch tips
   before and after replay, re-authorises repos against the session's grants,
@@ -849,6 +851,49 @@ reconciliation appends an outcome for an orphaned carrier) and `agent_run` (the
 VM arm mints the request row at run launch, and the outcome arrives later over
 the guest's HTTP surface — see the outcome-only shape in §5.6).
 
+**The host mint is an effect table too, and it is the multi-outcome precedent.**
+`HostMintAuditTable` (`grant.rs`) pairs the `request` table with a
+`mint_outcome` **view** over three physically different tables: `grant_log` (a
+credential was issued), `mint_failure` (the backend refused), and `mint_denied`
+(policy refused, schema 11). Its outcome slot is therefore a DU,
+`HostMintOutcome`, rather than one row shape. Two things follow, and both are
+the pattern any future multi-outcome effect should copy:
+
+- *Keep one precise table per ending.* A grant carries a jti, a scope and an
+  expiry; a failure carries an error; a denial carries a reason. Collapsing them
+  into one wide table with mostly-NULL columns would trade three exact shapes
+  for one that permits nonsense.
+- *Union them into a view whose only obligation is to expose the join column.*
+  The guard, the boot scan, and the Stage-0 oracle then need to know nothing
+  about the fan-out — `OUTCOME_TABLE` becomes a *logical* name, and every
+  existing one-pair query keeps working unchanged.
+
+`mint_denied` is what made this expressible at all. Before it, a denied request
+wrote a `request` row and no outcome, so "unpaired" meant "denied" far more
+often than "writd stopped mid-mint" — which is why the mint could not join the
+boot scan, and why `PlainRoute::GitClone` (§5.6) had to be documented as
+"audited, but elsewhere". A denial is a *row* rather than the guard's `abandon`
+escape hatch because it is a truthful outcome and the common case; `abandon` is
+for the rare ending no outcome can honestly describe, and routing denials
+through it would put a dangling row in the log for every refused request.
+
+The mint's half-pair writers (`record_pre_mint` / `record_grant` /
+`record_mint_failure`) are `#[cfg(test)]`, like the four VM-HTTP tables': the
+only production path is `begin_effect` + `complete`, held across the mint by
+`server::request_capability`. That function is the mint's *driver*, in the sense
+`broker_effect` (§5.6) is the VM-HTTP one; it is separate because
+`broker_effect` is shaped around a `VmHttpResponse` and is `vm_http`-private,
+while the mint also answers the host Unix socket. What the two share is
+`RecordedRequest`, which is the part that carries the guarantee.
+
+One asymmetry is deliberate. A failure to record the *grant* withholds the token
+(delivering an unrecorded credential would break "no unaudited grant"); a
+failure to record the *denial* still answers `Denied`. Nothing is conferred by a
+denial and the decision itself is already durable in `request.decision_json`, so
+answering `Error` would trade a true answer for a false one without making the
+log any more complete. The write failure is logged on
+`AUDIT_WRITE_FAILURE_TARGET` and the dangling row is left for the boot scan.
+
 The host arm records the agent kind its `run_agent.spawn_agent_kind` config
 declares, not the one the caller's session declares, and refuses a session that
 disagrees. The arm spawns exactly one binary and the operator who chose it is
@@ -962,25 +1007,33 @@ would let a reworded trigger pass. The one place the machine is deliberately str
 schema (a mint-capturing resolve from `Uncertain`) is enumerated in the test, not
 implicit.
 
-**Schema.** ~24 live tables across **7 migrations** (`audit/schema.rs`), versus
-the 4 tables `broker.md` documents. Version is tracked in a `schema_version`
-*registry table* — **not** `PRAGMA user_version` as `broker.md` implies.
+**Schema.** ~24 live tables and one view across **11 migrations**
+(`audit/schema.rs`), versus the 4 tables `broker.md` documents. Version is
+tracked in a `schema_version` *registry table* — **not** `PRAGMA user_version` as
+`broker.md` implies.
 
 **Guarantees & invariants.** Each migration runs its DDL + version-bump in one
 `BEGIN IMMEDIATE` transaction, so a mid-migration crash resumes cleanly; a
-down-rev/mismatched DB is refused (§4). At-most-one-outcome per request is
-enforced by SQL triggers (`grant_excludes_mint_failure` /
-`mint_failure_excludes_grant`), plus forward-only triggers on the approve-attempt
-ledger. Timestamps are `UnixMillis` integers. Boot reconciliation
+down-rev/mismatched DB is refused (§4). At-most-one-outcome per mint request is
+enforced by one SQL trigger per outcome table, each phrased against the
+`mint_outcome` view (`grant_log_excludes_other_mint_outcomes` and its two
+siblings) — the pairwise `grant_excludes_mint_failure` /
+`mint_failure_excludes_grant` triggers this replaced would have needed four more
+to admit a third ending. They are `BEFORE INSERT`, so `NEW` is not yet in its
+own table and the view reflects only committed outcomes, which is what makes it
+correct for a trigger on a table to consult a view that includes it. Alongside
+these are forward-only triggers on the approve-attempt ledger. Timestamps are
+`UnixMillis` integers. Boot reconciliation
 (`boot_reconcile.rs`) runs three passes at daemon startup:
 `reconcile_pending_approve_attempts` recovers or flags-uncertain "in-flight at
 crash" approve-attempt rows; `reconcile_orphaned_staged_carriers` re-pairs staged
 git-push carriers left on disk without an outcome; and
 `reconcile_unpaired_effect_rows` — the durable backstop for the audit-pair
 invariant (§4) — scans every short-lived `(request, outcome)` effect pair
-(`effect_scan::EFFECT_AUDIT_PAIRS`: the proxies, nix-cache, flake-provision, and
-git-push, but *not* outcome-only `agent_run`, whose request row legitimately
-outlives its outcome) and flags any request row left without its partner. That
+(`effect_scan::EFFECT_AUDIT_PAIRS`: the host mint, the proxies, nix-cache,
+flake-provision, and git-push, but *not* outcome-only `agent_run`, whose request
+row legitimately outlives its outcome) and flags any request row left without its
+partner. That
 last pass is **report-only** (it never fabricates an outcome) and runs *after*
 persisted-session reconciliation (§5.5), so a broker VM that survived a host
 crash and still writes the DB over virtiofs has been torn down — leaving the DB
@@ -1188,21 +1241,41 @@ moved every guest URL, and `/v1/session` began reporting a contract version, bot
 without a bump. A path change *is* a contract change.
 
 **The route table.** A request is classified **once**, by
-`VmHttpRoute::resolve`, into either `Brokered(BrokeredRoute)` — an effect whose
-`(request, outcome)` audit pair the `broker_effect` driver owns — or
-`Plain(PlainRoute)`, a *closed* set of routes that deliberately record no pair
-(the session endpoint; the agent-run *config* endpoint; `git_clone`, whose audit
-is the host mint, until that follow-up). The resolved route then answers every
-downstream question: which auth scheme applies, what body limit to read under,
-how an auth *denial* is recorded against that route's own table, and which
-handler runs. Four sites used to re-derive that from the target independently.
+`VmHttpRoute::resolve`, into one of three kinds:
+
+- `Brokered(BrokeredRoute)` — an effect whose `(request, outcome)` audit pair the
+  `broker_effect` driver owns.
+- `HostMinted(HostMintedRoute)` — an effect whose *authority is a host
+  capability mint*, so its pair is the mint's own (`request` ⋈ `mint_outcome`,
+  §5.4) and is held by `server::request_capability`'s guard. `POST
+  /v1/git/clone` is the sole member: it mints a `contents:read` installation
+  token, clones with it, and returns a bundle.
+- `Plain(PlainRoute)` — a *closed* set of routes that deliberately record no
+  pair: the session endpoint, and the agent-run *config* endpoint.
+
+The two audited kinds differ only in which driver holds the guard, and for a
+stated reason: `broker_effect` is shaped around a `VmHttpResponse` and is private
+to `vm_http`, while the mint also answers the host Unix socket. Routing the guest
+side through a second driver would give one effect two begin-sites, which is the
+thing the guard exists to make impossible.
+
+`git_clone` sat in `PlainRoute` — nominally "records nothing" — until the host
+mint became an `EffectAuditTable`, with a comment explaining that it did in fact
+record something, elsewhere. That is exactly the drift a closed enum is supposed
+to prevent, so it now has a kind that is true of it.
+
+The resolved route then answers every downstream question: which auth scheme
+applies, what body limit to read under, how an auth *denial* is recorded against
+that route's own table, and which handler runs. Four sites used to re-derive that
+from the target independently.
 
 Two oracles keep it honest, and together make the invariant
-add-a-capability-proof: adding a `BrokeredRoute` variant is a **compile error**
+add-a-capability-proof: adding an audited-route variant is a **compile error**
 until the body-limit, denial, and dispatch matches all handle it; a coverage test
 then fails until it appears in the documented endpoint map; and
-`every_brokered_route_records_a_complete_audit_pair` (`vm_http/tests.rs`) fails
-until the route is actually driven end-to-end and leaves a complete audit pair.
+`every_audited_route_records_a_complete_audit_pair` (`vm_http/tests.rs`) — which
+ranges over *both* audited enums — fails until the route is actually driven
+end-to-end and leaves a complete audit pair.
 
 **Nix binary cache — model vs service (two modules).** Two different *layers*,
 now named apart (they were both `nix_cache` until backlog Slice 2):

@@ -10,7 +10,10 @@ use writ::agent_run::{
     AgentPrompt, AgentRunId, CorrelationId, MAX_CORRELATION_ID_BYTES, MIN_CORRELATION_ID_BYTES,
 };
 use writ::agent_vm_lifecycle::parse_bridge_for_gateway;
-use writ::audit::{AgentRunAuditRecord, AuditLog, GitPushRequestRecord, PreMintRecord};
+use writ::audit::{
+    AgentRunAuditRecord, AuditLog, GitPushRequestRecord, HostMintAuditTable, HostMintOutcome,
+    PreMintRecord,
+};
 use writ::core::{
     AgentKind, CapabilityRequest, CapabilitySet, CredentialGrant, GitHubAccess, GitHubGrantedScope,
     GitHubPermissions, GitHubRequest, GrantedScope, Jti, MetadataAccess, PfInterface,
@@ -231,14 +234,22 @@ proptest! {
         }
     }
 
-    /// `record_grant ∘ record_pre_mint ∘ decide` accepts iff `decide`
-    /// returned `Grant`. The property exercises the full audit chain at
-    /// once: `record_pre_mint` is expected to accept any decision `decide`
-    /// produces (its output is structurally valid by construction), and
-    /// the trailing `record_grant` must succeed for `Grant` decisions and
-    /// fail for `Deny` ones.
+    /// The mint's audit pair is completable by **exactly** the outcome its
+    /// decision admits, and by no other.
+    ///
+    /// `begin_effect` is expected to accept any decision `decide` produces (its
+    /// output is structurally valid by construction). What varies is the
+    /// discharge: a `Grant` decision takes a `Granted` outcome and refuses
+    /// `Denied`; a `Deny` decision takes `Denied` and refuses `Granted`. Both
+    /// directions matter — the log holds two statements about each request (the
+    /// decision, and what came of it), and a pair that admitted the wrong
+    /// outcome would let them contradict each other.
+    ///
+    /// The `Denied` half is new: before `mint_denied` existed, a denied request
+    /// had no outcome to record at all, so this property could only be stated
+    /// for half the decisions `decide` produces.
     #[test]
-    fn audit_chain_accepts_grant_iff_decide_grants(
+    fn the_mint_pair_admits_exactly_the_outcome_its_decision_implies(
         req in arb_github_request(),
         writable in prop::collection::vec(arb_repo(), 0..5),
         ttl in arb_ttl(),
@@ -252,7 +263,7 @@ proptest! {
         let decision = decide(&cap_req, &policy);
         let decision_record = decision.to_record();
 
-        let log = AuditLog::open_in_memory().unwrap();
+        let log = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
         let session = SessionRecord {
             session_id: SessionId::new(),
             label: None,
@@ -263,70 +274,103 @@ proptest! {
         };
         log.open_session(&session).unwrap();
 
-        let request_id = RequestId::new();
-        let pre_mint = log.record_pre_mint(&PreMintRecord {
+        // One request row per attempt: a guard is per request id, and a
+        // refused `complete` consumes it, so the two halves cannot share one.
+        let begin = |request_id| log.begin_effect::<HostMintAuditTable>(&PreMintRecord {
             request_id,
             session_id: session.session_id,
             received_at: UnixMillis::from_millis(0),
             request: &cap_req,
             decision: &decision_record,
         });
+
+        let admitted_id = RequestId::new();
+        let refused_id = RequestId::new();
+        let (admitted, refused) = (begin(admitted_id), begin(refused_id));
         prop_assert!(
-            pre_mint.is_ok(),
-            "decide produced a decision record_pre_mint rejected: req={req:?} decision={decision:?} err={pre_mint:?}",
+            admitted.is_ok() && refused.is_ok(),
+            "decide produced a decision begin_effect rejected: req={req:?} decision={decision:?} \
+             admitted={admitted:?} refused={refused:?}",
+        );
+        let (admitted, refused) = (admitted.unwrap(), refused.unwrap());
+
+        // A grant shaped to agree with whatever decision was produced. For a
+        // `Deny` it is the deliberately-bogus one: `insert_grant_row` refuses on
+        // the recorded decision before it ever looks at the scope.
+        let grant_for = |request_id| match &decision {
+            Decision::Grant(auth) => CredentialGrant {
+                jti: Jti::new(),
+                request_id,
+                session_id: session.session_id,
+                github_app_id: Some(github_app_id),
+                scope: GrantedScope::GitHub(auth.scope().clone()),
+                issued_at: UnixMillis::from_millis(0),
+                expires_at: UnixMillis::from_millis(auth.ttl().as_i64().saturating_mul(1000)),
+            },
+            Decision::Deny { .. } => CredentialGrant {
+                jti: Jti::new(),
+                request_id,
+                session_id: session.session_id,
+                github_app_id: Some(github_app_id),
+                scope: GrantedScope::GitHub(GitHubGrantedScope {
+                    repository: req.repo().clone(),
+                    permissions: GitHubPermissions::default(),
+                }),
+                issued_at: UnixMillis::from_millis(0),
+                expires_at: UnixMillis::from_millis(1_000),
+            },
+        };
+
+        // Discharge both guards *before* asserting: an outstanding guard dropped
+        // by an early return trips the Drop backstop, which would bury the
+        // property's own diagnostic under "dropped without discharge".
+        let denied = |request_id, reason: &'static str| HostMintOutcome::Denied {
+            request_id,
+            denied_at: UnixMillis::from_millis(1),
+            reason,
+        };
+        let (admitted_grant, refused_grant) = (grant_for(admitted_id), grant_for(refused_id));
+        let (admitted_result, refused_result) = match &decision {
+            Decision::Grant(_) => (
+                admitted.complete(&HostMintOutcome::Granted(&admitted_grant)),
+                refused.complete(&denied(refused_id, "policy said no")),
+            ),
+            Decision::Deny { reason } => (
+                admitted.complete(&HostMintOutcome::Denied {
+                    request_id: admitted_id,
+                    denied_at: UnixMillis::from_millis(1),
+                    reason,
+                }),
+                refused.complete(&HostMintOutcome::Granted(&refused_grant)),
+            ),
+        };
+
+        prop_assert!(
+            admitted_result.is_ok(),
+            "the outcome the decision implies was refused: req={req:?} decision={decision:?} \
+             err={admitted_result:?}",
+        );
+        prop_assert!(
+            refused_result.is_err(),
+            "the outcome the decision contradicts was accepted: req={req:?} decision={decision:?}",
         );
 
-        match &decision {
-            Decision::Grant(auth) => {
-                let scope = GrantedScope::GitHub(auth.scope().clone());
-                let lifetime_ms = auth.ttl().as_i64().saturating_mul(1000);
-                let grant = CredentialGrant {
-                    jti: Jti::new(),
-                    request_id,
-                    session_id: session.session_id,
-                    github_app_id: Some(github_app_id),
-                    scope: scope.clone(),
-                    issued_at: UnixMillis::from_millis(0),
-                    expires_at: UnixMillis::from_millis(lifetime_ms),
-                };
-                let result = log.record_grant(&grant);
-                prop_assert!(
-                    result.is_ok(),
-                    "Grant decision but record_grant failed: req={req:?} scope={scope:?} err={result:?}",
-                );
-            }
-            Decision::Deny { .. } => {
-                // Any grant attempt against a Deny pre-mint row must fail.
-                // Scope is irrelevant: record_grant rejects on the recorded
-                // decision before checking the scope.
-                let bogus = CredentialGrant {
-                    jti: Jti::new(),
-                    request_id,
-                    session_id: session.session_id,
-                    github_app_id: Some(github_app_id),
-                    scope: GrantedScope::GitHub(GitHubGrantedScope {
-                        repository: req.repo().clone(),
-                        permissions: GitHubPermissions::default(),
-                    }),
-                    issued_at: UnixMillis::from_millis(0),
-                    expires_at: UnixMillis::from_millis(1_000),
-                };
-                let result = log.record_grant(&bogus);
-                prop_assert!(
-                    result.is_err(),
-                    "Deny decision but record_grant accepted: req={req:?} grant={bogus:?}",
-                );
-            }
-        }
+        // And the pair is complete: every request row that reached an outcome
+        // has one, which is the invariant the boot-time scan ranges over.
+        prop_assert_eq!(
+            log.count_unpaired_effect_request_rows("request", "mint_outcome", "request_id").unwrap(),
+            1,
+            "only the deliberately-refused request should be left dangling",
+        );
     }
 
-    /// `record_pre_mint` rejects any Grant decision whose scope isn't
+    /// Beginning the mint's effect rejects any Grant decision whose scope isn't
     /// structurally compatible with the request, regardless of which
     /// `GitHubRequest` variant is involved. The DAO previously had a
     /// single hand-rolled unit test for this; the property pins it for
     /// every variant against an oracle re-implementation of the rules.
     #[test]
-    fn record_pre_mint_agrees_with_scope_authorisation_oracle(
+    fn beginning_the_mint_agrees_with_the_scope_authorisation_oracle(
         req in arb_github_request(),
         // Bias scope.repository to the request's repo half the time, so
         // the `repo matches` branch gets exercised — random unrelated
@@ -335,7 +379,7 @@ proptest! {
         scope_repo in arb_repo(),
         permissions in arb_permissions(),
     ) {
-        let log = AuditLog::open_in_memory().unwrap();
+        let log = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
         let session = SessionRecord {
             session_id: SessionId::new(),
             label: None,
@@ -353,23 +397,51 @@ proptest! {
             scope: GrantedScope::GitHub(github_scope.clone()),
             ttl: TtlSeconds::new(300).unwrap(),
         };
-        let result = log.record_pre_mint(&PreMintRecord {
-            request_id: RequestId::new(),
+        let request_id = RequestId::new();
+        let begun = log.begin_effect::<HostMintAuditTable>(&PreMintRecord {
+            request_id,
             session_id: session.session_id,
             received_at: UnixMillis::from_millis(0),
             request: &cap_req,
             decision: &decision,
         });
 
+        // Discharge before asserting. The mint has no `abandon` — every ending
+        // it can reach is truthfully expressible — so an accepted request row
+        // has to be finished, and finishing it here also proves the accepted
+        // scope is one a grant can actually be recorded against.
+        let (accepted, completed) = match begun {
+            Ok(guard) => {
+                let grant = CredentialGrant {
+                    jti: Jti::new(),
+                    request_id,
+                    session_id: session.session_id,
+                    github_app_id: Some(1),
+                    scope: GrantedScope::GitHub(github_scope.clone()),
+                    issued_at: UnixMillis::from_millis(0),
+                    expires_at: UnixMillis::from_millis(300_000),
+                };
+                (true, Some(guard.complete(&HostMintOutcome::Granted(&grant))))
+            }
+            Err(_) => (false, None),
+        };
+
         let expected = oracle_scope_authorises_request(&req, &github_scope);
         prop_assert_eq!(
-            result.is_ok(),
+            accepted,
             expected,
-            "req={:?} scope={:?} actual={:?}",
+            "req={:?} scope={:?} completed={:?}",
             req,
             github_scope,
-            result,
+            completed,
         );
+        if let Some(completed) = completed {
+            prop_assert!(
+                completed.is_ok(),
+                "an authorised scope was begun but its grant was refused: req={req:?} \
+                 scope={github_scope:?} err={completed:?}",
+            );
+        }
     }
 }
 

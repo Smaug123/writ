@@ -9,16 +9,26 @@
 //!
 //! The invariant this buys, and the reason the `Plain` set is closed:
 //!
-//! > Every route is [`Brokered`](VmHttpRoute::Brokered) — reaching its effect's
-//! > IO only through the `broker_effect` driver, which owns its
-//! > `(request, outcome)` audit pair — or [`Plain`](VmHttpRoute::Plain), a named,
-//! > reviewed variant that provably performs no brokered effect. Never neither,
-//! > and never both.
+//! > Every route records a `(request, outcome)` audit pair — as
+//! > [`Brokered`](VmHttpRoute::Brokered), whose effect's IO is reachable only
+//! > through the `broker_effect` driver, or as
+//! > [`HostMinted`](VmHttpRoute::HostMinted), whose authority *is* a host
+//! > capability mint and whose pair is therefore written by the host mint's own
+//! > driver — or it is [`Plain`](VmHttpRoute::Plain), a named, reviewed variant
+//! > that provably performs no audited effect. Never neither, and never both.
+//!
+//! The two audited kinds differ only in *which* driver holds the guard, and for
+//! a stated reason: `broker_effect` is shaped around a [`VmHttpResponse`] and is
+//! private to this module, while the host mint also answers the host Unix
+//! socket, where there is no HTTP response to shape a driver around. What they
+//! share is `RecordedRequest` — the part that carries the guarantee.
 //!
 //! [`PlainRoute`] is deliberately a closed enum rather than an open extension
 //! point: an open one would let a future *effectful* endpoint be registered as
-//! plain and run IO outside `broker_effect` while a totality test still passed —
-//! which is the original discipline gap, reintroduced.
+//! plain and run IO outside a driver while a totality test still passed — which
+//! is the original discipline gap, reintroduced. `GitClone` sat in it for
+//! exactly that reason until the host mint became an `EffectAuditTable` of its
+//! own.
 //!
 //! This is a discriminated union interpreted by a `match`, not the
 //! `Box<dyn ErasedEffect>` the plan sketched. The registry entry is a
@@ -90,6 +100,9 @@ pub(crate) enum VmHttpRoute {
     /// Records a `(request, outcome)` audit pair through the `broker_effect`
     /// driver. Its effect's IO is unreachable except through that driver.
     Brokered(BrokeredRoute),
+    /// Records the host capability mint's `(request, mint_outcome)` pair,
+    /// through the host mint's own driver in `server::request_capability`.
+    HostMinted(HostMintedRoute),
     /// Explicitly non-audited, and a *closed* set: each variant states why it
     /// records nothing.
     Plain(PlainRoute),
@@ -121,6 +134,27 @@ route_enum! {
 }
 
 route_enum! {
+    /// A route whose audited effect *is* a host capability mint, and whose audit
+    /// pair is therefore the mint's own — the `request` table joined to the
+    /// `mint_outcome` view — written by `server::request_capability`'s guard
+    /// rather than by `broker_effect`.
+    ///
+    /// One driver rather than two because the same mint answers the host Unix
+    /// socket, where there is no `VmHttpResponse` for `broker_effect` to be
+    /// shaped around. Routing the guest side through a second driver would mean
+    /// two begin-sites for one effect, which is precisely the thing the guard
+    /// exists to make impossible.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum HostMintedRoute {
+        /// `POST /v1/git/clone` — mints a short-lived `contents:read`
+        /// installation token, clones, and returns a bundle. The token is the
+        /// authority; the clone is what it is spent on, and both are covered by
+        /// the one mint row pair.
+        GitClone,
+    }
+}
+
+route_enum! {
     /// A route that records no audit pair. Adding one is a deliberate, reviewed
     /// act — hence the closed enum and the per-variant justification.
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,13 +167,6 @@ route_enum! {
         /// host authority and performs no effect; the run's audit rows are
         /// written at launch and at outcome upload.
         AgentRunConfig(AgentRunId),
-        /// `POST /v1/git/clone`: its audit *is* the host capability mint
-        /// (`request` + one of `grant_log` / `mint_failure` / neither-on-deny), a
-        /// decision-dependent three-way rather than an `EffectAuditTable` pair.
-        /// It cannot supply a `(request, outcome)` table, so it is plain until
-        /// the host-mint follow-up teaches the guard the grant-flow shape (see
-        /// the plan's §7). It is *not* unaudited — it is audited elsewhere.
-        GitClone,
         /// No route matched: answered `404`/`405` without touching any service.
         Unmatched,
     }
@@ -205,6 +232,7 @@ impl VmHttpRoute {
     pub(crate) fn identity(&self) -> &'static str {
         match self {
             Self::Brokered(route) => route.name(),
+            Self::HostMinted(route) => route.name(),
             Self::Plain(route) => route.name(),
         }
     }
@@ -232,7 +260,7 @@ impl VmHttpRoute {
             return Self::Brokered(BrokeredRoute::OpenAiProxy);
         }
         if is_git_clone_target(target) {
-            return Self::Plain(PlainRoute::GitClone);
+            return Self::HostMinted(HostMintedRoute::GitClone);
         }
         if is_git_push_target(target) {
             return Self::Brokered(BrokeredRoute::GitPush);
@@ -265,9 +293,8 @@ impl VmHttpRoute {
                 | BrokeredRoute::FlakeProvision
                 | BrokeredRoute::AgentRunOutcome(_),
             )
-            | Self::Plain(PlainRoute::GitClone | PlainRoute::AgentRunConfig(_)) => {
-                ContractCheck::Required
-            }
+            | Self::HostMinted(HostMintedRoute::GitClone)
+            | Self::Plain(PlainRoute::AgentRunConfig(_)) => ContractCheck::Required,
             Self::Brokered(BrokeredRoute::ClaudeProxy) => ContractCheck::Exempt(ThirdPartyClient),
             Self::Brokered(BrokeredRoute::OpenAiProxy) => ContractCheck::Exempt(ThirdPartyClient),
             Self::Brokered(BrokeredRoute::NixCache) => ContractCheck::Exempt(ThirdPartyClient),
@@ -322,7 +349,7 @@ impl VmHttpRoute {
             Self::Brokered(BrokeredRoute::AgentRunOutcome(_)) => (request.method == "POST"
                 && services.agent_runs.is_some())
             .then_some(MAX_VM_HTTP_AGENT_RUN_OUTCOME_BODY_BYTES),
-            Self::Plain(PlainRoute::GitClone) => (request.method == "POST"
+            Self::HostMinted(HostMintedRoute::GitClone) => (request.method == "POST"
                 && services.git_clone.is_some())
             .then_some(MAX_VM_HTTP_BODY_BYTES),
             // Neither reads a body.
@@ -418,6 +445,12 @@ impl VmHttpRoute {
                 | BrokeredRoute::FlakeProvision
                 | BrokeredRoute::AgentRunOutcome(_),
             ) => response.into(),
+            // The mint's `mint_denied` row records a *policy* denial, which is a
+            // decision about an authenticated request. An unauthenticated one
+            // never reaches the mint, so it has no request row to pair against —
+            // recording it here would mean inventing one, and `mint_denied`
+            // would stop meaning "policy said no".
+            Self::HostMinted(HostMintedRoute::GitClone) => response.into(),
             Self::Plain(_) => response.into(),
         }
     }
@@ -485,22 +518,23 @@ pub(crate) mod tests {
     fn every_documented_endpoint_resolves_to_its_route() {
         for (method, target, expected) in ENDPOINT_MAP {
             let route = VmHttpRoute::resolve(&request(method, target));
-            let name = match &route {
-                VmHttpRoute::Brokered(brokered) => brokered.name(),
-                VmHttpRoute::Plain(plain) => plain.name(),
-            };
-            assert_eq!(&name, expected, "{method} {target} resolved to {route:?}");
+            assert_eq!(
+                &route.identity(),
+                expected,
+                "{method} {target} resolved to {route:?}"
+            );
         }
     }
 
-    /// The endpoint map must exercise *every* route, brokered and plain alike.
+    /// The endpoint map must exercise *every* route, audited and plain alike.
     /// Because `ALL_NAMES` is generated from the enum definition, a new route
-    /// fails here until it is documented above — and, for a brokered one, until
+    /// fails here until it is documented above — and, for an audited one, until
     /// the audit-pair drive test in `vm_http::tests` covers it too.
     #[test]
     fn the_endpoint_map_covers_every_route() {
         let documented: BTreeSet<&str> = ENDPOINT_MAP.iter().map(|(_, _, name)| *name).collect();
         let mut expected: BTreeSet<&str> = BrokeredRoute::ALL_NAMES.iter().copied().collect();
+        expected.extend(HostMintedRoute::ALL_NAMES.iter().copied());
         expected.extend(PlainRoute::ALL_NAMES.iter().copied());
         // `Unmatched` is the fallthrough, covered by its own test below rather
         // than by a documented endpoint.

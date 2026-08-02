@@ -77,7 +77,9 @@ pub use git_push::{
     RejectBlocker, RejectBlockerKind, UncertainAttempt, apply_approve_transition,
     position_predicate_sql,
 };
-pub use grant::{MintFailureRecord, PreMintRecord};
+pub use grant::{
+    HostMintAuditTable, HostMintOutcome, MintDenialRecord, MintFailureRecord, PreMintRecord,
+};
 pub use nix_cache::{
     NixCacheAuditDecision, NixCacheAuditEntry, NixCacheAuditRoute, NixCacheOutcomeRecord,
     NixCacheRequestRecord,

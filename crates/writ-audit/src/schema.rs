@@ -49,7 +49,7 @@ pub(super) struct Migration {
 /// a version higher than this is rejected with [`AuditError::SchemaTooNew`]
 /// rather than opened — we'd rather fail to start than silently drop data
 /// into a schema a newer broker wrote.
-pub(super) const SCHEMA_VERSION: i32 = 10;
+pub(super) const SCHEMA_VERSION: i32 = 11;
 
 /// The full migration history. Each entry documents exactly one state
 /// transition; the sequence of entries is the schema's lineage. Order
@@ -110,6 +110,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: 10,
         name: "0010_agent_run_stream_stopped_at_deadline",
         sql: include_str!("migrations/0010_agent_run_stream_stopped_at_deadline.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "0011_mint_denied",
+        sql: include_str!("migrations/0011_mint_denied.sql"),
     },
 ];
 
@@ -368,6 +373,7 @@ mod tests {
             "request",
             "grant_log",
             "mint_failure",
+            "mint_denied",
             "agent_run",
             "agent_run_outcome",
             "agent_vm_workspace_bootstrap",
@@ -407,8 +413,9 @@ mod tests {
         let triggers = names("trigger");
         for expected in [
             "request_requires_open_session",
-            "mint_failure_excludes_grant",
-            "grant_excludes_mint_failure",
+            "grant_log_excludes_other_mint_outcomes",
+            "mint_failure_excludes_other_mint_outcomes",
+            "mint_denied_excludes_other_mint_outcomes",
             "agent_run_requires_open_session",
             "agent_vm_workspace_bootstrap_requires_open_session",
             "claude_proxy_request_requires_open_session",
@@ -431,6 +438,24 @@ mod tests {
         ] {
             assert!(triggers.contains(expected), "missing trigger: {expected}");
         }
+
+        // Migration 0011 replaced the pairwise mint-exclusion triggers with one
+        // view-backed guard per outcome table. A fresh DB carrying both would
+        // have two overlapping rules for the same invariant, which is how they
+        // drift.
+        for retired in ["mint_failure_excludes_grant", "grant_excludes_mint_failure"] {
+            assert!(
+                !triggers.contains(retired),
+                "trigger {retired} was replaced by the view-backed guard and should be gone",
+            );
+        }
+
+        // The mint's logical outcome table. It is a view, not a table, which is
+        // why the table assertions above cannot speak for it.
+        assert!(
+            names("view").contains("mint_outcome"),
+            "missing view: mint_outcome",
+        );
     }
 
     /// A v1 DB that already carried a `decision = 'approved'` row
@@ -636,6 +661,129 @@ mod tests {
         assert!(
             rejected.is_err(),
             "the rebuilt CHECK must still be a closed set, not dropped"
+        );
+    }
+
+    /// Migration 11 backfills the denials the old schema could not hold, and
+    /// the reason it must is the boot scan: the mint joins `EFFECT_AUDIT_PAIRS`
+    /// with this migration, so an un-backfilled denial would be reported at
+    /// every boot, forever, as a dangling effect.
+    ///
+    /// So this plants a v10 DB with one of each thing the backfill must
+    /// distinguish — a denial, a denial with an empty reason (unproducible by
+    /// `policy::decide`, hence skipped rather than given a placeholder), a
+    /// completed grant, and a `Grant` decision that never reached its outcome —
+    /// and checks the scan afterwards reports *only* the last one.
+    #[test]
+    fn migration_11_backfills_denials_so_only_a_real_stop_is_reported() {
+        let db = NamedTempFile::new().unwrap();
+        let session_id = SessionId::new();
+        let denied = RequestId::new();
+        let denied_without_reason = RequestId::new();
+        let granted = RequestId::new();
+        let stopped_mid_mint = RequestId::new();
+        {
+            let mut conn = Connection::open(db.path()).unwrap();
+            ensure_schema_version_table(&conn).unwrap();
+            for migration in MIGRATIONS.iter().take_while(|m| m.version < 11) {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                tx.execute_batch(migration.sql).unwrap();
+                tx.execute(
+                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, 1_i64],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute(
+                "INSERT INTO session (session_id, opened_at, agent_kind) \
+                 VALUES (?1, 1, 'claude')",
+                params![session_id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+            let grant_decision = r#"{"result":"grant","scope":{},"ttl":300}"#;
+            for (request_id, received_at, decision) in [
+                (
+                    denied,
+                    10_i64,
+                    r#"{"result":"deny","reason":"not allowed"}"#,
+                ),
+                (
+                    denied_without_reason,
+                    11,
+                    r#"{"result":"deny","reason":""}"#,
+                ),
+                (granted, 12, grant_decision),
+                (stopped_mid_mint, 13, grant_decision),
+            ] {
+                conn.execute(
+                    "INSERT INTO request \
+                     (request_id, session_id, received_at, request_json, decision_json) \
+                     VALUES (?1, ?2, ?3, '{}', ?4)",
+                    params![
+                        request_id.as_uuid().to_string(),
+                        session_id.as_uuid().to_string(),
+                        received_at,
+                        decision,
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO grant_log \
+                 (jti, request_id, session_id, scope_json, issued_at, expires_at) \
+                 VALUES (?1, ?2, ?3, '{}', 12, 1012)",
+                params![
+                    Jti::new().as_uuid().to_string(),
+                    granted.as_uuid().to_string(),
+                    session_id.as_uuid().to_string(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let log = AuditLog::open(db.path()).unwrap();
+
+        let denials = log.list_mint_denials_for_session(session_id).unwrap();
+        assert_eq!(denials.len(), 1, "{denials:?}");
+        assert_eq!(denials[0].request_id, denied);
+        assert_eq!(denials[0].reason, "not allowed");
+        assert_eq!(
+            denials[0].denied_at,
+            UnixMillis::from_millis(10),
+            "a backfilled denial is stamped with the request row's own \
+             `received_at`, not a value chosen to look plausible",
+        );
+
+        // The empty-reason denial and the interrupted grant are what is left
+        // unpaired — one because no shipped writ could have written it, the
+        // other because it is a genuine stop mid-mint.
+        assert_eq!(
+            log.count_unpaired_effect_request_rows("request", "mint_outcome", "request_id")
+                .unwrap(),
+            2,
+        );
+        let unpaired: Vec<String> = log
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT r.request_id FROM request r \
+                     LEFT JOIN mint_outcome o ON o.request_id = r.request_id \
+                     WHERE o.request_id IS NULL ORDER BY r.received_at",
+                )?;
+                Ok(stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(
+            unpaired,
+            vec![
+                denied_without_reason.as_uuid().to_string(),
+                stopped_mid_mint.as_uuid().to_string(),
+            ],
         );
     }
 
