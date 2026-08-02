@@ -1607,6 +1607,52 @@ fn a_kept_pack_is_not_counted_towards_the_pack_threshold() {
     );
 }
 
+/// **A half-written pack does not count, against a real repo.**
+///
+/// Measured on git 2.54: a `.pack` with no `.idx` is reported under `garbage:`
+/// and excluded from `packs:`, so `gc.autoPackLimit` never sees it. Reachable
+/// here rather than hypothetical — writ kills a `gc` at
+/// `COMPACTION_GIT_TIMEOUT`, and an interrupted repack is how such a file
+/// appears. Counting it would let the repo sit permanently over the threshold on
+/// something no `gc` will consolidate: compact, fail to progress, back off an
+/// hour, repeat.
+#[test]
+fn a_pack_without_an_index_is_not_counted_towards_the_pack_threshold() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+    repo.write_note(&r, b"seed", b"body").unwrap();
+    raw_git(repo.path(), &["repack", "-q"]);
+
+    let real_packs = packs_on_disk(repo.path());
+    assert!(real_packs >= 1, "the fixture must produce a pack");
+
+    // Two files that look like packs and are not, as a killed repack leaves.
+    let pack_dir = repo.path().join("objects").join("pack");
+    for name in ["pack-deadbeef.pack", ".tmp-9-pack-cafe.pack"] {
+        fs::write(pack_dir.join(name), b"not a real pack").unwrap();
+    }
+    assert_eq!(
+        packs_on_disk(repo.path()),
+        real_packs + 2,
+        "precondition: the files are on disk and look like packs by name",
+    );
+
+    // A threshold one past the real packs: only the impostors could reach it.
+    let outcome = repo
+        .compact_if_needed_with(only_packs_compact(real_packs as u64 + 1))
+        .unwrap();
+
+    let CompactionOutcome::Skipped { counts } = outcome else {
+        panic!("unindexed packs must not trigger a compaction; got {outcome:?}");
+    };
+    assert_eq!(
+        counts.packs,
+        PackCount::new(real_packs as u64),
+        "only the indexed packs count",
+    );
+}
+
 /// A repo under *both* thresholds is left alone even when it has packs.
 ///
 /// The counterpart to the test above, and the one that keeps the pack axis from

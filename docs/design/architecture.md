@@ -1512,16 +1512,22 @@ objects or `gc.autoPackLimit`'s 50 packs — the aim being to do what git would
 have done, where git would have done it, but synchronously and under the
 per-repo mutex every other mutation here already takes.
 
-Reproducing that policy turned out to mean two details git states and it is easy
-to skip. Git phrases both knobs as *more than* N, while a `CompactionThreshold`
+Reproducing that policy turned out to mean honouring two details git states and
+that are easy to skip. Git phrases both knobs as *more than* N, while a `CompactionThreshold`
 is the count *at which* writ compacts, so `GIT_DEFAULT` is 6701 and 51 — 6700 and
-50 would fire one object and one pack early. And `gc.autoPackLimit` counts only
-local packs **without a `.keep` sidecar**, so the pack count is read from
-`<repo>/objects/pack` rather than from `count-objects -v`'s `packs:` line, which
-counts every pack. That second one is not cosmetic: a repo holding enough kept
-packs would compact on every request for ever, because `gc` cannot consolidate
-what it may not touch, so the count would never fall and the retry gate would
-reopen an hour later to try again.
+50 would fire one object and one pack early. And the pack count is read from
+`<repo>/objects/pack` rather than from `count-objects -v`'s `packs:` line,
+because git's limit sees a narrower set than that line reports: a pack counts
+only if it is **indexed** (a `.pack` with no `.idx` is `garbage:` to git) and
+**not marked `.keep`**. Both were measured on git 2.54 rather than inferred.
+
+Neither is cosmetic, and both fail the same way: a repo over the threshold on
+packs no `gc` can consolidate compacts, fails to progress, backs off an hour, and
+repeats — for ever. The index half is reachable in this codebase specifically,
+because writ kills a `gc` at `COMPACTION_GIT_TIMEOUT` and an interrupted repack
+is how a half-written pack appears. (A killed repack usually leaves the `.idx`
+too, and git counts *that* pair; so does writ. Matching git is the point, not
+being cleverer than it.)
 
 Two axes because writ has two shapes of repo, and the second is not decoration.
 A daemon-owned notes repo grows chiefly by **loose objects** (three per note

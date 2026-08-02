@@ -825,22 +825,23 @@ impl NotesRepo {
             .map_err(|source| NotesRepoError::CountObjectsParse { source })?;
         Ok(ObjectCounts {
             loose_objects,
-            packs: self.count_unkept_packs()?,
+            packs: self.count_packs_towards_the_limit()?,
         })
     }
 
     /// How many packs count towards the auto-pack limit, read from the pack
     /// directory rather than from `count-objects -v`.
     ///
-    /// Git's limit counts only local packs without a `.keep` sidecar, and the
-    /// `packs:` line counts every pack; `<repo>/objects/pack` is exactly the set
-    /// git looks at. The rule itself is
-    /// [`compaction::count_unkept_packs`], which takes names so it is testable
-    /// without a repo full of packs.
+    /// The `packs:` line counts every pack; git's limit sees a narrower set —
+    /// local packs that are *indexed* and *not* marked `.keep` — and
+    /// `<repo>/objects/pack` is exactly the directory git looks at. The rule
+    /// itself is [`compaction::count_packs_towards_the_limit`], which takes
+    /// names so it is testable without a repo full of packs, and states there
+    /// why each clause is git's rather than writ's.
     ///
     /// A missing pack directory is zero packs, not an error: git creates it
     /// lazily, so a repo that has never been packed simply has none.
-    fn count_unkept_packs(&self) -> Result<compaction::PackCount, NotesRepoError> {
+    fn count_packs_towards_the_limit(&self) -> Result<compaction::PackCount, NotesRepoError> {
         let pack_dir = self.canonical_path.join("objects").join("pack");
         let entries = match std::fs::read_dir(&pack_dir) {
             Ok(entries) => entries,
@@ -867,7 +868,7 @@ impl NotesRepo {
                 names.push(name.to_string());
             }
         }
-        Ok(compaction::count_unkept_packs(
+        Ok(compaction::count_packs_towards_the_limit(
             names.iter().map(String::as_str),
         ))
     }

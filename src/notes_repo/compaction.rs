@@ -308,7 +308,7 @@ pub(crate) const fn made_progress(
 /// **The pack count does not come from here**, even though `count-objects -v`
 /// prints a `packs:` line, because that line counts every pack. Git's own
 /// auto-pack policy counts only *local* packs *not marked with a `.keep`
-/// sidecar* — see [`count_unkept_packs`], which reads the pack directory
+/// sidecar* — see [`count_packs_towards_the_limit`], which reads the pack directory
 /// instead.
 pub fn parse_count_objects_verbose(
     stdout: &str,
@@ -352,33 +352,65 @@ pub enum CountObjectsParseError {
 /// How many of a pack directory's packs count towards the auto-pack limit,
 /// given its file names.
 ///
-/// **`.keep` packs are excluded, and that is what git does.** A `<name>.keep`
-/// sidecar marks its pack as one the repo wants left alone; `too_many_packs()`
-/// skips exactly those. Counting them would mean a repo holding 51 kept packs
-/// compacts on every request forever: the `gc` cannot consolidate what it is
-/// forbidden to touch, so the count never falls, `made_progress` closes the
-/// retry gate, and an hour later it happens again. Nothing in writ writes a
-/// `.keep`, so this is a guard rather than a fix for an observed failure — but a
-/// policy that claims to reproduce git's and diverges on the one case git
+/// Named for the question rather than for one of its two clauses: a pack counts
+/// if it is *both* indexed and unkept, and a name that mentioned only the keep
+/// exclusion would read as a licence to drop the other.
+///
+/// A `<stem>.pack` counts iff `<stem>.idx` is present and `<stem>.keep` is not.
+/// Both halves are git's, and both were measured against git 2.54 rather than
+/// inferred:
+///
+/// | `objects/pack` contains | git's `packs:` |
+/// |---|---|
+/// | a stray `.pack` with no `.idx` | **not counted** (reported as `garbage:`) |
+/// | a `.tmp-*` `.pack`+`.idx` pair | counted |
+/// | a `.keep` beside a real pack | counted here, but **not** by `gc.autoPackLimit` |
+///
+/// *The index requirement.* `prepare_packed_git` builds its pack list by walking
+/// `.idx` files and pairing each with its `.pack`; a `.pack` alone is garbage to
+/// git and invisible to the limit. That matters here rather than in the abstract:
+/// writ kills a `gc` at its own `COMPACTION_GIT_TIMEOUT`, and an interrupted
+/// repack is the ordinary way a half-written pack appears. Counting those would
+/// let a repo sit permanently over the threshold on files no `gc` will ever
+/// consolidate — compacting once an hour, for ever, achieving nothing.
+///
+/// A killed repack usually leaves the `.idx` too, and the table above says git
+/// counts that pair; so does this. Matching git is the point, not being cleverer
+/// than it.
+///
+/// *The keep exclusion.* A `<name>.keep` sidecar marks its pack as one the repo
+/// wants left alone, and `too_many_packs()` skips exactly those. Counting them
+/// would produce the same never-ending compaction for the same reason: `gc`
+/// cannot consolidate what it is forbidden to touch. Nothing in writ writes a
+/// `.keep`, so that half is a guard rather than a fix for an observed failure —
+/// but a policy that claims to reproduce git's and diverges on the one case git
 /// singles out is a policy whose docstring is wrong.
 ///
 /// Pure, taking names rather than a path, so the rule is testable without
 /// building a repo full of packs. The shell reads the directory.
 ///
 /// Reading the directory is also *more* faithful than `count-objects -v`'s
-/// `packs:` line in a second way: git counts only packs local to this repo, and
-/// `<repo>/objects/pack` is exactly those.
-pub fn count_unkept_packs<'a>(names: impl IntoIterator<Item = &'a str>) -> PackCount {
-    let mut packs: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    let mut kept: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+/// `packs:` line in a second way: git's limit counts only packs local to this
+/// repo, and `<repo>/objects/pack` is exactly those.
+pub fn count_packs_towards_the_limit<'a>(names: impl IntoIterator<Item = &'a str>) -> PackCount {
+    use std::collections::BTreeSet;
+    let (mut packs, mut indexes, mut kept): (BTreeSet<&str>, BTreeSet<&str>, BTreeSet<&str>) =
+        Default::default();
     for name in names {
         if let Some(stem) = name.strip_suffix(".pack") {
             packs.insert(stem);
+        } else if let Some(stem) = name.strip_suffix(".idx") {
+            indexes.insert(stem);
         } else if let Some(stem) = name.strip_suffix(".keep") {
             kept.insert(stem);
         }
     }
-    PackCount::new(packs.difference(&kept).count() as u64)
+    PackCount::new(
+        packs
+            .iter()
+            .filter(|stem| indexes.contains(*stem) && !kept.contains(*stem))
+            .count() as u64,
+    )
 }
 
 #[cfg(test)]
@@ -497,6 +529,7 @@ mod tests {
             "pack-aaa.pack",
             "pack-aaa.idx",
             "pack-bbb.pack",
+            "pack-bbb.idx",
             "pack-bbb.keep",
             "pack-ccc.pack",
             "pack-ccc.idx",
@@ -505,19 +538,48 @@ mod tests {
             "pack-ddd.keep",
         ];
         assert_eq!(
-            count_unkept_packs(names),
+            count_packs_towards_the_limit(names),
             PackCount::new(2),
-            "only pack-aaa and pack-ccc are unkept",
+            "only pack-aaa and pack-ccc are indexed and unkept",
+        );
+    }
+
+    /// **A `.pack` with no `.idx` is invisible to git, so it must be invisible
+    /// here.**
+    ///
+    /// Measured on git 2.54: such a file is reported under `garbage:` and
+    /// excluded from `packs:`, so `gc.autoPackLimit` never sees it. Counting it
+    /// would let a repo sit permanently over the threshold on a file no `gc`
+    /// will consolidate — compacting once an hour for ever, achieving nothing.
+    /// Reachable here rather than hypothetical: writ kills a `gc` at its
+    /// deadline, and an interrupted repack is how a half-written pack appears.
+    #[test]
+    fn an_unindexed_pack_does_not_count() {
+        assert_eq!(
+            count_packs_towards_the_limit(["pack-aaa.pack"]),
+            PackCount::new(0),
+            "a pack with no index is garbage to git",
+        );
+        // ...and one interrupted repack does not hide a real pack.
+        assert_eq!(
+            count_packs_towards_the_limit(["pack-aaa.pack", "pack-aaa.idx", "pack-half.pack"]),
+            PackCount::new(1),
+        );
+        // A killed repack usually leaves both halves, and git counts that pair.
+        // Matching git is the point, not being cleverer than it.
+        assert_eq!(
+            count_packs_towards_the_limit([".tmp-9-pack-abc.pack", ".tmp-9-pack-abc.idx"]),
+            PackCount::new(1),
         );
     }
 
     #[test]
     fn an_empty_pack_directory_has_no_packs() {
-        assert_eq!(count_unkept_packs([]), PackCount::new(0));
+        assert_eq!(count_packs_towards_the_limit([]), PackCount::new(0));
         // `.idx`/`.rev`/`.mtimes` siblings and the `pack` subdirectory's own
         // odds and ends are not packs.
         assert_eq!(
-            count_unkept_packs(["pack-aaa.idx", "pack-aaa.rev", "tmp_pack_x"]),
+            count_packs_towards_the_limit(["pack-aaa.idx", "pack-aaa.rev", "tmp_pack_x"]),
             PackCount::new(0),
         );
     }
@@ -567,21 +629,31 @@ mod tests {
             );
         }
 
-        /// Unkept packs are exactly the `.pack` names with no `.keep` sibling,
-        /// stated independently of how the counter is written.
+        /// A pack counts iff it is indexed and not kept, stated independently
+        /// of how the counter is written.
+        ///
+        /// The three name sets are generated over the same small alphabet so
+        /// they actually overlap: drawn from a wide space, "this pack has an
+        /// index" and "this pack is kept" would essentially never both hold,
+        /// and the property would range over only the easy cases.
         #[test]
-        fn unkept_packs_are_the_packs_without_a_keep_sibling(
-            stems in prop::collection::hash_set("[a-c]{1,2}", 0..6),
+        fn a_pack_counts_iff_it_is_indexed_and_not_kept(
+            packs in prop::collection::hash_set("[a-c]{1,2}", 0..6),
+            indexes in prop::collection::hash_set("[a-c]{1,2}", 0..6),
             kept in prop::collection::hash_set("[a-c]{1,2}", 0..6),
         ) {
-            let mut names: Vec<String> = stems.iter().map(|s| format!("pack-{s}.pack")).collect();
+            let mut names: Vec<String> = packs.iter().map(|s| format!("pack-{s}.pack")).collect();
+            names.extend(indexes.iter().map(|s| format!("pack-{s}.idx")));
             names.extend(kept.iter().map(|s| format!("pack-{s}.keep")));
-            // Siblings that are neither, to make sure they are ignored.
-            names.extend(stems.iter().map(|s| format!("pack-{s}.idx")));
+            // Siblings that are none of the three, to make sure they are ignored.
+            names.extend(packs.iter().map(|s| format!("pack-{s}.rev")));
 
-            let expected = stems.difference(&kept).count() as u64;
+            let expected = packs
+                .iter()
+                .filter(|s| indexes.contains(*s) && !kept.contains(*s))
+                .count() as u64;
             prop_assert_eq!(
-                count_unkept_packs(names.iter().map(String::as_str)),
+                count_packs_towards_the_limit(names.iter().map(String::as_str)),
                 PackCount::new(expected),
             );
         }
