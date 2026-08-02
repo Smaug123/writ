@@ -35,11 +35,24 @@ pub use views::{
 /// the client in [`ClientMessage::Hello`] and checked by the broker before it
 /// dispatches anything.
 ///
-/// **Bump this on any change to the wire shape of [`ClientMessage`] or
-/// [`ServerMessage`]** — a renamed variant, a removed field, a changed meaning.
-/// Adding an optional field with a `#[serde(default)]` is not a wire change in
-/// the sense that matters here (both sides still parse both shapes); renaming
-/// `AgentRunStarted` to `AgentRunAccepted`, as #21 did, is.
+/// **Bump this on any change to the serialized shape of [`ClientMessage`] or
+/// [`ServerMessage`]**: a renamed or added variant, an added or removed field,
+/// a changed meaning. The rule has no "but this one is backwards-compatible"
+/// exception, and the reason is specific to these two types rather than a
+/// general caution.
+///
+/// The tempting exception — "an optional field with `#[serde(default)]` is free,
+/// since both sides parse both shapes" — is **false here**. `ClientMessage`
+/// carries `#[serde(deny_unknown_fields)]`, so the moment a newer client
+/// actually emits that field, an older daemon rejects the whole message. And it
+/// would reject it *after* accepting the handshake, because the version did not
+/// move — which is precisely the skew this constant exists to catch, arrived at
+/// by reasoning that sounds conservative. `skip_serializing_if` narrows the
+/// window to callers who set the field; it does not close it.
+///
+/// So: if the bytes on the wire can differ, bump. Renaming `AgentRunStarted` to
+/// `AgentRunAccepted`, as #21 did, is the obvious case; adding an optional field
+/// to `RunAgent` is the non-obvious one, and it counts too.
 ///
 /// ## What this buys, stated exactly
 ///
