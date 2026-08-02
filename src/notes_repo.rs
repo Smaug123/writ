@@ -104,7 +104,7 @@ use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use self::compaction::{CompactionDecision, CompactionThreshold, LooseObjectCount};
+use self::compaction::{CompactionDecision, CompactionThreshold, ObjectCounts};
 use crate::core::{NotesRef, NotesRefError};
 use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome, SupervisorError};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
@@ -130,6 +130,35 @@ const NOTES_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// refname per line, and a truncated prefix would read as a complete, shorter
 /// listing — silently losing notes.
 const NOTES_GIT_STDOUT_CAP: usize = 64 * 1024 * 1024;
+
+/// Ceiling on how many entries the pack-directory scan will read.
+///
+/// Every *git* invocation in this module is bounded — a deadline and a stdout
+/// cap — precisely so that a damaged object directory costs one bounded attempt
+/// rather than wedging the daemon. The pack scan is in-process, so it inherits
+/// none of that, and an unbounded `read_dir` loop in a module whose whole
+/// discipline is boundedness is a gap whether or not anything reaches it today.
+///
+/// A repo with more than this many files in `objects/pack` is not a repo git
+/// would still be usable on: at ~4 files per pack that is over sixty thousand
+/// packs, against an auto-limit of fifty. So the cap is not a tuning knob, it is
+/// the point past which the directory is evidence of damage rather than of size.
+///
+/// Exceeding it is an **error**, not a saturated count. A saturated count would
+/// read as "far over the pack threshold" and provoke a full `gc` on a directory
+/// that plainly needs an operator instead; an error closes the retry gate for
+/// `COMPACTION_RETRY_BACKOFF` and degrades to "no compaction", which is what
+/// every other failure here does.
+///
+/// **What this does not bound**, stated because the difference matters: a
+/// *stalled* filesystem. `read_dir` blocks in the calling thread, so no
+/// in-process cap can interrupt it, and the notes-write mutex is held
+/// throughout. That is a property this module's in-process file access already
+/// had — the retry-gate read has it too — rather than something the pack scan
+/// introduces, and a filesystem wedged enough to hang a `read_dir` would hang
+/// the `count-objects` child's own directory walk as well. The cap bounds memory
+/// and iteration; it does not bound the kernel.
+const MAX_PACK_DIR_ENTRIES: usize = 250_000;
 
 /// Bound on retained stderr, re-exported from the supervisor so the tests assert
 /// against the same number the drain actually enforces.
@@ -381,8 +410,8 @@ pub enum WriteOutcome {
 /// decided to compact" whether or not the repack actually ran.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CompactionOutcome {
-    /// The repo was under the threshold; nothing was packed.
-    Skipped { loose_objects: LooseObjectCount },
+    /// The repo was under both thresholds; nothing was packed.
+    Skipped { counts: ObjectCounts },
     /// A recent attempt failed and the backoff has not elapsed, so this call did
     /// nothing at all — not even measure.
     ///
@@ -392,14 +421,18 @@ pub enum CompactionOutcome {
     /// fail, so the gate has to come before it, and reporting a stale figure
     /// would misrepresent when it was read.
     Deferred { retry_in: Duration },
-    /// The repo was at or over the threshold and `git gc` ran to completion.
+    /// The repo was at or over a threshold and `git gc` ran to completion.
     ///
-    /// Both counts are reported because completion is not the same as
-    /// effectiveness — a `gc` can return zero and leave the count exactly where
-    /// it was — and an operator reading one number cannot tell the difference.
+    /// Both readings are reported because completion is not the same as
+    /// effectiveness — a `gc` can return zero and leave the counts exactly where
+    /// they were — and an operator reading one number cannot tell the
+    /// difference. `trigger` says which axis put the repo over, which is the
+    /// difference between "this repo writes a lot" and "this repo fetches a
+    /// lot".
     Compacted {
-        loose_objects_before: LooseObjectCount,
-        loose_objects_after: LooseObjectCount,
+        before: ObjectCounts,
+        after: ObjectCounts,
+        trigger: compaction::CompactionTrigger,
     },
 }
 
@@ -797,12 +830,15 @@ impl NotesRepo {
         self.compact_if_needed_with(CompactionThreshold::GIT_DEFAULT)
     }
 
-    /// The repo's true loose-object count, straight from `count-objects -v`.
+    /// The repo's true loose-object and pack counts, straight from
+    /// `count-objects -v`.
     ///
     /// Called twice per compaction — once to decide, once to check the repack
     /// achieved something — so it is one function rather than two spellings of
-    /// the same parse.
-    fn count_loose_objects(&self) -> Result<LooseObjectCount, NotesRepoError> {
+    /// the same parse. Both axes come from one invocation, which is why they are
+    /// one struct: a `before` on one axis paired with an `after` on the other
+    /// would compare two different readings.
+    fn count_objects(&self) -> Result<ObjectCounts, NotesRepoError> {
         let stdout = run_git(
             &self.canonical_path,
             ["count-objects", "-v"],
@@ -814,8 +850,79 @@ impl NotesRepo {
         )?;
         let text = String::from_utf8(stdout)
             .map_err(|source| NotesRepoError::CountObjectsNonUtf8 { source })?;
-        compaction::parse_count_objects_verbose(&text)
-            .map_err(|source| NotesRepoError::CountObjectsParse { source })
+        let loose_objects = compaction::parse_count_objects_verbose(&text)
+            .map_err(|source| NotesRepoError::CountObjectsParse { source })?;
+        Ok(ObjectCounts {
+            loose_objects,
+            packs: self.count_packs_towards_the_limit()?,
+        })
+    }
+
+    /// How many packs count towards the auto-pack limit, read from the pack
+    /// directory rather than from `count-objects -v`.
+    ///
+    /// The `packs:` line counts every pack; git's limit sees a narrower set —
+    /// local packs that are *indexed* and *not* marked `.keep` — and
+    /// `<repo>/objects/pack` is exactly the directory git looks at. The rule
+    /// itself is [`compaction::count_packs_towards_the_limit`], which takes
+    /// names so it is testable without a repo full of packs, and states there
+    /// why each clause is git's rather than writ's.
+    ///
+    /// A missing pack directory is zero packs, not an error: git creates it
+    /// lazily, so a repo that has never been packed simply has none.
+    fn count_packs_towards_the_limit(&self) -> Result<compaction::PackCount, NotesRepoError> {
+        self.count_packs_towards_the_limit_capped(MAX_PACK_DIR_ENTRIES)
+    }
+
+    /// [`Self::count_packs_towards_the_limit`] under a caller-chosen entry cap.
+    ///
+    /// Only tests want anything but [`MAX_PACK_DIR_ENTRIES`], and they want it
+    /// for one reason: a cap whose only test is "we never reach it" is a cap
+    /// nothing has exercised. The same shape, and the same reason, as
+    /// `compact_if_needed_with_limits`.
+    fn count_packs_towards_the_limit_capped(
+        &self,
+        max_entries: usize,
+    ) -> Result<compaction::PackCount, NotesRepoError> {
+        let pack_dir = self.canonical_path.join("objects").join("pack");
+        let entries = match std::fs::read_dir(&pack_dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(compaction::PackCount::new(0));
+            }
+            Err(source) => {
+                return Err(NotesRepoError::ReadPackDir {
+                    path: pack_dir,
+                    source,
+                });
+            }
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| NotesRepoError::ReadPackDir {
+                path: pack_dir.clone(),
+                source,
+            })?;
+            if names.len() >= max_entries {
+                return Err(NotesRepoError::PackDirTooLarge {
+                    path: pack_dir,
+                    limit: max_entries,
+                });
+            }
+            // A non-UTF-8 name cannot be one git wrote (pack names are hex plus
+            // a known suffix), so it cannot be a pack or a keep marker and
+            // skipping it changes no count. Counted against the cap anyway: the
+            // cap bounds the *walk*, and a directory full of unreadable names
+            // costs the same to walk as one full of readable ones.
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            } else {
+                names.push(String::new());
+            }
+        }
+        Ok(compaction::count_packs_towards_the_limit(
+            names.iter().map(String::as_str),
+        ))
     }
 
     /// [`Self::compact_if_needed`] at a caller-chosen threshold. Only tests want
@@ -865,10 +972,9 @@ impl NotesRepo {
         match &outcome {
             // Ran, and moved nothing. Worse than failing, because nothing else
             // here would stop the next request repacking again.
-            Ok(CompactionOutcome::Compacted {
-                loose_objects_before,
-                loose_objects_after,
-            }) if !compaction::made_progress(*loose_objects_before, *loose_objects_after) => {
+            Ok(CompactionOutcome::Compacted { before, after, .. })
+                if !compaction::made_progress(*before, *after, threshold) =>
+            {
                 state.hold_off_compaction(&self.canonical_path, now);
             }
             // Cleared rather than left to expire: a repo that is packing
@@ -897,13 +1003,11 @@ impl NotesRepo {
         // objects is a walk of the 256 fanout directories and has no such growth,
         // so widening its bound would only slow down the discovery that the
         // object directory is wedged.
-        let loose_objects = self.count_loose_objects()?;
+        let counts = self.count_objects()?;
 
-        match compaction::decide(loose_objects, threshold) {
-            CompactionDecision::Skip { loose_objects } => {
-                Ok(CompactionOutcome::Skipped { loose_objects })
-            }
-            CompactionDecision::Compact { loose_objects } => {
+        match compaction::decide(counts, threshold) {
+            CompactionDecision::Skip { counts } => Ok(CompactionOutcome::Skipped { counts }),
+            CompactionDecision::Compact { counts, trigger } => {
                 run_git_with_limits(
                     &self.canonical_path,
                     GC_ARGV,
@@ -926,10 +1030,11 @@ impl NotesRepo {
                 // measured rather than assumed. Costs one `count-objects` against
                 // a repo that was just packed; the caller decides what an
                 // unmoved count means.
-                let after = self.count_loose_objects()?;
+                let after = self.count_objects()?;
                 Ok(CompactionOutcome::Compacted {
-                    loose_objects_before: loose_objects,
-                    loose_objects_after: after,
+                    before: counts,
+                    after,
+                    trigger,
                 })
             }
         }
@@ -1702,6 +1807,25 @@ pub enum NotesRepoError {
         #[source]
         source: compaction::CountObjectsParseError,
     },
+    /// The pack directory could not be listed. An error rather than "assume
+    /// zero packs": zero reads as "nothing to compact", which would disable half
+    /// the policy silently. (A *missing* directory is not this — git creates it
+    /// lazily, so absent means genuinely no packs.)
+    #[error("pack directory {path} could not be read: {source}")]
+    ReadPackDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The pack directory holds more entries than the module's scan cap.
+    /// Refusing beats guessing: a saturated count would read as "far over the
+    /// pack threshold" and provoke a full `gc` on a directory that needs an
+    /// operator, while the error closes the retry gate and leaves the repo
+    /// exactly as compaction found it.
+    #[error(
+        "pack directory {path} holds more than {limit} entries; it needs an operator, not a gc"
+    )]
+    PackDirTooLarge { path: PathBuf, limit: usize },
     #[error("git hash-object produced unparseable OID {raw:?}: {source}")]
     HashObjectParse {
         raw: String,

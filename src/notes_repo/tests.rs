@@ -1,5 +1,6 @@
 //! Tests for the shared bare-repo notes wrapper (ref writes, fetch, atomic update). Split out of `notes_repo.rs` (an inline `#[cfg(test)]` module); tests unchanged.
 
+use super::compaction::{CompactionTrigger, LooseObjectCount, PackCount};
 use super::*;
 use std::ffi::OsStr;
 use std::fs;
@@ -1377,8 +1378,37 @@ fn object_exists(repo: &Path, oid: &GitObjectId) -> bool {
     .success()
 }
 
+/// Count packfiles by listing `objects/pack/*.pack` directly.
+///
+/// Shares no code with production for the same reason as
+/// [`loose_objects_on_disk`]: if a repack is supposed to have consolidated the
+/// packs, the evidence should be files missing from the disk, not two callers of
+/// `parse_count_objects_verbose` agreeing with each other.
+fn packs_on_disk(repo: &Path) -> usize {
+    let pack_dir = repo.join("objects").join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return 0;
+    };
+    entries
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|ext| ext == "pack"))
+        })
+        .count()
+}
+
 fn always_compact() -> CompactionThreshold {
-    CompactionThreshold::new(LooseObjectCount::new(0))
+    CompactionThreshold::new(LooseObjectCount::new(0), PackCount::new(0))
+}
+
+/// A threshold that only the pack axis can reach.
+///
+/// `u64::MAX` on the loose-object axis rather than a large number: it makes the
+/// claim "only packs could have triggered this" true by construction rather than
+/// by the test happening to stay under a limit.
+fn only_packs_compact(packs: u64) -> CompactionThreshold {
+    CompactionThreshold::new(LooseObjectCount::new(u64::MAX), PackCount::new(packs))
 }
 
 #[test]
@@ -1402,14 +1432,23 @@ fn compaction_packs_the_loose_objects_note_writes_leave_behind() {
         "note writes should have left loose objects to pack"
     );
 
+    let packs_before = packs_on_disk(repo.path());
     let outcome = repo.compact_if_needed_with(always_compact()).unwrap();
     assert_eq!(
         outcome,
         CompactionOutcome::Compacted {
-            loose_objects_before: LooseObjectCount::new(before as u64),
+            before: ObjectCounts {
+                loose_objects: LooseObjectCount::new(before as u64),
+                packs: PackCount::new(packs_before as u64),
+            },
             // Real git with `--cruft`: the unreachable seed blobs move into a
             // cruft pack, so nothing is left loose at all.
-            loose_objects_after: LooseObjectCount::new(0),
+            after: ObjectCounts {
+                loose_objects: LooseObjectCount::new(0),
+                packs: PackCount::new(packs_on_disk(repo.path()) as u64),
+            },
+            // Both axes are at zero threshold here, so both are over.
+            trigger: CompactionTrigger::Both,
         },
         "the outcome must report the measurement that triggered it, and what it \
          achieved"
@@ -1434,6 +1473,253 @@ fn compaction_packs_the_loose_objects_note_writes_leave_behind() {
     }
 }
 
+/// **The pack axis fires against real git, and consolidates.**
+///
+/// This is the whole point of the second dimension. Bailiff's notes repo grows
+/// chiefly by whole *packs* — one per `fetch_from_remote` — so under the
+/// loose-only policy it took roughly 2200 note writes to trip a threshold while
+/// accumulating a pack per fetch the entire time. The loose-object axis is held
+/// at `u64::MAX` here, so nothing but the pack count can have triggered this.
+///
+/// Measured rather than assumed: on git 2.54, writ's exact `GC_ARGV` collapses
+/// four packs into one. If a future git stopped consolidating, the `packs_after`
+/// assertion is what would say so — and `made_progress` would then hold the
+/// retry gate closed rather than repacking on every request forever.
+#[test]
+fn a_repo_over_the_pack_threshold_is_compacted_and_its_packs_consolidated() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+
+    // One pack per round, the shape a fetch-heavy repo arrives in.
+    for i in 0..4 {
+        repo.write_note(&r, format!("run-{i}").as_bytes(), b"body")
+            .unwrap();
+        raw_git(repo.path(), &["repack", "-q"]);
+    }
+    let packs_before = packs_on_disk(repo.path());
+    assert!(
+        packs_before >= 2,
+        "the fixture must actually accumulate packs; got {packs_before}",
+    );
+    let loose_before = loose_objects_on_disk(repo.path());
+
+    let outcome = repo
+        .compact_if_needed_with(only_packs_compact(packs_before as u64))
+        .unwrap();
+
+    let CompactionOutcome::Compacted {
+        before,
+        after,
+        trigger,
+    } = outcome
+    else {
+        panic!("a repo at the pack threshold must compact; got {outcome:?}");
+    };
+    assert_eq!(
+        trigger,
+        CompactionTrigger::Packs,
+        "the loose-object threshold is u64::MAX, so only packs can have fired",
+    );
+    assert_eq!(before.packs, PackCount::new(packs_before as u64));
+    assert_eq!(
+        before.loose_objects,
+        LooseObjectCount::new(loose_before as u64),
+    );
+    assert!(
+        after.packs < before.packs,
+        "gc must consolidate: {before:?} -> {after:?}",
+    );
+
+    // On disk, not merely in the reported figures: a `Compacted` outcome whose
+    // numbers came from anywhere but the object database would pass the above.
+    assert_eq!(
+        packs_on_disk(repo.path()),
+        after.packs.get() as usize,
+        "the reported pack count must be the one on disk",
+    );
+
+    // And the notes still read back, which is the only thing any of this is
+    // allowed to cost.
+    for i in 0..4 {
+        let seed = format!("run-{i}");
+        let oid = repo
+            .write_note_if_absent(&r, seed.as_bytes(), b"body")
+            .unwrap();
+        let oid = match oid {
+            WriteOutcome::Written(oid) | WriteOutcome::AlreadyPresent(oid) => oid,
+        };
+        assert_eq!(repo.read_note(&r, &oid).unwrap(), b"body");
+    }
+}
+
+/// **A `.keep` pack does not count towards the limit, against a real repo.**
+///
+/// The pure rule is property-tested; this is the end-to-end half, because the
+/// claim is about what writ *measures* and the measurement reads a real
+/// directory. Counting kept packs would mean a repo holding enough of them
+/// compacts on every request for ever — `gc` cannot consolidate what it may not
+/// touch, so the count never falls, `made_progress` closes the retry gate, and
+/// an hour later it tries again.
+#[test]
+fn a_kept_pack_is_not_counted_towards_the_pack_threshold() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+
+    for i in 0..3 {
+        repo.write_note(&r, format!("run-{i}").as_bytes(), b"body")
+            .unwrap();
+        raw_git(repo.path(), &["repack", "-q"]);
+    }
+    let packs = packs_on_disk(repo.path());
+    assert!(packs >= 2, "the fixture must accumulate packs; got {packs}");
+
+    // Mark every pack as kept, exactly as git would.
+    let pack_dir = repo.path().join("objects").join("pack");
+    for entry in fs::read_dir(&pack_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            fs::write(path.with_extension("keep"), b"").unwrap();
+        }
+    }
+
+    // A threshold of one pack: unmissable if kept packs were counted.
+    let outcome = repo.compact_if_needed_with(only_packs_compact(1)).unwrap();
+
+    assert!(
+        matches!(outcome, CompactionOutcome::Skipped { .. }),
+        "kept packs must not trigger a compaction that could not consolidate \
+         them; got {outcome:?}",
+    );
+    match outcome {
+        CompactionOutcome::Skipped { counts } => assert_eq!(
+            counts.packs,
+            PackCount::new(0),
+            "every pack is kept, so none counts",
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        packs_on_disk(repo.path()),
+        packs,
+        "nothing should have been repacked",
+    );
+}
+
+/// **A half-written pack does not count, against a real repo.**
+///
+/// Measured on git 2.54: a `.pack` with no `.idx` is reported under `garbage:`
+/// and excluded from `packs:`, so `gc.autoPackLimit` never sees it. Reachable
+/// here rather than hypothetical — writ kills a `gc` at
+/// `COMPACTION_GIT_TIMEOUT`, and an interrupted repack is how such a file
+/// appears. Counting it would let the repo sit permanently over the threshold on
+/// something no `gc` will consolidate: compact, fail to progress, back off an
+/// hour, repeat.
+#[test]
+fn a_pack_without_an_index_is_not_counted_towards_the_pack_threshold() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+    repo.write_note(&r, b"seed", b"body").unwrap();
+    raw_git(repo.path(), &["repack", "-q"]);
+
+    let real_packs = packs_on_disk(repo.path());
+    assert!(real_packs >= 1, "the fixture must produce a pack");
+
+    // Two files that look like packs and are not, as a killed repack leaves.
+    let pack_dir = repo.path().join("objects").join("pack");
+    for name in ["pack-deadbeef.pack", ".tmp-9-pack-cafe.pack"] {
+        fs::write(pack_dir.join(name), b"not a real pack").unwrap();
+    }
+    assert_eq!(
+        packs_on_disk(repo.path()),
+        real_packs + 2,
+        "precondition: the files are on disk and look like packs by name",
+    );
+
+    // A threshold one past the real packs: only the impostors could reach it.
+    let outcome = repo
+        .compact_if_needed_with(only_packs_compact(real_packs as u64 + 1))
+        .unwrap();
+
+    let CompactionOutcome::Skipped { counts } = outcome else {
+        panic!("unindexed packs must not trigger a compaction; got {outcome:?}");
+    };
+    assert_eq!(
+        counts.packs,
+        PackCount::new(real_packs as u64),
+        "only the indexed packs count",
+    );
+}
+
+/// The pack scan refuses a directory past its entry cap rather than guessing.
+///
+/// Every git invocation in this module is bounded, so an in-process `read_dir`
+/// loop that was not would be a hole in the one discipline the module is built
+/// around. A saturated count would be worse than an error: it would read as
+/// "far over the pack threshold" and provoke a full `gc` on a directory that
+/// plainly needs an operator, whereas the error closes the retry gate and leaves
+/// the repo as compaction found it.
+///
+/// Driven at a cap of two rather than the production quarter-million, because a
+/// cap whose only test is "we never reach it" is a cap nothing has exercised.
+#[test]
+fn the_pack_scan_refuses_a_directory_past_its_entry_cap() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    repo.write_note(&notes_ref(), b"seed", b"body").unwrap();
+    raw_git(repo.path(), &["repack", "-q"]);
+
+    let pack_dir = repo.path().join("objects").join("pack");
+    let entries = fs::read_dir(&pack_dir).unwrap().count();
+    assert!(entries >= 2, "a repack leaves a pack and an index");
+
+    // Under the cap: a real count.
+    repo.count_packs_towards_the_limit_capped(entries + 1)
+        .expect("a directory within the cap is counted");
+
+    let err = repo
+        .count_packs_towards_the_limit_capped(entries - 1)
+        .unwrap_err();
+    assert!(
+        matches!(err, NotesRepoError::PackDirTooLarge { .. }),
+        "got: {err:?}",
+    );
+    // The message names the fix rather than the mechanism: this is a directory
+    // an operator has to look at.
+    assert!(err.to_string().contains("needs an operator"), "{err}");
+}
+
+/// A repo under *both* thresholds is left alone even when it has packs.
+///
+/// The counterpart to the test above, and the one that keeps the pack axis from
+/// being "compact always": adding a dimension to a policy is only safe if the
+/// new dimension can also say no.
+#[test]
+fn a_repo_under_the_pack_threshold_is_left_alone() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+    repo.write_note(&r, b"seed", b"body").unwrap();
+    raw_git(repo.path(), &["repack", "-q"]);
+
+    let packs_before = packs_on_disk(repo.path());
+    let outcome = repo
+        .compact_if_needed_with(only_packs_compact(packs_before as u64 + 1))
+        .unwrap();
+
+    assert!(
+        matches!(outcome, CompactionOutcome::Skipped { .. }),
+        "one pack below the threshold must skip; got {outcome:?}",
+    );
+    assert_eq!(
+        packs_on_disk(repo.path()),
+        packs_before,
+        "a skipped compaction must leave the object database untouched",
+    );
+}
+
 #[test]
 fn compaction_below_the_threshold_touches_nothing() {
     let tmp = TempDir::new().unwrap();
@@ -1442,13 +1728,20 @@ fn compaction_below_the_threshold_touches_nothing() {
     repo.write_note(&r, b"seed", b"body").unwrap();
 
     let before = loose_objects_on_disk(repo.path());
-    let threshold = CompactionThreshold::new(LooseObjectCount::new(before as u64 + 1));
+    let packs_before = packs_on_disk(repo.path());
+    let threshold = CompactionThreshold::new(
+        LooseObjectCount::new(before as u64 + 1),
+        PackCount::new(packs_before as u64 + 1),
+    );
     let outcome = repo.compact_if_needed_with(threshold).unwrap();
 
     assert_eq!(
         outcome,
         CompactionOutcome::Skipped {
-            loose_objects: LooseObjectCount::new(before as u64)
+            counts: ObjectCounts {
+                loose_objects: LooseObjectCount::new(before as u64),
+                packs: PackCount::new(packs_before as u64),
+            },
         }
     );
     // The real assertion: the objects are still loose, so no repack ran. A
@@ -1896,10 +2189,17 @@ fn a_gc_that_packs_nothing_does_not_run_again_on_the_next_write() {
     assert_eq!(
         first,
         CompactionOutcome::Compacted {
-            loose_objects_before: LooseObjectCount::new(9000),
-            loose_objects_after: LooseObjectCount::new(9000),
+            before: ObjectCounts {
+                loose_objects: LooseObjectCount::new(9000),
+                packs: PackCount::new(0),
+            },
+            after: ObjectCounts {
+                loose_objects: LooseObjectCount::new(9000),
+                packs: PackCount::new(0),
+            },
+            trigger: CompactionTrigger::Both,
         },
-        "the outcome must report both counts, so 'ran' and 'helped' stay distinguishable"
+        "the outcome must report both readings, so 'ran' and 'helped' stay distinguishable"
     );
     assert_eq!(attempt_count(&attempts), 1);
 
