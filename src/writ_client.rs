@@ -30,7 +30,7 @@ use tokio::net::UnixStream;
 
 use crate::agent_run::AgentPrompt;
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId, SshSignature};
-use crate::protocol::{ClientMessage, ServerMessage, SignedRunMetadata};
+use crate::protocol::{ClientMessage, HOST_PROTOCOL_VERSION, ServerMessage, SignedRunMetadata};
 use crate::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
 
 /// Matches the broker-side cap in `src/server.rs`. The largest legal
@@ -149,6 +149,13 @@ pub enum WritClientError {
     /// so the cleanup path can react without parsing prose.
     #[error("writ session {session_id} is already closed")]
     ClosedSession { session_id: SessionId },
+    /// The connection's version handshake failed, so **nothing was
+    /// dispatched**. Distinct from [`Self::WritError`] because the request was
+    /// never seen: a caller retrying this without changing anything will fail
+    /// identically, and the fix is operational (one of the two binaries is from
+    /// a different build) rather than anything about the request.
+    #[error("writ and writd disagree about the host protocol: {message}")]
+    ProtocolRefused { message: String },
     /// Writ returned a structured reply that isn't a legal answer to
     /// `RunAgent`. The only legal answer is
     /// [`ServerMessage::RunAgentCompleted`] (success) or
@@ -275,10 +282,17 @@ impl WritClient {
         }
     }
 
-    /// Dial, write one framed [`ClientMessage`], read one framed
-    /// [`ServerMessage`]. Shared by every RPC on this client so the
-    /// framing contract (one connection per call, newline-delimited
-    /// JSON, bounded reads) lives in one place.
+    /// Dial, complete the version handshake, write one framed
+    /// [`ClientMessage`], read one framed [`ServerMessage`]. Shared by every
+    /// RPC on this client so the framing contract (one connection per call,
+    /// newline-delimited JSON, bounded reads) lives in one place.
+    ///
+    /// The handshake is a full round trip *before* `msg` is written, and
+    /// deliberately not pipelined behind it. A daemon too old to know `Hello`
+    /// answers [`ServerMessage::Error`] and carries on reading — so a pipelined
+    /// request would be dispatched by the very daemon that just failed the
+    /// handshake, which is the failure the handshake exists to prevent. One
+    /// extra round trip on a Unix socket is not a price worth haggling over.
     async fn roundtrip(&self, msg: ClientMessage) -> Result<ServerMessage, WritClientError> {
         let stream =
             UnixStream::connect(&self.socket_path)
@@ -290,24 +304,61 @@ impl WritClient {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
-        let mut json =
-            serde_json::to_string(&msg).map_err(|source| WritClientError::Serialize { source })?;
-        json.push('\n');
-        writer
-            .write_all(json.as_bytes())
-            .await
-            .map_err(|e| WritClientError::Write { source: e })?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| WritClientError::Write { source: e })?;
+        let hello = ClientMessage::Hello {
+            protocol_version: HOST_PROTOCOL_VERSION,
+        };
+        match write_then_read(&mut writer, &mut reader, &hello).await? {
+            ServerMessage::HelloAccepted { protocol_version }
+                if protocol_version == HOST_PROTOCOL_VERSION => {}
+            // Both skews land here. A *new* daemon that refuses us, and an
+            // *old* one that could not parse `Hello` at all, both answer
+            // `Error` — which is why the refusal is that variant and not a new
+            // one this client would itself fail to read.
+            ServerMessage::Error { message } => {
+                return Err(WritClientError::ProtocolRefused { message });
+            }
+            other => {
+                return Err(WritClientError::ProtocolRefused {
+                    message: format!(
+                        "writd answered the version handshake with {other:?} instead of \
+                         accepting version {HOST_PROTOCOL_VERSION}"
+                    ),
+                });
+            }
+        }
 
-        let bytes = read_line_bounded(&mut reader, MAX_LINE_BYTES)
-            .await
-            .map_err(|e| WritClientError::ReadFraming { source: e })?
-            .ok_or(WritClientError::ReadEof)?;
-        serde_json::from_slice(&bytes).map_err(|e| WritClientError::ReadDecode { source: e })
+        write_then_read(&mut writer, &mut reader, &msg).await
     }
+}
+
+/// Write one framed [`ClientMessage`] and read the one framed
+/// [`ServerMessage`] that answers it.
+async fn write_then_read<W, R>(
+    writer: &mut W,
+    reader: &mut R,
+    msg: &ClientMessage,
+) -> Result<ServerMessage, WritClientError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    let mut json =
+        serde_json::to_string(msg).map_err(|source| WritClientError::Serialize { source })?;
+    json.push('\n');
+    writer
+        .write_all(json.as_bytes())
+        .await
+        .map_err(|e| WritClientError::Write { source: e })?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| WritClientError::Write { source: e })?;
+
+    let bytes = read_line_bounded(reader, MAX_LINE_BYTES)
+        .await
+        .map_err(|e| WritClientError::ReadFraming { source: e })?
+        .ok_or(WritClientError::ReadEof)?;
+    serde_json::from_slice(&bytes).map_err(|e| WritClientError::ReadDecode { source: e })
 }
 
 /// Mirror of `server::read_line_bounded`. Duplicated rather than
@@ -468,7 +519,15 @@ mod tests {
                         return;
                     };
                     let (reader, mut writer) = stream.into_split();
-                    let mut lines = BufReader::new(reader).lines();
+                    let mut reader = BufReader::new(reader);
+                    // The daemon's own handshake rule, not a second copy of it.
+                    if !crate::server::answer_host_handshake(&mut reader, &mut writer)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let mut lines = reader.lines();
                     if let Ok(Some(line)) = lines.next_line().await
                         && let Ok(msg) = serde_json::from_str::<ClientMessage>(&line)
                     {
@@ -491,6 +550,95 @@ mod tests {
         async fn observed_requests(&self) -> Vec<ClientMessage> {
             self.requests.lock().await.clone()
         }
+    }
+
+    /// A stub that behaves like a **daemon too old to know `Hello`**: it
+    /// answers every line it cannot decode with `Error` and *keeps reading*,
+    /// exactly as `handle_connection` did before the handshake existed. It
+    /// records every line it receives, decodable or not.
+    ///
+    /// This is the fixture for the one guarantee the server-side tests cannot
+    /// give, because it is a property of the *client*: that the request is not
+    /// pipelined behind the `Hello`. A pipelined request would be read and
+    /// acted on by precisely this daemon.
+    struct PreHandshakeBroker {
+        socket_path: PathBuf,
+        lines: Arc<Mutex<Vec<String>>>,
+        _task: JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl PreHandshakeBroker {
+        async fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("writ.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&lines);
+            let task = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        seen.lock().await.push(line.clone());
+                        // What a pre-handshake daemon does with an unknown
+                        // `type` tag: reply `Error`, then loop for the next
+                        // line. Never close.
+                        let reply = ServerMessage::Error {
+                            message: "invalid request: unknown variant `hello`".into(),
+                        };
+                        let mut json = serde_json::to_string(&reply).unwrap();
+                        json.push('\n');
+                        if writer.write_all(json.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                socket_path,
+                lines,
+                _task: task,
+                _dir: dir,
+            }
+        }
+    }
+
+    /// **An old daemon is never sent the request.**
+    ///
+    /// The handshake's server half stops an old *client*; this is the other
+    /// direction, and it is the client's job. A pre-handshake daemon reads
+    /// lines in order and acts on each, so a client that wrote its request
+    /// alongside the `Hello` would have that request dispatched by the very
+    /// daemon that just failed the handshake — the exact failure the handshake
+    /// exists to prevent, arrived at through the fix for it.
+    ///
+    /// The assertion is on what the daemon *received*: exactly one line, the
+    /// `Hello`. Remove the early return in `roundtrip` and this sees two.
+    #[tokio::test]
+    async fn an_old_daemon_is_refused_before_the_request_is_written() {
+        let broker = PreHandshakeBroker::start().await;
+        let client = WritClient::new(&broker.socket_path);
+
+        let err = client.run_agent(sample_request()).await.unwrap_err();
+        assert!(
+            matches!(err, WritClientError::ProtocolRefused { .. }),
+            "got: {err:?}",
+        );
+
+        let seen = broker.lines.lock().await.clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the request must not be pipelined behind the handshake: {seen:?}",
+        );
+        let sent: ClientMessage = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(
+            sent,
+            ClientMessage::Hello {
+                protocol_version: HOST_PROTOCOL_VERSION,
+            },
+        );
     }
 
     /// Happy path: client sends `RunAgent`, broker replies

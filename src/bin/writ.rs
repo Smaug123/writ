@@ -1058,16 +1058,99 @@ fn call_with_timeout(
 ) -> Result<ServerMessage, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| format!("cannot connect to {}: {e}", socket_path.display()))?;
-    // Apply to both sides so a stuck broker can't wedge the CLI on
-    // either write or read.
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
 
+    // `timeout` is a budget for the whole call, not for each blocking read.
+    // The socket options behind it (`SO_RCVTIMEO`/`SO_SNDTIMEO`) are per
+    // syscall, so once the handshake made this two round trips instead of one,
+    // setting them once would have let the total reach *twice* the caller's
+    // bound — `promote approve`'s documented 30-minute ceiling becoming an
+    // hour. One deadline, re-derived before each phase, keeps the number the
+    // caller passed meaning what it says.
+    let deadline = std::time::Instant::now() + timeout;
+
+    let mut reader = BufReader::new(&stream);
+
+    // The version handshake, and a full round trip before `msg` goes anywhere.
+    // Not pipelined on purpose: a daemon too old to know `Hello` answers
+    // `Error` and keeps reading, so a request sent alongside would be
+    // dispatched by exactly the daemon that just failed the handshake.
+    let hello = ClientMessage::Hello {
+        protocol_version: writ::protocol::HOST_PROTOCOL_VERSION,
+    };
+    match write_and_read_reply(socket_path, &stream, &mut reader, &hello, deadline)? {
+        ServerMessage::HelloAccepted { protocol_version }
+            if protocol_version == writ::protocol::HOST_PROTOCOL_VERSION => {}
+        // Both directions of skew arrive as `Error`: a new daemon refusing our
+        // version, and an old one that could not parse `Hello` at all.
+        ServerMessage::Error { message } => {
+            return Err(format!(
+                "writ and writd disagree about the host protocol, so nothing was run: {message}"
+            )
+            .into());
+        }
+        other => {
+            return Err(format!(
+                "writ daemon at {} answered the version handshake with {other:?} instead of \
+                 accepting version {}",
+                socket_path.display(),
+                writ::protocol::HOST_PROTOCOL_VERSION,
+            )
+            .into());
+        }
+    }
+
+    write_and_read_reply(socket_path, &stream, &mut reader, msg, deadline)
+}
+
+/// Set the socket's read and write timeouts to what is left of the call's
+/// budget, so the two round trips share one deadline rather than getting one
+/// each.
+///
+/// A budget already spent is an error rather than a zero timeout, and that is
+/// not a stylistic choice: `set_read_timeout(Some(Duration::ZERO))` means *no
+/// timeout at all* in `std`, so passing an exhausted budget through would
+/// silently remove the bound at exactly the moment it was doing its job.
+fn apply_remaining_budget(
+    socket_path: &Path,
+    stream: &UnixStream,
+    deadline: std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(format!(
+            "timed out waiting for the writ daemon at {}",
+            socket_path.display()
+        )
+        .into());
+    }
+    // Both sides, so a stuck broker can't wedge the CLI on either write or read.
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
+    Ok(())
+}
+
+/// Write one framed [`ClientMessage`] and read the framed [`ServerMessage`]
+/// answering it, on an already-connected socket, within what is left of the
+/// call's budget.
+///
+/// It applies the budget itself rather than trusting the caller to do so before
+/// each round trip. That is the difference between an invariant and a habit:
+/// the handshake made this two round trips, and a third would be one more place
+/// to forget — after which the caller's timeout would quietly mean "per phase"
+/// again.
+fn write_and_read_reply(
+    socket_path: &Path,
+    stream: &UnixStream,
+    reader: &mut BufReader<&UnixStream>,
+    msg: &ClientMessage,
+    deadline: std::time::Instant,
+) -> Result<ServerMessage, Box<dyn std::error::Error>> {
+    apply_remaining_budget(socket_path, stream, deadline)?;
     let mut line = serde_json::to_string(msg)
         .map_err(|e| format!("encoding request for writ daemon as JSON failed: {e}"))?;
     line.push('\n');
 
-    let mut w = &stream;
+    let mut w = stream;
     w.write_all(line.as_bytes()).map_err(|e| {
         format!(
             "writing request to writ daemon at {} failed: {e}",
@@ -1081,7 +1164,6 @@ fn call_with_timeout(
         )
     })?;
 
-    let mut reader = BufReader::new(&stream);
     let mut reply = String::new();
     let bytes_read = reader.read_line(&mut reply).map_err(|e| {
         format!(
@@ -1138,6 +1220,66 @@ fn reply_preview(reply: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The call's timeout is a budget for the call, not for each read.**
+    ///
+    /// `SO_RCVTIMEO` applies per blocking syscall, so once the handshake made
+    /// this two round trips, a single `set_read_timeout` would have let the
+    /// total reach twice what the caller asked for — `promote approve`'s
+    /// documented 30-minute ceiling silently becoming an hour. Re-deriving from
+    /// one deadline is what keeps the number meaning what it says, and the
+    /// observable consequence is that the second application is *strictly
+    /// smaller* than the first.
+    #[test]
+    fn the_second_round_trip_gets_what_is_left_of_the_budget() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let path = Path::new("/nonexistent.sock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        apply_remaining_budget(path, &stream, deadline).unwrap();
+        let first = stream.read_timeout().unwrap().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        apply_remaining_budget(path, &stream, deadline).unwrap();
+        let second = stream.read_timeout().unwrap().unwrap();
+
+        assert!(
+            second < first,
+            "the second phase was handed a fresh budget: first={first:?} second={second:?}",
+        );
+        assert!(
+            first <= std::time::Duration::from_secs(5),
+            "the budget grew: {first:?}",
+        );
+        // The write side moves with it; a stuck broker must not be able to
+        // wedge the CLI on either direction.
+        assert_eq!(stream.write_timeout().unwrap().unwrap(), second);
+    }
+
+    /// An exhausted budget is an error, **not** a zero timeout.
+    ///
+    /// `set_read_timeout(Some(Duration::ZERO))` means *no timeout at all* in
+    /// `std`, so passing the remaining budget straight through would remove the
+    /// bound at exactly the moment it was doing its job. The trap is invisible
+    /// at the call site, which is why it gets its own test.
+    #[test]
+    fn an_exhausted_budget_is_refused_rather_than_disabling_the_timeout() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let path = Path::new("/nonexistent.sock");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let err = apply_remaining_budget(path, &stream, past).unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(
+            stream.read_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(1)),
+            "a refused budget must leave the socket's existing bound alone,              never replace it with the `Duration::ZERO` that means 'no timeout'",
+        );
+    }
 
     #[test]
     fn call_reports_closed_connection_without_raw_json_eof() {

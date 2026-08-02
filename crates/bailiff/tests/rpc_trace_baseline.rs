@@ -120,7 +120,17 @@ impl StubBroker {
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (reader, mut writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
+                let mut reader = BufReader::new(reader);
+                // The daemon's own handshake rule, not a second copy of it: a
+                // stub that accepted a version writd would refuse would be
+                // testing a protocol nothing speaks.
+                if !writ::server::answer_host_handshake(&mut reader, &mut writer)
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let mut lines = reader.lines();
                 // Record *before* looking for a reply. Draining the
                 // request first is what makes the zero-RPC fixtures
                 // mean anything: with no scripted reply the earlier

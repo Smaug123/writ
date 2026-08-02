@@ -813,7 +813,17 @@ mod session_mismatch_tests {
                         return;
                     };
                     let (reader, mut writer) = stream.into_split();
-                    let mut lines = BufReader::new(reader).lines();
+                    let mut reader = BufReader::new(reader);
+                    // The daemon's own handshake rule, not a second copy of it:
+                    // a stub that accepted a version writd would refuse would
+                    // be testing a protocol nothing speaks.
+                    if !writ::server::answer_host_handshake(&mut reader, &mut writer)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let mut lines = reader.lines();
                     if let Ok(Some(line)) = lines.next_line().await
                         && let Ok(msg) = serde_json::from_str::<ClientMessage>(&line)
                     {
