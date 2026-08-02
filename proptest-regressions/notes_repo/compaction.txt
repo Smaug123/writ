@@ -10,3 +10,4 @@ cc e604b92e3052affbc1d82222b537c3db5ea4342ffbd29d75692a15ceeef83cb6 # shrinks to
 cc 7513b4cec51b79a65bba97e1f722cb9e4c062565cd7383f34577b9c45380b8cf # shrinks to count = 0, threshold = 0
 cc 964556d58f5410e166cde6f1b97d59d322ccca1fced57e3aa5e62495d006aa57 # shrinks to count = 0, threshold = 0
 cc d7c42dcabaa5f0ceb7689fbf3957e478c39e6cb8cf0aec53c2ecf834286e438f # shrinks to before = 9, after = 9
+cc a47cdf2178fb7e5c102076c49edd149d11ea6ca1782d857f57331a312e6b2c81 # shrinks to stems = {"c"}, kept = {"c"}

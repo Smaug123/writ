@@ -23,10 +23,12 @@
 //!
 //! ## Two axes, because writ has two shapes of repo
 //!
-//! [`CompactionThreshold::GIT_DEFAULT`] is git's own pair: `gc.auto` = 6700
-//! loose objects and `gc.autoPackLimit` = 50 packs. The intent is to do what git
-//! would have done, at the point git would have done it, but synchronously and
-//! under the lock writ already holds for every other mutation of the repo.
+//! [`CompactionThreshold::GIT_DEFAULT`] is git's own pair, expressed in this
+//! module's units: `gc.auto`'s 6700 loose objects and `gc.autoPackLimit`'s 50
+//! packs, each +1 because git phrases both as *more than* while a threshold here
+//! is the count *at which* writ compacts. The intent is to do what git would
+//! have done, at the point git would have done it, but synchronously and under
+//! the lock writ already holds for every other mutation of the repo.
 //!
 //! Both axes are needed, and the second is not decoration. A daemon-owned notes
 //! repo grows chiefly by **loose objects** — three per note write. Bailiff's
@@ -41,7 +43,9 @@
 //! (`objects/17/`) and multiplying by 256. `count-objects -v`'s `count:` is the
 //! true total, so this fires on the real figure rather than a sample. That makes
 //! it more accurate, not more eager: for a repo with evenly-distributed OIDs the
-//! two agree. The pack count needs no such caveat — git reads it exactly too.
+//! two agree. The pack count is exact on both sides, but is read from the pack
+//! directory rather than from `count-objects -v`: git's limit counts only local
+//! packs without a `.keep` sidecar, and that line counts every pack.
 
 /// The number of loose (unpacked) objects in a repo's object database.
 ///
@@ -133,18 +137,28 @@ pub struct CompactionThreshold {
 }
 
 impl CompactionThreshold {
-    /// Git's own defaults: `gc.auto` = 6700 loose objects, `gc.autoPackLimit`
-    /// = 50 packs.
+    /// Git's own trigger points, expressed in this type's units.
     ///
-    /// Not numbers writ invented. Git applies them to every repo that has not
-    /// disabled auto-maintenance, so they are the figures this repo would have
-    /// been compacted at before writ suppressed git's background writer.
-    /// Choosing our own would mean claiming to know better than upstream about a
-    /// tradeoff (lookup cost vs. repack cost) that upstream has tuned against
-    /// far more repositories than writ will ever see.
+    /// Not numbers writ invented. Git applies its equivalents to every repo that
+    /// has not disabled auto-maintenance, so these are the figures this repo
+    /// would have been compacted at before writ suppressed git's background
+    /// writer. Choosing our own would mean claiming to know better than upstream
+    /// about a tradeoff (lookup cost vs. repack cost) that upstream has tuned
+    /// against far more repositories than writ will ever see.
+    ///
+    /// **The +1 is not a fencepost slip.** Git phrases both knobs as *more
+    /// than*: `gc.auto` is documented as "approximately more than this many
+    /// loose objects", and `gc.autoPackLimit` as "more than this many packs
+    /// that are not marked with `*.keep`" — `too_many_packs()` compares
+    /// `limit < count`. A [`CompactionThreshold`] is the count *at which* writ
+    /// compacts (see `decide`, which is at-or-above so that a threshold of
+    /// zero means "always"), so git's `N` becomes writ's `N + 1` and the two
+    /// fire on exactly the same repos. Spelling the defaults 6700 and 50 here
+    /// would make writ compact one object, and one pack, earlier than the policy
+    /// it claims to be reproducing.
     pub const GIT_DEFAULT: Self = Self {
-        loose_objects: LooseObjectCount::new(6700),
-        packs: PackCount::new(50),
+        loose_objects: LooseObjectCount::new(6701),
+        packs: PackCount::new(51),
     };
 
     /// A threshold at arbitrary counts. Tests use small values so a compaction
@@ -278,80 +292,93 @@ pub(crate) const fn made_progress(
     loose_ok && packs_ok
 }
 
-/// Read the loose-object and pack counts out of `git count-objects -v` output.
+/// Read the loose-object count out of `git count-objects -v` output.
 ///
-/// The format is one `key: value` per line. We interpret exactly two keys —
-/// `count` and `packs` — and ignore every other line, because the set of keys
-/// grows between git versions and one of them (`alternate: <path>`) carries a
-/// value that is not a number at all. Ignoring unknown keys is therefore not
-/// laziness: a parser that insisted every value be numeric would fail on any
-/// repo with an alternate object store configured.
+/// The format is one `key: value` per line. We interpret exactly one key —
+/// `count` — and ignore every other line, because the set of keys grows between
+/// git versions and one of them (`alternate: <path>`) carries a value that is
+/// not a number at all. Ignoring unknown keys is therefore not laziness: a
+/// parser that insisted every value be numeric would fail on any repo with an
+/// alternate object store configured.
 ///
-/// A missing, duplicated, or non-numeric value for either key is an error rather
-/// than a default. Defaulting to zero would read as "nothing to compact" and
-/// silently disable compaction forever the moment git's output shape changed.
+/// A missing, duplicated, or non-numeric `count` is an error rather than a
+/// default. Defaulting to zero would read as "nothing to compact" and silently
+/// disable compaction forever the moment git's output shape changed.
 ///
-/// Both keys are unconditionally present in the output — verified on git 2.54
-/// for a fresh bare repo, a repo with only loose objects, and a packed repo:
-/// `packs: 0` is emitted rather than the line being omitted. So requiring
-/// `packs` costs nothing on a healthy git and is what makes a shape change loud
-/// instead of silent.
-pub fn parse_count_objects_verbose(stdout: &str) -> Result<ObjectCounts, CountObjectsParseError> {
-    let mut loose_objects: Option<u64> = None;
-    let mut packs: Option<u64> = None;
+/// **The pack count does not come from here**, even though `count-objects -v`
+/// prints a `packs:` line, because that line counts every pack. Git's own
+/// auto-pack policy counts only *local* packs *not marked with a `.keep`
+/// sidecar* — see [`count_unkept_packs`], which reads the pack directory
+/// instead.
+pub fn parse_count_objects_verbose(
+    stdout: &str,
+) -> Result<LooseObjectCount, CountObjectsParseError> {
+    let mut found: Option<LooseObjectCount> = None;
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let key = key.trim();
-        let slot = match key {
-            "count" => &mut loose_objects,
-            "packs" => &mut packs,
-            _ => continue,
-        };
-        // Structural error first: two lines for one key mean the output is not
-        // the shape we think it is, which is worth saying even if the second
-        // value also happens to be unparseable.
-        if slot.is_some() {
-            return Err(CountObjectsParseError::DuplicateKey {
-                key: key.to_string(),
-            });
+        if key.trim() != "count" {
+            continue;
+        }
+        // Structural error first: two `count:` lines mean the output is not the
+        // shape we think it is, which is worth saying even if the second value
+        // also happens to be unparseable.
+        if found.is_some() {
+            return Err(CountObjectsParseError::DuplicateCount);
         }
         let raw = value.trim();
-        *slot = Some(
-            raw.parse::<u64>()
-                .map_err(|_| CountObjectsParseError::UnparseableValue {
-                    key: key.to_string(),
-                    raw: raw.to_string(),
-                })?,
-        );
+        let parsed = raw
+            .parse::<u64>()
+            .map_err(|_| CountObjectsParseError::UnparseableCount {
+                raw: raw.to_string(),
+            })?;
+        found = Some(LooseObjectCount::new(parsed));
     }
-    Ok(ObjectCounts {
-        loose_objects: LooseObjectCount::new(loose_objects.ok_or(
-            CountObjectsParseError::MissingKey {
-                key: "count".to_string(),
-            },
-        )?),
-        packs: PackCount::new(packs.ok_or(CountObjectsParseError::MissingKey {
-            key: "packs".to_string(),
-        })?),
-    })
+    found.ok_or(CountObjectsParseError::MissingCount)
 }
 
 /// Why `git count-objects -v` output could not be read.
-///
-/// Keyed by the field name rather than one variant per key: the set of keys writ
-/// reads grew from one to two, and a variant per key per failure mode grows as
-/// their product. The name is carried in the message so the diagnostic loses
-/// nothing.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum CountObjectsParseError {
-    #[error("git count-objects -v output has no `{key}:` line")]
-    MissingKey { key: String },
-    #[error("git count-objects -v output has more than one `{key}:` line")]
-    DuplicateKey { key: String },
-    #[error("git count-objects -v reported a non-numeric `{key}` value {raw:?}")]
-    UnparseableValue { key: String, raw: String },
+    #[error("git count-objects -v output has no `count:` line")]
+    MissingCount,
+    #[error("git count-objects -v output has more than one `count:` line")]
+    DuplicateCount,
+    #[error("git count-objects -v reported a non-numeric loose-object count {raw:?}")]
+    UnparseableCount { raw: String },
+}
+
+/// How many of a pack directory's packs count towards the auto-pack limit,
+/// given its file names.
+///
+/// **`.keep` packs are excluded, and that is what git does.** A `<name>.keep`
+/// sidecar marks its pack as one the repo wants left alone; `too_many_packs()`
+/// skips exactly those. Counting them would mean a repo holding 51 kept packs
+/// compacts on every request forever: the `gc` cannot consolidate what it is
+/// forbidden to touch, so the count never falls, `made_progress` closes the
+/// retry gate, and an hour later it happens again. Nothing in writ writes a
+/// `.keep`, so this is a guard rather than a fix for an observed failure — but a
+/// policy that claims to reproduce git's and diverges on the one case git
+/// singles out is a policy whose docstring is wrong.
+///
+/// Pure, taking names rather than a path, so the rule is testable without
+/// building a repo full of packs. The shell reads the directory.
+///
+/// Reading the directory is also *more* faithful than `count-objects -v`'s
+/// `packs:` line in a second way: git counts only packs local to this repo, and
+/// `<repo>/objects/pack` is exactly those.
+pub fn count_unkept_packs<'a>(names: impl IntoIterator<Item = &'a str>) -> PackCount {
+    let mut packs: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut kept: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for name in names {
+        if let Some(stem) = name.strip_suffix(".pack") {
+            packs.insert(stem);
+        } else if let Some(stem) = name.strip_suffix(".keep") {
+            kept.insert(stem);
+        }
+    }
+    PackCount::new(packs.difference(&kept).count() as u64)
 }
 
 #[cfg(test)]
@@ -383,7 +410,7 @@ mod tests {
     fn parses_the_output_git_actually_emits() {
         assert_eq!(
             parse_count_objects_verbose(&real_output(3, 1)).unwrap(),
-            counts(3, 1),
+            LooseObjectCount::new(3),
         );
     }
 
@@ -393,105 +420,169 @@ mod tests {
         // alternate object store. A parser that required numeric values would
         // reject every repo that has one.
         let out = format!("{}alternate: /srv/shared/objects\n", real_output(7, 2));
-        assert_eq!(parse_count_objects_verbose(&out).unwrap(), counts(7, 2));
+        assert_eq!(
+            parse_count_objects_verbose(&out).unwrap(),
+            LooseObjectCount::new(7),
+        );
     }
 
     #[test]
     fn tolerates_unknown_keys_blank_lines_and_reordering() {
         let out = "\nsize-garbage: 0\nfuture-key: whatever\n\ncount: 42\npacks: 9\n";
-        assert_eq!(parse_count_objects_verbose(out).unwrap(), counts(42, 9));
-    }
-
-    #[test]
-    fn is_not_confused_by_keys_that_merely_contain_a_read_key() {
-        // `prune-packable` and `size-pack` are real keys; a substring match
-        // would be fine today, but a future `loose-count:` or `cruft-packs:`
-        // would not be.
-        let out = "loose-count: 999\nrecount: 888\ncruft-packs: 7\ncount: 5\npacks: 2\n";
-        assert_eq!(parse_count_objects_verbose(out).unwrap(), counts(5, 2));
-    }
-
-    /// Both keys are required, and each names itself when missing.
-    ///
-    /// `packs` is as required as `count`, which is a real strengthening: before
-    /// the pack threshold, output without a `packs:` line parsed fine. Git emits
-    /// it unconditionally (`packs: 0` on a fresh repo), so requiring it costs
-    /// nothing and is what makes a shape change loud rather than silently
-    /// disabling half the policy.
-    #[test]
-    fn rejects_output_missing_either_key() {
-        for (out, missing) in [
-            ("size: 12\npacks: 1\n", "count"),
-            ("count: 3\nsize: 12\n", "packs"),
-        ] {
-            assert_eq!(
-                parse_count_objects_verbose(out).unwrap_err(),
-                CountObjectsParseError::MissingKey {
-                    key: missing.to_string(),
-                },
-                "{out:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_a_non_numeric_value_for_either_key() {
-        for (out, key, raw) in [
-            ("count: banana\npacks: 1\n", "count", "banana"),
-            ("count: 3\npacks: lots\n", "packs", "lots"),
-            // Not a thing git emits, but `-1` parsed as a `u64` failure rather
-            // than wrapping to `u64::MAX` is the difference between "refuse" and
-            // "compact immediately, forever".
-            ("count: -1\npacks: 1\n", "count", "-1"),
-            ("count: 3\npacks: -1\n", "packs", "-1"),
-        ] {
-            assert_eq!(
-                parse_count_objects_verbose(out).unwrap_err(),
-                CountObjectsParseError::UnparseableValue {
-                    key: key.to_string(),
-                    raw: raw.to_string(),
-                },
-                "{out:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_duplicated_lines_for_either_key() {
-        for (out, key) in [
-            ("count: 1\ncount: 2\npacks: 1\n", "count"),
-            ("count: 1\npacks: 1\npacks: 2\n", "packs"),
-        ] {
-            assert_eq!(
-                parse_count_objects_verbose(out).unwrap_err(),
-                CountObjectsParseError::DuplicateKey {
-                    key: key.to_string(),
-                },
-                "{out:?}",
-            );
-        }
-    }
-
-    /// The thresholds are git's, not writ's, and differ by two orders of
-    /// magnitude. Pinned because they are the whole justification for not
-    /// inventing our own: a silent edit here would be writ claiming to know
-    /// better than upstream without saying so.
-    #[test]
-    fn the_defaults_are_gits_own() {
         assert_eq!(
-            CompactionThreshold::GIT_DEFAULT,
-            threshold(6700, 50),
-            "git 6700 loose objects, 50 packs",
+            parse_count_objects_verbose(out).unwrap(),
+            LooseObjectCount::new(42),
         );
     }
 
+    #[test]
+    fn is_not_confused_by_keys_that_merely_contain_count() {
+        // `prune-packable` and `size-pack` are real keys; a substring match on
+        // "count" would be fine today, but a future `loose-count:` would not be.
+        let out = "loose-count: 999\nrecount: 888\ncount: 5\n";
+        assert_eq!(
+            parse_count_objects_verbose(out).unwrap(),
+            LooseObjectCount::new(5),
+        );
+    }
+
+    #[test]
+    fn rejects_output_with_no_count_line() {
+        assert_eq!(
+            parse_count_objects_verbose("size: 12\npacks: 1\n").unwrap_err(),
+            CountObjectsParseError::MissingCount,
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_count() {
+        assert_eq!(
+            parse_count_objects_verbose("count: banana\n").unwrap_err(),
+            CountObjectsParseError::UnparseableCount {
+                raw: "banana".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_a_negative_count() {
+        // Not a thing git emits, but `-1` parsed as a `u64` failure rather than
+        // wrapping to `u64::MAX` is the difference between "refuse" and
+        // "compact immediately, forever".
+        assert_eq!(
+            parse_count_objects_verbose("count: -1\n").unwrap_err(),
+            CountObjectsParseError::UnparseableCount {
+                raw: "-1".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_duplicated_count_lines() {
+        assert_eq!(
+            parse_count_objects_verbose("count: 1\ncount: 2\n").unwrap_err(),
+            CountObjectsParseError::DuplicateCount,
+        );
+    }
+
+    /// **A kept pack does not count towards the limit**, which is the one case
+    /// git's own policy singles out.
+    ///
+    /// Counting it would mean a repo holding enough kept packs compacts on every
+    /// request for ever: `gc` cannot consolidate what it may not touch, so the
+    /// count never falls and the retry gate reopens an hour later to try again.
+    #[test]
+    fn kept_packs_do_not_count_towards_the_limit() {
+        let names = [
+            "pack-aaa.pack",
+            "pack-aaa.idx",
+            "pack-bbb.pack",
+            "pack-bbb.keep",
+            "pack-ccc.pack",
+            "pack-ccc.idx",
+            "pack-ccc.rev",
+            // A stray keep with no pack beside it counts nothing either way.
+            "pack-ddd.keep",
+        ];
+        assert_eq!(
+            count_unkept_packs(names),
+            PackCount::new(2),
+            "only pack-aaa and pack-ccc are unkept",
+        );
+    }
+
+    #[test]
+    fn an_empty_pack_directory_has_no_packs() {
+        assert_eq!(count_unkept_packs([]), PackCount::new(0));
+        // `.idx`/`.rev`/`.mtimes` siblings and the `pack` subdirectory's own
+        // odds and ends are not packs.
+        assert_eq!(
+            count_unkept_packs(["pack-aaa.idx", "pack-aaa.rev", "tmp_pack_x"]),
+            PackCount::new(0),
+        );
+    }
+
+    /// The defaults are git's trigger points, not writ's, and the +1 on each is
+    /// load-bearing rather than a fencepost slip.
+    ///
+    /// Git documents both knobs as *more than* N — 6700 loose objects, 50 packs
+    /// — while a threshold here is the count *at which* writ compacts. So 6701
+    /// and 51 make the two fire on exactly the same repos, and 6700/50 would
+    /// make writ compact one object and one pack earlier than the policy it
+    /// claims to reproduce. Pinned because the numbers are the whole
+    /// justification for not inventing our own.
+    #[test]
+    fn the_defaults_fire_where_git_fires() {
+        assert_eq!(CompactionThreshold::GIT_DEFAULT, threshold(6701, 51));
+
+        // Stated behaviourally as well as numerically, since that is the claim.
+        for (at_gits_limit, one_past) in [
+            (counts(6700, 0), counts(6701, 0)),
+            (counts(0, 50), counts(0, 51)),
+        ] {
+            assert!(
+                matches!(
+                    decide(at_gits_limit, CompactionThreshold::GIT_DEFAULT),
+                    CompactionDecision::Skip { .. },
+                ),
+                "git does not compact *at* its limit, only past it: {at_gits_limit:?}",
+            );
+            assert!(
+                matches!(
+                    decide(one_past, CompactionThreshold::GIT_DEFAULT),
+                    CompactionDecision::Compact { .. },
+                ),
+                "one past git's limit must compact: {one_past:?}",
+            );
+        }
+    }
+
     proptest! {
-        /// Round trip: any pair of counts git could report is recovered exactly.
+        /// Round trip: any count git could report is recovered exactly.
         #[test]
-        fn any_counts_round_trip_through_the_real_output_shape(loose: u64, packs: u64) {
+        fn any_count_round_trips_through_the_real_output_shape(loose: u64, packs: u64) {
             prop_assert_eq!(
                 parse_count_objects_verbose(&real_output(loose, packs)).unwrap(),
-                counts(loose, packs),
+                LooseObjectCount::new(loose),
+            );
+        }
+
+        /// Unkept packs are exactly the `.pack` names with no `.keep` sibling,
+        /// stated independently of how the counter is written.
+        #[test]
+        fn unkept_packs_are_the_packs_without_a_keep_sibling(
+            stems in prop::collection::hash_set("[a-c]{1,2}", 0..6),
+            kept in prop::collection::hash_set("[a-c]{1,2}", 0..6),
+        ) {
+            let mut names: Vec<String> = stems.iter().map(|s| format!("pack-{s}.pack")).collect();
+            names.extend(kept.iter().map(|s| format!("pack-{s}.keep")));
+            // Siblings that are neither, to make sure they are ignored.
+            names.extend(stems.iter().map(|s| format!("pack-{s}.idx")));
+
+            let expected = stems.difference(&kept).count() as u64;
+            prop_assert_eq!(
+                count_unkept_packs(names.iter().map(String::as_str)),
+                PackCount::new(expected),
             );
         }
 

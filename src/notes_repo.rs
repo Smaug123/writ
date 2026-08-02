@@ -821,8 +821,55 @@ impl NotesRepo {
         )?;
         let text = String::from_utf8(stdout)
             .map_err(|source| NotesRepoError::CountObjectsNonUtf8 { source })?;
-        compaction::parse_count_objects_verbose(&text)
-            .map_err(|source| NotesRepoError::CountObjectsParse { source })
+        let loose_objects = compaction::parse_count_objects_verbose(&text)
+            .map_err(|source| NotesRepoError::CountObjectsParse { source })?;
+        Ok(ObjectCounts {
+            loose_objects,
+            packs: self.count_unkept_packs()?,
+        })
+    }
+
+    /// How many packs count towards the auto-pack limit, read from the pack
+    /// directory rather than from `count-objects -v`.
+    ///
+    /// Git's limit counts only local packs without a `.keep` sidecar, and the
+    /// `packs:` line counts every pack; `<repo>/objects/pack` is exactly the set
+    /// git looks at. The rule itself is
+    /// [`compaction::count_unkept_packs`], which takes names so it is testable
+    /// without a repo full of packs.
+    ///
+    /// A missing pack directory is zero packs, not an error: git creates it
+    /// lazily, so a repo that has never been packed simply has none.
+    fn count_unkept_packs(&self) -> Result<compaction::PackCount, NotesRepoError> {
+        let pack_dir = self.canonical_path.join("objects").join("pack");
+        let entries = match std::fs::read_dir(&pack_dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(compaction::PackCount::new(0));
+            }
+            Err(source) => {
+                return Err(NotesRepoError::ReadPackDir {
+                    path: pack_dir,
+                    source,
+                });
+            }
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| NotesRepoError::ReadPackDir {
+                path: pack_dir.clone(),
+                source,
+            })?;
+            // A non-UTF-8 name cannot be one git wrote (pack names are hex plus
+            // a known suffix), so it cannot be a pack or a keep marker and
+            // skipping it changes no count.
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(compaction::count_unkept_packs(
+            names.iter().map(String::as_str),
+        ))
     }
 
     /// [`Self::compact_if_needed`] at a caller-chosen threshold. Only tests want
@@ -1706,6 +1753,16 @@ pub enum NotesRepoError {
     CountObjectsParse {
         #[source]
         source: compaction::CountObjectsParseError,
+    },
+    /// The pack directory could not be listed. An error rather than "assume
+    /// zero packs": zero reads as "nothing to compact", which would disable half
+    /// the policy silently. (A *missing* directory is not this — git creates it
+    /// lazily, so absent means genuinely no packs.)
+    #[error("pack directory {path} could not be read: {source}")]
+    ReadPackDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
     #[error("git hash-object produced unparseable OID {raw:?}: {source}")]
     HashObjectParse {

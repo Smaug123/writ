@@ -1507,10 +1507,21 @@ curates `refs/notes/bailiff/v1/plans/*`).
 every repo writ owns, packing loose objects is now writ's job.
 `NotesRepo::compact_if_needed` measures with `count-objects -v`, decides with the
 pure policy in `notes_repo/compaction.rs`, and runs a plain `git gc` when the
-repo reaches **either** of git's own defaults — `gc.auto` = 6700 loose objects or
-`gc.autoPackLimit` = 50 packs — the aim being to do what git would have done,
-where git would have done it, but synchronously and under the per-repo mutex
-every other mutation here already takes.
+repo passes **either** of git's own trigger points — `gc.auto`'s 6700 loose
+objects or `gc.autoPackLimit`'s 50 packs — the aim being to do what git would
+have done, where git would have done it, but synchronously and under the
+per-repo mutex every other mutation here already takes.
+
+Reproducing that policy turned out to mean two details git states and it is easy
+to skip. Git phrases both knobs as *more than* N, while a `CompactionThreshold`
+is the count *at which* writ compacts, so `GIT_DEFAULT` is 6701 and 51 — 6700 and
+50 would fire one object and one pack early. And `gc.autoPackLimit` counts only
+local packs **without a `.keep` sidecar**, so the pack count is read from
+`<repo>/objects/pack` rather than from `count-objects -v`'s `packs:` line, which
+counts every pack. That second one is not cosmetic: a repo holding enough kept
+packs would compact on every request for ever, because `gc` cannot consolidate
+what it may not touch, so the count would never fall and the retry gate would
+reopen an hour later to try again.
 
 Two axes because writ has two shapes of repo, and the second is not decoration.
 A daemon-owned notes repo grows chiefly by **loose objects** (three per note

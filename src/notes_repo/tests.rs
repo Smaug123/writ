@@ -1553,6 +1553,60 @@ fn a_repo_over_the_pack_threshold_is_compacted_and_its_packs_consolidated() {
     }
 }
 
+/// **A `.keep` pack does not count towards the limit, against a real repo.**
+///
+/// The pure rule is property-tested; this is the end-to-end half, because the
+/// claim is about what writ *measures* and the measurement reads a real
+/// directory. Counting kept packs would mean a repo holding enough of them
+/// compacts on every request for ever — `gc` cannot consolidate what it may not
+/// touch, so the count never falls, `made_progress` closes the retry gate, and
+/// an hour later it tries again.
+#[test]
+fn a_kept_pack_is_not_counted_towards_the_pack_threshold() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    let r = notes_ref();
+
+    for i in 0..3 {
+        repo.write_note(&r, format!("run-{i}").as_bytes(), b"body")
+            .unwrap();
+        raw_git(repo.path(), &["repack", "-q"]);
+    }
+    let packs = packs_on_disk(repo.path());
+    assert!(packs >= 2, "the fixture must accumulate packs; got {packs}");
+
+    // Mark every pack as kept, exactly as git would.
+    let pack_dir = repo.path().join("objects").join("pack");
+    for entry in fs::read_dir(&pack_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            fs::write(path.with_extension("keep"), b"").unwrap();
+        }
+    }
+
+    // A threshold of one pack: unmissable if kept packs were counted.
+    let outcome = repo.compact_if_needed_with(only_packs_compact(1)).unwrap();
+
+    assert!(
+        matches!(outcome, CompactionOutcome::Skipped { .. }),
+        "kept packs must not trigger a compaction that could not consolidate \
+         them; got {outcome:?}",
+    );
+    match outcome {
+        CompactionOutcome::Skipped { counts } => assert_eq!(
+            counts.packs,
+            PackCount::new(0),
+            "every pack is kept, so none counts",
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        packs_on_disk(repo.path()),
+        packs,
+        "nothing should have been repacked",
+    );
+}
+
 /// A repo under *both* thresholds is left alone even when it has packs.
 ///
 /// The counterpart to the test above, and the one that keeps the pack axis from
