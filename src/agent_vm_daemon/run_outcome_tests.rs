@@ -45,6 +45,7 @@ fn seed_synthetic_outcome(
         byte_len: 0,
         sha256_hex: "0".repeat(64),
         truncated: false,
+        stopped_at_deadline: false,
     };
     crate::audit::AgentRunOutcomeAuditRecord {
         completed_at: UnixMillis::from_millis(1_700_000_100),

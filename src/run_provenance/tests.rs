@@ -82,6 +82,7 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
                     byte_len: 0,
                     sha256_hex: sha,
                     truncated: false,
+                    stopped_at_deadline: false,
                 };
                 let request = AgentRunAuditRecord {
                     run_id,

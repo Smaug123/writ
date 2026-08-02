@@ -47,13 +47,19 @@ fn stream_summary() -> impl Strategy<Value = AgentRunStreamSummary> {
         0u64..1_000_000,
         sha256_hex(),
         any::<bool>(),
+        // Varies independently of `truncated`, because the two are independent:
+        // a stream can outrun the capture cap and *then* be cut at the
+        // deadline. Pinning either would leave the handler free to report one
+        // in place of the other on the combinations never generated.
+        any::<bool>(),
     )
         .prop_map(
-            |(path, byte_len, sha256_hex, truncated)| AgentRunStreamSummary {
+            |(path, byte_len, sha256_hex, truncated, stopped_at_deadline)| AgentRunStreamSummary {
                 path: std::path::PathBuf::from(path),
                 byte_len,
                 sha256_hex,
                 truncated,
+                stopped_at_deadline,
             },
         )
 }
@@ -282,7 +288,16 @@ fn assert_stream(
     let got = got.as_object().expect("a stream object");
     let mut keys: Vec<&str> = got.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    prop_assert_eq!(keys, vec!["byte_len", "path", "sha256_hex", "truncated"]);
+    prop_assert_eq!(
+        keys,
+        vec![
+            "byte_len",
+            "path",
+            "sha256_hex",
+            "stopped_at_deadline",
+            "truncated"
+        ]
+    );
     prop_assert_eq!(
         got["path"].as_str(),
         Some(expected.path.to_str().expect("a UTF-8 path"))
@@ -293,6 +308,14 @@ fn assert_stream(
         Some(expected.sha256_hex.as_str())
     );
     prop_assert_eq!(got["truncated"].as_bool(), Some(expected.truncated));
+    // The two flags are reported separately for the reason they are stored
+    // separately: "writ kept a prefix" and "writ stopped reading" are different
+    // facts, and an operator triaging a run needs the second one to know the
+    // remainder is unbounded rather than merely past a cap.
+    prop_assert_eq!(
+        got["stopped_at_deadline"].as_bool(),
+        Some(expected.stopped_at_deadline)
+    );
     Ok(())
 }
 
@@ -322,6 +345,7 @@ async fn stdout_and_stderr_are_not_transposed() {
         byte_len: 0,
         sha256_hex: std::iter::repeat_n(digit, 64).collect(),
         truncated: false,
+        stopped_at_deadline: false,
     };
     let outcome = AgentRunOutcomeAuditRecord {
         completed_at: UnixMillis::from_millis(1_700_000_100),

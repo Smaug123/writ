@@ -167,11 +167,13 @@ fn insert_agent_run_outcome_row(
              stdout_bytes,
              stdout_sha256,
              stdout_truncated,
+             stdout_stopped_at_deadline,
              stderr_path,
              stderr_bytes,
              stderr_sha256,
-             stderr_truncated
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             stderr_truncated,
+             stderr_stopped_at_deadline
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             r.outcome.run_id.as_uuid().to_string(),
             r.completed_at.as_millis(),
@@ -181,10 +183,12 @@ fn insert_agent_run_outcome_row(
             u64_to_sql_i64(r.outcome.stdout.byte_len, "stdout bytes")?,
             &r.outcome.stdout.sha256_hex,
             bool_to_sql_i64(r.outcome.stdout.truncated),
+            bool_to_sql_i64(r.outcome.stdout.stopped_at_deadline),
             path_to_sql_text(&r.outcome.stderr.path, "stderr path")?,
             u64_to_sql_i64(r.outcome.stderr.byte_len, "stderr bytes")?,
             &r.outcome.stderr.sha256_hex,
             bool_to_sql_i64(r.outcome.stderr.truncated),
+            bool_to_sql_i64(r.outcome.stderr.stopped_at_deadline),
         ],
     )?;
     Ok(())
@@ -389,7 +393,9 @@ impl AuditLog {
                 .query_row(
                     "SELECT run_id, completed_at, status, exit_code,
                             stdout_path, stdout_bytes, stdout_sha256, stdout_truncated,
-                            stderr_path, stderr_bytes, stderr_sha256, stderr_truncated
+                            stdout_stopped_at_deadline,
+                            stderr_path, stderr_bytes, stderr_sha256, stderr_truncated,
+                            stderr_stopped_at_deadline
                      FROM agent_run_outcome
                      WHERE run_id = ?1",
                     params![run_id.as_uuid().to_string()],
@@ -684,10 +690,12 @@ fn agent_run_outcome_from_row(
     let stdout_bytes: i64 = row.get(5)?;
     let stdout_sha256: String = row.get(6)?;
     let stdout_truncated: i64 = row.get(7)?;
-    let stderr_path: String = row.get(8)?;
-    let stderr_bytes: i64 = row.get(9)?;
-    let stderr_sha256: String = row.get(10)?;
-    let stderr_truncated: i64 = row.get(11)?;
+    let stdout_stopped_at_deadline: i64 = row.get(8)?;
+    let stderr_path: String = row.get(9)?;
+    let stderr_bytes: i64 = row.get(10)?;
+    let stderr_sha256: String = row.get(11)?;
+    let stderr_truncated: i64 = row.get(12)?;
+    let stderr_stopped_at_deadline: i64 = row.get(13)?;
 
     let parse = || -> Result<AgentRunOutcomeAuditRecord, AuditError> {
         let run_id = uuid::Uuid::parse_str(&run_id_str)
@@ -699,6 +707,7 @@ fn agent_run_outcome_from_row(
             stdout_bytes,
             stdout_sha256,
             stdout_truncated,
+            stdout_stopped_at_deadline,
             "stdout",
         )?;
         let stderr = agent_run_stream_from_sql(
@@ -706,6 +715,7 @@ fn agent_run_outcome_from_row(
             stderr_bytes,
             stderr_sha256,
             stderr_truncated,
+            stderr_stopped_at_deadline,
             "stderr",
         )?;
         Ok(AgentRunOutcomeAuditRecord {
@@ -727,28 +737,48 @@ fn agent_run_stream_from_sql(
     byte_len: i64,
     sha256_hex: String,
     truncated: i64,
+    stopped_at_deadline: i64,
     label: &'static str,
 ) -> Result<AgentRunStreamSummary, AuditError> {
     validate_agent_run_stream_path_text(&path, label)?;
     let byte_len = u64::try_from(byte_len)
         .map_err(|_| labeled_invariant(label, "agent run stream bytes is negative"))?;
     validate_sha256_hex(&sha256_hex, label)?;
-    let truncated = match truncated {
-        0 => false,
-        1 => true,
-        _ => {
-            return Err(labeled_invariant(
-                label,
-                "agent run stream truncated flag is invalid",
-            ));
-        }
-    };
+    let truncated = agent_run_stream_flag_from_sql(truncated, label, "truncated")?;
+    let stopped_at_deadline =
+        agent_run_stream_flag_from_sql(stopped_at_deadline, label, "stopped_at_deadline")?;
     Ok(AgentRunStreamSummary {
         path: path.into(),
         byte_len,
         sha256_hex,
         truncated,
+        stopped_at_deadline,
     })
+}
+
+/// Read one of a stream summary's boolean columns.
+///
+/// The CHECK constraints in the schema already confine these to 0 and 1, so a
+/// third value means the row was not written by this code — a hand-edited DB, or
+/// a future schema read by an older binary. Refused rather than coerced, which
+/// is the same "correctness over availability" choice the version gate makes for
+/// the DB as a whole.
+fn agent_run_stream_flag_from_sql(
+    raw: i64,
+    label: &'static str,
+    flag: &'static str,
+) -> Result<bool, AuditError> {
+    match raw {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(labeled_invariant(
+            label,
+            match flag {
+                "truncated" => "agent run stream truncated flag is invalid",
+                _ => "agent run stream stopped_at_deadline flag is invalid",
+            },
+        )),
+    }
 }
 
 fn agent_run_status_str(status: &AgentRunTerminalStatus) -> &'static str {
@@ -819,46 +849,58 @@ mod tests {
         .unwrap()
     }
 
-    #[allow(clippy::type_complexity)]
-    fn dump_agent_run_outcome_rows(
-        log: &AuditLog,
-    ) -> Vec<(
-        String,
-        i64,
-        String,
-        i64,
-        String,
-        i64,
-        String,
-        i64,
-        String,
-        i64,
-        String,
-        i64,
-    )> {
+    /// One `agent_run_outcome` row, every column, in insert order.
+    ///
+    /// A named struct rather than a tuple because there are more columns than
+    /// the standard library derives `Debug`/`PartialEq` for — and because a
+    /// failure here should say *which* column diverged rather than print
+    /// fourteen positional values.
+    #[derive(Debug, Eq, PartialEq)]
+    struct AgentRunOutcomeRow {
+        run_id: String,
+        completed_at: i64,
+        status: String,
+        exit_code: i64,
+        stdout_path: String,
+        stdout_bytes: i64,
+        stdout_sha256: String,
+        stdout_truncated: i64,
+        stdout_stopped_at_deadline: i64,
+        stderr_path: String,
+        stderr_bytes: i64,
+        stderr_sha256: String,
+        stderr_truncated: i64,
+        stderr_stopped_at_deadline: i64,
+    }
+
+    fn dump_agent_run_outcome_rows(log: &AuditLog) -> Vec<AgentRunOutcomeRow> {
         log.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT run_id, completed_at, status, exit_code, \
                  stdout_path, stdout_bytes, stdout_sha256, stdout_truncated, \
-                 stderr_path, stderr_bytes, stderr_sha256, stderr_truncated \
+                 stdout_stopped_at_deadline, \
+                 stderr_path, stderr_bytes, stderr_sha256, stderr_truncated, \
+                 stderr_stopped_at_deadline \
                  FROM agent_run_outcome ORDER BY rowid",
             )?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                        r.get(10)?,
-                        r.get(11)?,
-                    ))
+                    Ok(AgentRunOutcomeRow {
+                        run_id: r.get(0)?,
+                        completed_at: r.get(1)?,
+                        status: r.get(2)?,
+                        exit_code: r.get(3)?,
+                        stdout_path: r.get(4)?,
+                        stdout_bytes: r.get(5)?,
+                        stdout_sha256: r.get(6)?,
+                        stdout_truncated: r.get(7)?,
+                        stdout_stopped_at_deadline: r.get(8)?,
+                        stderr_path: r.get(9)?,
+                        stderr_bytes: r.get(10)?,
+                        stderr_sha256: r.get(11)?,
+                        stderr_truncated: r.get(12)?,
+                        stderr_stopped_at_deadline: r.get(13)?,
+                    })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -958,12 +1000,14 @@ mod tests {
                 byte_len: 12,
                 sha256_hex: writ_agent_run::sha256_hex(b"stdout bytes"),
                 truncated: false,
+                stopped_at_deadline: false,
             },
             stderr: AgentRunStreamSummary {
                 path: "/private/writ/runs/stderr.log".into(),
                 byte_len: 4096,
                 sha256_hex: writ_agent_run::sha256_hex(b"stderr bytes"),
                 truncated: true,
+                stopped_at_deadline: false,
             },
         };
         let outcome_record = AgentRunOutcomeAuditRecord {
@@ -1013,12 +1057,14 @@ mod tests {
                 byte_len: 0,
                 sha256_hex: writ_agent_run::sha256_hex(b""),
                 truncated: false,
+                stopped_at_deadline: false,
             },
             stderr: AgentRunStreamSummary {
                 path: "/private/writ/runs/stderr.log".into(),
                 byte_len: 0,
                 sha256_hex: writ_agent_run::sha256_hex(b""),
                 truncated: false,
+                stopped_at_deadline: false,
             },
         };
 
@@ -1078,12 +1124,14 @@ mod tests {
                         byte_len: 0,
                         sha256_hex: writ_agent_run::sha256_hex(b""),
                         truncated: false,
+                        stopped_at_deadline: false,
                     },
                     stderr: AgentRunStreamSummary {
                         path: "/private/writ/runs/stderr.log".into(),
                         byte_len: 0,
                         sha256_hex: writ_agent_run::sha256_hex(b""),
                         truncated: false,
+                        stopped_at_deadline: false,
                     },
                 },
             })
@@ -1512,6 +1560,8 @@ mod tests {
             stderr_bytes in 0u64..=(i64::MAX as u64),
             stdout_truncated in any::<bool>(),
             stderr_truncated in any::<bool>(),
+            stdout_stopped in any::<bool>(),
+            stderr_stopped in any::<bool>(),
         ) {
             let direct = AuditLog::open_in_memory().unwrap();
             let guarded = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
@@ -1551,12 +1601,14 @@ mod tests {
                         byte_len: stdout_bytes,
                         sha256_hex: writ_agent_run::sha256_hex(b"stdout"),
                         truncated: stdout_truncated,
+                        stopped_at_deadline: stdout_stopped,
                     },
                     stderr: AgentRunStreamSummary {
                         path: "/private/writ/runs/stderr.log".into(),
                         byte_len: stderr_bytes,
                         sha256_hex: writ_agent_run::sha256_hex(b"stderr"),
                         truncated: stderr_truncated,
+                        stopped_at_deadline: stderr_stopped,
                     },
                 },
             };

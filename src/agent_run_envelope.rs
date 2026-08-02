@@ -136,16 +136,27 @@ pub async fn materialize_signed_run_envelope(
     // read-back cap *never* fires) and common on the VM arm. Fall back to the
     // recorded flag when the read-back cap didn't trigger; `byte_len` is the
     // retained prefix length when truncated, which is the correct cap point.
-    let stdout_truncated_at = stdout_host_truncated_at.or(outcome
-        .outcome
-        .stdout
-        .truncated
-        .then_some(outcome.outcome.stdout.byte_len));
-    let stderr_truncated_at = stderr_host_truncated_at.or(outcome
-        .outcome
-        .stderr
-        .truncated
-        .then_some(outcome.outcome.stderr.byte_len));
+    //
+    // A capture stopped at the run's deadline sets the marker for the same
+    // reason, and it is a *third* layer rather than a variant of the capture
+    // cap. The envelope asks one question — "are these bytes the whole stream,
+    // or a prefix of it?" — and both endings answer "a prefix". Only the audit
+    // row needs to keep *why* apart, which is what its two flags are for; a
+    // verifier holding an envelope needs to know not to read the absence of
+    // more bytes as the agent having stopped writing.
+    //
+    // Without this, the case is exactly the one the comment above describes and
+    // worse: a stream cut at the deadline before ever reaching either cap has
+    // `truncated == false` and a file shorter than the read-back cap, so
+    // *neither* existing source fires and the envelope would be signed as the
+    // complete output of a run whose output writ merely stopped listening to.
+    let prefix_at = |summary: &crate::agent_run::AgentRunStreamSummary| {
+        (summary.truncated || summary.stopped_at_deadline).then_some(summary.byte_len)
+    };
+    let stdout_truncated_at =
+        stdout_host_truncated_at.or_else(|| prefix_at(&outcome.outcome.stdout));
+    let stderr_truncated_at =
+        stderr_host_truncated_at.or_else(|| prefix_at(&outcome.outcome.stderr));
 
     let output_envelope = OutputEnvelope {
         stdout: stdout_bytes,

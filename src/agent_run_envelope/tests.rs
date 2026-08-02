@@ -44,12 +44,14 @@ fn outcome_for_streams(
                 byte_len: stdout_bytes.len() as u64,
                 sha256_hex: sha256_hex(stdout_bytes),
                 truncated: false,
+                stopped_at_deadline: false,
             },
             stderr: AgentRunStreamSummary {
                 path: stderr_path,
                 byte_len: stderr_bytes.len() as u64,
                 sha256_hex: sha256_hex(stderr_bytes),
                 truncated: false,
+                stopped_at_deadline: false,
             },
         },
     }
@@ -280,12 +282,14 @@ async fn materialize_vm_envelope_preserves_guest_truncation_flag() {
                 byte_len: stdout_prefix.len() as u64,
                 sha256_hex: sha256_hex(&stdout_prefix),
                 truncated: true,
+                stopped_at_deadline: false,
             },
             stderr: AgentRunStreamSummary {
                 path: stderr_path,
                 byte_len: 0,
                 sha256_hex: sha256_hex(b""),
                 truncated: false,
+                stopped_at_deadline: false,
             },
         },
     };
@@ -309,6 +313,91 @@ async fn materialize_vm_envelope_preserves_guest_truncation_flag() {
         Some(stdout_prefix.len() as u64),
         "guest truncation must reach the envelope marker even when the host cap doesn't fire",
     );
+    assert_eq!(output_envelope.stderr_truncated_at, None);
+}
+
+/// A capture stopped at the run's deadline must reach the envelope's prefix
+/// marker too — and this is the case where *nothing else* would set it.
+///
+/// The sibling test above covers a stream that outran the capture cap, where
+/// `truncated` carries the signal. Here the stream never reached either cap: it
+/// is short, the host read-back cap does not fire, and `truncated` is false.
+/// The only thing that knows these bytes are a prefix is
+/// `stopped_at_deadline` — writ stopped reading while something still held the
+/// write end.
+///
+/// Without consulting it the materialiser signs a short file as the complete
+/// output of the run, and a verifier reassembling the envelope sees an agent
+/// that stopped writing rather than a writ that stopped listening. The audit
+/// row keeps the two endings apart, because *why* it stopped is a different
+/// fact; the envelope only has to answer "is this all of it", and to both
+/// endings the answer is no.
+#[tokio::test]
+async fn materialize_envelope_marks_a_stream_cut_at_the_deadline_as_a_prefix() {
+    use crate::agent_run::{
+        AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus, sha256_hex,
+    };
+    use crate::core::Sha256Hex;
+    use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
+    use crate::signing::WritSigningKey;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signing_key = WritSigningKey::from_openssh_pem(TEST_SIGNING_PEM).unwrap();
+    let run_id = AgentRunId::new();
+    let run_dir = tmp.path().join(run_id.to_string());
+    fs::create_dir_all(&run_dir).unwrap();
+    // Deliberately tiny, and `truncated: false`. Both caps are inert here, so a
+    // marker on this envelope can only have come from `stopped_at_deadline`.
+    let stdout_prefix = b"partial output before writ stopped reading\n".to_vec();
+    let stdout_path = run_dir.join("stdout.log");
+    let stderr_path = run_dir.join("stderr.log");
+    fs::write(&stdout_path, &stdout_prefix).unwrap();
+    fs::write(&stderr_path, b"").unwrap();
+    let outcome = crate::audit::AgentRunOutcomeAuditRecord {
+        completed_at: UnixMillis::from_millis(1_700_000_000),
+        outcome: AgentRunOutcome {
+            run_id,
+            status: AgentRunTerminalStatus::TimedOut,
+            exit_code: -1,
+            stdout: AgentRunStreamSummary {
+                path: stdout_path,
+                byte_len: stdout_prefix.len() as u64,
+                sha256_hex: sha256_hex(&stdout_prefix),
+                truncated: false,
+                stopped_at_deadline: true,
+            },
+            stderr: AgentRunStreamSummary {
+                path: stderr_path,
+                byte_len: 0,
+                sha256_hex: sha256_hex(b""),
+                truncated: false,
+                stopped_at_deadline: false,
+            },
+        },
+    };
+
+    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let materialized = materialize_signed_run_envelope(
+        &outcome,
+        SessionId::new(),
+        prompt_sha256,
+        vec![],
+        &signing_key,
+    )
+    .await
+    .unwrap();
+
+    let decoded = SignedRunEnvelope::from_bytes(&materialized.envelope_bytes).unwrap();
+    let output_envelope = OutputEnvelope::from_bytes(&decoded.output).unwrap();
+    assert_eq!(output_envelope.stdout, stdout_prefix);
+    assert_eq!(
+        output_envelope.stdout_truncated_at,
+        Some(stdout_prefix.len() as u64),
+        "a stream writ stopped reading must be signed as a prefix, not as the whole stream",
+    );
+    // The other stream drained to EOF, so it is complete and must not be
+    // marked — otherwise the flag would read as a property of the run rather
+    // than of the stream that actually got cut.
     assert_eq!(output_envelope.stderr_truncated_at, None);
 }
 

@@ -484,6 +484,19 @@ fn materialize_agent_run_stream(
         retained_sha256_hex: upload.retained_sha256_hex,
         full_byte_len: upload.byte_len,
         full_sha256_hex: upload.sha256_hex,
+        // False by construction, not by trust. `stopped_at_deadline` means writ
+        // stopped reading a stream at a deadline, and only a run *given* a
+        // deadline can do that: the guest builds its `AgentProcessPlan` without
+        // ever calling `with_timeout`, so a guest capture has no deadline to
+        // stop at and always drains to EOF or to the cap.
+        //
+        // So there is nothing to carry across this boundary — the upload does
+        // not have the field, and adding one would be asking the guest a
+        // question about writ's own conduct that the broker could not check
+        // against anything. The host's separate `RUN_AGENT_VM_TIMEOUT` is not
+        // this flag either: it fires when no outcome arrives at all, which
+        // leaves the request unpaired rather than producing a row to mark.
+        stopped_at_deadline: false,
     }
     .to_summary())
 }

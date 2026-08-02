@@ -543,14 +543,52 @@ none — the guarantee has to come from bounding the drain.
 
 **State the guarantee precisely: a run tears down descendants that stay in the
 agent's process group.** Two things leave that set. A descendant may call
-`setsid`/`setpgid` and step out deliberately — one syscall, and anything that
-daemonises does it. Or it may be forked in the window above and never signalled.
-Either way it holds stdout or stderr, the drains never see EOF, and the run
-hangs. Closing that means capture threads that stop draining, which introduces a
-third way a captured stream can be incomplete ("writ stopped reading") alongside
-the two that already have deliberately chosen meanings; that is a decision about
-what a note lets a verifier conclude, tracked separately rather than settled
-here.
+`setsid`/`setpgid` and step out deliberately — one syscall. (Not merely
+"anything that daemonises": plain `&` backgrounding stays in the group, and a
+correctly-written daemoniser closes stdio as step two of the double fork, so the
+ones that bite are those that escape *and* keep the inherited pipe.) Or it may be
+forked in the window above and never signalled, which needs no cooperation at
+all and is the likelier of the two. Either way it holds stdout or stderr and the
+drains never see EOF.
+
+**So the drain is bounded, and says when it was.** Once the sweep has run, every
+legitimate writer is dead and EOF should follow within microseconds; the captures
+are given `DRAIN_GRACE` (five seconds) beyond that, and a stream that still has
+not ended is closed and flagged rather than waited on. The grace is measured from
+the *sweep*, not from the run's deadline: tying it to the deadline would make a
+run whose agent exited in a second but whose deadline was an hour away wait the
+full hour, and would leave an unbounded run — equally vulnerable — with no bound
+at all.
+
+Stopping, rather than abandoning the thread, is the load-bearing part. An
+abandoned reader goes on appending to the file after the outcome is recorded, so
+the `byte_len` and `sha256_hex` in the row would describe something still
+growing. Here the file is closed and synced before the summary is built, so the
+row stays true of it — which is what makes the row checkable at all.
+
+That gives a captured stream a **third** way to be incomplete, and it gets its
+own flag rather than reusing `truncated`:
+
+| flags | meaning |
+| --- | --- |
+| neither | drained to EOF; the file *is* the stream |
+| `truncated` | the stream outran the capture cap; the remainder is past a bound writ chose |
+| `stopped_at_deadline` | writ stopped reading; the remainder is **unknown and unbounded** |
+
+Two flags rather than one three-valued field, because they are independent — a
+stream can outrun the cap and *then* be cut short — and because the questions
+differ: "did writ choose to keep less?" against "did writ stop listening?". Only
+the host arm can set the second; the guest never gives its run a timeout, so a
+VM-path capture has no deadline to stop at and the broker records `false` by
+construction rather than believing a claim it could not check.
+
+The signed envelope does *not* keep the two apart, and deliberately so. It asks
+one question — are these bytes the whole stream, or a prefix? — and both endings
+answer "a prefix", so both set `*_truncated_at`. The case that forces this is a
+stream cut at the deadline before reaching either cap: `truncated` is false and
+the file is under the read-back cap, so without consulting `stopped_at_deadline`
+the envelope would be signed as the complete output of a run whose output writ
+merely stopped listening to.
 
 The same fork race applies to `process_supervisor`'s group kill, which is
 single-shot. Its consequence there is already bounded — that supervisor stops
