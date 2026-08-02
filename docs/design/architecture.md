@@ -1521,7 +1521,18 @@ because git's limit sees a narrower set than that line reports: a pack counts
 only if it is **indexed** (a `.pack` with no `.idx` is `garbage:` to git) and
 **not marked `.keep`**. Both were measured on git 2.54 rather than inferred.
 
-Neither is cosmetic, and both fail the same way: a repo over the threshold on
+That scan is the one piece of this subsystem that is not a supervised
+subprocess, so it carries its own bound: `MAX_PACK_DIR_ENTRIES` refuses a pack
+directory past a quarter-million entries rather than counting on. Refusing beats
+saturating — a saturated count would read as "far over the pack threshold" and
+provoke a full `gc` on a directory that plainly needs an operator, whereas the
+error closes the retry gate and leaves the repo as compaction found it. It bounds
+memory and iteration, not the kernel: a *stalled* filesystem blocks `read_dir` in
+the calling thread with the notes-write mutex held, which is a property this
+module's in-process file access already had (the retry-gate read has it too) and
+which would equally hang the `count-objects` child's own walk.
+
+Neither divergence is cosmetic, and both fail the same way: a repo over the threshold on
 packs no `gc` can consolidate compacts, fails to progress, backs off an hour, and
 repeats — for ever. The index half is reachable in this codebase specifically,
 because writ kills a `gc` at `COMPACTION_GIT_TIMEOUT` and an interrupted repack

@@ -1653,6 +1653,44 @@ fn a_pack_without_an_index_is_not_counted_towards_the_pack_threshold() {
     );
 }
 
+/// The pack scan refuses a directory past its entry cap rather than guessing.
+///
+/// Every git invocation in this module is bounded, so an in-process `read_dir`
+/// loop that was not would be a hole in the one discipline the module is built
+/// around. A saturated count would be worse than an error: it would read as
+/// "far over the pack threshold" and provoke a full `gc` on a directory that
+/// plainly needs an operator, whereas the error closes the retry gate and leaves
+/// the repo as compaction found it.
+///
+/// Driven at a cap of two rather than the production quarter-million, because a
+/// cap whose only test is "we never reach it" is a cap nothing has exercised.
+#[test]
+fn the_pack_scan_refuses_a_directory_past_its_entry_cap() {
+    let tmp = TempDir::new().unwrap();
+    let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
+    repo.write_note(&notes_ref(), b"seed", b"body").unwrap();
+    raw_git(repo.path(), &["repack", "-q"]);
+
+    let pack_dir = repo.path().join("objects").join("pack");
+    let entries = fs::read_dir(&pack_dir).unwrap().count();
+    assert!(entries >= 2, "a repack leaves a pack and an index");
+
+    // Under the cap: a real count.
+    repo.count_packs_towards_the_limit_capped(entries + 1)
+        .expect("a directory within the cap is counted");
+
+    let err = repo
+        .count_packs_towards_the_limit_capped(entries - 1)
+        .unwrap_err();
+    assert!(
+        matches!(err, NotesRepoError::PackDirTooLarge { .. }),
+        "got: {err:?}",
+    );
+    // The message names the fix rather than the mechanism: this is a directory
+    // an operator has to look at.
+    assert!(err.to_string().contains("needs an operator"), "{err}");
+}
+
 /// A repo under *both* thresholds is left alone even when it has packs.
 ///
 /// The counterpart to the test above, and the one that keeps the pack axis from
