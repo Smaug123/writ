@@ -104,7 +104,7 @@ use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use self::compaction::{CompactionDecision, CompactionThreshold, LooseObjectCount};
+use self::compaction::{CompactionDecision, CompactionThreshold, ObjectCounts};
 use crate::core::{NotesRef, NotesRefError};
 use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome, SupervisorError};
 use crate::vm_git::{GitObjectId, GitObjectIdError};
@@ -381,8 +381,8 @@ pub enum WriteOutcome {
 /// decided to compact" whether or not the repack actually ran.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CompactionOutcome {
-    /// The repo was under the threshold; nothing was packed.
-    Skipped { loose_objects: LooseObjectCount },
+    /// The repo was under both thresholds; nothing was packed.
+    Skipped { counts: ObjectCounts },
     /// A recent attempt failed and the backoff has not elapsed, so this call did
     /// nothing at all — not even measure.
     ///
@@ -392,14 +392,18 @@ pub enum CompactionOutcome {
     /// fail, so the gate has to come before it, and reporting a stale figure
     /// would misrepresent when it was read.
     Deferred { retry_in: Duration },
-    /// The repo was at or over the threshold and `git gc` ran to completion.
+    /// The repo was at or over a threshold and `git gc` ran to completion.
     ///
-    /// Both counts are reported because completion is not the same as
-    /// effectiveness — a `gc` can return zero and leave the count exactly where
-    /// it was — and an operator reading one number cannot tell the difference.
+    /// Both readings are reported because completion is not the same as
+    /// effectiveness — a `gc` can return zero and leave the counts exactly where
+    /// they were — and an operator reading one number cannot tell the
+    /// difference. `trigger` says which axis put the repo over, which is the
+    /// difference between "this repo writes a lot" and "this repo fetches a
+    /// lot".
     Compacted {
-        loose_objects_before: LooseObjectCount,
-        loose_objects_after: LooseObjectCount,
+        before: ObjectCounts,
+        after: ObjectCounts,
+        trigger: compaction::CompactionTrigger,
     },
 }
 
@@ -797,12 +801,15 @@ impl NotesRepo {
         self.compact_if_needed_with(CompactionThreshold::GIT_DEFAULT)
     }
 
-    /// The repo's true loose-object count, straight from `count-objects -v`.
+    /// The repo's true loose-object and pack counts, straight from
+    /// `count-objects -v`.
     ///
     /// Called twice per compaction — once to decide, once to check the repack
     /// achieved something — so it is one function rather than two spellings of
-    /// the same parse.
-    fn count_loose_objects(&self) -> Result<LooseObjectCount, NotesRepoError> {
+    /// the same parse. Both axes come from one invocation, which is why they are
+    /// one struct: a `before` on one axis paired with an `after` on the other
+    /// would compare two different readings.
+    fn count_objects(&self) -> Result<ObjectCounts, NotesRepoError> {
         let stdout = run_git(
             &self.canonical_path,
             ["count-objects", "-v"],
@@ -865,10 +872,9 @@ impl NotesRepo {
         match &outcome {
             // Ran, and moved nothing. Worse than failing, because nothing else
             // here would stop the next request repacking again.
-            Ok(CompactionOutcome::Compacted {
-                loose_objects_before,
-                loose_objects_after,
-            }) if !compaction::made_progress(*loose_objects_before, *loose_objects_after) => {
+            Ok(CompactionOutcome::Compacted { before, after, .. })
+                if !compaction::made_progress(*before, *after, threshold) =>
+            {
                 state.hold_off_compaction(&self.canonical_path, now);
             }
             // Cleared rather than left to expire: a repo that is packing
@@ -897,13 +903,11 @@ impl NotesRepo {
         // objects is a walk of the 256 fanout directories and has no such growth,
         // so widening its bound would only slow down the discovery that the
         // object directory is wedged.
-        let loose_objects = self.count_loose_objects()?;
+        let counts = self.count_objects()?;
 
-        match compaction::decide(loose_objects, threshold) {
-            CompactionDecision::Skip { loose_objects } => {
-                Ok(CompactionOutcome::Skipped { loose_objects })
-            }
-            CompactionDecision::Compact { loose_objects } => {
+        match compaction::decide(counts, threshold) {
+            CompactionDecision::Skip { counts } => Ok(CompactionOutcome::Skipped { counts }),
+            CompactionDecision::Compact { counts, trigger } => {
                 run_git_with_limits(
                     &self.canonical_path,
                     GC_ARGV,
@@ -926,10 +930,11 @@ impl NotesRepo {
                 // measured rather than assumed. Costs one `count-objects` against
                 // a repo that was just packed; the caller decides what an
                 // unmoved count means.
-                let after = self.count_loose_objects()?;
+                let after = self.count_objects()?;
                 Ok(CompactionOutcome::Compacted {
-                    loose_objects_before: loose_objects,
-                    loose_objects_after: after,
+                    before: counts,
+                    after,
+                    trigger,
                 })
             }
         }

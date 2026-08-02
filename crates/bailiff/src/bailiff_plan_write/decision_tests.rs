@@ -47,8 +47,8 @@ fn writing_a_decision_note_compacts_the_repo_if_needed() {
         .compaction
         .expect("compaction must have been attempted")
     {
-        CompactionOutcome::Skipped { loose_objects } => assert!(
-            loose_objects.get() > 0,
+        CompactionOutcome::Skipped { counts } => assert!(
+            counts.loose_objects.get() > 0,
             "the note write leaves loose objects behind, so a zero count means \
              the measurement did not see this repo"
         ),

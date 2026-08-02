@@ -1507,9 +1507,29 @@ curates `refs/notes/bailiff/v1/plans/*`).
 every repo writ owns, packing loose objects is now writ's job.
 `NotesRepo::compact_if_needed` measures with `count-objects -v`, decides with the
 pure policy in `notes_repo/compaction.rs`, and runs a plain `git gc` when the
-loose count reaches git's own `gc.auto` default of 6700 — the aim being to do
-what git would have done, where git would have done it, but synchronously and
-under the per-repo mutex every other mutation here already takes. `writd` calls it
+repo reaches **either** of git's own defaults — `gc.auto` = 6700 loose objects or
+`gc.autoPackLimit` = 50 packs — the aim being to do what git would have done,
+where git would have done it, but synchronously and under the per-repo mutex
+every other mutation here already takes.
+
+Two axes because writ has two shapes of repo, and the second is not decoration.
+A daemon-owned notes repo grows chiefly by **loose objects** (three per note
+write); bailiff's grows chiefly by whole **packs**, one per `fetch_from_remote`.
+Under a loose-only policy bailiff's repo needed roughly 2200 note writes to trip
+a threshold while accumulating a pack per fetch throughout — so on that repo a
+loose-only threshold was not a smaller version of this policy, it was one that
+essentially never fired.
+
+The effectiveness check is **per axis**, and that is the load-bearing part rather
+than a tidiness. `made_progress` demands a strict decrease on every axis that was
+over its threshold, and asks nothing of an axis that was under it. Judging a
+pack-triggered compaction by its loose-object count would call it effective
+whenever the repo had no loose objects — exactly the state a fetch-heavy repo is
+in when it trips the pack threshold — so the retry gate would never close and the
+repo would run a full `gc` on every request, for ever. `CompactionTrigger` on the
+outcome names which axis fired, both for that check and because "compacted: 51
+packs" and "compacted: 6700 loose objects" are different stories for an
+operator. `writd` calls it
 after the note write in `sign_and_store_run`, so both `RunAgent` arms are covered;
 a compaction failure is logged and does not fail a run whose envelope is already
 durable.
@@ -1584,14 +1604,10 @@ Bailiff now compacts too: `write_stage_note` and `write_decision_note` call
 (`NoteWritten`), the same shape and for the same reason as `sign_and_store_run`
 — the note is durable by then, so a failure to pack must not turn a recorded
 decision into a failed command. Deliberately after a *note write* and not after
-a bare fetch, which is where the remaining gap is: the threshold counts loose
-objects, and bailiff's repo grows chiefly by whole packs, one per
-`fetch_from_remote`. So the trigger that exists fires on bailiff's own notes,
-while the pack half of git's auto policy (`gc.autoPackLimit`) still has none and
-remains unimplemented — `CompactionThreshold` would need a second dimension, and
-`parse_count_objects_verbose` would need to read the `packs:` value it currently
-only tolerates. Wiring the call in is what makes that half possible, not a
-substitute for it.
+a bare fetch: a fetch-only path would measure and skip on every read. That was a
+real gap while the threshold counted only loose objects, because the fetches were
+bailiff's actual growth; the pack axis closes it, since the packs those fetches
+leave behind are now what the next note write's measurement sees.
 
 **The repack gets its own deadline.** A plain `gc` rewrites all packs, so its
 cost grows with total history while the threshold that fires it counts only the

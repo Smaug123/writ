@@ -781,14 +781,20 @@ async fn sign_and_store_run(
     match compaction {
         Ok(crate::notes_repo::CompactionOutcome::Skipped { .. }) => {}
         Ok(crate::notes_repo::CompactionOutcome::Compacted {
-            loose_objects_before,
-            loose_objects_after,
+            before,
+            after,
+            trigger,
         }) => {
-            // Both counts, because "gc succeeded" and "gc helped" are different
-            // claims and only the pair distinguishes them.
+            // Both readings, because "gc succeeded" and "gc helped" are
+            // different claims and only the pair distinguishes them — and the
+            // trigger, because which axis fired is the difference between a repo
+            // that writes a lot and one that fetches a lot.
             tracing::info!(
-                loose_objects_before = loose_objects_before.get(),
-                loose_objects_after = loose_objects_after.get(),
+                trigger = %trigger,
+                loose_objects_before = before.loose_objects.get(),
+                loose_objects_after = after.loose_objects.get(),
+                packs_before = before.packs.get(),
+                packs_after = after.packs.get(),
                 "compacted writ's notes repo"
             );
         }
