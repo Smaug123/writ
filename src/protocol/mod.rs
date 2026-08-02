@@ -5,6 +5,11 @@
 //! with one [`ServerMessage`] per line. No multiplexing, no framing
 //! beyond the newline.
 //!
+//! The **first** line on every connection is a [`ClientMessage::Hello`]
+//! declaring [`HOST_PROTOCOL_VERSION`], and the broker refuses the connection
+//! before dispatching anything if it does not arrive or does not match. See
+//! that constant for why, and `server::handshake` for the rule.
+//!
 //! These types are thin wrappers over the core domain types: the
 //! [`CapabilityRequest`] a client sends is exactly the struct the
 //! policy engine consumes, and [`SessionId`]/[`UnixMillis`] are the
@@ -26,6 +31,60 @@ pub use views::{
     StagedPushSummary,
 };
 
+/// The version of the host Unix-socket protocol this build speaks, declared by
+/// the client in [`ClientMessage::Hello`] and checked by the broker before it
+/// dispatches anything.
+///
+/// **Bump this on any change to the wire shape of [`ClientMessage`] or
+/// [`ServerMessage`]** — a renamed variant, a removed field, a changed meaning.
+/// Adding an optional field with a `#[serde(default)]` is not a wire change in
+/// the sense that matters here (both sides still parse both shapes); renaming
+/// `AgentRunStarted` to `AgentRunAccepted`, as #21 did, is.
+///
+/// ## What this buys, stated exactly
+///
+/// It is an **exact-match assertion**, not a negotiation of a common subset.
+/// `writ` and `writd` are one build from one repo, so there is no supported
+/// skew to negotiate — the only question worth asking is "are these the same
+/// build?", and the only useful answer to "no" is to stop.
+///
+/// The skew it exists for is operational rather than contractual: leaving a
+/// daemon running across an upgrade is an ordinary thing to do on a dev
+/// machine. Before this, the two directions failed differently and one failed
+/// silently:
+///
+/// * **Old client, new daemon.** The request still decoded, so the daemon
+///   *acted* — and then wrote a reply variant the client could not parse. A
+///   `StartAgentRun` booted a VM the caller never learned the name of,
+///   recoverable only through `writ agent-vm list`. This is the case the
+///   handshake actually fixes: the daemon now refuses a connection that
+///   declares no version, before dispatching.
+/// * **New client, old daemon.** The old daemon cannot parse `Hello` at all
+///   (an unknown `type` tag is a deserialization error) and answers
+///   [`ServerMessage::Error`], which every version has always understood. The
+///   client stops there. This is why the client must **not** pipeline its
+///   request behind the `Hello`: an old daemon processes lines in order, so a
+///   pipelined request would be dispatched by the very daemon that just
+///   refused the handshake. One extra round trip on a Unix socket is the price
+///   of that, and it is not a price worth haggling over.
+///
+/// ## The honest limit
+///
+/// This protects the *next* breaking change, not the one already shipped. An
+/// old `writ` binary does not send a `Hello` and never will; what changes is
+/// that it is now refused cleanly instead of being served half an operation.
+///
+/// Version 1 is the first that says its own number. There is no version 0: a
+/// connection that declares nothing is not "version 0", it is a client that
+/// predates the handshake, and the broker says exactly that.
+///
+/// This is the third versioned boundary in writ, alongside
+/// [`BROKER_PROTOCOL_VERSION`](crate::broker_protocol::BROKER_PROTOCOL_VERSION)
+/// on the broker VM's ready file and
+/// [`VM_HTTP_CONTRACT_VERSION`](writ_vm_git::VM_HTTP_CONTRACT_VERSION) on the
+/// guest HTTP surface.
+pub const HOST_PROTOCOL_VERSION: u32 = 1;
+
 /// A message from the agent to the broker.
 ///
 /// `#[serde(deny_unknown_fields)]` at the enum level catches typos at the
@@ -36,6 +95,13 @@ pub use views::{
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
+    /// Declare the protocol version this client speaks. Must be the **first**
+    /// message on every connection; the broker dispatches nothing until it has
+    /// arrived and matched [`HOST_PROTOCOL_VERSION`].
+    ///
+    /// Answered with [`ServerMessage::HelloAccepted`], or with
+    /// [`ServerMessage::Error`] and a closed connection.
+    Hello { protocol_version: u32 },
     /// Begin a new session. The broker assigns a session ID, records it
     /// in the audit log, and returns [`ServerMessage::SessionOpened`].
     OpenSession {
@@ -325,6 +391,19 @@ pub enum ClientMessage {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Acknowledges [`ClientMessage::Hello`]: the client's declared version
+    /// matched, and the connection may now carry requests.
+    ///
+    /// `protocol_version` is the broker's own, and equals the client's by
+    /// construction — the broker accepts nothing else. It is echoed anyway so
+    /// a client that logs the handshake records what it actually agreed with,
+    /// rather than what it assumed.
+    ///
+    /// Safe to add as a new variant, unlike a refusal: only a client that sent
+    /// `Hello` can receive this, and any client new enough to send one is new
+    /// enough to know the reply. A *refusal* has the opposite property, which
+    /// is why refusals are [`Self::Error`].
+    HelloAccepted { protocol_version: u32 },
     /// Acknowledges [`ClientMessage::OpenSession`]; carries the
     /// broker-assigned session ID for use in subsequent messages.
     SessionOpened { session_id: SessionId },
@@ -482,6 +561,10 @@ pub enum ServerMessage {
 impl std::fmt::Debug for ServerMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HelloAccepted { protocol_version } => f
+                .debug_struct("HelloAccepted")
+                .field("protocol_version", protocol_version)
+                .finish(),
             Self::SessionOpened { session_id } => f
                 .debug_struct("SessionOpened")
                 .field("session_id", session_id)

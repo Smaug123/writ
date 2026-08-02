@@ -1063,11 +1063,53 @@ fn call_with_timeout(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
+    let mut reader = BufReader::new(&stream);
+
+    // The version handshake, and a full round trip before `msg` goes anywhere.
+    // Not pipelined on purpose: a daemon too old to know `Hello` answers
+    // `Error` and keeps reading, so a request sent alongside would be
+    // dispatched by exactly the daemon that just failed the handshake.
+    let hello = ClientMessage::Hello {
+        protocol_version: writ::protocol::HOST_PROTOCOL_VERSION,
+    };
+    match write_and_read_reply(socket_path, &stream, &mut reader, &hello)? {
+        ServerMessage::HelloAccepted { protocol_version }
+            if protocol_version == writ::protocol::HOST_PROTOCOL_VERSION => {}
+        // Both directions of skew arrive as `Error`: a new daemon refusing our
+        // version, and an old one that could not parse `Hello` at all.
+        ServerMessage::Error { message } => {
+            return Err(format!(
+                "writ and writd disagree about the host protocol, so nothing was run: {message}"
+            )
+            .into());
+        }
+        other => {
+            return Err(format!(
+                "writ daemon at {} answered the version handshake with {other:?} instead of \
+                 accepting version {}",
+                socket_path.display(),
+                writ::protocol::HOST_PROTOCOL_VERSION,
+            )
+            .into());
+        }
+    }
+
+    write_and_read_reply(socket_path, &stream, &mut reader, msg)
+}
+
+/// Write one framed [`ClientMessage`] and read the framed [`ServerMessage`]
+/// answering it, on an already-connected socket.
+fn write_and_read_reply(
+    socket_path: &Path,
+    stream: &UnixStream,
+    reader: &mut BufReader<&UnixStream>,
+    msg: &ClientMessage,
+) -> Result<ServerMessage, Box<dyn std::error::Error>> {
     let mut line = serde_json::to_string(msg)
         .map_err(|e| format!("encoding request for writ daemon as JSON failed: {e}"))?;
     line.push('\n');
 
-    let mut w = &stream;
+    let mut w = stream;
     w.write_all(line.as_bytes()).map_err(|e| {
         format!(
             "writing request to writ daemon at {} failed: {e}",
@@ -1081,7 +1123,6 @@ fn call_with_timeout(
         )
     })?;
 
-    let mut reader = BufReader::new(&stream);
     let mut reply = String::new();
     let bytes_read = reader.read_line(&mut reply).map_err(|e| {
         format!(

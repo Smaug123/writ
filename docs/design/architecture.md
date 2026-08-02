@@ -752,6 +752,40 @@ ownership, and the mode-only (`mode & 0o077 == 0`) checks guarding the secret
 store, socket parent, and bearer file are bypassable by a macOS ACL, which
 `st_mode` does not reflect. That is a separate, still-open question.
 
+**The connection's version handshake.** The first line on every host-socket
+connection is a `ClientMessage::Hello` declaring `HOST_PROTOCOL_VERSION`;
+`server::handshake::admit` is a pure `(state, message) -> Admission` and
+`Dispatch` is unreachable from `AwaitingHello`, so **nothing is acted on before
+the peer has said what it speaks**. It is an exact-match assertion, not a
+negotiation of a common subset: `writ` and `writd` are one build, so the only
+question worth asking is "are these the same build?".
+
+Two details are load-bearing and easy to get backwards:
+
+- **The refusal is `ServerMessage::Error`, never a new variant.**
+  `ServerMessage` is `#[serde(tag = "type")]`, so an unknown tag is a
+  deserialization error at the peer — a refusal the refused peer cannot parse is
+  the original bug wearing a different name. `Error` is the one variant every
+  version has understood. (`HelloAccepted` *is* a new variant, and safely so:
+  only a client that sent `Hello` can receive it.)
+- **The client must not pipeline its request behind the `Hello`.** A daemon too
+  old to know `Hello` answers `Error` and *keeps reading*, so a pipelined
+  request would be dispatched by exactly the daemon that just failed the
+  handshake. Both clients pay a full round trip for the handshake instead;
+  `writ_client::tests::an_old_daemon_is_refused_before_the_request_is_written`
+  drives a pre-handshake stub and asserts it received one line.
+
+What this does *not* buy is stated where the constant is: it protects the
+**next** breaking change, not the one already shipped. An old `writ` binary
+never sends a `Hello`; what changes is that it is refused cleanly instead of
+being served half an operation — which is what #21's `AgentRunStarted` →
+`AgentRunAccepted` rename did to it, booting a VM whose name the caller could
+not read.
+
+The test stubs that stand in for writd (bailiff has two, `writ_client` a third)
+call the exported `server::answer_host_handshake` rather than re-implementing
+the server half, so a stub cannot accept a version writd would refuse.
+
 **Neighbours.** Calls audit, credential minting, the git pipeline
 (staged-push), and the VM sandbox (`AgentVmDaemon`). Called by the `writ` CLI
 over the socket; guests reach the *separate* `vm_http` surface (§5.6), not this
@@ -1181,12 +1215,18 @@ refuses its `workspace init` clone with `426` naming the same remedy, before an
 agent process exists to issue a model request
 (`docs/plans/2026-07-25-proxy-vendor-namespaces.md`, Stage 2).
 
-**Two version handshakes, one fingerprint.** The guest and the broker are built
-from the same tree and only ever meant to ship together, but both run from images
-loaded into the local container store, so a rebuilt host can launch a stale one.
-Each axis has a constant and refuses a mismatch with an actionable "rebuild the
-image":
+**Three version handshakes, one fingerprint.** Every side of writ is built from
+the same tree and only ever meant to ship together — but images are loaded into
+the local container store and daemons outlive upgrades, so any of the three can
+meet a stale peer. Each axis has a constant and refuses a mismatch with an
+actionable message naming the stale side:
 
+- **client ↔ writd** (the host Unix socket): `HOST_PROTOCOL_VERSION`
+  (`protocol/mod.rs`), declared by the client in a `Hello` that must be the
+  first line on every connection, and checked by `server::handshake::admit`
+  before anything is dispatched. See §5.2 for why the refusal is
+  `ServerMessage::Error` rather than a variant of its own, and why the client
+  must not pipeline its request behind the `Hello`.
 - **host ↔ broker VM** (`broker_placement = vm`): `BROKER_PROTOCOL_VERSION`
   (`broker_protocol.rs`), stamped into the broker's ready file and checked by the
   host at launch.

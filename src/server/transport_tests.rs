@@ -27,6 +27,10 @@ async fn socket_roundtrip_open_and_close_session() {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
+    // Every connection declares its protocol version first; nothing is
+    // dispatched until it has.
+    declare_protocol_version(&mut writer, &mut lines).await;
+
     // Open session
     let open_msg = serde_json::to_string(&ClientMessage::OpenSession {
         label: Some("integration".into()),
@@ -123,6 +127,7 @@ async fn oversize_request_over_socket_returns_structured_error() {
     let stream = connect_with_retries(&sock_path).await;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
+    declare_protocol_version(&mut writer, &mut lines).await;
 
     // Write > MAX_LINE_BYTES non-newline bytes, then a newline. The
     // writes may fail with BrokenPipe/ConnectionReset: the server
@@ -219,4 +224,146 @@ async fn bind_socket_refuses_to_delete_non_socket_file() {
     std::fs::write(&sock, b"not a socket").unwrap();
     let err = bind_socket(&sock).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+}
+
+/// Complete the client half of the handshake on a raw socket: one `Hello`
+/// carrying [`HOST_PROTOCOL_VERSION`], one `HelloAccepted` back.
+///
+/// One helper rather than the literal at each site, so a version bump reaches
+/// every raw-framing test at once — the same reason the stub brokers call
+/// `answer_host_handshake` rather than re-implementing the server half.
+async fn declare_protocol_version<W, R>(writer: &mut W, lines: &mut tokio::io::Lines<BufReader<R>>)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let hello = serde_json::to_string(&ClientMessage::Hello {
+        protocol_version: crate::protocol::HOST_PROTOCOL_VERSION,
+    })
+    .unwrap()
+        + "\n";
+    writer.write_all(hello.as_bytes()).await.unwrap();
+    let reply: ServerMessage = serde_json::from_str(&lines.next_line().await.unwrap().unwrap())
+        .expect("the handshake reply must decode");
+    assert_eq!(
+        reply,
+        ServerMessage::HelloAccepted {
+            protocol_version: crate::protocol::HOST_PROTOCOL_VERSION,
+        },
+    );
+}
+
+/// Bind a listener on a fresh socket and return its path. Shared by the
+/// handshake-refusal tests below, which differ only in what they send.
+async fn spawn_listener<S: crate::secret::SecretStore + Send + Sync + 'static>(
+    state: &Arc<BrokerState<S>>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock_path = dir.path().join("test.sock");
+    let state_clone = Arc::clone(state);
+    let path_clone = sock_path.clone();
+    tokio::spawn(async move {
+        let _ = run(&path_clone, state_clone).await;
+    });
+    (dir, sock_path)
+}
+
+/// **The whole point: a connection that does not declare its version gets
+/// nothing dispatched on it.**
+///
+/// This is the shape of the bug that motivated the handshake. #21 renamed a
+/// `ServerMessage` variant, and across a version skew the *request* still
+/// decoded while the *reply* did not — so writd acted, and the caller could not
+/// read what it had done. An old `writ` sends its request as the first line on
+/// the connection, exactly as this test does.
+///
+/// The assertion that matters is not the refusal text but the empty audit log:
+/// `OpenSession` is the cheapest message with a durable side effect, so if the
+/// session row is absent, nothing was dispatched.
+#[tokio::test]
+async fn a_connection_that_declares_no_version_gets_nothing_dispatched() {
+    let server = MockServer::start().await;
+    let state = make_state(&server, vec![], "o");
+    let (_dir, sock_path) = spawn_listener(&state).await;
+
+    let stream = connect_with_retries(&sock_path).await;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let open = serde_json::to_string(&ClientMessage::OpenSession {
+        label: Some("stale client".into()),
+        agent_kind: Some(AgentKind::Claude),
+        agent_model: None,
+    })
+    .unwrap()
+        + "\n";
+    writer.write_all(open.as_bytes()).await.unwrap();
+
+    let reply: ServerMessage =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let ServerMessage::Error { message } = reply else {
+        panic!("expected a refusal the peer can parse, got {reply:?}");
+    };
+    assert!(
+        message.contains("declared no host protocol version"),
+        "{message}"
+    );
+
+    // And the connection is closed, so a stale client cannot simply try again
+    // on the same one.
+    assert!(lines.next_line().await.unwrap().is_none());
+
+    assert_eq!(
+        state.audit.table_row_count_for_test("session"),
+        0,
+        "a refused connection dispatched OpenSession anyway",
+    );
+}
+
+/// The same guarantee for a client that declares the *wrong* version, and the
+/// message names both numbers so an operator can tell which side is behind.
+#[tokio::test]
+async fn a_connection_that_declares_the_wrong_version_gets_nothing_dispatched() {
+    let server = MockServer::start().await;
+    let state = make_state(&server, vec![], "o");
+    let (_dir, sock_path) = spawn_listener(&state).await;
+
+    let stream = connect_with_retries(&sock_path).await;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let hello = serde_json::to_string(&ClientMessage::Hello {
+        protocol_version: crate::protocol::HOST_PROTOCOL_VERSION + 1,
+    })
+    .unwrap()
+        + "\n";
+    writer.write_all(hello.as_bytes()).await.unwrap();
+    // Pipelined behind it, which is what a client must *not* do — sent here on
+    // purpose, because the guarantee is that writd would not act on it even so.
+    let open = serde_json::to_string(&ClientMessage::OpenSession {
+        label: Some("newer client".into()),
+        agent_kind: Some(AgentKind::Claude),
+        agent_model: None,
+    })
+    .unwrap()
+        + "\n";
+    let _ = writer.write_all(open.as_bytes()).await;
+
+    let reply: ServerMessage =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let ServerMessage::Error { message } = reply else {
+        panic!("expected a refusal the peer can parse, got {reply:?}");
+    };
+    assert!(message.contains("mismatch"), "{message}");
+    assert!(
+        message.contains(&(crate::protocol::HOST_PROTOCOL_VERSION + 1).to_string()),
+        "{message}",
+    );
+    assert!(lines.next_line().await.unwrap().is_none());
+    assert_eq!(
+        state.audit.table_row_count_for_test("session"),
+        0,
+        "a refused connection dispatched the request pipelined behind its Hello",
+    );
 }

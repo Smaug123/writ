@@ -57,6 +57,11 @@ use crate::vm_git_mirror_cache::MirrorPins;
 /// `reconcile`), split out of this file to keep the dispatcher readable.
 mod staged_push;
 
+/// The connection-level protocol-version handshake, which every connection
+/// must complete before anything is dispatched on it.
+mod handshake;
+pub use handshake::answer_host_handshake;
+
 /// Run-agent orchestration (the `RunAgent` handler and its VM-dispatch
 /// path), split out of this file to keep the dispatcher readable.
 mod run_agent;
@@ -377,6 +382,16 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
     // evaluating to the reply it always did.
     let mut after_reply: Option<AfterReply<S>> = None;
     let reply = match msg {
+        // Unreachable over the socket: `handshake::admit` answers `Hello`
+        // itself and never returns `Dispatch` for it, because the handshake is
+        // a property of the *connection* and this function has no connection to
+        // speak of. An error rather than a panic, because `dispatch_message` is
+        // `pub` and reachable from tests and from any future in-process caller;
+        // the reply says where the message belongs instead of taking the
+        // daemon down over a misrouted line.
+        ClientMessage::Hello { .. } => ServerMessage::Error {
+            message: "hello is answered by the connection handshake, not the dispatcher".into(),
+        },
         ClientMessage::OpenSession {
             label,
             agent_kind,
@@ -872,6 +887,7 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+    let mut handshake = handshake::Handshake::default();
     loop {
         let read = tokio::time::timeout(
             IDLE_READ_TIMEOUT,
@@ -897,23 +913,65 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
             }
             Ok(Err(e)) => return Err(e),
         };
-        let dispatched = match serde_json::from_slice::<ClientMessage>(&bytes) {
-            Err(e) => Dispatched::reply_only(ServerMessage::Error {
-                message: format!("invalid request: {e}"),
-            }),
-            Ok(msg) => dispatch_message_with_agent_vm(msg, &state, agent_vm.as_ref()).await,
+        // An undecodable line is refused-and-closed before the handshake and
+        // merely reported after it. The difference is not cosmetic: before the
+        // handshake, "we could not read this" and "no version was declared" are
+        // the same fact, and a connection whose version is unknown must not be
+        // left open to try again.
+        let message = match serde_json::from_slice::<ClientMessage>(&bytes) {
+            Ok(message) => message,
+            Err(e) => {
+                let reply = ServerMessage::Error {
+                    message: format!("invalid request: {e}"),
+                };
+                if handshake == handshake::Handshake::AwaitingHello {
+                    write_reply(&mut writer, &reply).await?;
+                    return Ok(());
+                }
+                write_reply(&mut writer, &reply).await?;
+                continue;
+            }
         };
-        let mut json =
-            serde_json::to_string(dispatched.reply()).expect("ServerMessage always serializes");
-        json.push('\n');
+
+        // The connection-level gate. `Dispatch` is the only arm that reaches
+        // the dispatcher, so no request can be acted on before the peer has
+        // said what protocol it speaks — which is the failure this exists for:
+        // a daemon that acts, and then answers in a variant the caller cannot
+        // parse.
+        match handshake::admit(handshake, &message) {
+            handshake::Admission::Accepted(reply) => {
+                handshake = handshake::Handshake::Negotiated;
+                write_reply(&mut writer, &reply).await?;
+                continue;
+            }
+            handshake::Admission::Refused(reply) => {
+                write_reply(&mut writer, &reply).await?;
+                return Ok(());
+            }
+            handshake::Admission::Dispatch => {}
+        }
+
+        let dispatched = dispatch_message_with_agent_vm(message, &state, agent_vm.as_ref()).await;
         // Write first, then start. The `?` is what makes the ordering mean
         // something: a write that fails takes `dispatched` — and with it the
         // accepted run, its queue place and its registry entry — out of scope
         // unstarted. So a client that has already gone gets no VM booted in its
         // name, rather than one it will never hear about.
-        writer.write_all(json.as_bytes()).await?;
+        write_reply(&mut writer, dispatched.reply()).await?;
         dispatched.begin_deferred_work();
     }
+}
+
+/// Write one newline-framed [`ServerMessage`]. Factored out because the
+/// handshake added three more reply sites, and a framing that is spelled out
+/// per site is a framing that eventually differs per site.
+async fn write_reply<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    reply: &ServerMessage,
+) -> io::Result<()> {
+    let mut json = serde_json::to_string(reply).expect("ServerMessage always serializes");
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await
 }
 
 /// Bind the listener, handling the stale-socket case safely.
