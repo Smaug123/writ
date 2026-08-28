@@ -100,6 +100,12 @@ impl AgentVmDaemon {
         if guest_command.is_empty() {
             return Err(AgentVmDaemonError::EmptyGuestCommand);
         }
+        // Before the session has an id, and so before it has an audit row, a
+        // network, a VM, or anything to clean up. A refusal that left state
+        // behind would be a worse answer than the start it replaced.
+        if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
+            return Err(AgentVmDaemonError::Ipv6ConfinementUnavailableForVmBroker);
+        }
 
         let session_id = SessionId::new();
         let session_lock = self.session_lock_handle(session_id).await;
@@ -1117,8 +1123,12 @@ impl AgentVmDaemon {
     // session rather than live in a caller's scope. Splitting the parameter list
     // into a struct would move the same fields behind a name without making any
     // of them optional.
+    /// `pub(super)` so that the tests of what a VM-placement session *is* can
+    /// still reach it: new ones are refused at [`Self::start_session`] while
+    /// nothing confines IPv6 between guests there, which puts this machinery
+    /// out of reach of the public entry point.
     #[allow(clippy::too_many_arguments)]
-    async fn start_session_after_audit_opened<S: SecretStore + Send + Sync + 'static>(
+    pub(super) async fn start_session_after_audit_opened<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: Arc<BrokerState<S>>,
         session_id: SessionId,

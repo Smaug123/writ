@@ -398,6 +398,28 @@ pub enum AgentVmDaemonError {
          clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
     )]
     AgentRunUnsupportedForVmBroker,
+    /// `broker_placement = vm` has no IPv6 confinement, so no new session under
+    /// it can be started.
+    ///
+    /// Host PF is what confines IPv6 for host placement, and it may not see
+    /// frames switched directly between two guests on the shared vmnet — so
+    /// under VM placement a guest that reacquires IPv6 can reach the broker VM,
+    /// and another session's guest, over a path nothing inspects. Closing it
+    /// needs the broker VM to install its own internal-interface firewall,
+    /// which does not exist yet.
+    ///
+    /// Refused at the start rather than degraded: an operator who has selected
+    /// this placement is told it cannot be served, instead of being given a
+    /// session whose confinement is weaker than the one the placement above it
+    /// advertises. Sessions already running are untouched; only new ones are
+    /// refused, so nothing in flight is stranded.
+    #[error(
+        "broker_placement = vm cannot confine IPv6 between guests: host PF does not see frames \
+         switched directly between guests on the shared vmnet, and the broker VM does not yet \
+         install its own internal-interface firewall. New sessions are refused until it does. \
+         Use broker_placement = host."
+    )]
+    Ipv6ConfinementUnavailableForVmBroker,
     /// The run was stopped while it was still queued.
     ///
     /// Reachable only because `StartAgentRun` returns a session id before the

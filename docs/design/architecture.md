@@ -1154,7 +1154,16 @@ broker `BrokerVmPlan`/`BrokerSessionSpec`/`GuestAbsPath` (`broker_vm.rs:190`,
 
 **Guarantees.** No egress except the broker: host placement via PF default-deny
 (whitelist broker ports, then `block return`); VM placement by topology
-(`--internal`, no NAT). IPv6 isolated with a backstop guest deny. The agent VM
+(`--internal`, no NAT). IPv6 is confined for host placement by the host PF
+rule (`block return in quick on <iface> inet6 all`,
+`agent_vm_firewall.rs:705`), with a guest deny in front of it that is a
+precondition rather than an authority boundary — the root workload can
+reverse it. Under **VM broker placement there is no such confinement**: PF may
+not see frames switched directly between two guests on the shared vmnet, and
+the broker VM does not yet install its own internal-interface firewall, so
+starting a new session there is refused outright
+(`AgentVmDaemonError::Ipv6ConfinementUnavailableForVmBroker`). Sessions
+already running are untouched; only new starts are refused. The agent VM
 gets no host mounts (tmpfs only); only the broker VM bind-mounts
 session/secrets(ro)/audit. Idempotent restart: `Probe*Absent` steps refuse to
 touch infra this call didn't create. On boot, `reconcile_one_session` closes

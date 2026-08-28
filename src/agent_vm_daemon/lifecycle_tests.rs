@@ -11,6 +11,107 @@ use proptest::prelude::*;
 use std::fs;
 use std::path::Path;
 
+/// Starts a VM-placement session past the admission gate.
+///
+/// New VM-placement sessions are refused outright while nothing confines IPv6
+/// between guests there, so the public entry point cannot reach the machinery
+/// below it. The tests that are *about* that machinery — which broker the
+/// agent is pointed at, what its environment advertises — call the inner start
+/// directly, opening the audit session the way `start_session` would. They
+/// stay honest about what they cover: how a VM-placement session is built, not
+/// whether one may be.
+async fn start_vm_placement_session_past_the_gate<S>(
+    daemon: &AgentVmDaemon,
+    state: &Arc<BrokerState<S>>,
+    label: &str,
+    agent_kind: Option<AgentKind>,
+) -> Result<AgentVmStarted, AgentVmDaemonError>
+where
+    S: crate::secret::SecretStore + Send + Sync + 'static,
+{
+    let session_id = SessionId::new();
+    state
+        .audit
+        .open_session(&crate::core::SessionRecord {
+            session_id,
+            label: Some(label.to_string()),
+            agent_kind,
+            agent_model: agent_kind.map(|_| "claude-test".to_string()),
+            opened_at: UnixMillis::now(),
+            closed_at: None,
+        })
+        .unwrap();
+    daemon
+        .start_session_after_audit_opened(
+            Arc::clone(state),
+            session_id,
+            agent_kind,
+            None,
+            vec!["sleep".into(), "600".into()],
+            None,
+            None,
+        )
+        .await
+}
+
+/// No new session may start under a placement that cannot confine IPv6.
+///
+/// Host PF confines IPv6 for host placement and may not see frames switched
+/// directly between two guests on the shared vmnet, so under VM placement a
+/// guest that reacquires IPv6 reaches the broker VM, and another session's
+/// guest, over a path nothing inspects. Until the broker VM installs its own
+/// internal firewall there is nothing to enforce the guarantee the placement
+/// above it advertises, so the start is refused rather than served weakly.
+///
+/// The refusal has to leave nothing behind: it comes before the session has an
+/// id, and so before it has an audit row, a network, a VM, or anything that
+/// would need cleaning up.
+#[tokio::test]
+async fn vm_broker_placement_refuses_new_sessions_while_ipv6_is_unconfined() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) =
+        daemon_config_with_broker_placement(dir.path(), &fake_tool, BrokerPlacement::Vm);
+    let daemon = AgentVmDaemon::new(config);
+    let audit_path = dir.path().join("audit.db");
+    let state = make_state_with_audit(AuditLog::open(&audit_path).unwrap());
+
+    let err = daemon
+        .start_session(
+            Arc::clone(&state),
+            Some("vm placement".into()),
+            Some(AgentKind::Claude),
+            Some("claude-test".into()),
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap_err();
+
+    // Bare, not wrapped in `StartFailed`: there is no session for it to name.
+    assert!(
+        matches!(
+            err,
+            AgentVmDaemonError::Ipv6ConfinementUnavailableForVmBroker
+        ),
+        "expected Ipv6ConfinementUnavailableForVmBroker, got {err:?}"
+    );
+
+    assert!(
+        !args_log.exists(),
+        "a refused start must run no container command"
+    );
+    assert!(
+        state_store.load_all().unwrap().is_empty(),
+        "a refused start must persist no session state"
+    );
+    // Nothing to look an audit row up *by* is the point: `open_session` takes a
+    // session id, and the bare error above says none was ever minted.
+}
+
 #[tokio::test]
 async fn vm_broker_placement_requires_an_agent_kind() {
     let dir = tempfile::tempdir().unwrap();
@@ -24,24 +125,14 @@ async fn vm_broker_placement_requires_an_agent_kind() {
     let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
 
     // No agent_kind: the broker has no GitHub App to mint with, so vm placement
-    // fails fast — before any container/network work.
-    let err = daemon
-        .start_session(
-            Arc::clone(&state),
-            Some("vm placement".into()),
-            None,
-            None,
-            None,
-            vec!["sleep".into(), "600".into()],
-        )
+    // fails fast — before any container/network work. Reached past the
+    // admission gate, which refuses these sessions for an unrelated reason.
+    let err = start_vm_placement_session_past_the_gate(&daemon, &state, "vm placement", None)
         .await
         .unwrap_err();
-    let AgentVmDaemonError::StartFailed { source, .. } = err else {
-        panic!("vm placement should fail with StartFailed, got {err:?}");
-    };
     assert!(
-        matches!(*source, AgentVmDaemonError::AgentKindRequiredForVmBroker),
-        "expected AgentKindRequiredForVmBroker, got {source:?}"
+        matches!(err, AgentVmDaemonError::AgentKindRequiredForVmBroker),
+        "expected AgentKindRequiredForVmBroker, got {err:?}"
     );
     assert!(
         !args_log.exists(),
@@ -195,17 +286,14 @@ async fn vm_broker_placement_starts_agent_pointed_at_the_broker_vm() {
         .put(&crate::secret::SecretKey::new("gh-app-pk").unwrap(), "PEM")
         .unwrap();
 
-    let started = daemon
-        .start_session(
-            Arc::clone(&state),
-            Some("vm session".into()),
-            Some(AgentKind::Claude),
-            Some("claude-test".into()),
-            None,
-            vec!["sleep".into(), "600".into()],
-        )
-        .await
-        .unwrap();
+    let started = start_vm_placement_session_past_the_gate(
+        &daemon,
+        &state,
+        "vm session",
+        Some(AgentKind::Claude),
+    )
+    .await
+    .unwrap();
 
     // The agent is pointed at the broker VM's discovered IP on the fixed port.
     assert_eq!(started.broker_url(), "http://192.168.252.7:1024/");
@@ -297,17 +385,14 @@ async fn vm_broker_placement_advertises_prewarm_substituter_when_prewarm_dir_con
         .put(&crate::secret::SecretKey::new("gh-app-pk").unwrap(), "PEM")
         .unwrap();
 
-    let started = daemon
-        .start_session(
-            Arc::clone(&state),
-            Some("vm session".into()),
-            Some(AgentKind::Claude),
-            Some("claude-test".into()),
-            None,
-            vec!["sleep".into(), "600".into()],
-        )
-        .await
-        .unwrap();
+    let started = start_vm_placement_session_past_the_gate(
+        &daemon,
+        &state,
+        "vm session",
+        Some(AgentKind::Claude),
+    )
+    .await
+    .unwrap();
 
     let env = fs::read_to_string(&env_log).unwrap();
     assert!(
