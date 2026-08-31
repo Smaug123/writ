@@ -566,7 +566,7 @@ fn valid_agent_vm_lifecycle_config() -> AgentVmLifecycleConfig {
         sudo: PathBuf::from("sudo"),
         pf_helper: PathBuf::from("/usr/local/libexec/writ-agent-vm-pf-helper"),
         state_dir: Some(PathBuf::from("/var/folders/writ/agent-vm-state")),
-        ipv6_mode: Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ipv6_mode: ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
         broker_placement: BrokerPlacement::Host,
         image: "alpine:latest".into(),
         broker_image: None,

@@ -19,10 +19,11 @@ use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmNames, AgentVmResources,
     AgentVmSessionManagerError, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError,
     AgentVmSessionStateStatus, AgentVmSessionStateStore, AgentVmToolPaths, BoundedOutput,
-    BrokerPlacement, ContainerImage, HostIface, Ipv6IsolationMode, NetworkHealth, ProbeDebounce,
-    ProbeObservation, ProcessInvocation, ProcessInvocationError, claim_agent_vm_session_subnet,
-    cleanup_managed_agent_vm_session, complete_agent_vm_session_start, evaluate_host_path,
-    host_interfaces, remove_managed_agent_vm_session_state, start_agent_vm_session,
+    BrokerPlacement, ConfiguredIpv6Profile, ContainerImage, HostIface, Ipv6IsolationMode,
+    Ipv6ProfileClosed, NetworkHealth, ProbeDebounce, ProbeObservation, ProcessInvocation,
+    ProcessInvocationError, claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
+    complete_agent_vm_session_start, evaluate_host_path, host_interfaces,
+    remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
 use crate::audit::{
     AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog, NixCacheAuditEntry,
@@ -163,7 +164,12 @@ pub struct AgentVmLifecycleRuntimeConfig {
     subnet_index_min: u16,
     subnet_index_max: u16,
     state_store: AgentVmSessionStateStore,
-    ipv6_mode: Ipv6IsolationMode,
+    /// What the operator configured, not what a session runs under. A closed
+    /// profile still has to be representable here, because `writd` must start
+    /// under one: the sessions already running need stopping and reconciling.
+    /// [`ConfiguredIpv6Profile::admit`] is what turns it into an active mode,
+    /// and it is the only thing that does.
+    ipv6_profile: ConfiguredIpv6Profile,
     broker_placement: BrokerPlacement,
     image: ContainerImage,
     /// Image for the dedicated broker VM, required only when
@@ -413,6 +419,18 @@ pub enum AgentVmDaemonError {
     /// session whose confinement is weaker than the one the placement above it
     /// advertises. Sessions already running are untouched; only new ones are
     /// refused, so nothing in flight is stranded.
+    /// `ipv6_mode = ipv4_only_no_guest_ipv6` is recognised for the sessions
+    /// already running under it, and closed to new ones.
+    ///
+    /// `ipv6_mode = ipv4_only_locked_v1` is recognised so that a config naming
+    /// it is understood rather than read as a typo, and refused because it does
+    /// not exist yet.
+    #[error(
+        "ipv6_mode = ipv4_only_locked_v1 is not implemented: the profile is recognised so that a \
+         config naming it is refused for the right reason, but nothing yet stops the workload \
+         reversing the guest IPv6 deny. No session starts under it."
+    )]
+    Ipv6ProfileLockedNotImplemented,
     #[error(
         "broker_placement = vm cannot confine IPv6 between guests: host PF does not see frames \
          switched directly between guests on the shared vmnet, and the broker VM does not yet \
@@ -675,7 +693,7 @@ impl AgentVmLifecycleRuntimeConfig {
         subnet_index_min: u16,
         subnet_index_max: u16,
         state_store: AgentVmSessionStateStore,
-        ipv6_mode: Ipv6IsolationMode,
+        ipv6_profile: ConfiguredIpv6Profile,
         broker_placement: BrokerPlacement,
         image: ContainerImage,
         broker_image: Option<ContainerImage>,
@@ -705,7 +723,7 @@ impl AgentVmLifecycleRuntimeConfig {
         // incompatible with dual-stack. Reject it here rather than launch a broker
         // VM whose agent start then fails every time.
         if broker_placement == BrokerPlacement::Vm
-            && ipv6_mode == Ipv6IsolationMode::DualStackRequired
+            && ipv6_profile == ConfiguredIpv6Profile::DualStackRequired
         {
             return Err(AgentVmLifecycleRuntimeConfigError::VmPlacementRequiresIpv4Only);
         }
@@ -716,7 +734,7 @@ impl AgentVmLifecycleRuntimeConfig {
             subnet_index_min,
             subnet_index_max,
             state_store,
-            ipv6_mode,
+            ipv6_profile,
             broker_placement,
             image,
             broker_image,
@@ -989,7 +1007,7 @@ mod broker_image_invariant_tests {
             252,
             253,
             AgentVmSessionStateStore::new("/tmp/writ-test-broker-image-invariant"),
-            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
             placement,
             ContainerImage::new("agent:latest").unwrap(),
             broker_image.map(|image| ContainerImage::new(image).unwrap()),
@@ -1032,7 +1050,7 @@ mod broker_image_invariant_tests {
             252,
             253,
             AgentVmSessionStateStore::new("/tmp/writ-test-vm-dual-stack"),
-            Ipv6IsolationMode::DualStackRequired,
+            ConfiguredIpv6Profile::DualStackRequired,
             BrokerPlacement::Vm,
             ContainerImage::new("agent:latest").unwrap(),
             Some(ContainerImage::new("broker:latest").unwrap()),

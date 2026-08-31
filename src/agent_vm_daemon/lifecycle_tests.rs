@@ -11,6 +11,150 @@ use proptest::prelude::*;
 use std::fs;
 use std::path::Path;
 
+/// A closed profile refuses new sessions and leaves nothing behind.
+///
+/// `ipv4_only_locked_v1` is recognised so that a config naming it is refused
+/// for the right reason rather than read as a typo. The refusal arrives before
+/// the session has an id — and so before an audit row, a subprocess, or a state
+/// record — which is why the error is bare rather than wrapped in
+/// `StartFailed`: there is no session for it to name.
+#[tokio::test]
+async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
+    for (profile, expected) in [(
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+        AgentVmDaemonError::Ipv6ProfileLockedNotImplemented,
+    )] {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) =
+            daemon_config_with_ipv6_profile(dir.path(), &fake_tool, profile);
+        let daemon = AgentVmDaemon::new(config);
+        let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+        let err = daemon
+            .start_session(
+                Arc::clone(&state),
+                Some("closed".into()),
+                Some(AgentKind::Claude),
+                Some("claude-test".into()),
+                None,
+                vec!["sleep".into(), "600".into()],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&err),
+            std::mem::discriminant(&expected),
+            "start_session under {profile:?}: expected {expected:?}, got {err:?}"
+        );
+
+        // The agent-run route refuses the same way, and equally early.
+        let run_err = daemon
+            .accept_agent_run_session(
+                &state,
+                Some("closed run".into()),
+                AgentKind::Claude,
+                "claude-test".into(),
+                AgentVmWorkspaceBootstrap {
+                    repo: "owner/repo".parse().unwrap(),
+                    destination: None,
+                    warm: WorkspaceWarmMode::None,
+                },
+                crate::agent_run::AgentPrompt::new("do it"),
+                crate::agent_vm_daemon::AgentRunTags::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&run_err),
+            std::mem::discriminant(&expected),
+            "accept_agent_run_session under {profile:?}: got {run_err:?}"
+        );
+
+        assert!(
+            !args_log.exists(),
+            "{profile:?}: a refused start must run no subprocess"
+        );
+        assert!(
+            state_store.load_all().unwrap().is_empty(),
+            "{profile:?}: a refused start must persist no session state"
+        );
+    }
+}
+
+/// A persisted session is taken down by the mode it was started in, not the
+/// one the daemon is configured with now.
+///
+/// This is what lets the admitted set change without stranding sessions: an
+/// operator who edits `ipv6_mode` — or a `writd` whose admitted set narrows
+/// across an upgrade — must still be able to stop what is already running. The
+/// record keeps its own mode and the schema version it was written with, and
+/// the stop plan is derived from the record.
+#[tokio::test]
+async fn a_persisted_session_is_stopped_by_the_mode_it_was_started_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config_with_ipv6_profile(
+        dir.path(),
+        &fake_tool,
+        ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
+    );
+    occupy_subnet(&state_store, 252);
+    let persisted = state_store.load_all().unwrap().pop().unwrap();
+
+    // Not relabelled, and not migrated to a new schema.
+    assert_eq!(
+        persisted.ipv6_mode(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6
+    );
+
+    // Cleanup is derived from the record, not from what the daemon is
+    // configured with: the same record read under a daemon configured for a
+    // different profile produces the same invocations.
+    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
+    let under_legacy = persisted.to_stop_plan(tools.clone()).stop_invocations();
+    let (dual_config, dual_store) = daemon_config_with_ipv6_profile(
+        dir.path(),
+        &fake_tool,
+        ConfiguredIpv6Profile::DualStackRequired,
+    );
+    let under_dual_stack = dual_store
+        .load_all()
+        .unwrap()
+        .pop()
+        .expect("the same persisted record")
+        .to_stop_plan(tools)
+        .stop_invocations();
+    assert_eq!(under_legacy, under_dual_stack);
+    assert!(!under_legacy.is_empty(), "a session has material to remove");
+    drop(dual_config);
+
+    let session_id = persisted.session_id();
+    let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+    audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(1_700_000_000),
+            closed_at: None,
+        })
+        .unwrap();
+    let daemon = AgentVmDaemon::new(config);
+
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+    assert_eq!(report.cleaned(), &[session_id]);
+    assert!(report.failed().is_empty());
+    assert!(state_store.load_all().unwrap().is_empty());
+}
+
 /// Starts a VM-placement session past the admission gate.
 ///
 /// New VM-placement sessions are refused outright while nothing confines IPv6
@@ -45,6 +189,14 @@ where
         .start_session_after_audit_opened(
             Arc::clone(state),
             session_id,
+            // Supplied rather than admitted, because these tests are about what
+            // a vm-placement session *is* and the gate refuses one outright.
+            // It must still be the mode such a session would really run in:
+            // `AgentVmLifecycleRuntimeConfig::new` rejects vm placement under
+            // dual-stack, so passing that would build a combination the config
+            // layer forbids and would stop covering the ipv4-only guest setup
+            // this placement depends on.
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
             agent_kind,
             None,
             vec!["sleep".into(), "600".into()],
@@ -171,12 +323,11 @@ async fn vm_broker_placement_rejects_agent_run_sessions() {
         )
         .await
         .unwrap_err();
-    let AgentVmDaemonError::StartFailed { source, .. } = err else {
-        panic!("expected StartFailed, got {err:?}");
-    };
+    // Bare, not wrapped in `StartFailed`: the refusal comes before the run has
+    // an id, so there is no session for it to name.
     assert!(
-        matches!(*source, AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
-        "expected AgentRunUnsupportedForVmBroker, got {source:?}"
+        matches!(err, AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
+        "expected AgentRunUnsupportedForVmBroker, got {err:?}"
     );
     assert!(
         !args_log.exists(),
@@ -239,7 +390,8 @@ fn write_vm_broker_fake_tool(dir: &Path, args_log: &Path, env_log: &Path) -> std
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> {args_log}\n\
          if [ \"$1\" = network ] && [ \"$2\" = inspect ]; then\n\
-         printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'; exit 0; fi\n\
+         printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1' \\
+           'ipv6Subnet: fd83:b6f2:e57:fc::/64' 'ipv6Gateway: fd83:b6f2:e57:fc::1'; exit 0; fi\n\
          if [ \"$1\" = inspect ]; then id=\"${{2#writ-broker-vm-}}\";\n\
          printf '[{{\"status\":{{\"networks\":[{{\"network\":\"writ-agent-net-%s\",\"ipv4Address\":\"192.168.252.7/24\"}}],\"state\":\"running\"}}}}]\\n' \"$id\"; exit 0; fi\n\
          if [ \"$1\" = run ]; then prev=\"\";\n\

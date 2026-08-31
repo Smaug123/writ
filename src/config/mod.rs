@@ -14,7 +14,7 @@ use crate::agent_vm_daemon::{
 };
 use crate::agent_vm_lifecycle::{
     AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmToolPaths,
-    BrokerPlacement, ContainerImage, Ipv6IsolationMode, default_agent_vm_state_dir,
+    BrokerPlacement, ConfiguredIpv6Profile, ContainerImage, default_agent_vm_state_dir,
 };
 use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
 use crate::flake_lock::{FlakeProvisionBounds, FlakeProvisionBoundsError};
@@ -496,7 +496,15 @@ pub struct AgentVmLifecycleConfig {
     pub pf_helper: PathBuf,
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
-    pub ipv6_mode: Ipv6IsolationMode,
+    /// Which IPv6 profile the operator selected.
+    ///
+    /// The key keeps its name; the type is [`ConfiguredIpv6Profile`] rather
+    /// than the active [`crate::agent_vm_lifecycle::Ipv6IsolationMode`], because a config may name a
+    /// profile no new session may start under. Parsing it and admitting it are
+    /// different questions, and `writd` has to answer the first `Ok` under a
+    /// closed profile in order to stop and reconcile the sessions already
+    /// running beneath it.
+    pub ipv6_mode: ConfiguredIpv6Profile,
     /// Where the per-session broker runs; defaults to [`BrokerPlacement::Host`]
     /// (today's in-process host broker). Set to `vm` to run the broker in a
     /// dedicated VM, working around the macOS vmnet `accept()` defect.

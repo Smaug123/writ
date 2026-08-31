@@ -10,9 +10,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use writ::agent_vm_lifecycle::{
     AgentVmResources, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateStore,
     AgentVmSessionStopPlan, AgentVmStartInvocation, AgentVmToolPaths, BrokerPlacement,
-    ContainerImage, Ipv6IsolationMode, ProcessInvocation, default_agent_vm_state_dir,
-    start_agent_vm_session, start_managed_agent_vm_session, stop_agent_vm_session,
-    stop_managed_agent_vm_session,
+    ConfiguredIpv6Profile, ContainerImage, Ipv6IsolationMode, Ipv6ProfileClosed, ProcessInvocation,
+    default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
+    stop_agent_vm_session, stop_managed_agent_vm_session,
 };
 use writ::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use writ::core::{
@@ -165,13 +165,39 @@ enum Ipv6ModeArg {
     DualStackRequired,
     /// Allow missing Apple IPv6 inspect data only after proving the guest has no routable IPv6.
     Ipv4OnlyNoGuestIpv6,
+    /// The intended replacement for the above, in which the workload cannot
+    /// reverse the deny. Named here so `stop` and `start` refuse it for the
+    /// right reason rather than as an unknown flag value.
+    Ipv4OnlyLockedV1,
 }
 
-impl From<Ipv6ModeArg> for Ipv6IsolationMode {
+impl From<Ipv6ModeArg> for ConfiguredIpv6Profile {
     fn from(value: Ipv6ModeArg) -> Self {
         match value {
             Ipv6ModeArg::DualStackRequired => Self::DualStackRequired,
             Ipv6ModeArg::Ipv4OnlyNoGuestIpv6 => Self::Ipv4OnlyNoGuestIpv6,
+            Ipv6ModeArg::Ipv4OnlyLockedV1 => Self::Ipv4OnlyLockedV1,
+        }
+    }
+}
+
+impl Ipv6ModeArg {
+    /// The active mode a session already running was started in.
+    ///
+    /// Separate from admission, and deliberately still accepting the legacy
+    /// mode: this is how `stop` is told what to tear down, and refusing it here
+    /// would strand exactly the sessions the profile is kept for. There is
+    /// nothing to return for the locked profile, because no session has ever
+    /// been started in it.
+    fn started_in(self) -> Result<Ipv6IsolationMode, String> {
+        match self {
+            Self::DualStackRequired => Ok(Ipv6IsolationMode::DualStackRequired),
+            Self::Ipv4OnlyNoGuestIpv6 => Ok(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6),
+            Self::Ipv4OnlyLockedV1 => Err(
+                "no session has ever been started with ipv6-mode = ipv4-only-locked-v1, so \
+                 there is nothing to stop under it"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -297,12 +323,29 @@ fn build_start_plan(
         args.session.subnet_index,
         broker_ports,
         broker_port_range,
-        args.ipv6_mode.into(),
+        // The same admission the daemon applies, for the same reason: this
+        // command starts a real session, and a profile no new session may run
+        // under must not acquire one through a second front door.
+        ConfiguredIpv6Profile::from(args.ipv6_mode)
+            .admit()
+            .map_err(describe_closed_profile)?,
         ContainerImage::new(args.image)?,
         args.guest_command,
         AgentVmResources::new(args.cpus, args.memory_mib)?,
         tools,
     )?)
+}
+
+/// Why a closed profile cannot start a session, in the words an operator at a
+/// terminal needs.
+fn describe_closed_profile(closed: Ipv6ProfileClosed) -> String {
+    match closed {
+        Ipv6ProfileClosed::NotImplemented => {
+            "ipv6-mode = ipv4-only-locked-v1 is not implemented: nothing yet stops the workload \
+             reversing the guest IPv6 deny, so no session starts under it."
+                .to_string()
+        }
+    }
 }
 
 fn build_stop_plan(
@@ -314,7 +357,7 @@ fn build_stop_plan(
         parsed.session_id,
         parsed.pool,
         args.session.subnet_index,
-        args.ipv6_mode.into(),
+        args.ipv6_mode.started_in()?,
         args.broker_placement.into(),
         tools,
     )?)
@@ -429,6 +472,76 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    fn start_args(ipv6_mode: &str) -> StartArgs {
+        let cli = Cli::try_parse_from([
+            "writ-agent-vm-runner",
+            "start",
+            "--session-id",
+            "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            "--ipv4-pool",
+            "192.168.0.0/16",
+            "--ipv6-pool",
+            "fd83:b6f2:e57::/48",
+            "--subnet-index",
+            "252",
+            "--broker-port",
+            "51375",
+            "--image",
+            "alpine:latest",
+            "--ipv6-mode",
+            ipv6_mode,
+            // The ipv4-only preflight requires an explicit guest command, so
+            // supply one here: these tests are about admission, and a plan that
+            // failed for want of a command would not tell us about it.
+            "--",
+            "sleep",
+            "600",
+        ])
+        .expect("start args parse");
+        match cli.cmd {
+            Cmd::Start(args) => args,
+            Cmd::Stop(_) | Cmd::ManagedStart(_) | Cmd::ManagedStop(_) => {
+                panic!("expected start command")
+            }
+        }
+    }
+
+    fn tools() -> AgentVmToolPaths {
+        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo")
+    }
+
+    /// This binary is a second front door onto the same machinery, and a
+    /// profile no new session may run under must not acquire one through it.
+    #[test]
+    fn starting_under_a_closed_profile_is_refused_here_too() {
+        let err = build_start_plan(start_args("ipv4-only-locked-v1"), tools())
+            .expect_err("a closed profile must not start a session")
+            .to_string();
+        assert!(err.contains("not implemented"), "{err}");
+
+        // The profiles that admit still do.
+        for mode in ["dual-stack-required", "ipv4-only-no-guest-ipv6"] {
+            build_start_plan(start_args(mode), tools()).unwrap_or_else(|e| panic!("{mode}: {e}"));
+        }
+    }
+
+    /// Stopping is a separate question from starting: `stop` is *told* which
+    /// mode a session was started in, so it must accept every mode a session
+    /// can be running in, whatever the admitted set is now.
+    #[test]
+    fn stopping_a_legacy_session_is_still_possible() {
+        assert_eq!(
+            Ipv6ModeArg::Ipv4OnlyNoGuestIpv6.started_in(),
+            Ok(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
+        );
+        assert_eq!(
+            Ipv6ModeArg::DualStackRequired.started_in(),
+            Ok(Ipv6IsolationMode::DualStackRequired)
+        );
+        // Nothing was ever started in it, so there is nothing to stop.
+        assert!(Ipv6ModeArg::Ipv4OnlyLockedV1.started_in().is_err());
     }
 
     #[test]
