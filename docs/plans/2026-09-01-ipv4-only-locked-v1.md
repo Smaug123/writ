@@ -92,6 +92,10 @@ profile and its tests from `codex/ipv4-lock-stage-1-gate`
 - The `security-ready` record is one line, versioned, under a fixed byte
   bound, and emitted exactly once; a property fuzzes the wrapped argv and
   asserts the record is unchanged.
+- The wait is armed before the record is published: the integration test
+  sends `USR1` the instant it reads the record, repeatedly across many runs,
+  and the probe command runs every time; a variant that sends `USR1` before
+  the record is read observes no release and no termination.
 
 ---
 
@@ -179,6 +183,34 @@ session as unreleasable (it is already fail-closed on any helper error).
   a correct readback always compares equal.
 - The order of `pfctl` invocations is asserted exactly: syntax check before
   load, readback after, never a flush.
+
+---
+
+## Stage C2b: Interface-scoped IPv4 rules
+
+**Dependencies:** Stage C2. May proceed alongside C3.
+
+**Implements:** Layer 1, known delta "the IPv4 rules are source-scoped".
+
+The renderer scopes the IPv4 allow and deny to the resolved bridge and
+members, with `block return in quick on <iface> inet from any to any` as the
+default, so an out-of-subnet source has nothing to fall through to. Because
+this changes the anchor the legacy profile installs, it lands behind the
+existing `--deny-guest-ipv6` step (the interfaces are known there) and the
+subnet-scoped rules stay in front of it as today; the property that the two
+placements share one renderer (F1) applies here first.
+
+**Correctness oracle:**
+- Property over generated session facts and interface sets: the rendered
+  anchor's rule list, in order, is the subnet-scoped allow and deny, then per
+  interface an IPv4 allow for the broker tuple, an IPv4 default deny, and the
+  IPv6 deny; render → parse is the identity.
+- A pure packet-decision model over the rendered rules: for every generated
+  IPv4 packet on a resolved interface, only the intended broker tuple passes,
+  regardless of source; on an unrelated interface the anchor decides nothing.
+- `scripts/prove-agent-vm-lifecycle.sh` gains the spoofed-source probe from
+  the root guest and asserts the labelled IPv4 deny counter rose, with the
+  unconfined-control clause from E3 applied once E3 exists.
 
 ---
 
@@ -299,16 +331,25 @@ guarantee layer 2 exists to give. So: broker-ready becomes part of the release
 signal (the daemon does not send `USR1` until the broker is ready, so the
 marker has nothing left to say), and the bootstrap outcome is read from the
 same bounded `container logs` channel as `security-ready`, as versioned
-records with the failure bounded exactly as today's failure file is. After
-`USR1`, the daemon runs no `container exec` against a locked session, and the
-helper for the mode that still needs one (`Ipv4OnlyNoGuestIpv6`) is the only
-caller left.
+records with the failure bounded exactly as today's failure file is. The two
+records have different standing. The `security-ready` record is emitted
+before any untrusted code runs and gates release. The bootstrap record is
+emitted after release, by which point repository-controlled code has run
+under the same UID as PID 1 and can write whatever it likes to PID 1's
+stdout; it therefore gates nothing that carries authority, exactly as today's
+bootstrap files do not, and is used only to end the wait, report to the
+operator, and bound the timeout. A forged bootstrap success harms only the
+agent that forged it. After `USR1`, the daemon runs no `container exec`
+against a locked session, and the helper for the mode that still needs one
+(`Ipv4OnlyNoGuestIpv6`) is the only caller left.
 
 With that in place, `Ipv6IsolationMode` gains `Ipv4OnlyLockedV1`, the state
 schema gains its mode spelling, and `admit` calls D's `admit_locked` for the
-locked profile: this is the stage at which the profile opens, for host
-placement only (vm placement's refusal stays until F3). Both front doors open
-together: `writ-agent-vm-runner start` and `managed-start` call the same
+locked profile. The host-placement pin list ships **empty**, so at the end of
+this stage the profile still admits on no real host; E3 adds the first (CLI,
+macOS build) pair in the same change that records its proof passing. That is
+what keeps a stage landing on its own from exposing an unproven path. Both
+front doors open together: `writ-agent-vm-runner start` and `managed-start` call the same
 library gatherer as the daemon and pass its evidence to the same `admit`, so
 the runner cannot start a locked session on a host the daemon would refuse.
 
@@ -319,17 +360,21 @@ fake tool, with every step's failure leaving the workload unreleased.
 - Fake-tool daemon tests: the recorded `container run` argv contains exactly
   the B1 profile; `USR1` is sent iff the ready record was observed, the broker
   is ready, and the deny readback succeeded; a missing, malformed, duplicated,
-  or over-long ready record, a `logs` timeout, a helper readback failure, or a
-  `kill` failure each leave the session in a non-released phase and trigger
-  cleanup.
+  or over-long ready record, a `logs` timeout, or a helper readback failure
+  each leave the session in a phase before `ReleaseAttempted` and trigger
+  cleanup. A `kill` that fails or times out is different: the record already
+  says `ReleaseAttempted`, and the daemon revokes authority and cleans up
+  without ever re-entering the release path, under every kill outcome.
 - The fake tool's invocation log for a locked session contains no `exec` after
   the `kill --signal USR1` line, asserted by a test that runs the full
   start-and-bootstrap sequence; the legacy profile's sequence is unchanged and
   its existing tests still pass.
 - Property over fuzzed `container logs` output: only a line that parses as
-  the versioned ready record releases, and only a line that parses as the
-  versioned bootstrap record completes bootstrap; anything the guest could
-  print after release (either record again, a forged success line) is ignored.
+  the versioned ready record releases, and a ready record appearing after
+  `USR1` is ignored. Bootstrap records are parsed the same way but a test
+  asserts, by inspecting every consumer, that nothing with authority (grants,
+  proxies, staged pushes) keys off bootstrap success; it ends the wait and
+  is reported, nothing more.
 - `admit` now yields `Ipv4OnlyLockedV1` under exactly D's admitting evidence
   and refuses otherwise; the "creates nothing" test runs for every refusing
   combination: no subprocess beyond the probes, no audit row, no state record.
@@ -344,7 +389,7 @@ fake tool, with every step's failure leaving the workload unreleased.
 
 ## Stage E3: The vertical proof, with host-owned evidence
 
-**Dependencies:** Stages E2 and C3.
+**Dependencies:** Stages E2, C2b, and C3.
 
 **Implements:** Proof obligations 1 and 2; Evidence protocol rules 1–6.
 
@@ -371,7 +416,9 @@ setuid, file capability, child process); do not build a schedule language.
 - On hardware, locked profile: the positive control reaches its listener; the
   protected session's listener accepts nothing and its deny counters are
   zero; the pre-release `/proc/<pid>/status` read matches B1's acceptance
-  type.
+  type. The change that records this passing is the change that adds the
+  host's (CLI, macOS build) pair to the host-placement pin list; the pin list
+  test asserts every entry names a proof record.
 - The proof fails, each with a distinct message, when the positive control
   does not reach its listener (observer broken), when the listener tool is
   missing, when the legacy run's RA route never returns, and when a locked
@@ -461,7 +508,10 @@ precede `USR1`; the finalized anchor was resolved with one member.
   it absent, and removes the anchor, in that order; the E1 state-machine
   property runs with the vm phases present.
 - The vm-placement refusal is removed for the locked profile only; the legacy
-  profile under vm placement is still refused, with the existing test.
+  profile under vm placement is still refused, with the existing test. The
+  vm-placement pin list is separate from host placement's and ships empty; F4
+  populates it, so vm placement admits on no real host until its proof has
+  passed there.
 
 ---
 

@@ -158,6 +158,20 @@ not rediscovered. None reopens the bypass #288 closed.
   the intended one. Both are required before `ipv4_only_locked_v1` admits,
   because vm placement's quarantine-then-replace sequence (below) has no
   meaning without an exact readback.
+- **The IPv4 rules are source-scoped, not interface-scoped.** The shipped
+  anchor is `pass in quick inet proto tcp from <agent /24> to <broker> port
+  $broker_ports` and `block return in quick inet from <agent /24> to any`. A
+  packet whose IPv4 source is outside the session subnet matches neither, and
+  falls through to whatever the host's default PF policy is. Linux lets even
+  an unprivileged process send a one-way UDP datagram with a foreign source
+  via `IP_FREEBIND`, so this does not need `CAP_NET_RAW`; whether such a frame
+  is forwarded by vmnet at all is unknown and must be measured, not assumed.
+  The target rules match the IPv4 allow and a default deny on the resolved
+  interfaces, exactly as the IPv6 deny already does, and the vertical proof
+  sends a spoofed-source probe. This is the one delta that is a possible live
+  gap under the legacy profile today rather than hardening; it is listed here
+  because the fix is the same interface-scoped renderer the locked profile
+  needs, and it is not blocked on any of layers 2 or 3.
 - **`ifconfig` text.** Resolution parses `ifconfig` output rather than a
   `getifaddrs` snapshot. The parser is pure and property-tested
   (`parse_bridge_for_gateway`); replacing it is not a security item.
@@ -241,8 +255,12 @@ Before announcing readiness, PID 1:
    consumed by the calls that need them.
 7. Re-verifies identity, every capability set (bounding included),
    `NoNewPrivs`, sysctls, addresses, and routes.
-8. Emits one bounded, versioned `security-ready` record and waits as the
-   restricted identity for the host release signal.
+8. Blocks `USR1` and arms the wait for it (a `sigwait` on the blocked set,
+   or a `signalfd`), *then* emits one bounded, versioned `security-ready`
+   record and waits as the restricted identity for the host release signal.
+   The order matters: the host may send the signal the instant it observes
+   the record, and an unblocked `USR1` arriving before the wait is armed would
+   either terminate PID 1 with the default action or be lost.
 9. On release, `exec`s the existing guest bootstrap command. No root
    supervisor survives.
 
@@ -422,7 +440,9 @@ records RA behaviour changing across an OS update): the Apple `container` CLI
 version line (today `1.0.0`, build `ee848e3`) and the macOS build
 (`sw_vers` BuildVersion, today `25G72`). Both are exact-match pins against a
 list the proof maintains, so a host update closes the profile until the proof
-is re-run there. Those are inputs to `admit`, gathered at start, so that a
+is re-run there. The list starts empty and a platform enters it only in the
+same change that records the proof passing on it, so the code that can admit
+the profile lands before the profile actually admits anywhere. Those are inputs to `admit`, gathered at start, so that a
 plan can only ever be built from an admitted mode; there is no separate gate
 type and no bypass on the plan for tests, because a test that bypasses the
 guard is not testing it.
@@ -471,8 +491,13 @@ diagnostics. The obligations, in the order the plan delivers them:
    the bridge accepts nothing, across at least two RA intervals. The positive
    control is an unconfined root guest on a proof-created network with no
    anchor, reaching an identical listener in the same run. This is the only
-   proof in which the deny counter is expected to rise, because it is the only
-   one whose workload can emit IPv6.
+   proof in which the IPv6 deny counter is expected to rise, because it is the
+   only one whose workload can emit IPv6. The same run sends an IPv4 probe
+   with a spoofed, out-of-subnet source to a forbidden host port and expects
+   the interface-scoped IPv4 deny counter to rise and the listener to stay
+   silent; the unconfined control sends the same probe and must reach its
+   listener, or the platform does not forward such frames and the case is
+   recorded as not applicable there, which is itself a pinned fact.
 2. **Host placement under the locked profile**: before release, the host reads
    the initializer's `security-ready` record and the released process's
    `/proc/<pid>/status` via bounded `container exec` and sees the locked
