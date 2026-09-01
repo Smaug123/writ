@@ -1,0 +1,389 @@
+# `ipv4_only_locked_v1` implementation plan
+
+Implement this plan with each stage on its own branch, stacked as necessary on
+previous branches, so that a reviewer can review each branch in isolation.
+
+The design is
+[`docs/design/ipv4-only-network-confinement.md`](../design/ipv4-only-network-confinement.md).
+This plan supersedes the July 2026 plan that lived on the
+`codex/ipv4-lock-stage-1-gate` branch. That plan's Stage 1 gate refused every
+startable configuration, its Stage 2 harness needed observers that were Stages
+4, 5, 7 and 8, and Stage 5 depended on Stage 2 in turn. The re-slice below
+follows one rule: **build the host-owned observers first, then one vertical
+experiment, and generalise only when a second experiment demands it.**
+
+Starting point on `main` (September 2026): layer 1 is shipped for host
+placement (#288); vm placement refuses new sessions (#396);
+`ipv4_only_locked_v1` parses and is refused by `ConfiguredIpv6Profile::admit`
+(#397). Parked branches worth mining are named per stage. None should be
+rebased wholesale.
+
+Two conventions apply throughout. Guest-side code goes in a crate or behind
+the `vm-client` feature, never in the flat root crate, so a host build cannot
+pull it in by accident. And nothing gains a test-only bypass on the object a
+gate guards: a test that needs to get past admission constructs the admitted
+value directly, as the vm-placement tests do today.
+
+---
+
+## Stage A: Design record
+
+**Dependencies:** None. This is the branch that carries this file.
+
+**Implements:** The whole design as a record; layer 1 rewritten as
+current-state; the evidence protocol.
+
+**Correctness oracle:** Every symbol, step name, and PR number the design cites
+for shipped behaviour exists on `main` (`AgentVmStartStep`'s step sequence,
+`--deny-guest-ipv6`, `parse_bridge_for_gateway`, `ConfiguredIpv6Profile::admit`,
+the PF rule text in `agent_vm_firewall.rs`). `cargo doc` is unaffected;
+markdown links resolve.
+
+---
+
+## Stage B1: Guest handoff plan, as data
+
+**Dependencies:** Stage A.
+
+**Implements:** Layer 2, "Before announcing readiness" steps 1–8, as a pure
+description; the fixed `container run` capability argv.
+
+Add a Linux-only crate (`crates/writ-guest-init`, no host deps) holding: the
+ordered handoff plan as a DU of steps (chown, sysctl write, verify-no-ipv6,
+drop-caps, set-no-new-privs, setgroups, setresgid, setresuid, re-verify), the
+expected post-handoff `/proc/self/status` shape as a parsed type, and the
+`LOCKED_CAPABILITY_ARGV_PROFILE` constant with its parser. Salvage the argv
+profile and its tests from `codex/ipv4-lock-stage-1-gate`
+(`src/agent_vm_start_gate.rs`).
+
+**Correctness oracle:**
+- Property: the argv profile parses back to exactly the capability set the
+  design lists, and any argv that adds, drops, or reorders a `--cap-add`
+  fails to parse.
+- Property: a `/proc/self/status` document is accepted iff every capability
+  field is zero, `NoNewPrivs` is 1, Uid/Gid are all 1000, and Groups is empty;
+  generators mutate one field at a time and each mutation is rejected.
+- The step sequence is exhaustive and ordered: a property asserts no
+  identity-changing step precedes the sysctl steps and no step follows
+  re-verify.
+
+---
+
+## Stage B2: `writ-agent-vm-guest-init` binary
+
+**Dependencies:** Stage B1.
+
+**Implements:** Layer 2 steps 1–10: the interpreter for B1's plan, the
+`security-ready` record, the USR1 wait, and the final `exec`.
+
+**Correctness oracle:**
+- Integration test on the Linux CI runner: run the binary in a container
+  launched with the B1 argv profile, wrapping a probe command that prints
+  `/proc/self/status`, `ip -6 addr`, and `ip -6 route`; after sending USR1 the
+  output satisfies B1's acceptance type. This is host-observed and pre-release,
+  so it is trusted evidence.
+- Every injected failure (chown of a missing dir, a sysctl that cannot be
+  written, an address that survives step 3, a capability that survives step 5)
+  prevents `exec`: the probe command never runs, and one bounded failure
+  record is emitted.
+- The `security-ready` record is one line, versioned, under a fixed byte
+  bound, and emitted exactly once; a property fuzzes the wrapped argv and
+  asserts the record is unchanged.
+
+---
+
+## Stage B3: Official image with the isolation ABI
+
+**Dependencies:** Stage B2.
+
+**Implements:** Layer 2, "fixed identity and initializer ABI"; the
+`org.writ.agent-vm.isolation-abi = 1` label.
+
+The Nix image sets the initializer as PID 1, fixes UID/GID 1000 with a
+writable home, workspace, and Nix store owned by it, and stamps the label.
+Salvage the label constant, `parse_image_inspect_isolation_abi_v1`, and the
+bounded `container inspect` reader from the stage-1 branch; the host side
+lands in Stage D.
+
+**Correctness oracle:**
+- `nix build` of the image succeeds; the B2 integration test passes against
+  the built image rather than a bespoke container.
+- Image scan (in CI, over the built rootfs): no setuid or setgid file, no file
+  capabilities, no writable path on the initializer's own binary or its
+  directory.
+- Smoke: `git`, `nix`, `claude`, and `codex` each start and print a version
+  as UID 1000 after handoff.
+
+---
+
+## Stage C1: PF helper `protocol-version` and a versioned result
+
+**Dependencies:** Stage A. Independent of B.
+
+**Implements:** Privileged-helper boundary, the probe and the bounded JSON
+result.
+
+Salvage `ProtocolVersion` and `protocol_version_json` from the stage-1 branch.
+Report version 2 only once C2 has landed; until then the command exists and
+reports 1, so Stage D can be written against a real probe.
+
+**Correctness oracle:**
+- The command is non-mutating: with a fake `pfctl` recorder injected, it
+  invokes nothing.
+- Output is one line, one object, under `PF_HELPER_PROTOCOL_MAX_BYTES`, parsed
+  by a host-side type that rejects trailing data, a second object, or an
+  unknown protocol name.
+
+---
+
+## Stage C2: Exact readback and post-load re-resolve
+
+**Dependencies:** Stage C1.
+
+**Implements:** Privileged-helper boundary, "syntax-checks, atomically loads,
+parses exact readback, and re-resolves after the load"; closes two of the
+layer-1 deltas.
+
+`install` and `--deny-guest-ipv6` run: precheck, resolve, `pfctl -n` syntax
+check, load, `pfctl -sr` readback parsed to the ruleset type and compared for
+equality with the intended one, resolve again and compare interface names. Any
+mismatch is an error *after* the anchor has been loaded, so the helper's
+result says which phase failed and the daemon treats the session as
+unreleasable (it is already fail-closed on any helper error).
+
+**Correctness oracle:**
+- With a fake `pfctl` scripted per invocation: a readback that is missing a
+  rule, has an extra rule, has a rule on a different interface, or is empty
+  fails with the readback-phase error; an interface that changes name between
+  the two resolutions fails with the re-resolve error.
+- Property: for any valid session ruleset, render → parse is the identity, so
+  a correct readback always compares equal.
+- The order of `pfctl` invocations is asserted exactly: syntax check before
+  load, readback after, never a flush.
+
+---
+
+## Stage C3: Labelled counters as a host observer
+
+**Dependencies:** Stage C2.
+
+**Implements:** Evidence protocol rule 1, the PF counter source.
+
+Add a `counters` helper command that reads `pfctl -vsr` for a session anchor
+and returns, per label, the packet and byte counters as a typed
+`PfCounterSnapshot`; `PfCounterDelta` is the difference of two snapshots and
+rejects a pair with different rule sets. This is infrastructure for Stage E3
+and is inert until then.
+
+**Correctness oracle:**
+- Property: parsing `pfctl -vsr` verbose output for a generated ruleset with
+  generated counters recovers every label's counters; unlabelled rules are
+  ignored; a label seen twice is an error.
+- Property: `delta(a, b)` is defined iff `a` and `b` have the same label set,
+  and is componentwise `b - a`, refusing a negative (counters only rise
+  between snapshots of the same loaded anchor).
+
+---
+
+## Stage D: `ipv4_only_locked_v1` admits on host-gathered evidence
+
+**Dependencies:** Stages B3 and C1.
+
+**Implements:** Persistence and compatibility, "admission is conditional on
+host-gathered runtime evidence".
+
+`ConfiguredIpv6Profile::admit` stays the one gate. It grows a second form,
+`admit_locked(evidence: LockedV1RuntimeEvidence)`, where the evidence is a
+struct of parsed, host-observed facts: the helper's protocol probe (C1), the
+image's ABI label read via bounded `container inspect` (B3), and the Apple
+`container` CLI version line. The daemon gathers these at each entry point
+before a session id exists, exactly where the current refusal sits.
+`Ipv6IsolationMode` gains `Ipv4OnlyLockedV1`, because a session can now be
+running in it. Salvage the three parsers from the stage-1 branch; do not
+salvage `decide_agent_vm_start`, and do not add a bypass field to the plan.
+
+**Correctness oracle:**
+- Exhaustive: every combination of {helper v1, v2, unparseable} × {label
+  absent, 0, 1, unknown} × {CLI pinned, other, unparseable} is tested, and only
+  the one admitting combination yields a mode; each refusal names the wrong
+  fact.
+- The existing "refuses new sessions and creates nothing" test runs for every
+  refusing combination: no subprocess, no audit row, no state record.
+- Stop and reconcile of a persisted `Ipv4OnlyLockedV1` session need no
+  evidence: the persisted-session tests run under a daemon whose evidence
+  gathering is scripted to fail.
+
+---
+
+## Stage E1: Lifecycle phases and state schema v3
+
+**Dependencies:** Stage D.
+
+**Implements:** Lifecycle model; Persistence and compatibility, schema v3 and
+the v2 cleanup-only reader.
+
+The phase DU replaces the boolean-ish start outcomes for the locked mode; the
+persisted record carries the phase reached, the resolved interfaces, and the
+firewall phase. The v2 reader produces only a stop plan.
+
+**Correctness oracle:**
+- State-machine property: for every phase, inject failure or a simulated crash
+  immediately after it, then run boot reconcile; the session is cleaned, PF is
+  removed only after VM absence is proved, and `WorkloadReleased` was never
+  reached without `GuestSecurityLocked` and `FinalFirewallInstalled`.
+- Property: `WorkloadReleased` is unconstructible from any other pair of
+  phases (a compile-time fact where the types allow it, a test where not).
+- Every v2 record in `proptest-regressions` and the existing state-store tests
+  still loads, as cleanup-only, and is never reported as locked.
+
+---
+
+## Stage E2: Host-placement locked start
+
+**Dependencies:** Stages E1, B3, C2.
+
+**Implements:** Layer 2 host side: the locked `StartVm` argv, waiting for
+`security-ready` via bounded `container logs`, release via
+`container kill --signal USR1`; Layer 1 with C2's readback in the deny step.
+
+Nothing here is a proof. It is the daemon doing the locked sequence under the
+fake tool, with every step's failure leaving the workload unreleased.
+
+**Correctness oracle:**
+- Fake-tool daemon tests: the recorded `container run` argv contains exactly
+  the B1 profile; `USR1` is sent iff the ready record was observed and the deny
+  readback succeeded; a missing, malformed, duplicated, or over-long ready
+  record, a `logs` timeout, a helper readback failure, or a `kill` failure each
+  leave the session in a non-released phase and trigger cleanup.
+- Property over fuzzed `container logs` output: only a line that parses as
+  the versioned ready record releases; anything the guest could print after
+  release (the record again, a forged success line) is ignored.
+
+---
+
+## Stage E3: The vertical proof, with host-owned evidence
+
+**Dependencies:** Stages E2 and C3.
+
+**Implements:** Proof obligations 1 and 2; Evidence protocol rules 1–6.
+
+Evolve `scripts/prove-agent-vm-lifecycle.sh`, and the small Rust it shells to,
+so that grading uses only host-owned facts: a host-minted nonce, a host
+listener on the bridge's ULA and link-local addresses expecting that nonce, the
+labelled deny counter delta from C3 across a host-timed window of two RA
+intervals, and an unsafe control in the same run with the deny withheld. The
+guest attack binary is told the targets and its output is attached as
+diagnostics. This is where `ipv4-lock/02-claim`'s `Claim<T>` gets its first
+consumer: guest-reported facts arrive as claims, and the grader cannot read
+them without unwrapping into the diagnostics appendix. Keep the attack set to
+what the design lists (sysctl, rtnetlink, raw socket, namespace, proc alias,
+setuid, file capability, child process); do not build a schedule language.
+
+**Correctness oracle:**
+- On hardware: the proof passes for the locked profile; the positive control
+  reaches the listener and its counter delta is zero; the protected case's
+  listener accepts nothing and its counter rose by at least the commanded
+  probe count.
+- The proof fails when the deny is withheld from the protected case (a
+  deliberate `--prove-fail-open` run), when the listener tool is missing, and
+  when the RA route never returns, each with a distinct message.
+- Under the locked image, the attack binary's own diagnostics show each
+  attack failing at the syscall as UID 1000, and the host evidence is
+  unchanged with those diagnostics deleted.
+
+---
+
+## Stage F1: Quarantine and atomic replacement in the helper
+
+**Dependencies:** Stage C2. May proceed alongside D and E.
+
+**Implements:** Layer 1, "Quarantine and replacement".
+
+Two operations: `quarantine` loads an interface-wide IPv6 deny plus an IPv4
+deny-all for the session network before any VM exists on it, and `finalize`
+replaces it with the final ruleset in one `pfctl -f` load, verified by
+readback. Never a flush.
+
+**Correctness oracle:**
+- With a scripted fake `pfctl`: a failed `finalize` load, a failed syntax
+  check, or a readback that does not match leave the quarantine ruleset as the
+  readback; a property over failure position asserts the anchor is never
+  observed empty between the two loads.
+- Property: `finalize` output equals the host-placement ruleset for the same
+  session facts plus the broker-VM endpoint, so the two placements share one
+  rule renderer.
+
+---
+
+## Stage F2: Broker-VM internal firewall in the ready document
+
+**Dependencies:** Stage F1.
+
+**Implements:** Layer 3.
+
+The broker VM installs its internal-interface rules, reads them back, records
+the readback in `BrokerReadyDoc`, and drops `CAP_NET_ADMIN` before executing
+`writd`. The daemon refuses a ready document without a matching readback.
+
+**Correctness oracle:**
+- Property over fuzzed ready documents: only a document whose readback equals
+  the rendered internal ruleset for the session subnet and port is accepted.
+- Broker entrypoint test in a Linux container: after readiness, the entrypoint
+  process has no `CAP_NET_ADMIN`, and the rules are present.
+
+---
+
+## Stage F3: VM-placement locked start
+
+**Dependencies:** Stages E2, F1, F2.
+
+**Implements:** Lifecycle model for vm placement; lifts
+`Ipv6ConfinementUnavailableForVmBroker`.
+
+Split network creation from broker launch: quarantine, start broker, wait for
+its ready document, discover its IPv4, `finalize`, then the E2 agent sequence.
+
+**Correctness oracle:**
+- Fake-tool daemon tests: the order of helper and `container` invocations is
+  exactly the design's; every failure position leaves quarantine loaded and
+  the agent VM never started; the E1 state-machine property runs with the vm
+  phases present.
+- The vm-placement refusal is removed for the locked profile only; the legacy
+  profile under vm placement is still refused, with the existing test.
+
+---
+
+## Stage F4: Proof obligation 3
+
+**Dependencies:** Stages E3 and F3.
+
+**Implements:** Proof obligations 3.
+
+Extend the E3 proof with a forbidden listener on the broker VM's internal
+interface, and a second session, in both teardown orders.
+
+**Correctness oracle:** As E3, plus: the broker listener accepts nothing; each
+session's positive control reaches only its own broker; neither session's
+attack reaches the other; both teardown orders leave both anchors empty and
+both networks absent.
+
+---
+
+## Stage G: Soak, closing the legacy profile, and release
+
+**Dependencies:** Stage F4.
+
+**Implements:** Proof obligation 4; Persistence and compatibility, upgrade and
+rollback; closing `ipv4_only_no_guest_ipv6` to new sessions.
+
+**Correctness oracle:**
+- A soak driver runs start, attack, stop repeatedly and restarts `writd` at
+  every persisted phase; no run is inconclusive; sleep/wake, `container`
+  restart, and interface churn are each exercised once with the E3 evidence
+  intact.
+- Closing the legacy profile is the one-line change to `admit`; the existing
+  refusal and reconcile tests run against it with `Ipv4OnlyNoGuestIpv6` in
+  place of `Ipv4OnlyLockedV1`.
+- Upgrade from a legacy daemon with a live session: the new daemon reconciles
+  it as cleanup-only; rollback with a locked session live: the old daemon
+  refuses to start on the spelling, as #397's test already asserts.

@@ -364,6 +364,18 @@ explicit IPv6 binding and authentication semantics.
 
 Third manual lifecycle slice: explicit IPv6 posture:
 
+> **Security correction (2026-09-01):** the in-guest `disable_ipv6=1` described
+> below is a reversible guest-root sysctl, not a boundary against the
+> compromised-guest threat model at the top of this document. What actually
+> confines IPv6 for `ipv4-only-no-guest-ipv6` today is the interface-scoped host
+> PF deny added in #288, installed by the privileged helper on the bridge the
+> helper itself resolves. The guest-side disable is a precondition the workload
+> can undo. The remaining gaps (the guest keeps network authority; the broker VM
+> has no ingress firewall, so vm placement refuses new sessions) and the target
+> state, `ipv4_only_locked_v1`, are in
+> [`ipv4-only-network-confinement.md`](ipv4-only-network-confinement.md). The
+> historical detail stays here so the sequence of findings is reviewable.
+
 - the lifecycle plan now carries an explicit IPv6 isolation mode. The default
   `dual-stack-required` mode preserves the original fail-closed behavior:
   Apple `container network inspect` must report both IPv4 and IPv6 fields, and
