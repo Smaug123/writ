@@ -514,6 +514,24 @@ pub(super) fn daemon_config_with_broker_placement(
     daemon_config_inner(dir, fake_tool, 252, 253, None, broker_placement)
 }
 
+/// A host-placement config under a chosen IPv6 profile, for the tests about
+/// which profiles admit a session.
+pub(super) fn daemon_config_with_ipv6_profile(
+    dir: &Path,
+    fake_tool: &Path,
+    ipv6_profile: ConfiguredIpv6Profile,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_inner_with_profile(
+        dir,
+        fake_tool,
+        252,
+        253,
+        None,
+        BrokerPlacement::Host,
+        ipv6_profile,
+    )
+}
+
 fn daemon_config_inner(
     dir: &Path,
     fake_tool: &Path,
@@ -521,6 +539,29 @@ fn daemon_config_inner(
     subnet_index_max: u16,
     nix_prewarm_cache_dir: Option<PathBuf>,
     broker_placement: BrokerPlacement,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_inner_with_profile(
+        dir,
+        fake_tool,
+        subnet_index_min,
+        subnet_index_max,
+        nix_prewarm_cache_dir,
+        broker_placement,
+        // The profile that actually starts a session on current Apple
+        // `container`, and so the one these fixtures should exercise.
+        ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn daemon_config_inner_with_profile(
+    dir: &Path,
+    fake_tool: &Path,
+    subnet_index_min: u16,
+    subnet_index_max: u16,
+    nix_prewarm_cache_dir: Option<PathBuf>,
+    broker_placement: BrokerPlacement,
+    ipv6_profile: ConfiguredIpv6Profile,
 ) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
     let state_store = AgentVmSessionStateStore::new(dir.join("state"));
     // The vm placement requires a broker image; supply one so vm-placement
@@ -534,7 +575,7 @@ fn daemon_config_inner(
         subnet_index_min,
         subnet_index_max,
         state_store.clone(),
-        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        ipv6_profile,
         broker_placement,
         ContainerImage::new("alpine:latest").unwrap(),
         broker_image,

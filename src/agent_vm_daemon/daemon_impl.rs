@@ -85,6 +85,15 @@ impl AgentVmDaemon {
         &self.config
     }
 
+    /// The active IPv6 mode a new session may start in, or the reason none may.
+    ///
+    /// Pure, and cheap enough to ask again rather than thread onward: the
+    /// admission gates below consult it before a session has an identity, and
+    /// the start path consults it again when it needs the mode itself.
+    fn admitted_ipv6_mode(&self) -> Result<Ipv6IsolationMode, AgentVmDaemonError> {
+        Ok(self.config.lifecycle.ipv6_profile.admit()?)
+    }
+
     pub async fn start_session<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: Arc<BrokerState<S>>,
@@ -106,6 +115,7 @@ impl AgentVmDaemon {
         if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
             return Err(AgentVmDaemonError::Ipv6ConfinementUnavailableForVmBroker);
         }
+        let ipv6_mode = self.admitted_ipv6_mode()?;
 
         let session_id = SessionId::new();
         let session_lock = self.session_lock_handle(session_id).await;
@@ -128,6 +138,7 @@ impl AgentVmDaemon {
                 self.start_session_after_audit_opened(
                     Arc::clone(&state),
                     session_id,
+                    ipv6_mode,
                     agent_kind,
                     workspace,
                     guest_command,
@@ -191,6 +202,15 @@ impl AgentVmDaemon {
         prompt: AgentPrompt,
         tags: AgentRunTags,
     ) -> Result<AcceptedAgentRun, AgentVmDaemonError> {
+        // Everything refusable is refused before the run has an identity, so a
+        // refusal names no session that never existed. Placement is asked first,
+        // because it is the more specific answer: a vm config under a closed
+        // profile would otherwise be told about the profile, when this route
+        // does not exist on the v1 broker VM under any profile.
+        if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
+            return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
+        }
+        self.admitted_ipv6_mode()?;
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
         // Everything that can refuse this request happens before the per-session
@@ -208,12 +228,6 @@ impl AgentVmDaemon {
         //
         // Recomputed rather than threaded onward: the checks are cheap and pure,
         // and a second call cannot disagree with the first.
-        if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
-            return Err(AgentVmDaemonError::StartFailed {
-                session_id,
-                source: Box::new(AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
-            });
-        }
         workspace_bootstrap_audit_record(session_id, &workspace).map_err(|source| {
             AgentVmDaemonError::StartFailed {
                 session_id,
@@ -354,6 +368,7 @@ impl AgentVmDaemon {
                 self.start_session_after_audit_opened(
                     Arc::clone(&state),
                     session_id,
+                    self.admitted_ipv6_mode()?,
                     Some(agent_kind),
                     Some(workspace),
                     guest_command,
@@ -1070,6 +1085,7 @@ impl AgentVmDaemon {
     /// egress-gate IPv6 posture, and the strict pre-warm substituter when set.
     fn build_agent_guest_env(
         &self,
+        ipv6_mode: Ipv6IsolationMode,
         broker_url: &str,
         bearer_token: &str,
     ) -> Result<Vec<AgentVmGuestEnvVar>, AgentVmDaemonError> {
@@ -1095,7 +1111,7 @@ impl AgentVmDaemon {
         // Exhaustive over the mode so a future variant must decide: the dual-stack
         // mode provisions a ULA on purpose, so only the no-guest-IPv6 mode forbids
         // a global-scope address.
-        let require_no_ipv6 = match self.config.lifecycle.ipv6_mode {
+        let require_no_ipv6 = match ipv6_mode {
             Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => "1",
             Ipv6IsolationMode::DualStackRequired => "0",
         };
@@ -1132,6 +1148,11 @@ impl AgentVmDaemon {
         &self,
         state: Arc<BrokerState<S>>,
         session_id: SessionId,
+        // The mode this session runs in, which only
+        // [`ConfiguredIpv6Profile::admit`] produces. Threaded in rather than
+        // looked up here, so a session cannot be built under a profile no
+        // session may start under: there is no mode to build it with.
+        ipv6_mode: Ipv6IsolationMode,
         agent_kind: Option<AgentKind>,
         workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
@@ -1159,6 +1180,7 @@ impl AgentVmDaemon {
                 }
                 return self
                     .start_vm_broker_session(
+                        ipv6_mode,
                         state,
                         session_id,
                         agent_kind,
@@ -1205,11 +1227,15 @@ impl AgentVmDaemon {
             let broker_port = prepared.broker_port();
             let broker_url = format!("http://{}:{}/", network.ipv4_gateway(), broker_port.get());
             let broker_ports = BrokerPorts::new([broker_port])?;
-            let guest_env =
-                self.build_agent_guest_env(&broker_url, prepared.bearer_token().as_str())?;
+            let guest_env = self.build_agent_guest_env(
+                ipv6_mode,
+                &broker_url,
+                prepared.bearer_token().as_str(),
+            )?;
             let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
             let plan = self.build_agent_plan(
                 session_id,
+                ipv6_mode,
                 subnet_index,
                 broker_ports,
                 guest_env,
@@ -1276,6 +1302,7 @@ impl AgentVmDaemon {
     fn build_agent_plan(
         &self,
         session_id: SessionId,
+        ipv6_mode: Ipv6IsolationMode,
         subnet_index: u16,
         broker_ports: BrokerPorts,
         guest_env: Vec<AgentVmGuestEnvVar>,
@@ -1287,7 +1314,7 @@ impl AgentVmDaemon {
             subnet_index,
             broker_ports,
             self.config.vm_http.broker_port_range(),
-            self.config.lifecycle.ipv6_mode,
+            ipv6_mode,
             self.config.lifecycle.broker_placement,
             self.config.lifecycle.image.clone(),
             guest_env,
@@ -1315,6 +1342,7 @@ impl AgentVmDaemon {
     /// claim routes through that single rollback.
     async fn start_vm_broker_session<S: SecretStore + Send + Sync + 'static>(
         &self,
+        ipv6_mode: Ipv6IsolationMode,
         state: Arc<BrokerState<S>>,
         session_id: SessionId,
         agent_kind: Option<AgentKind>,
@@ -1361,6 +1389,7 @@ impl AgentVmDaemon {
                 tokio::task::spawn_blocking(move || choose_subnet_index(&lifecycle)).await??;
             let claim_plan = self.build_agent_plan(
                 session_id,
+                ipv6_mode,
                 subnet_index,
                 broker_ports.clone(),
                 Vec::new(),
@@ -1384,6 +1413,7 @@ impl AgentVmDaemon {
         // record — see cleanup_managed_agent_vm_session for vm placement).
         let outcome = self
             .complete_vm_broker_start(
+                ipv6_mode,
                 Arc::clone(&state),
                 session_id,
                 agent_kind,
@@ -1458,6 +1488,7 @@ impl AgentVmDaemon {
     #[allow(clippy::too_many_arguments)]
     async fn complete_vm_broker_start<S: SecretStore + Send + Sync + 'static>(
         &self,
+        ipv6_mode: Ipv6IsolationMode,
         state: Arc<BrokerState<S>>,
         session_id: SessionId,
         agent_kind: AgentKind,
@@ -1535,10 +1566,11 @@ impl AgentVmDaemon {
 
         // Boot the agent VM pointed at the broker VM: WRIT_BROKER_URL + token in the
         // guest env, and the host PF allow target set to the broker VM's IP.
-        let guest_env = self.build_agent_guest_env(&broker_url, &bearer_token)?;
+        let guest_env = self.build_agent_guest_env(ipv6_mode, &broker_url, &bearer_token)?;
         let boot_plan = self
             .build_agent_plan(
                 session_id,
+                ipv6_mode,
                 subnet_index,
                 broker_ports,
                 guest_env,

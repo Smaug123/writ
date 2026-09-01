@@ -364,11 +364,93 @@ pub struct ResourcePresenceProbe {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerUrl(String);
 
+/// How a session's IPv6 is actually set up: the *active* mode, and the one
+/// persisted with a running session.
+///
+/// Every variant here is a configuration a session can be running under, which
+/// is why the set is smaller than [`ConfiguredIpv6Profile`]: a profile that no
+/// new session may start under has no active mode to be in, and giving it one
+/// would make a state no session can reach representable in the state store.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ipv6IsolationMode {
     DualStackRequired,
     Ipv4OnlyNoGuestIpv6,
+}
+
+/// What an operator wrote in `ipv6_mode`, before anything decides whether a
+/// session may start under it.
+///
+/// Deliberately a different type from [`Ipv6IsolationMode`]. The configured set
+/// is the larger one — it has to name profiles that exist only to be refused,
+/// so that the refusal can say *which* profile and why — while the active set
+/// names only what a session can actually be running under. Collapsing them
+/// would put a variant into the persisted state store that no session can ever
+/// be in, and every `match` on a running session's mode would have to invent an
+/// answer for it.
+///
+/// Recognising a profile and admitting one are also different questions, and
+/// keeping them apart is what lets `writd` start at all under a closed profile:
+/// it has to, or the sessions already running under the legacy one could never
+/// be stopped or reconciled.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfiguredIpv6Profile {
+    /// The guest is expected to have IPv6 as well as IPv4.
+    ///
+    /// Admitted, but note that it does not start a session on current Apple
+    /// `container`: nothing asks for an IPv6 subnet (`create_network_invocation`
+    /// passes only `--subnet`), while [`Ipv6IsolationMode::DualStackRequired`]
+    /// requires the inspected network to report writ's own planned `/64`. It has
+    /// failed closed there since the mode was introduced, deliberately — see
+    /// `docs/design/apple-container-agent-vm.md`. Admission is not the place to
+    /// say so: whether the platform provisions IPv6 is a fact about the host,
+    /// not about what the operator asked for, and network validation is where
+    /// the host gets to answer.
+    DualStackRequired,
+    /// IPv6 denied inside the guest and — since the host PF backstop — blocked
+    /// on the agent's bridge by an interface-scoped `inet6` deny.
+    ///
+    /// The only profile that starts a session today, and the strongest IPv6
+    /// containment writ has: the interface scope holds against a root workload
+    /// that reassigns its source address, which a source-CIDR rule does not.
+    Ipv4OnlyNoGuestIpv6,
+    /// The intended successor, in which the guest cannot reverse the in-guest
+    /// deny at all. Recognised so that a config naming it is understood — and
+    /// refused for the right reason — rather than failing as a typo; closed
+    /// until it is built.
+    Ipv4OnlyLockedV1,
+}
+
+/// Why no new session may start under a configured profile.
+///
+/// The one place the reason is worded: the daemon and the runner both surface
+/// this error as-is, so an operator reads the same sentence whichever front
+/// door refused them.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum Ipv6ProfileClosed {
+    /// The profile is named but not built.
+    #[error(
+        "the ipv4_only_locked_v1 IPv6 profile is not implemented: it is recognised so that a \
+         config naming it is refused for the right reason, but nothing yet stops the workload \
+         reversing the guest IPv6 deny. No session starts under it."
+    )]
+    NotImplemented,
+}
+
+impl ConfiguredIpv6Profile {
+    /// The active mode a new session may start in under this profile.
+    ///
+    /// This is the only way to obtain an [`Ipv6IsolationMode`] from a
+    /// configuration, so a closed profile cannot reach the code that builds a
+    /// session: there is no mode for it to build one with.
+    pub fn admit(self) -> Result<Ipv6IsolationMode, Ipv6ProfileClosed> {
+        match self {
+            Self::DualStackRequired => Ok(Ipv6IsolationMode::DualStackRequired),
+            Self::Ipv4OnlyNoGuestIpv6 => Ok(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6),
+            Self::Ipv4OnlyLockedV1 => Err(Ipv6ProfileClosed::NotImplemented),
+        }
+    }
 }
 
 /// Where the per-session vm_http broker runs.
@@ -1172,6 +1254,14 @@ impl BrokerUrl {
 /// foreign resource can still be removed. The `writ.owner` label stamped on the
 /// created resources is informational (see [`AgentVmOwnerToken`]); it does not
 /// gate cleanup.
+///
+/// There is deliberately no admission check here, because a plan cannot carry a
+/// closed profile: a plan holds an [`Ipv6IsolationMode`], every mode admits (see
+/// `each_configured_profile_says_whether_a_session_may_start_under_it`), and the
+/// only closed profile has no mode to be built from. The compiler enforces what
+/// a runtime check here would only restate. A future closed profile that *does*
+/// get an active mode would break that, and the exhaustive `admit` test is where
+/// it has to be decided.
 pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLifecycleRunError> {
     for step in plan.start_steps() {
         if let Err((failure, outcome)) = run_start_step(plan, &step) {
@@ -1568,6 +1658,94 @@ mod guest_env_tests;
 mod invocation_tests;
 #[cfg(test)]
 mod network_inspection_tests;
+/// The configuration boundary: which profiles are recognised, which admit a
+/// session, and what an older binary does with a spelling it has never seen.
+#[cfg(test)]
+mod configured_profile_tests {
+    use super::*;
+
+    /// Every profile is recognised, and each says for itself whether a session
+    /// may start under it.
+    ///
+    /// Exhaustive on purpose: a profile added later must decide here, rather
+    /// than inherit an answer.
+    #[test]
+    fn each_configured_profile_says_whether_a_session_may_start_under_it() {
+        for (profile, expected) in [
+            (
+                ConfiguredIpv6Profile::DualStackRequired,
+                Ok(Ipv6IsolationMode::DualStackRequired),
+            ),
+            (
+                ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
+                Ok(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6),
+            ),
+            (
+                ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+                Err(Ipv6ProfileClosed::NotImplemented),
+            ),
+        ] {
+            assert_eq!(profile.admit(), expected, "{profile:?}");
+        }
+    }
+
+    /// The configured set names a profile the active set does not, and must.
+    ///
+    /// `Ipv4OnlyLockedV1` has no active mode because no session runs in it. If
+    /// it were a variant of [`Ipv6IsolationMode`] instead, the state store
+    /// could hold a session in a mode no session can be in, and every match on
+    /// a running session's mode would have to invent an answer for it.
+    #[test]
+    fn the_active_set_holds_no_mode_that_no_session_can_be_in() {
+        let active: Vec<Ipv6IsolationMode> = [
+            ConfiguredIpv6Profile::DualStackRequired,
+            ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
+            ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+        ]
+        .into_iter()
+        .filter_map(|profile| profile.admit().ok())
+        .collect();
+        assert_eq!(
+            active,
+            vec![
+                Ipv6IsolationMode::DualStackRequired,
+                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            ]
+        );
+    }
+
+    /// The new spelling parses here, and is refused by a binary that predates
+    /// it — which is what makes rolling back fail closed.
+    ///
+    /// An older `writd` typed this field as [`Ipv6IsolationMode`], so it reads
+    /// `ipv4_only_locked_v1` as an unknown variant and refuses to start,
+    /// rather than falling back to some default and running a config it does
+    /// not understand. That is the behaviour a rollback depends on, so it is
+    /// asserted rather than assumed.
+    #[test]
+    fn the_locked_spelling_parses_here_and_is_unknown_to_an_older_binary() {
+        assert_eq!(
+            serde_json::from_str::<ConfiguredIpv6Profile>("\"ipv4_only_locked_v1\"").unwrap(),
+            ConfiguredIpv6Profile::Ipv4OnlyLockedV1
+        );
+        // Exactly what an older binary's field type does with it.
+        assert!(serde_json::from_str::<Ipv6IsolationMode>("\"ipv4_only_locked_v1\"").is_err());
+
+        // The spellings that binary does know still mean the same thing to it.
+        for spelling in ["dual_stack_required", "ipv4_only_no_guest_ipv6"] {
+            let quoted = format!("\"{spelling}\"");
+            assert!(
+                serde_json::from_str::<Ipv6IsolationMode>(&quoted).is_ok(),
+                "{spelling}"
+            );
+            assert!(
+                serde_json::from_str::<ConfiguredIpv6Profile>(&quoted).is_ok(),
+                "{spelling}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod state_store_tests;
 #[cfg(test)]

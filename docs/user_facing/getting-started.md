@@ -192,6 +192,27 @@ start.
 }
 ```
 
+`ipv6_mode` selects the IPv6 profile, and `ipv4_only_no_guest_ipv6` is the value
+to use: it is the only one that starts a session on current Apple `container`.
+IPv6 is disabled inside the guest and — because a root workload can undo that —
+blocked on the agent's own bridge by an interface-scoped host PF rule the guest
+cannot reach. The interface scope is what makes the containment real: a rule
+matched on the guest's source address would not survive the guest reassigning it.
+
+`dual_stack_required` is accepted but does not currently start a session. It
+requires the session network to report the IPv6 `/64` writ planned, and writ
+never asks `container` for an IPv6 subnet, so the start fails closed at network
+validation. This has been true since the profile was introduced and is not a
+regression; a session that cannot be confined does not run.
+
+`ipv4_only_locked_v1` names the intended successor to the ipv4-only profile, in
+which the guest cannot undo the deny at all. It is recognised so that a config
+naming it is refused for the right reason rather than read as a typo, and
+refused because it is not built yet. A `writd` older than this change rejects
+that spelling outright as an unknown value, which is what makes rolling back
+fail closed rather than silently running under some other profile.
+
+
 Before that block does anything useful you need four things on disk:
 
 1. **`pf_helper`** — `writ-agent-vm-pf-helper` from `agent-infra`. The

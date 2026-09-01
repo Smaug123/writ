@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## What this is
 
 `writ` is a local capability broker for coding agents. `writd` is a daemon on a
@@ -39,8 +37,7 @@ The `cargo doc` gate is load-bearing and easy to forget: `build`, `test`, and
 warnings denied catches it.
 
 Run a single test: `cargo test <substring>` or, scoped to a member crate,
-`cargo test -p bailiff <substring>` (workspace members are `writ`, `writ-core`,
-`writ-vm-git`, `bailiff`).
+`cargo test -p bailiff <substring>`.
 
 Do **not** raise `--test-threads` (or `RUST_TEST_THREADS`) above the core count.
 Much of this suite spawns real subprocesses and waits on real deadlines, so
@@ -71,9 +68,7 @@ the gates above is what catches feature-combination mistakes.
 - **`crates/writ-core`** — the pure functional core: request/decision/grant
   types, capability sets, signing, ids. No host effects (tokio is behind its own
   `host` feature). Re-exported from the root crate as `writ::core`.
-- **root `writ` crate** — the imperative shell. Binaries: `writd` (daemon),
-  `writ` (CLI client), `writ-vm` (guest CLI), `writ-agent-vm-runner`,
-  `writ-agent-vm-pf-helper`.
+- **root `writ` crate** — the imperative shell.
 - **`crates/writ-vm-git`** — wire types shared between host and guest for
   VM-mediated git (branch/object-id parsing, clone/push request shapes).
 - **`crates/bailiff`** — a plan-workflow product (submit → review → decide →

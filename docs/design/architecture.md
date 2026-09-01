@@ -1163,7 +1163,42 @@ not see frames switched directly between two guests on the shared vmnet, and
 the broker VM does not yet install its own internal-interface firewall, so
 starting a new session there is refused outright
 (`AgentVmDaemonError::Ipv6ConfinementUnavailableForVmBroker`). Sessions
-already running are untouched; only new starts are refused. The agent VM
+already running are untouched; only new starts are refused.
+
+**Which IPv6 profile may start a session is a separate question from which a
+session can be running in**, and they are separate types: `ConfiguredIpv6Profile`
+is what an operator writes in `ipv6_mode`, `Ipv6IsolationMode` is what a running
+— and persisted — session is in, and `ConfiguredIpv6Profile::admit` is the only
+way between them. The configured set is the larger one, because it must name
+profiles that exist only to be refused; the active set names only what a session
+can be in, so no unreachable state is representable in the state store.
+`dual_stack_required` and `ipv4_only_no_guest_ipv6` admit; `ipv4_only_locked_v1`
+is recognised, so a config naming it is refused for the right reason rather than
+read as a typo, and refused because it is not built. Admission is enforced at
+each entry point (`start_session`, `accept_agent_run_session`,
+`writ-agent-vm-runner start`), before a session has an id and so before an audit
+row, a subprocess, or a state record; stop and persisted-state decoding stay
+permissive, so narrowing the admitted set can never strand a running session.
+
+There is deliberately **no admission check on the plan itself**. A plan carries
+an `Ipv6IsolationMode`, every mode admits, and the only closed profile has no
+mode to be built from — so a plan cannot represent a closed profile and a check
+there could never fire. The compiler enforces what the check would restate. A
+future closed profile that *does* get an active mode would break that, which is
+why `admit`'s test is exhaustive over the configured set.
+
+**Only `ipv4_only_no_guest_ipv6` actually starts a session on current Apple
+`container`.** `dual_stack_required` requires the session network to report
+writ's planned IPv6 `/64`, but `create_network_invocation` passes only
+`--subnet`, so it fails closed at network validation — as it has since the
+ipv4-only mode was introduced (see `apple-container-agent-vm.md`), deliberately.
+Admission is not the place to say so: whether the platform provisions IPv6 is a
+fact about the host, not about what the operator asked for. Making dual-stack
+work needs both a `--subnet-v6` on network create (the CLI has one) *and* an
+interface-scoped deny, because vmnet advertises RAs on an Apple-chosen ULA
+regardless of the network's own v6 config, and a source-CIDR rule cannot pin an
+address the guest can reassign. That is also why the ipv4-only profile is the
+*stronger* of the two today: its confinement is interface-scoped. The agent VM
 gets no host mounts (tmpfs only); only the broker VM bind-mounts
 session/secrets(ro)/audit. Idempotent restart: `Probe*Absent` steps refuse to
 touch infra this call didn't create. On boot, `reconcile_one_session` closes

@@ -11,6 +11,143 @@ use proptest::prelude::*;
 use std::fs;
 use std::path::Path;
 
+/// A closed profile refuses new sessions and leaves nothing behind.
+///
+/// `ipv4_only_locked_v1` is recognised so that a config naming it is refused
+/// for the right reason rather than read as a typo. The refusal arrives before
+/// the session has an id — and so before an audit row, a subprocess, or a state
+/// record — which is why the error is bare rather than wrapped in
+/// `StartFailed`: there is no session for it to name.
+#[tokio::test]
+async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
+    for (profile, expected) in [(
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+        Ipv6ProfileClosed::NotImplemented,
+    )] {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) =
+            daemon_config_with_ipv6_profile(dir.path(), &fake_tool, profile);
+        let daemon = AgentVmDaemon::new(config);
+        let audit_db = dir.path().join("audit.db");
+        let state = make_state_with_audit(AuditLog::open(&audit_db).unwrap());
+
+        let err = daemon
+            .start_session(
+                Arc::clone(&state),
+                Some("closed".into()),
+                Some(AgentKind::Claude),
+                Some("claude-test".into()),
+                None,
+                vec!["sleep".into(), "600".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentVmDaemonError::Ipv6ProfileClosed(closed) if closed == expected),
+            "start_session under {profile:?}: expected {expected:?}, got {err:?}"
+        );
+
+        // The agent-run route refuses the same way, and equally early.
+        let run_err = daemon
+            .accept_agent_run_session(
+                &state,
+                Some("closed run".into()),
+                AgentKind::Claude,
+                "claude-test".into(),
+                AgentVmWorkspaceBootstrap {
+                    repo: "owner/repo".parse().unwrap(),
+                    destination: None,
+                    warm: WorkspaceWarmMode::None,
+                },
+                crate::agent_run::AgentPrompt::new("do it"),
+                crate::agent_vm_daemon::AgentRunTags::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(run_err, AgentVmDaemonError::Ipv6ProfileClosed(closed) if closed == expected),
+            "accept_agent_run_session under {profile:?}: got {run_err:?}"
+        );
+
+        assert!(
+            !args_log.exists(),
+            "{profile:?}: a refused start must run no subprocess"
+        );
+        assert!(
+            state_store.load_all().unwrap().is_empty(),
+            "{profile:?}: a refused start must persist no session state"
+        );
+        // No session was ever named, so none was opened in the audit log. Read
+        // the table directly: the log has no "list every session" accessor, and
+        // a refused start has no id to ask about.
+        let conn = rusqlite::Connection::open(&audit_db).unwrap();
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "{profile:?}: a refused start must open no audit session"
+        );
+    }
+}
+
+/// A `writd` configured with a closed profile still stops what is running.
+///
+/// This is why a closed profile has to be representable in the runtime config
+/// at all: an operator who edits `ipv6_mode` — or a `writd` whose admitted set
+/// narrows across an upgrade — must still be able to reconcile the sessions
+/// already running. The persisted record carries its own mode, the stop plan is
+/// derived from the record alone (`to_stop_plan` takes no config), and boot-time
+/// reconcile under the closed profile removes the session.
+#[tokio::test]
+async fn a_daemon_under_a_closed_profile_still_reconciles_a_running_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let env_path_log = dir.path().join("env-path.log");
+    let env_log = dir.path().join("env.log");
+    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let (config, state_store) = daemon_config_with_ipv6_profile(
+        dir.path(),
+        &fake_tool,
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+    );
+    // Started, in an earlier life, under the legacy profile.
+    occupy_subnet(&state_store, 252);
+    let persisted = state_store.load_all().unwrap().pop().unwrap();
+    assert_eq!(
+        persisted.ipv6_mode(),
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        "the record keeps the mode it was started in"
+    );
+
+    let session_id = persisted.session_id();
+    let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+    audit
+        .open_session(&SessionRecord {
+            session_id,
+            label: None,
+            agent_kind: Some(AgentKind::Claude),
+            agent_model: None,
+            opened_at: UnixMillis::from_millis(1_700_000_000),
+            closed_at: None,
+        })
+        .unwrap();
+    let daemon = AgentVmDaemon::new(config);
+
+    let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+    assert_eq!(report.cleaned(), &[session_id]);
+    assert!(report.failed().is_empty());
+    assert!(state_store.load_all().unwrap().is_empty());
+    assert!(
+        args_log.exists(),
+        "reconcile tears the session down with real invocations"
+    );
+}
+
 /// Starts a VM-placement session past the admission gate.
 ///
 /// New VM-placement sessions are refused outright while nothing confines IPv6
@@ -45,6 +182,14 @@ where
         .start_session_after_audit_opened(
             Arc::clone(state),
             session_id,
+            // Supplied rather than admitted, because these tests are about what
+            // a vm-placement session *is* and the gate refuses one outright.
+            // It must still be the mode such a session would really run in:
+            // `AgentVmLifecycleRuntimeConfig::new` rejects vm placement under
+            // dual-stack, so passing that would build a combination the config
+            // layer forbids and would stop covering the ipv4-only guest setup
+            // this placement depends on.
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
             agent_kind,
             None,
             vec!["sleep".into(), "600".into()],
@@ -171,12 +316,11 @@ async fn vm_broker_placement_rejects_agent_run_sessions() {
         )
         .await
         .unwrap_err();
-    let AgentVmDaemonError::StartFailed { source, .. } = err else {
-        panic!("expected StartFailed, got {err:?}");
-    };
+    // Bare, not wrapped in `StartFailed`: the refusal comes before the run has
+    // an id, so there is no session for it to name.
     assert!(
-        matches!(*source, AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
-        "expected AgentRunUnsupportedForVmBroker, got {source:?}"
+        matches!(err, AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
+        "expected AgentRunUnsupportedForVmBroker, got {err:?}"
     );
     assert!(
         !args_log.exists(),
