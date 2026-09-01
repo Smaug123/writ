@@ -182,20 +182,26 @@ which brings the bridge up with one member; install the **quarantine** anchor
 (the bridge-scoped IPv6 deny plus an IPv4 deny-all from the session subnet)
 and read it back; discover the broker's IPv4 address from its ready document;
 **finalize** by atomically replacing the anchor with the final ruleset, verified
-by readback; only then start the agent VM; then re-run the interface deny with
-the agent's member expected, as host placement does today. The agent VM never
-exists on a bridge whose anchor is not in a read-back known state, and the
-only guest code that runs before the final ruleset is the broker VM's, which is
-trusted.
+by readback; only then start the agent VM, whose initializer waits for the
+release signal; then re-run the interface deny with both members expected and
+read it back; and only after that readback send `USR1`. The final ruleset was
+resolved while the bridge had one member, so the two-member deny is not
+optional tidying: it is the last step before release, exactly where host
+placement runs it today. The agent VM never exists on a bridge whose anchor is
+not in a read-back known state, and the only guest code that runs before the
+two-member readback is the broker VM's and the initializer's, both trusted.
 
 Finalize failure has a defined recovery: `pfctl -f` replaces the anchor, so a
-readback mismatch after a successful load means quarantine is already gone.
-The helper then reloads quarantine and reads *that* back. Its result names the
-anchor's state as one of `Quarantined`, `Final`, or `Unknown`; the daemon
-starts the agent only on `Final`, and on anything else tears the session down
-(broker VM stopped and proven absent, then the anchor removed). The invariant
-is not "quarantine survives every failure" but "the agent VM is never started
-unless the anchor is read back as final".
+readback mismatch after a successful load means quarantine is already gone,
+and a load that failed or timed out proves nothing about whether the kernel
+committed it. The helper therefore reads the anchor back after every load
+outcome, reloads quarantine if the readback matches neither ruleset, and
+reads that back. Its result names the anchor's state as one of `Quarantined`,
+`Final`, or `Unknown`, always from a readback and never from an exit status;
+the daemon starts the agent only on `Final`, and on anything else tears the
+session down (broker VM stopped and proven absent, then the anchor removed).
+The invariant is not "quarantine survives every failure" but "the agent VM is
+never started unless the anchor is read back as final".
 
 ## Enforcement layer 2: one-way guest handoff (not built)
 
@@ -339,13 +345,21 @@ Claimed
 -> FinalFirewallInstalled
 -> AgentVmStartedQuarantined
 -> GuestSecurityLocked
+-> ReleaseAttempted
 -> WorkloadReleased
 ```
 
 Not every placement performs every effect, but it uses the same ordered state
-model. `WorkloadReleased` is constructible only from `GuestSecurityLocked` and
+model. `ReleaseAttempted` is constructible only from `GuestSecurityLocked` and
 `FinalFirewallInstalled` (plus `BrokerReady` with a final internal firewall for
-vm placement). The shipped start steps map onto these phases with
+vm placement), and it is persisted *before* `container kill --signal USR1` is
+run. The signal is an effect whose outcome the daemon cannot always learn: a
+failed or timed-out `kill` does not prove the signal was not delivered, and
+the daemon can crash after delivery and before recording it. A session found
+in `ReleaseAttempted` is therefore treated as released: reconciliation revokes
+its authority and cleans it up, never resumes it. `WorkloadReleased` records
+that the kill reported success and is the only phase in which the daemon
+proceeds to wait for bootstrap. The shipped start steps map onto these phases with
 `QuarantineInstalled` and `BrokerReady` absent for host placement and
 `GuestSecurityLocked` currently meaning "the prelaunch precondition held", which
 layer 2 upgrades to "the initializer's security-ready record was observed".
@@ -392,8 +406,11 @@ under another profile.
 The legacy `ipv4_only_no_guest_ipv6` profile **is not refused** and will not
 be while it is the strongest confinement available. Once `locked_v1` admits, the
 legacy profile's remaining weakness is that its guest keeps network authority
-(layer 2), and at that point closing it to new sessions is a one-line change
-to `admit` with an already-tested refusal path.
+(layer 2), and at that point closing it to new sessions is a small change to
+`admit` with an already-tested refusal path. `dual_stack_required` closes with
+it: it does not start on this platform today, but it too runs the root
+prelaunch, and invariant 9 says no profile may keep the guest's network
+authority once the handoff exists.
 
 When `locked_v1` admits, admission is conditional on host-gathered runtime
 evidence, not on the spelling alone: the helper's protocol probe reports v2,

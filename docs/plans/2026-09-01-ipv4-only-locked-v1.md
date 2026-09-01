@@ -255,15 +255,24 @@ the v2 cleanup-only reader.
 
 The phase DU replaces the boolean-ish start outcomes for the locked mode; the
 persisted record carries the phase reached, the resolved interfaces, and the
-firewall phase. The v2 reader produces only a stop plan.
+firewall phase. `ReleaseAttempted` is written before the release signal is
+sent, so a crash or an unreadable `kill` result cannot leave a running
+workload behind a record that says it was never released. The v2 reader
+produces only a stop plan.
 
 **Correctness oracle:**
 - State-machine property: for every phase, inject failure or a simulated crash
   immediately after it, then run boot reconcile; the session is cleaned, PF is
-  removed only after VM absence is proved, and `WorkloadReleased` was never
+  removed only after VM absence is proved, and `ReleaseAttempted` was never
   reached without `GuestSecurityLocked` and `FinalFirewallInstalled`.
-- Property: `WorkloadReleased` is unconstructible from any other pair of
-  phases (a compile-time fact where the types allow it, a test where not).
+- Property: `ReleaseAttempted` is unconstructible from any other pair of
+  phases (a compile-time fact where the types allow it, a test where not), and
+  the persisted record shows `ReleaseAttempted` before the fake tool's log
+  shows the `kill`, under every injected `kill` outcome (success, failure,
+  timeout, daemon crash mid-call).
+- Reconcile treats `ReleaseAttempted` exactly as `WorkloadReleased`: authority
+  revoked first, then cleanup; it never re-sends the signal or re-enters the
+  start path.
 - Every v2 record in `proptest-regressions` and the existing state-store tests
   still loads, as cleanup-only, and is never reported as locked.
 
@@ -298,7 +307,10 @@ caller left.
 With that in place, `Ipv6IsolationMode` gains `Ipv4OnlyLockedV1`, the state
 schema gains its mode spelling, and `admit` calls D's `admit_locked` for the
 locked profile: this is the stage at which the profile opens, for host
-placement only (vm placement's refusal stays until F3).
+placement only (vm placement's refusal stays until F3). Both front doors open
+together: `writ-agent-vm-runner start` and `managed-start` call the same
+library gatherer as the daemon and pass its evidence to the same `admit`, so
+the runner cannot start a locked session on a host the daemon would refuse.
 
 Nothing here is a proof. It is the daemon doing the locked sequence under the
 fake tool, with every step's failure leaving the workload unreleased.
@@ -321,6 +333,9 @@ fake tool, with every step's failure leaving the workload unreleased.
 - `admit` now yields `Ipv4OnlyLockedV1` under exactly D's admitting evidence
   and refuses otherwise; the "creates nothing" test runs for every refusing
   combination: no subprocess beyond the probes, no audit row, no state record.
+- The runner's existing "closed profile is refused here too" test runs for
+  every refusing evidence combination, with the probes faked, and the runner
+  builds a locked plan only under the admitting one.
 - Stop and reconcile of a persisted `Ipv4OnlyLockedV1` session need no
   evidence: the persisted-session tests run under a daemon whose evidence
   gathering is scripted to fail.
@@ -381,13 +396,22 @@ with the final ruleset in one `pfctl -f` load, verified by readback, and on a
 readback mismatch reloads quarantine and reads that back too. Never a flush.
 Both return the anchor's state as `Quarantined`, `Final`, or `Unknown`.
 
+The reported state always comes from a readback, never from a `pfctl` exit
+status: a failed or timed-out load does not prove the kernel did not commit
+it. After any load outcome the helper reads the anchor back and reports what
+it saw; `Unknown` means the readback itself failed or matched neither ruleset.
+
 **Correctness oracle:**
-- With a scripted fake `pfctl`: a failed syntax check or a failed `finalize`
-  load reports `Quarantined` (nothing replaced it); a readback mismatch after a
-  successful load reports `Quarantined` iff the re-quarantine's readback
-  matches, and `Unknown` otherwise; a property over failure position asserts
-  that every result is one of the three states and that `Final` is reported
-  only when the final readback matched exactly.
+- With a scripted fake `pfctl`: a failed syntax check (no load attempted)
+  reports `Quarantined` after a readback confirming it; a failed, killed, or
+  timed-out `finalize` load is followed by a readback and reports whichever
+  ruleset that readback matches, re-quarantining first if it matched neither;
+  a readback mismatch after a successful load reports `Quarantined` iff the
+  re-quarantine's readback matches, and `Unknown` otherwise; a property over
+  failure position and over the fake's post-failure anchor contents asserts
+  that every result is one of the three states, that `Final` is reported only
+  when the final readback matched exactly, and that no result is reported
+  without a readback having run after the last load attempt.
 - `quarantine` before any VM is on the network fails closed with the
   no-bridge error, and `finalize` without a prior quarantine readback is
   refused.
@@ -424,15 +448,18 @@ the readback in `BrokerReadyDoc`, and drops `CAP_NET_ADMIN` before executing
 
 Split network creation from broker launch: create network, start broker,
 `quarantine` (the bridge now exists), wait for the ready document, discover
-the broker IPv4, `finalize`, then the E2 agent sequence, then the member-count
-deny as today.
+the broker IPv4, `finalize`, start the agent VM (its initializer waits), the
+two-member interface deny with readback, and only then the E2 release
+(`security-ready` observed, `USR1`). The deny with both members present must
+precede `USR1`; the finalized anchor was resolved with one member.
 
 **Correctness oracle:**
 - Fake-tool daemon tests: the order of helper and `container` invocations is
   exactly the design's; the agent VM is started only after a helper result of
-  `Final`; on `Quarantined` or `Unknown` the daemon stops the broker, proves it
-  absent, and removes the anchor, in that order; the E1 state-machine property
-  runs with the vm phases present.
+  `Final`; `kill --signal USR1` appears only after a two-member deny readback
+  succeeded; on `Quarantined` or `Unknown` the daemon stops the broker, proves
+  it absent, and removes the anchor, in that order; the E1 state-machine
+  property runs with the vm phases present.
 - The vm-placement refusal is removed for the locked profile only; the legacy
   profile under vm placement is still refused, with the existing test.
 
@@ -459,16 +486,21 @@ both networks absent.
 **Dependencies:** Stage F4.
 
 **Implements:** Proof obligation 4; Persistence and compatibility, upgrade and
-rollback; closing `ipv4_only_no_guest_ipv6` to new sessions.
+rollback; closing `ipv4_only_no_guest_ipv6` and `dual_stack_required` to new
+sessions.
 
 **Correctness oracle:**
 - A soak driver runs start, attack, stop repeatedly and restarts `writd` at
   every persisted phase; no run is inconclusive; sleep/wake, `container`
   restart, and interface churn are each exercised once with the E3 evidence
   intact.
-- Closing the legacy profile is the one-line change to `admit`; the existing
-  refusal and reconcile tests run against it with `Ipv4OnlyNoGuestIpv6` in
-  place of `Ipv4OnlyLockedV1`.
+- Closing the two unlocked profiles is the change to `admit`: after it, only
+  `Ipv4OnlyLockedV1` yields a mode. `DualStackRequired` is closed alongside
+  the legacy profile, not merely left unstartable: it still runs the root
+  prelaunch path, so on any platform where its IPv6 validation passed it would
+  restore network-management authority, against invariant 9. The existing
+  refusal and reconcile tests run against both, in place of
+  `Ipv4OnlyLockedV1`.
 - Upgrade from a legacy daemon with a live session: the new daemon reconciles
   it as cleanup-only; rollback with a locked session live: the old daemon
   refuses to start on the spelling, as #397's test already asserts.
