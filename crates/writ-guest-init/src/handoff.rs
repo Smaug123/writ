@@ -159,8 +159,12 @@ impl OwnedDirectory {
 /// at the first failure; the workload is never started after a failure.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum HandoffStep {
-    /// `chown -R LOCKED_UID:LOCKED_GID` on one of the fixed directories.
-    ChownOwnedDirectory(OwnedDirectory),
+    /// Create one of the fixed directories if it is absent (`/run` is a
+    /// fresh tmpfs at launch, so the runtime directory never pre-exists),
+    /// then `chown -R LOCKED_UID:LOCKED_GID` it. One step, because a
+    /// directory created for the locked identity is never meant to be left
+    /// root-owned even for an instant.
+    PrepareOwnedDirectory(OwnedDirectory),
     /// Write one IPv6 sysctl under one scope.
     WriteSysctl {
         scope: SysctlScope,
@@ -196,7 +200,7 @@ pub enum HandoffStep {
 pub fn handoff_plan(interfaces: &[InterfaceName]) -> Vec<HandoffStep> {
     let mut steps = Vec::new();
     for dir in OwnedDirectory::ALL {
-        steps.push(HandoffStep::ChownOwnedDirectory(dir));
+        steps.push(HandoffStep::PrepareOwnedDirectory(dir));
     }
     let scopes: Vec<SysctlScope> = [SysctlScope::All, SysctlScope::Default]
         .into_iter()
@@ -228,7 +232,8 @@ pub fn handoff_plan(interfaces: &[InterfaceName]) -> Vec<HandoffStep> {
 /// enough bookkeeping to know whether the IPv6 and ownership steps have been
 /// done. It encodes the Linux rules the handoff depends on:
 ///
-/// - `chown` of a root-owned directory needs effective `CAP_CHOWN`;
+/// - creating and `chown`ing a directory for another identity needs
+///   effective `CAP_CHOWN` (creation as UID 0 needs nothing further);
 /// - writing a net sysctl needs UID 0 (the file is root-writable) and
 ///   effective `CAP_NET_ADMIN`;
 /// - dropping the bounding set needs effective `CAP_SETPCAP`;
@@ -347,6 +352,10 @@ pub enum StepRefusal {
     Ipv6NotYetDisabled,
     #[error("the locked identity is not established: {0}")]
     NotLocked(#[from] LockedStateViolation),
+    /// The plan ended without [`HandoffStep::VerifyLockedIdentity`] as its
+    /// last step. Reported at index `steps.len()`, the step that is missing.
+    #[error("the plan does not end with the locked-identity verification")]
+    NotTerminal,
 }
 
 /// The step at which a simulation stopped, and why.
@@ -359,8 +368,10 @@ pub struct SimulationFailure {
 }
 
 /// Run the steps against the model from launch, stopping at the first the
-/// kernel rules would refuse. Success means every step ran *and* the final
-/// verification found the locked state.
+/// kernel rules would refuse. Success means every step ran *and* the last
+/// step was [`HandoffStep::VerifyLockedIdentity`] and it found the locked
+/// state: a plan that runs out without verifying, or verifies and then keeps
+/// going, is not a handoff.
 pub fn simulate(
     steps: &[HandoffStep],
     interfaces: &[InterfaceName],
@@ -375,7 +386,14 @@ pub fn simulate(
                 reason,
             })?;
     }
-    Ok(model)
+    match steps.last() {
+        Some(HandoffStep::VerifyLockedIdentity) => Ok(model),
+        _ => Err(SimulationFailure {
+            index: steps.len(),
+            step: HandoffStep::VerifyLockedIdentity,
+            reason: StepRefusal::NotTerminal,
+        }),
+    }
 }
 
 impl ProcessModel {
@@ -393,7 +411,7 @@ impl ProcessModel {
         interfaces: &[InterfaceName],
     ) -> Result<(), StepRefusal> {
         match step {
-            HandoffStep::ChownOwnedDirectory(dir) => {
+            HandoffStep::PrepareOwnedDirectory(dir) => {
                 self.require(TemporaryCapability::Chown)?;
                 self.owned.insert(*dir);
             }
@@ -490,7 +508,7 @@ pub fn precedence_violations(
         for step in &steps[at + 1..] {
             let privileged = matches!(
                 step,
-                HandoffStep::ChownOwnedDirectory(_)
+                HandoffStep::PrepareOwnedDirectory(_)
                     | HandoffStep::WriteSysctl { .. }
                     | HandoffStep::DropBoundingSet
                     | HandoffStep::ClearSupplementaryGroups
@@ -533,7 +551,7 @@ pub fn precedence_violations(
             let has = |p: &dyn Fn(&HandoffStep) -> bool| steps.iter().any(p);
             OwnedDirectory::ALL
                 .iter()
-                .all(|d| has(&|s| *s == HandoffStep::ChownOwnedDirectory(*d)))
+                .all(|d| has(&|s| *s == HandoffStep::PrepareOwnedDirectory(*d)))
                 && has(&|s| *s == HandoffStep::VerifyNoIpv6)
                 && has(&|s| *s == HandoffStep::DropBoundingSet)
                 && has(&|s| *s == HandoffStep::ClearInheritableAndAmbient)
@@ -574,10 +592,10 @@ mod tests {
         let ws = |scope: SysctlScope, sysctl| HandoffStep::WriteSysctl { scope, sysctl };
         let iface = || SysctlScope::Interface(eth0.clone());
         let expected = vec![
-            HandoffStep::ChownOwnedDirectory(OwnedDirectory::Runtime),
-            HandoffStep::ChownOwnedDirectory(OwnedDirectory::Home),
-            HandoffStep::ChownOwnedDirectory(OwnedDirectory::Workspace),
-            HandoffStep::ChownOwnedDirectory(OwnedDirectory::NixStore),
+            HandoffStep::PrepareOwnedDirectory(OwnedDirectory::Runtime),
+            HandoffStep::PrepareOwnedDirectory(OwnedDirectory::Home),
+            HandoffStep::PrepareOwnedDirectory(OwnedDirectory::Workspace),
+            HandoffStep::PrepareOwnedDirectory(OwnedDirectory::NixStore),
             ws(SysctlScope::All, Ipv6Sysctl::AcceptRa),
             ws(SysctlScope::Default, Ipv6Sysctl::AcceptRa),
             ws(iface(), Ipv6Sysctl::AcceptRa),
@@ -662,6 +680,15 @@ mod tests {
     enum Reorder {
         Shuffle(Vec<usize>),
         AdjacentSwaps(Vec<usize>),
+        /// Take the step at one position and re-insert it at another,
+        /// leaving everything else in order. This is the shape the other two
+        /// almost never produce: a single step far out of place, such as an
+        /// unprivileged step moved after the final verification, or the
+        /// verification moved into the middle.
+        Relocate {
+            from: usize,
+            to: usize,
+        },
     }
 
     fn arb_reorder(len: usize) -> impl Strategy<Value = Reorder> {
@@ -671,6 +698,7 @@ mod tests {
                 .prop_map(Reorder::Shuffle),
             proptest::collection::vec(0..len.saturating_sub(1), 0..4)
                 .prop_map(Reorder::AdjacentSwaps),
+            (0..len, 0..len).prop_map(|(from, to)| Reorder::Relocate { from, to }),
         ]
     }
 
@@ -684,7 +712,37 @@ mod tests {
                 }
                 out
             }
+            Reorder::Relocate { from, to } => {
+                let mut out = steps.to_vec();
+                let step = out.remove(*from);
+                out.insert(*to, step);
+                out
+            }
         }
+    }
+
+    /// The two shapes the earlier generator never produced, spelled out:
+    /// a plan that runs out before verifying, and one that verifies early
+    /// and keeps going. Both are refused by the model and by the rules.
+    #[test]
+    fn a_plan_that_does_not_end_in_verification_is_refused() {
+        let failure = simulate(&[], &[]).expect_err("an empty plan is not a handoff");
+        assert_eq!(failure.reason, StepRefusal::NotTerminal);
+        assert_eq!(failure.index, 0);
+
+        let mut early = handoff_plan(&[]);
+        let clear = early
+            .iter()
+            .position(|s| *s == HandoffStep::ClearInheritableAndAmbient)
+            .unwrap();
+        let step = early.remove(clear);
+        early.push(step); // ..., VerifyLockedIdentity, ClearInheritableAndAmbient
+        let failure = simulate(&early, &[]).expect_err("verification must be last");
+        assert_eq!(failure.reason, StepRefusal::NotTerminal);
+        assert!(
+            precedence_violations(&early, &[])
+                .contains(&PrecedenceViolation::VerifyLockedIdentityNotLast)
+        );
     }
 
     proptest! {
