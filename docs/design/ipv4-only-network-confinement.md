@@ -170,11 +170,30 @@ not rediscovered. None reopens the bypass #288 closed.
 
 Host placement installs the final anchor before the agent VM's workload runs,
 as above. VM placement creates the shared network before the broker's IPv4
-address is known. It must therefore install an interface-wide IPv6 quarantine
-anchor first, start the trusted broker VM, discover the broker IPv4 address,
-syntax-check the final rules, and atomically replace quarantine. It never
-flushes the anchor before replacement, and a failed replacement must leave
-quarantine observable. This is the part of layer 1 that layer 3 depends on.
+address is known, and on this platform the host `bridgeN` and its `vmenetN`
+members exist only once a VM is running on the network. An interface-scoped
+rule therefore cannot precede the broker VM; the helper derives interfaces
+from the gateway and would find nothing.
+
+The sequence is instead: create the network; start the trusted broker VM,
+which brings the bridge up with one member; install the **quarantine** anchor
+(the bridge-scoped IPv6 deny plus an IPv4 deny-all from the session subnet)
+and read it back; discover the broker's IPv4 address from its ready document;
+**finalize** by atomically replacing the anchor with the final ruleset, verified
+by readback; only then start the agent VM; then re-run the interface deny with
+the agent's member expected, as host placement does today. The agent VM never
+exists on a bridge whose anchor is not in a read-back known state, and the
+only guest code that runs before the final ruleset is the broker VM's, which is
+trusted.
+
+Finalize failure has a defined recovery: `pfctl -f` replaces the anchor, so a
+readback mismatch after a successful load means quarantine is already gone.
+The helper then reloads quarantine and reads *that* back. Its result names the
+anchor's state as one of `Quarantined`, `Final`, or `Unknown`; the daemon
+starts the agent only on `Final`, and on anything else tears the session down
+(broker VM stopped and proven absent, then the anchor removed). The invariant
+is not "quarantine survives every failure" but "the agent VM is never started
+unless the anchor is read back as final".
 
 ## Enforcement layer 2: one-way guest handoff (not built)
 
@@ -203,17 +222,21 @@ Before announcing readiness, PID 1:
 2. Sets `accept_ra=0`, `autoconf=0`, and `router_solicitations=0` where present.
 3. Sets `disable_ipv6=1` for `all`, `default`, and every existing interface.
 4. Verifies that no non-loopback IPv6 address or IPv6 route exists.
-5. Drops every bounding, permitted, effective, inheritable, and ambient
-   capability.
-6. Sets `NoNewPrivs=1`.
-7. Clears supplementary groups and changes real, effective, and saved UID and
-   GID to the fixed official-image identity 1000:1000.
-8. Re-verifies identity, capability masks, `NoNewPrivs`, sysctls, addresses,
-   and routes.
-9. Emits one bounded, versioned `security-ready` record and waits as the
+5. While still UID 0 and holding `CAP_SETPCAP`: drops every capability from
+   the bounding set, clears the inheritable and ambient sets, and sets
+   `NoNewPrivs=1`. The order matters: dropping the bounding set needs
+   `CAP_SETPCAP`, and the identity change in step 6 discards it.
+6. Clears supplementary groups and changes real, effective, and saved GID then
+   UID to the fixed official-image identity 1000:1000, with `KEEPCAPS` off, so
+   the transition itself clears the permitted and effective sets. `CAP_SETGID`
+   and `CAP_SETUID` are therefore the last capabilities held, and they are
+   consumed by the calls that need them.
+7. Re-verifies identity, every capability set (bounding included),
+   `NoNewPrivs`, sysctls, addresses, and routes.
+8. Emits one bounded, versioned `security-ready` record and waits as the
    restricted identity for the host release signal.
-10. On release, `exec`s the existing guest bootstrap command. No root
-    supervisor survives.
+9. On release, `exec`s the existing guest bootstrap command. No root
+   supervisor survives.
 
 The agent image has a fixed identity and initializer ABI, advertised by an OCI
 label (`org.writ.agent-vm.isolation-abi`); UID, GID, and the capability set are
@@ -279,10 +302,15 @@ The rules are:
    in the session's audit rows, so two concurrent proofs cannot grade each
    other's packets.
 5. **Inconclusive is failure, and every negative has a positive control in the
-   same run.** A deny counter that did not rise proves nothing unless the same
-   run shows the unsafe control's packets *did* reach the listener, with the
-   same tooling. Missing tools, missing routes, and timeouts are failures, not
-   skips.
+   same run.** A silent listener proves nothing unless the same run shows a
+   sender that *can* emit IPv6 on a bridge of the same kind reaching that
+   listener, with the same tooling. The positive control is therefore a
+   separate, unconfined sender the proof controls (a root guest on a
+   proof-created network with no anchor), not the protected workload with a
+   layer withheld: under the locked profile the workload has no IPv6 and no
+   network authority, so withholding the host deny would produce no packets
+   and the "control" would be vacuous. Missing tools, missing routes, and
+   timeouts are failures, not skips.
 6. **Evidence is concrete host-owned types.** `PfCounterDelta`,
    `ListenerObservation`, `PhaseTransition`, and the like, joined by nonce and
    phase, with the guest's diagnostic records attached as an untrusted
@@ -336,8 +364,8 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
 - pools, allowed ports, and admitted interface policy come from a fixed,
   root-owned, non-symlink, non-group/world-writable policy file (not shipped;
   today they are validated CLI arguments);
-- it syntax-checks, atomically loads, parses exact readback, and re-resolves
-  after the load (not shipped);
+- it syntax-checks, atomically loads, parses exact readback, re-resolves
+  after the load, and reports the anchor's state (not shipped);
 - it answers `protocol-version` with one bounded JSON object, and returns
   bounded versioned JSON describing anchor, interfaces, and firewall phase (not
   shipped; the daemon's `ipv4_only_locked_v1` admission depends on the probe).
@@ -406,16 +434,24 @@ in place rather than replaced. Today it grades the re-enabled-IPv6 probe on the
 guest's `ping` exit status, which the evidence protocol classifies as
 diagnostics. The obligations, in the order the plan delivers them:
 
-1. **Host placement, layer 1** (exists; upgrade its evidence): the labelled
-   IPv6 deny counter on the session anchor rises by the number of probes the
-   host commanded, and a host ULA or link-local listener bound on the bridge
-   accepts nothing, across at least two RA intervals; an unsafe control (same
-   image, deny withheld) reaches the same listener in the same run.
-2. **Layer 2**: after the security-ready record, the host reads the released
-   process's `/proc/<pid>/status` via bounded `container exec` *before*
-   release and sees the locked identity; and the layer-1 attacks re-run from
-   the released, unprivileged workload fail at the syscall, which is recorded
-   as diagnostics, while the host evidence from (1) still holds.
+1. **Host placement, layer 1, under the legacy profile** (exists; upgrade
+   its evidence): the root guest re-enables IPv6 and is commanded to probe; the
+   labelled IPv6 deny counters on the session anchor rise by at least the
+   number of probes commanded, and a host ULA or link-local listener bound on
+   the bridge accepts nothing, across at least two RA intervals. The positive
+   control is an unconfined root guest on a proof-created network with no
+   anchor, reaching an identical listener in the same run. This is the only
+   proof in which the deny counter is expected to rise, because it is the only
+   one whose workload can emit IPv6.
+2. **Host placement under the locked profile**: before release, the host reads
+   the initializer's `security-ready` record and the released process's
+   `/proc/<pid>/status` via bounded `container exec` and sees the locked
+   identity; after release, the same attacks run from the unprivileged
+   workload and the host observes: listener silent, deny counters *zero* (a
+   rise would mean the guest emitted IPv6, which is itself a layer-2 failure),
+   positive control still reaching its listener. The guest's diagnostics show
+   each attack failing at the syscall, and the host verdict is unchanged with
+   those diagnostics deleted.
 3. **VM placement, layer 3**: broker readiness implies a read-back internal
    firewall; the agent reaches only its IPv4 broker; a forbidden listener on
    the broker's internal interface accepts nothing; two sessions cannot reach
