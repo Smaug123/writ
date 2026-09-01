@@ -69,7 +69,11 @@ More concretely:
 9. The irreversible guest privilege handoff applies to every agent-VM profile,
    so changing profiles cannot restore network-management authority.
 
-Today, `HostFirewallFinal` holds for host placement (layer 1).
+Today, `HostFirewallFinal` holds for host placement (layer 1) for IPv6, and
+for IPv4 traffic whose source is inside the session subnet; an out-of-subnet
+IPv4 source is not covered by the shipped rules (see the known deltas below),
+and whether vmnet forwards such a frame is unmeasured, so the current
+no-egress guarantee is qualified by exactly that until C2b lands.
 `GuestNetworkAuthorityRemoved` does not hold anywhere (layer 2 is unbuilt), and
 `BrokerInternalFirewallFinal` does not hold anywhere (layer 3 is unbuilt), which
 is why vm placement refuses new sessions (#396). `GuestIpv6Absent` is
@@ -249,8 +253,10 @@ Before announcing readiness, PID 1:
    The order matters: the host may send the signal the instant it observes
    the record, and an unblocked `USR1` arriving before the wait is armed would
    either terminate PID 1 with the default action or be lost.
-9. On release, `exec`s the existing guest bootstrap command. No root
-   supervisor survives.
+9. On release, restores the signal mask (unblocking `USR1`) and closes any
+   `signalfd`, then `exec`s the existing guest bootstrap command. `exec`
+   preserves the mask, and a workload that inherited `USR1` blocked would
+   silently lose a signal it may use itself. No root supervisor survives.
 
 The agent image has a fixed identity and initializer ABI, advertised by an OCI
 label (`org.writ.agent-vm.isolation-abi`); UID, GID, and the capability set are
@@ -423,11 +429,12 @@ The legacy `ipv4_only_no_guest_ipv6` profile **is not refused** and will not
 be while it is the strongest confinement available. Once `locked_v1` admits on
 a host, the legacy profile's remaining weakness there is that its guest keeps
 network authority (layer 2), and invariant 9 says no profile may keep it once
-the handoff exists. So the two decisions are one decision: on a host whose
-evidence admits `locked_v1`, `ipv4_only_no_guest_ipv6` and
-`dual_stack_required` refuse; on any other host they admit as today. Per host,
-not globally, so that a host without a proof record is never left with
-nothing startable. `dual_stack_required` is included even though it does not
+the handoff exists. So the two decisions are one decision, with firewall
+safety in front of it: if preflight says the session anchor is not reached,
+nothing admits; otherwise, on a host whose evidence admits `locked_v1`,
+`ipv4_only_no_guest_ipv6` and `dual_stack_required` refuse, and on any other
+host they admit as today. Per host, not globally, so that a host without a
+proof record is never left with nothing startable for want of a pin. `dual_stack_required` is included even though it does not
 start on this platform, because it too runs the root prelaunch.
 
 When `locked_v1` admits, admission is conditional on host-gathered runtime
@@ -442,9 +449,13 @@ version line (today `1.0.0`, build `ee848e3`) and the macOS build
 pin captures it: the effective placement of the `writ/session/*` anchor in
 the main ruleset. A `pass in quick` in `/etc/pf.conf` ahead of that anchor
 means no session rule is ever consulted, while every child-anchor readback
-still succeeds. The helper therefore reads the main ruleset back and reports
-whether the anchor is present and precedes any `quick` pass, and that report
-is admission evidence too. Both are exact-match pins against a
+still succeeds; a `quick` pass loaded inside an earlier anchor such as
+`com.apple/*` has the same effect and is invisible to a main-ruleset
+readback. The helper therefore reads the main ruleset back and reports
+whether writ's anchor is present and precedes every `quick` pass and every
+other filter anchor, and that report is admission evidence too. A preflight
+failure is not a reason to fall back to another profile: it says the anchor
+does not confine, which no profile survives. Both are exact-match pins against a
 list the proof maintains, so a host update closes the profile until the proof
 is re-run there. The list starts empty and a platform enters it only in the
 same change that records the proof passing on it, so the code that can admit

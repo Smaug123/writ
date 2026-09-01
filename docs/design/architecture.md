@@ -1153,8 +1153,12 @@ broker `BrokerVmPlan`/`BrokerSessionSpec`/`GuestAbsPath` (`broker_vm.rs:190`,
 `broker_session.rs:63,24`).
 
 **Guarantees.** No egress except the broker: host placement via PF default-deny
-(whitelist broker ports, then `block return`); VM placement by topology
-(`--internal`, no NAT). IPv6 is confined for host placement by the host PF
+(whitelist broker ports, then `block return`), with one qualification — the
+IPv4 rules are matched on the session subnet as source, so a frame the guest
+sends with an out-of-subnet source is not covered by them (whether vmnet
+forwards such a frame is unmeasured; `ipv4-only-network-confinement.md`
+records this as a known delta and the interface-scoped fix); VM placement by
+topology (`--internal`, no NAT). IPv6 is confined for host placement by the host PF
 rule (`block return in quick on <iface> inet6 all`,
 `agent_vm_firewall.rs:705`), with a guest deny in front of it that is a
 precondition rather than an authority boundary — the root workload can

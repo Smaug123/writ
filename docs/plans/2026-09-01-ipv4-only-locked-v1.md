@@ -94,7 +94,9 @@ profile and its tests from `codex/ipv4-lock-stage-1-gate`
   asserts the record is unchanged.
 - The wait is armed before the record is published: the integration test
   sends `USR1` the instant it reads the record, repeatedly across many runs,
-  and the probe command runs every time, never a terminated PID 1. (A signal
+  and the probe command runs every time, never a terminated PID 1. The probe
+  command also prints its signal mask (`SigBlk` in `/proc/self/status`), and
+  B1's acceptance type requires `USR1` unblocked in it. (A signal
   that arrives after arming and before the host reads the record is simply
   pending and released next; the guest cannot observe when the host read the
   line, so ordering on the host side is the trusted host's job, and it sends
@@ -169,11 +171,15 @@ would open the profile while the helper still took its own bounds from the
 unprivileged caller.
 
 A `preflight` command reads the *main* ruleset (`pfctl -sr` without an
-anchor) and reports whether `anchor "writ/session/*"` is present and no
-`pass ... quick` rule precedes it; the proof script's existing anchor check
-moves into it. This is host-local state no version pin captures, and a
-matching `pass in quick` ahead of the anchor would let every child-anchor
-readback succeed while no session rule is ever consulted.
+anchor) and reports whether `anchor "writ/session/*"` is present and is
+preceded by neither a `pass ... quick` rule nor *any other filter anchor*;
+the proof script's existing anchor check moves into it. The second condition
+is the important one: a main-ruleset readback shows an earlier anchor only as
+its invocation line, not the rules loaded inside it, and a `quick` pass
+inside `com.apple/*` is just as final as one in `pf.conf`. So the only
+placement preflight can vouch for is writ's anchor ahead of everything else
+that filters, and the installation docs say to put it there. This is
+host-local state no version pin captures.
 
 `install` and `--deny-guest-ipv6` then run: precheck, resolve, `pfctl -n`
 syntax check, load, `pfctl -sr` readback parsed to the ruleset type and
@@ -184,8 +190,9 @@ session as unreleasable (it is already fail-closed on any helper error).
 
 **Correctness oracle:**
 - `preflight` over generated main rulesets: reports present-and-first iff
-  the anchor line exists and every earlier rule is not a `quick` pass; a
-  `quick` pass after the anchor, or a non-quick pass before it, is accepted.
+  the anchor line exists and every earlier line is neither a `quick` pass nor
+  an anchor invocation; a `quick` pass or another anchor after writ's, or a
+  non-quick pass or a scrub/nat/rdr anchor before it, is accepted.
 - Policy loading is a library function taking a path: a temp-dir test covers
   each refusal (missing, symlink, wrong owner, group-writable, world-writable,
   unparseable) and the one acceptance; a property asserts a session fact
@@ -502,10 +509,15 @@ parked.
 The two unlocked profiles are not left for that revision. Both still run the
 root prelaunch, and invariant 9 admits neither on a host where the handoff
 exists, so they close *per host* in the same decision that opens the locked
-profile there: `admit` for `ipv4_only_no_guest_ipv6` or `dual_stack_required`
-refuses whenever the locked evidence on this host would admit, and admits
-otherwise. That lands in E2 as part of `admit`, so E3's first allowlist entry
-closes the legacy profiles on that host in the same change, and no host is
-ever left with nothing startable, which is the #397 failure. The oracle is
-E2's existing exhaustive one, extended: for every evidence combination,
-exactly one of {locked admits, legacy admits} holds.
+profile there. The decision has two levels. First, firewall safety: if
+`preflight` reports that the session anchor is not reached, nothing admits,
+because that is a fact about whether any session rule is consulted and no
+profile survives it. Second, only when the firewall is safe: `admit` for
+`ipv4_only_no_guest_ipv6` or `dual_stack_required` refuses whenever the
+locked evidence on this host would admit, and admits otherwise. That lands in
+E2 as part of `admit`, so E3's first allowlist entry closes the legacy
+profiles on that host in the same change, and a host without a proof record
+is never left with nothing startable for want of a pin, which is the #397
+failure. The oracle is E2's existing exhaustive one, extended: for every
+evidence combination with preflight failed, nothing admits; for every other
+combination, exactly one of {locked admits, legacy admits} holds.
