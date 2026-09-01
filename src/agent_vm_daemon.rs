@@ -381,9 +381,12 @@ pub enum AgentVmLifecycleRuntimeConfigError {
         "broker_placement = vm requires an agent_vm.lifecycle.broker_image (the dedicated broker VM image)"
     )]
     BrokerImageRequiredForVmPlacement,
+    /// Only dual-stack is refused here. A closed ipv4-only profile still
+    /// constructs under vm placement, because `writd` has to start under it to
+    /// reconcile what is already running; the start path then refuses.
     #[error(
-        "broker_placement = vm requires ipv6_mode = ipv4_only_no_guest_ipv6: the broker VM creates \
-         an IPv4-only internal network and the broker host-PF override is IPv4-only"
+        "broker_placement = vm cannot run under ipv6_mode = dual_stack_required: the broker VM \
+         creates an IPv4-only internal network and the broker host-PF override is IPv4-only"
     )]
     VmPlacementRequiresIpv4Only,
     #[error(transparent)]
@@ -404,6 +407,14 @@ pub enum AgentVmDaemonError {
          clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
     )]
     AgentRunUnsupportedForVmBroker,
+    /// The configured `ipv6_mode` names a profile no new session may start
+    /// under. Sessions already running are untouched, and `writd` itself still
+    /// starts, so they can be stopped and reconciled.
+    ///
+    /// The wording lives on [`Ipv6ProfileClosed`], because the runner refuses
+    /// with the same sentence.
+    #[error(transparent)]
+    Ipv6ProfileClosed(#[from] Ipv6ProfileClosed),
     /// `broker_placement = vm` has no IPv6 confinement, so no new session under
     /// it can be started.
     ///
@@ -419,18 +430,6 @@ pub enum AgentVmDaemonError {
     /// session whose confinement is weaker than the one the placement above it
     /// advertises. Sessions already running are untouched; only new ones are
     /// refused, so nothing in flight is stranded.
-    /// `ipv6_mode = ipv4_only_no_guest_ipv6` is recognised for the sessions
-    /// already running under it, and closed to new ones.
-    ///
-    /// `ipv6_mode = ipv4_only_locked_v1` is recognised so that a config naming
-    /// it is understood rather than read as a typo, and refused because it does
-    /// not exist yet.
-    #[error(
-        "ipv6_mode = ipv4_only_locked_v1 is not implemented: the profile is recognised so that a \
-         config naming it is refused for the right reason, but nothing yet stops the workload \
-         reversing the guest IPv6 deny. No session starts under it."
-    )]
-    Ipv6ProfileLockedNotImplemented,
     #[error(
         "broker_placement = vm cannot confine IPv6 between guests: host PF does not see frames \
          switched directly between guests on the shared vmnet, and the broker VM does not yet \

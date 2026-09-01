@@ -22,7 +22,7 @@ use std::path::Path;
 async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
     for (profile, expected) in [(
         ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
-        AgentVmDaemonError::Ipv6ProfileLockedNotImplemented,
+        Ipv6ProfileClosed::NotImplemented,
     )] {
         let dir = tempfile::tempdir().unwrap();
         let args_log = dir.path().join("args.log");
@@ -32,7 +32,8 @@ async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
         let (config, state_store) =
             daemon_config_with_ipv6_profile(dir.path(), &fake_tool, profile);
         let daemon = AgentVmDaemon::new(config);
-        let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+        let audit_db = dir.path().join("audit.db");
+        let state = make_state_with_audit(AuditLog::open(&audit_db).unwrap());
 
         let err = daemon
             .start_session(
@@ -45,9 +46,8 @@ async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
             )
             .await
             .unwrap_err();
-        assert_eq!(
-            std::mem::discriminant(&err),
-            std::mem::discriminant(&expected),
+        assert!(
+            matches!(err, AgentVmDaemonError::Ipv6ProfileClosed(closed) if closed == expected),
             "start_session under {profile:?}: expected {expected:?}, got {err:?}"
         );
 
@@ -67,9 +67,8 @@ async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
                 crate::agent_vm_daemon::AgentRunTags::default(),
             )
             .unwrap_err();
-        assert_eq!(
-            std::mem::discriminant(&run_err),
-            std::mem::discriminant(&expected),
+        assert!(
+            matches!(run_err, AgentVmDaemonError::Ipv6ProfileClosed(closed) if closed == expected),
             "accept_agent_run_session under {profile:?}: got {run_err:?}"
         );
 
@@ -81,19 +80,30 @@ async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
             state_store.load_all().unwrap().is_empty(),
             "{profile:?}: a refused start must persist no session state"
         );
+        // No session was ever named, so none was opened in the audit log. Read
+        // the table directly: the log has no "list every session" accessor, and
+        // a refused start has no id to ask about.
+        let conn = rusqlite::Connection::open(&audit_db).unwrap();
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "{profile:?}: a refused start must open no audit session"
+        );
     }
 }
 
-/// A persisted session is taken down by the mode it was started in, not the
-/// one the daemon is configured with now.
+/// A `writd` configured with a closed profile still stops what is running.
 ///
-/// This is what lets the admitted set change without stranding sessions: an
-/// operator who edits `ipv6_mode` — or a `writd` whose admitted set narrows
-/// across an upgrade — must still be able to stop what is already running. The
-/// record keeps its own mode and the schema version it was written with, and
-/// the stop plan is derived from the record.
+/// This is why a closed profile has to be representable in the runtime config
+/// at all: an operator who edits `ipv6_mode` — or a `writd` whose admitted set
+/// narrows across an upgrade — must still be able to reconcile the sessions
+/// already running. The persisted record carries its own mode, the stop plan is
+/// derived from the record alone (`to_stop_plan` takes no config), and boot-time
+/// reconcile under the closed profile removes the session.
 #[tokio::test]
-async fn a_persisted_session_is_stopped_by_the_mode_it_was_started_in() {
+async fn a_daemon_under_a_closed_profile_still_reconciles_a_running_session() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");
     let env_path_log = dir.path().join("env-path.log");
@@ -102,37 +112,16 @@ async fn a_persisted_session_is_stopped_by_the_mode_it_was_started_in() {
     let (config, state_store) = daemon_config_with_ipv6_profile(
         dir.path(),
         &fake_tool,
-        ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
     );
+    // Started, in an earlier life, under the legacy profile.
     occupy_subnet(&state_store, 252);
     let persisted = state_store.load_all().unwrap().pop().unwrap();
-
-    // Not relabelled, and not migrated to a new schema.
     assert_eq!(
         persisted.ipv6_mode(),
-        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6
+        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+        "the record keeps the mode it was started in"
     );
-
-    // Cleanup is derived from the record, not from what the daemon is
-    // configured with: the same record read under a daemon configured for a
-    // different profile produces the same invocations.
-    let tools = AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo");
-    let under_legacy = persisted.to_stop_plan(tools.clone()).stop_invocations();
-    let (dual_config, dual_store) = daemon_config_with_ipv6_profile(
-        dir.path(),
-        &fake_tool,
-        ConfiguredIpv6Profile::DualStackRequired,
-    );
-    let under_dual_stack = dual_store
-        .load_all()
-        .unwrap()
-        .pop()
-        .expect("the same persisted record")
-        .to_stop_plan(tools)
-        .stop_invocations();
-    assert_eq!(under_legacy, under_dual_stack);
-    assert!(!under_legacy.is_empty(), "a session has material to remove");
-    drop(dual_config);
 
     let session_id = persisted.session_id();
     let audit = Arc::new(AuditLog::open_in_memory().unwrap());
@@ -153,6 +142,10 @@ async fn a_persisted_session_is_stopped_by_the_mode_it_was_started_in() {
     assert_eq!(report.cleaned(), &[session_id]);
     assert!(report.failed().is_empty());
     assert!(state_store.load_all().unwrap().is_empty());
+    assert!(
+        args_log.exists(),
+        "reconcile tears the session down with real invocations"
+    );
 }
 
 /// Starts a VM-placement session past the admission gate.
@@ -390,8 +383,7 @@ fn write_vm_broker_fake_tool(dir: &Path, args_log: &Path, env_log: &Path) -> std
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> {args_log}\n\
          if [ \"$1\" = network ] && [ \"$2\" = inspect ]; then\n\
-         printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1' \\
-           'ipv6Subnet: fd83:b6f2:e57:fc::/64' 'ipv6Gateway: fd83:b6f2:e57:fc::1'; exit 0; fi\n\
+         printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'; exit 0; fi\n\
          if [ \"$1\" = inspect ]; then id=\"${{2#writ-broker-vm-}}\";\n\
          printf '[{{\"status\":{{\"networks\":[{{\"network\":\"writ-agent-net-%s\",\"ipv4Address\":\"192.168.252.7/24\"}}],\"state\":\"running\"}}}}]\\n' \"$id\"; exit 0; fi\n\
          if [ \"$1\" = run ]; then prev=\"\";\n\

@@ -423,25 +423,19 @@ pub enum ConfiguredIpv6Profile {
 }
 
 /// Why no new session may start under a configured profile.
+///
+/// The one place the reason is worded: the daemon and the runner both surface
+/// this error as-is, so an operator reads the same sentence whichever front
+/// door refused them.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum Ipv6ProfileClosed {
     /// The profile is named but not built.
-    #[error("ipv6_mode = ipv4_only_locked_v1 is not implemented")]
+    #[error(
+        "the ipv4_only_locked_v1 IPv6 profile is not implemented: it is recognised so that a \
+         config naming it is refused for the right reason, but nothing yet stops the workload \
+         reversing the guest IPv6 deny. No session starts under it."
+    )]
     NotImplemented,
-}
-
-impl Ipv6IsolationMode {
-    /// The configured profile a session in this mode was started under.
-    ///
-    /// Total, because every active mode was admitted from some profile. Its
-    /// purpose is to ask the admission question of a *plan*, so that the answer
-    /// comes from one place however the plan was built.
-    pub fn as_configured(self) -> ConfiguredIpv6Profile {
-        match self {
-            Self::DualStackRequired => ConfiguredIpv6Profile::DualStackRequired,
-            Self::Ipv4OnlyNoGuestIpv6 => ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
-        }
-    }
 }
 
 impl ConfiguredIpv6Profile {
@@ -1260,9 +1254,10 @@ impl BrokerUrl {
 /// foreign resource can still be removed. The `writ.owner` label stamped on the
 /// created resources is informational (see [`AgentVmOwnerToken`]); it does not
 /// gate cleanup.
+///
 /// There is deliberately no admission check here, because a plan cannot carry a
 /// closed profile: a plan holds an [`Ipv6IsolationMode`], every mode admits (see
-/// `admitting_the_profile_an_active_mode_came_from_returns_that_mode`), and the
+/// `each_configured_profile_says_whether_a_session_may_start_under_it`), and the
 /// only closed profile has no mode to be built from. The compiler enforces what
 /// a runtime check here would only restate. A future closed profile that *does*
 /// get an active mode would break that, and the exhaustive `admit` test is where
@@ -1717,21 +1712,6 @@ mod configured_profile_tests {
                 Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
             ]
         );
-    }
-
-    /// Round-tripping an active mode through the configured set is the
-    /// identity, so admission cannot silently move a session to another mode.
-    ///
-    /// This is what lets a persisted session's mode be re-asked of `admit`
-    /// without the answer drifting from the mode it is already running in.
-    #[test]
-    fn admitting_the_profile_an_active_mode_came_from_returns_that_mode() {
-        for mode in [
-            Ipv6IsolationMode::DualStackRequired,
-            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
-        ] {
-            assert_eq!(mode.as_configured().admit(), Ok(mode), "{mode:?}");
-        }
     }
 
     /// The new spelling parses here, and is refused by a binary that predates

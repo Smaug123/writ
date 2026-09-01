@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use writ::agent_vm_lifecycle::{
     AgentVmResources, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateStore,
     AgentVmSessionStopPlan, AgentVmStartInvocation, AgentVmToolPaths, BrokerPlacement,
-    ConfiguredIpv6Profile, ContainerImage, Ipv6IsolationMode, Ipv6ProfileClosed, ProcessInvocation,
+    ConfiguredIpv6Profile, ContainerImage, Ipv6IsolationMode, ProcessInvocation,
     default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
     stop_agent_vm_session, stop_managed_agent_vm_session,
 };
@@ -328,24 +328,12 @@ fn build_start_plan(
         // under must not acquire one through a second front door.
         ConfiguredIpv6Profile::from(args.ipv6_mode)
             .admit()
-            .map_err(describe_closed_profile)?,
+            .map_err(|closed| closed.to_string())?,
         ContainerImage::new(args.image)?,
         args.guest_command,
         AgentVmResources::new(args.cpus, args.memory_mib)?,
         tools,
     )?)
-}
-
-/// Why a closed profile cannot start a session, in the words an operator at a
-/// terminal needs.
-fn describe_closed_profile(closed: Ipv6ProfileClosed) -> String {
-    match closed {
-        Ipv6ProfileClosed::NotImplemented => {
-            "ipv6-mode = ipv4-only-locked-v1 is not implemented: nothing yet stops the workload \
-             reversing the guest IPv6 deny, so no session starts under it."
-                .to_string()
-        }
-    }
 }
 
 fn build_stop_plan(

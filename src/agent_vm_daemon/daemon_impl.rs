@@ -91,15 +91,7 @@ impl AgentVmDaemon {
     /// admission gates below consult it before a session has an identity, and
     /// the start path consults it again when it needs the mode itself.
     fn admitted_ipv6_mode(&self) -> Result<Ipv6IsolationMode, AgentVmDaemonError> {
-        self.config
-            .lifecycle
-            .ipv6_profile
-            .admit()
-            .map_err(|closed| match closed {
-                Ipv6ProfileClosed::NotImplemented => {
-                    AgentVmDaemonError::Ipv6ProfileLockedNotImplemented
-                }
-            })
+        Ok(self.config.lifecycle.ipv6_profile.admit()?)
     }
 
     pub async fn start_session<S: SecretStore + Send + Sync + 'static>(
@@ -211,11 +203,10 @@ impl AgentVmDaemon {
         tags: AgentRunTags,
     ) -> Result<AcceptedAgentRun, AgentVmDaemonError> {
         // Everything refusable is refused before the run has an identity, so a
-        // refusal names no session that never existed. Placement is asked first:
-        // under vm placement no profile is admitted — a vm config must be
-        // ipv4-only to construct at all — so asking about the profile first
-        // would leave the more specific answer, that this route does not exist
-        // on the v1 broker VM, permanently unreachable.
+        // refusal names no session that never existed. Placement is asked first,
+        // because it is the more specific answer: a vm config under a closed
+        // profile would otherwise be told about the profile, when this route
+        // does not exist on the v1 broker VM under any profile.
         if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
             return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
         }
