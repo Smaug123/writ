@@ -118,8 +118,10 @@ The helper, not the daemon, resolves the interface: it runs the fixed
 gateway, requires that bridge to have the expected number of `vmenetN` members
 (one for host placement, the agent's; two for vm placement, the broker's and
 the agent's), retries while they attach, and fails closed if no single such
-bridge exists or an unrelated interface shares the gateway. It then re-loads
-the session anchor with, on the bridge and each member:
+bridge exists. An unrelated interface that happens to share the gateway (an
+`en0` or `utun` on an overlapping LAN) is rejected as a candidate rather than
+matched, so it can neither be selected nor block the real bridge. It then
+re-loads the session anchor with, on the bridge and each member:
 
 ```pf
 block return in quick on <iface> inet6 all label "writ deny agent v6 iface"
@@ -246,9 +248,13 @@ daemon does not know, does not admit `ipv4_only_locked_v1`.
 The host observes the pre-release record through bounded `container logs` and
 releases PID 1 with `container kill --signal USR1`. This preserves the no-host-
 mount invariant and avoids creating a privileged `container exec` process after
-untrusted code starts. Bootstrap success and bounded failure records use the
-same host-side log channel, but guest-written post-release records remain
-untrusted diagnostics.
+untrusted code starts. That rule has consequences for the existing
+post-release interactions, which today are `container exec` calls: the
+broker-ready marker is subsumed by the release signal (the host does not send
+`USR1` until its broker is ready), and workspace-bootstrap success and bounded
+failure records use the same host-side log channel as `security-ready`. After
+release the host never `exec`s into a locked session; guest-written
+post-release records remain untrusted diagnostics.
 
 Layer 2's correctness is checkable without any macOS proof: run the initializer
 in a Linux container in CI and read `/proc/self/status` of the released process
@@ -391,11 +397,18 @@ to `admit` with an already-tested refusal path.
 
 When `locked_v1` admits, admission is conditional on host-gathered runtime
 evidence, not on the spelling alone: the helper's protocol probe reports v2,
-the image's isolation-ABI label is v1, and the Apple `container` CLI version is
-one the proof has been run against (today `1.0.0`, build `ee848e3`). Those are
-inputs to `admit`, gathered at start, so that a plan can only ever be built
-from an admitted mode; there is no separate gate type and no bypass on the plan
-for tests, because a test that bypasses the guard is not testing it.
+the image's isolation-ABI label is v1, and the platform is one the proof has
+been run against. "Platform" is two identifiers, because PF and vmnet belong
+to macOS while the guest kernel ships with the CLI, and macOS updates change
+vmnet behaviour without touching the CLI version (this subsystem's journal
+records RA behaviour changing across an OS update): the Apple `container` CLI
+version line (today `1.0.0`, build `ee848e3`) and the macOS build
+(`sw_vers` BuildVersion, today `25G72`). Both are exact-match pins against a
+list the proof maintains, so a host update closes the profile until the proof
+is re-run there. Those are inputs to `admit`, gathered at start, so that a
+plan can only ever be built from an admitted mode; there is no separate gate
+type and no bypass on the plan for tests, because a test that bypasses the
+guard is not testing it.
 
 The locked lifecycle writes state schema v3 containing interface identity,
 firewall phase, isolation profile and ABI, placement, and cleanup facts. A v2

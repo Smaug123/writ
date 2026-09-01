@@ -208,34 +208,41 @@ is infrastructure for Stage E3 and is inert until then.
 
 ---
 
-## Stage D: `ipv4_only_locked_v1` admits on host-gathered evidence
+## Stage D: Locked-profile admission evidence, inert
 
 **Dependencies:** Stages B3 and C2.
 
 **Implements:** Persistence and compatibility, "admission is conditional on
-host-gathered runtime evidence".
+host-gathered runtime evidence", as infrastructure only. **The profile stays
+closed at the end of this stage.** Opening it before the locked start path
+exists (E2) would route a `locked_v1` session down the legacy root prelaunch,
+which is the one thing the profile promises not to do.
 
-`ConfiguredIpv6Profile::admit` stays the one gate. It grows a second form,
-`admit_locked(evidence: LockedV1RuntimeEvidence)`, where the evidence is a
-struct of parsed, host-observed facts: the helper's protocol probe (C1,
-reporting v2 only once C2 including its policy file has landed), the image's
-ABI label read via bounded `container inspect` (B3), and the Apple `container`
-CLI version line. The daemon gathers these at each entry point before a
-session id exists, exactly where the current refusal sits.
-`Ipv6IsolationMode` gains `Ipv4OnlyLockedV1`, because a session can now be
-running in it. Salvage the three parsers from the stage-1 branch; do not
-salvage `decide_agent_vm_start`, and do not add a bypass field to the plan.
+Add `LockedV1RuntimeEvidence`, a struct of parsed, host-observed facts: the
+helper's protocol probe (C1, reporting v2 only once C2 including its policy
+file has landed), the image's ABI label read via bounded `container inspect`
+(B3), the Apple `container` CLI version line, and the macOS build from
+`sw_vers`. Add `ConfiguredIpv6Profile::admit_locked(evidence)`, the pure
+decision, and the daemon-side gatherer that produces the evidence by running
+the probes with bounded output. `ConfiguredIpv6Profile::admit` is unchanged
+and still refuses `Ipv4OnlyLockedV1`; nothing calls `admit_locked` yet.
+`Ipv6IsolationMode` does *not* yet gain a variant: no session can run in the
+mode until E2, and the state store must not be able to say one does. Salvage
+the three parsers from the stage-1 branch; do not salvage
+`decide_agent_vm_start`, and do not add a bypass field to the plan.
 
 **Correctness oracle:**
-- Exhaustive: every combination of {helper v1, v2, unparseable} × {label
-  absent, 0, 1, unknown} × {CLI pinned, other, unparseable} is tested, and only
-  the one admitting combination yields a mode; each refusal names the wrong
+- Exhaustive over `admit_locked`: every combination of {helper v1, v2,
+  unparseable} × {label absent, 0, 1, unknown} × {CLI pinned, other,
+  unparseable} × {macOS build pinned, other, unparseable} is tested, and only
+  the one admitting combination yields `Ok`; each refusal names the wrong
   fact.
-- The existing "refuses new sessions and creates nothing" test runs for every
-  refusing combination: no subprocess, no audit row, no state record.
-- Stop and reconcile of a persisted `Ipv4OnlyLockedV1` session need no
-  evidence: the persisted-session tests run under a daemon whose evidence
-  gathering is scripted to fail.
+- The gatherer with a fake tool: each probe's output is bounded and a probe
+  that hangs, over-produces, or exits non-zero yields the corresponding
+  "unparseable" evidence, never a panic or an admit.
+- The existing "closed profile refuses new sessions and creates nothing" test
+  still passes unchanged: `admit` did not change, so `locked_v1` is refused
+  before any probe runs.
 
 ---
 
@@ -262,26 +269,61 @@ firewall phase. The v2 reader produces only a stop plan.
 
 ---
 
-## Stage E2: Host-placement locked start
+## Stage E2: Host-placement locked start, and the profile opens
 
-**Dependencies:** Stages E1, B3, C2.
+**Dependencies:** Stages D, E1.
 
 **Implements:** Layer 2 host side: the locked `StartVm` argv, waiting for
 `security-ready` via bounded `container logs`, release via
-`container kill --signal USR1`; Layer 1 with C2's readback in the deny step.
+`container kill --signal USR1`; Layer 1 with C2's readback in the deny step;
+and the migration of every post-release host-to-guest interaction off
+`container exec`.
+
+The last item is the one an earlier draft of this plan missed. Today the
+daemon releases the guest and then runs `container exec` to write the
+broker-ready marker and to poll the workspace-bootstrap result files
+(`release_and_wait_for_workspace_bootstrap_with_timeout`). Under the locked
+profile the container's initial process holds temporary capabilities, and a
+post-release `exec` is a fresh process in that container with whatever
+authority the runtime grants it, which contradicts the no-post-release-exec
+guarantee layer 2 exists to give. So: broker-ready becomes part of the release
+signal (the daemon does not send `USR1` until the broker is ready, so the
+marker has nothing left to say), and the bootstrap outcome is read from the
+same bounded `container logs` channel as `security-ready`, as versioned
+records with the failure bounded exactly as today's failure file is. After
+`USR1`, the daemon runs no `container exec` against a locked session, and the
+helper for the mode that still needs one (`Ipv4OnlyNoGuestIpv6`) is the only
+caller left.
+
+With that in place, `Ipv6IsolationMode` gains `Ipv4OnlyLockedV1`, the state
+schema gains its mode spelling, and `admit` calls D's `admit_locked` for the
+locked profile: this is the stage at which the profile opens, for host
+placement only (vm placement's refusal stays until F3).
 
 Nothing here is a proof. It is the daemon doing the locked sequence under the
 fake tool, with every step's failure leaving the workload unreleased.
 
 **Correctness oracle:**
 - Fake-tool daemon tests: the recorded `container run` argv contains exactly
-  the B1 profile; `USR1` is sent iff the ready record was observed and the deny
-  readback succeeded; a missing, malformed, duplicated, or over-long ready
-  record, a `logs` timeout, a helper readback failure, or a `kill` failure each
-  leave the session in a non-released phase and trigger cleanup.
+  the B1 profile; `USR1` is sent iff the ready record was observed, the broker
+  is ready, and the deny readback succeeded; a missing, malformed, duplicated,
+  or over-long ready record, a `logs` timeout, a helper readback failure, or a
+  `kill` failure each leave the session in a non-released phase and trigger
+  cleanup.
+- The fake tool's invocation log for a locked session contains no `exec` after
+  the `kill --signal USR1` line, asserted by a test that runs the full
+  start-and-bootstrap sequence; the legacy profile's sequence is unchanged and
+  its existing tests still pass.
 - Property over fuzzed `container logs` output: only a line that parses as
-  the versioned ready record releases; anything the guest could print after
-  release (the record again, a forged success line) is ignored.
+  the versioned ready record releases, and only a line that parses as the
+  versioned bootstrap record completes bootstrap; anything the guest could
+  print after release (either record again, a forged success line) is ignored.
+- `admit` now yields `Ipv4OnlyLockedV1` under exactly D's admitting evidence
+  and refuses otherwise; the "creates nothing" test runs for every refusing
+  combination: no subprocess beyond the probes, no audit row, no state record.
+- Stop and reconcile of a persisted `Ipv4OnlyLockedV1` session need no
+  evidence: the persisted-session tests run under a daemon whose evidence
+  gathering is scripted to fail.
 
 ---
 
