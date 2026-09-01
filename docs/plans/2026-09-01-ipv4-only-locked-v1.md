@@ -198,7 +198,7 @@ default, so an out-of-subnet source has nothing to fall through to. Because
 this changes the anchor the legacy profile installs, it lands behind the
 existing `--deny-guest-ipv6` step (the interfaces are known there) and the
 subnet-scoped rules stay in front of it as today; the property that the two
-placements share one renderer (F1) applies here first.
+placements will share one renderer applies here first.
 
 **Correctness oracle:**
 - Property over generated session facts and interface sets: the rendered
@@ -429,128 +429,44 @@ setuid, file capability, child process); do not build a schedule language.
 
 ---
 
-## Stage F1: Quarantine and atomic replacement in the helper
+## Beyond E3: what waits on the proof
 
-**Dependencies:** Stage C2. May proceed alongside D and E.
+Nothing past E3 is planned as a stage yet, on purpose. The rest of the
+design — vm-placement quarantine and atomic replacement in the helper, the
+broker VM's internal firewall in its ready document, the vm-placement locked
+start, closing the two unlocked profiles, and soak, upgrade, and rollback —
+depends on facts about this platform that nobody has measured, and a stage
+written before the measurement gets an oracle that cannot be satisfied or,
+worse, one that can be satisfied by the wrong implementation. Four rounds of
+review on an earlier draft of this plan found a new such contradiction every
+round; each was real, and each was in a stage past this line.
 
-**Implements:** Layer 1, "Quarantine and replacement".
+E3's proof is where the answers get recorded, as pinned facts about the
+(CLI, macOS build) it ran on. The questions, and what each one decides:
 
-Two operations. `quarantine` resolves the bridge carrying the session gateway
-with at least one member (the broker VM's; the bridge does not exist before a
-VM runs on the network), loads the bridge-scoped IPv6 deny plus an IPv4
-deny-all for the session subnet, and reads it back. `finalize` replaces that
-with the final ruleset in one `pfctl -f` load, verified by readback, and on a
-readback mismatch reloads quarantine and reads that back too. Never a flush.
-Both return the anchor's state as `Quarantined`, `Final`, or `Unknown`.
+1. **When does the host bridge exist, and when do members attach?** The
+   helper derives interfaces from the gateway, so an interface-scoped
+   quarantine cannot be installed before there is an interface. If the bridge
+   appears only with the first VM, vm placement's sequence is: broker first,
+   then quarantine, then agent. If it can be created earlier, the sequence
+   simplifies.
+2. **Does host PF see frames switched between two guests on the shared
+   bridge?** Layer 3 exists because the design *assumes* it may not. If PF
+   does see them, the broker VM's own firewall is defence in depth rather
+   than the only boundary, and its readback need not gate readiness.
+3. **Does PF see vmnet's router advertisements, and in which direction?**
+   Decides whether the IPv6 deny needs an `out` half, and whether a guest can
+   even acquire an address to attack from.
+4. **Does vmnet forward a frame whose IPv4 source is outside the subnet?**
+   Decides whether the source-scoped IPv4 rules are a live gap or a
+   theoretical one, and so how urgent C2b is for the legacy profile.
+5. **What does `pfctl -sr` readback look like for a loaded session anchor on
+   this platform** (rule order, label rendering, counter formatting)? C2 and
+   C3 are written against the documented format; the proof confirms it.
 
-The reported state always comes from a readback, never from a `pfctl` exit
-status: a failed or timed-out load does not prove the kernel did not commit
-it. After any load outcome the helper reads the anchor back and reports what
-it saw; `Unknown` means the readback itself failed or matched neither ruleset.
-
-**Correctness oracle:**
-- With a scripted fake `pfctl`: a failed syntax check (no load attempted)
-  reports `Quarantined` after a readback confirming it; a failed, killed, or
-  timed-out `finalize` load is followed by a readback and reports whichever
-  ruleset that readback matches, re-quarantining first if it matched neither;
-  a readback mismatch after a successful load reports `Quarantined` iff the
-  re-quarantine's readback matches, and `Unknown` otherwise; a property over
-  failure position and over the fake's post-failure anchor contents asserts
-  that every result is one of the three states, that `Final` is reported only
-  when the final readback matched exactly, and that no result is reported
-  without a readback having run after the last load attempt.
-- `quarantine` before any VM is on the network fails closed with the
-  no-bridge error, and `finalize` without a prior quarantine readback is
-  refused.
-- Property: `finalize` output equals the host-placement ruleset for the same
-  session facts plus the broker-VM endpoint, so the two placements share one
-  rule renderer.
-
----
-
-## Stage F2: Broker-VM internal firewall in the ready document
-
-**Dependencies:** Stage F1.
-
-**Implements:** Layer 3.
-
-The broker VM installs its internal-interface rules, reads them back, records
-the readback in `BrokerReadyDoc`, and drops `CAP_NET_ADMIN` before executing
-`writd`. The daemon refuses a ready document without a matching readback.
-
-**Correctness oracle:**
-- Property over fuzzed ready documents: only a document whose readback equals
-  the rendered internal ruleset for the session subnet and port is accepted.
-- Broker entrypoint test in a Linux container: after readiness, the entrypoint
-  process has no `CAP_NET_ADMIN`, and the rules are present.
-
----
-
-## Stage F3: VM-placement locked start
-
-**Dependencies:** Stages E2, F1, F2.
-
-**Implements:** Lifecycle model for vm placement; lifts
-`Ipv6ConfinementUnavailableForVmBroker`.
-
-Split network creation from broker launch: create network, start broker,
-`quarantine` (the bridge now exists), wait for the ready document, discover
-the broker IPv4, `finalize`, start the agent VM (its initializer waits), the
-two-member interface deny with readback, and only then the E2 release
-(`security-ready` observed, `USR1`). The deny with both members present must
-precede `USR1`; the finalized anchor was resolved with one member.
-
-**Correctness oracle:**
-- Fake-tool daemon tests: the order of helper and `container` invocations is
-  exactly the design's; the agent VM is started only after a helper result of
-  `Final`; `kill --signal USR1` appears only after a two-member deny readback
-  succeeded; on `Quarantined` or `Unknown` the daemon stops the broker, proves
-  it absent, and removes the anchor, in that order; the E1 state-machine
-  property runs with the vm phases present.
-- The vm-placement refusal is removed for the locked profile only; the legacy
-  profile under vm placement is still refused, with the existing test. The
-  vm-placement pin list is separate from host placement's and ships empty; F4
-  populates it, so vm placement admits on no real host until its proof has
-  passed there.
-
----
-
-## Stage F4: Proof obligation 3
-
-**Dependencies:** Stages E3 and F3.
-
-**Implements:** Proof obligations 3.
-
-Extend the E3 proof with a forbidden listener on the broker VM's internal
-interface, and a second session, in both teardown orders.
-
-**Correctness oracle:** As E3, plus: the broker listener accepts nothing; each
-session's positive control reaches only its own broker; neither session's
-attack reaches the other; both teardown orders leave both anchors empty and
-both networks absent.
-
----
-
-## Stage G: Soak, closing the legacy profile, and release
-
-**Dependencies:** Stage F4.
-
-**Implements:** Proof obligation 4; Persistence and compatibility, upgrade and
-rollback; closing `ipv4_only_no_guest_ipv6` and `dual_stack_required` to new
-sessions.
-
-**Correctness oracle:**
-- A soak driver runs start, attack, stop repeatedly and restarts `writd` at
-  every persisted phase; no run is inconclusive; sleep/wake, `container`
-  restart, and interface churn are each exercised once with the E3 evidence
-  intact.
-- Closing the two unlocked profiles is the change to `admit`: after it, only
-  `Ipv4OnlyLockedV1` yields a mode. `DualStackRequired` is closed alongside
-  the legacy profile, not merely left unstartable: it still runs the root
-  prelaunch path, so on any platform where its IPv6 validation passed it would
-  restore network-management authority, against invariant 9. The existing
-  refusal and reconcile tests run against both, in place of
-  `Ipv4OnlyLockedV1`.
-- Upgrade from a legacy daemon with a live session: the new daemon reconciles
-  it as cleanup-only; rollback with a locked session live: the old daemon
-  refuses to start on the spelling, as #397's test already asserts.
+When E3 has recorded those, the next plan revision adds stages for vm
+placement with oracles that reference the recorded facts, and a stage that
+closes `ipv4_only_no_guest_ipv6` and `dual_stack_required` to new sessions
+(both still run the root prelaunch; invariant 9 admits neither once the
+handoff exists). Until then vm placement keeps refusing new sessions, the
+unlocked profiles keep admitting, and the parked harness branch stays parked.

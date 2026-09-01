@@ -1,6 +1,7 @@
 # IPv4-only agent-VM network confinement
 
-Status: **layer 1 shipped; layers 2 and 3 designed, not built.** This document
+Status: **layer 1 shipped; layer 2 designed, not built; layer 3 and vm
+placement provisional.** This document
 is the design record behind the `ipv4_only_locked_v1` IPv6 profile, which
 `writd` recognises and refuses today (#397) and will admit once every layer
 below is in force. The implementation plan is
@@ -182,40 +183,27 @@ not rediscovered. None reopens the bypass #288 closed.
   mean a root-resident attachment mechanism, a deliberately host-wide deny, or
   keeping the profile closed.
 
-### Quarantine and replacement (vm placement, not built)
+### VM placement (provisional)
 
 Host placement installs the final anchor before the agent VM's workload runs,
-as above. VM placement creates the shared network before the broker's IPv4
-address is known, and on this platform the host `bridgeN` and its `vmenetN`
-members exist only once a VM is running on the network. An interface-scoped
-rule therefore cannot precede the broker VM; the helper derives interfaces
-from the gateway and would find nothing.
+as above. VM placement is harder in two ways that are facts about the
+platform, not choices: the shared network exists before the broker's IPv4
+address is known, and the host `bridgeN` and its `vmenetN` members appear
+only once a VM is running on the network, so an interface-scoped rule cannot
+precede the first VM.
 
-The sequence is instead: create the network; start the trusted broker VM,
-which brings the bridge up with one member; install the **quarantine** anchor
-(the bridge-scoped IPv6 deny plus an IPv4 deny-all from the session subnet)
-and read it back; discover the broker's IPv4 address from its ready document;
-**finalize** by atomically replacing the anchor with the final ruleset, verified
-by readback; only then start the agent VM, whose initializer waits for the
-release signal; then re-run the interface deny with both members expected and
-read it back; and only after that readback send `USR1`. The final ruleset was
-resolved while the bridge had one member, so the two-member deny is not
-optional tidying: it is the last step before release, exactly where host
-placement runs it today. The agent VM never exists on a bridge whose anchor is
-not in a read-back known state, and the only guest code that runs before the
-two-member readback is the broker VM's and the initializer's, both trusted.
-
-Finalize failure has a defined recovery: `pfctl -f` replaces the anchor, so a
-readback mismatch after a successful load means quarantine is already gone,
-and a load that failed or timed out proves nothing about whether the kernel
-committed it. The helper therefore reads the anchor back after every load
-outcome, reloads quarantine if the readback matches neither ruleset, and
-reads that back. Its result names the anchor's state as one of `Quarantined`,
-`Final`, or `Unknown`, always from a readback and never from an exit status;
-the daemon starts the agent only on `Final`, and on anything else tears the
-session down (broker VM stopped and proven absent, then the anchor removed).
-The invariant is not "quarantine survives every failure" but "the agent VM is
-never started unless the anchor is read back as final".
+What is fixed is the invariant, not the sequence: **the agent VM's workload
+is never released unless the session anchor has been read back as the final
+ruleset with both members present, immediately before the release signal**,
+and any state the helper cannot read back as known forbids release and tears
+the session down. The sequence that satisfies it (broker first, then a
+quarantine anchor on the one-member bridge, then discovery of the broker's
+IPv4, then atomic replacement, then the agent VM, then the two-member deny)
+is the likely shape, but it is written down in the plan's "Beyond E3"
+section as questions rather than here as steps, because whether PF even sees
+guest-to-guest frames on that bridge, and when the bridge appears, are things
+the host-placement proof has to measure first. Until then vm placement
+refuses new sessions (`Ipv6ConfinementUnavailableForVmBroker`, #396).
 
 ## Enforcement layer 2: one-way guest handoff (not built)
 
@@ -287,11 +275,13 @@ and no non-loopback IPv6 state; scan the image for setuid bits and file
 capabilities. Those facts are observed *before* the workload starts, by code
 that is still trusted, which is the whole point of the handoff.
 
-## Enforcement layer 3: broker-VM ingress (not built)
+## Enforcement layer 3: broker-VM ingress (provisional)
 
 Host PF may not see frames switched directly between two guests on the shared
-vmnet. The trusted broker VM therefore installs its own internal-interface
-firewall before publishing readiness:
+vmnet. That is an assumption, and the first thing the vertical proof measures
+for vm placement; if it is false, this layer is defence in depth and its
+readback need not gate readiness. If it is true, the trusted broker VM must
+install its own internal-interface firewall before publishing readiness:
 
 - deny all IPv6 input and forwarding on the internal interface;
 - allow only IPv4 TCP from the session subnet to the broker port;
@@ -368,7 +358,9 @@ Claimed
 ```
 
 Not every placement performs every effect, but it uses the same ordered state
-model. `ReleaseAttempted` is constructible only from `GuestSecurityLocked` and
+model; the two vm-only phases, `QuarantineInstalled` and `BrokerReady`, are
+provisional on the questions above and host placement never enters them.
+`ReleaseAttempted` is constructible only from `GuestSecurityLocked` and
 `FinalFirewallInstalled` (plus `BrokerReady` with a final internal firewall for
 vm placement), and it is persisted *before* `container kill --signal USR1` is
 run. The signal is an effect whose outcome the daemon cannot always learn: a
@@ -402,8 +394,8 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
 - pools, allowed ports, and admitted interface policy come from a fixed,
   root-owned, non-symlink, non-group/world-writable policy file (not shipped;
   today they are validated CLI arguments);
-- it syntax-checks, atomically loads, parses exact readback, re-resolves
-  after the load, and reports the anchor's state (not shipped);
+- it syntax-checks, atomically loads, parses exact readback, and re-resolves
+  after the load (not shipped);
 - it answers `protocol-version` with one bounded JSON object, and returns
   bounded versioned JSON describing anchor, interfaces, and firewall phase (not
   shipped; the daemon's `ipv4_only_locked_v1` admission depends on the probe).
@@ -507,13 +499,11 @@ diagnostics. The obligations, in the order the plan delivers them:
    positive control still reaching its listener. The guest's diagnostics show
    each attack failing at the syscall, and the host verdict is unchanged with
    those diagnostics deleted.
-3. **VM placement, layer 3**: broker readiness implies a read-back internal
-   firewall; the agent reaches only its IPv4 broker; a forbidden listener on
-   the broker's internal interface accepts nothing; two sessions cannot reach
-   each other; final-PF failure leaves quarantine and never starts the agent.
-4. **Soak**: repeated start, attack, stop; restart at every persisted phase;
-   both two-session teardown orders; sleep and wake; Apple `container`
-   restart; interface churn; upgrade and rollback.
+3. **Everything past host placement** — vm placement, layer 3, two-session
+   isolation, soak, upgrade and rollback — is stated as obligations only once
+   the proof above has recorded the platform facts listed in the plan's
+   "Beyond E3" section. Writing those obligations now would be specifying an
+   oracle for machinery whose shape those facts decide.
 
 Pure tests cover packet classification, interface resolution, lifecycle phase
 ordering, cleanup reconstruction, and every injected failure position. Property
