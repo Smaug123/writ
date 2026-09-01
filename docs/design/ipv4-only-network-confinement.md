@@ -347,15 +347,21 @@ Start is represented by explicit phases:
 
 ```text
 Claimed
--> NetworkValidated
--> QuarantineInstalled
--> BrokerReady
--> FinalFirewallInstalled
--> AgentVmStartedQuarantined
--> GuestSecurityLocked
--> ReleaseAttempted
+-> NetworkValidated            (bootstrap anchor loaded; no interface yet)
+-> QuarantineInstalled         (vm placement only, provisional)
+-> BrokerReady                 (vm placement only, provisional)
+-> AgentVmStarted              (initializer running, holding for release)
+-> FinalFirewallInstalled      (interface-scoped anchor, members attached,
+                                read back)
+-> GuestSecurityLocked         (security-ready observed)
+-> ReleaseAttempted            (persisted before the signal is sent)
 -> WorkloadReleased
 ```
+
+The interface firewall becomes final *after* the agent VM starts, because
+that is when its `vmenet` member exists; this is the shipped order
+(`StartVm` then `InstallGuestIpv6Deny`), and between the two the VM runs only
+trusted code under the bootstrap anchor.
 
 Not every placement performs every effect, but it uses the same ordered state
 model; the two vm-only phases, `QuarantineInstalled` and `BrokerReady`, are
@@ -414,13 +420,15 @@ value, which is what makes rolling back fail closed rather than quietly running
 under another profile.
 
 The legacy `ipv4_only_no_guest_ipv6` profile **is not refused** and will not
-be while it is the strongest confinement available. Once `locked_v1` admits, the
-legacy profile's remaining weakness is that its guest keeps network authority
-(layer 2), and at that point closing it to new sessions is a small change to
-`admit` with an already-tested refusal path. `dual_stack_required` closes with
-it: it does not start on this platform today, but it too runs the root
-prelaunch, and invariant 9 says no profile may keep the guest's network
-authority once the handoff exists.
+be while it is the strongest confinement available. Once `locked_v1` admits on
+a host, the legacy profile's remaining weakness there is that its guest keeps
+network authority (layer 2), and invariant 9 says no profile may keep it once
+the handoff exists. So the two decisions are one decision: on a host whose
+evidence admits `locked_v1`, `ipv4_only_no_guest_ipv6` and
+`dual_stack_required` refuse; on any other host they admit as today. Per host,
+not globally, so that a host without a proof record is never left with
+nothing startable. `dual_stack_required` is included even though it does not
+start on this platform, because it too runs the root prelaunch.
 
 When `locked_v1` admits, admission is conditional on host-gathered runtime
 evidence, not on the spelling alone: the helper's protocol probe reports v2,
@@ -430,7 +438,13 @@ to macOS while the guest kernel ships with the CLI, and macOS updates change
 vmnet behaviour without touching the CLI version (this subsystem's journal
 records RA behaviour changing across an OS update): the Apple `container` CLI
 version line (today `1.0.0`, build `ee848e3`) and the macOS build
-(`sw_vers` BuildVersion, today `25G72`). Both are exact-match pins against a
+(`sw_vers` BuildVersion, today `25G72`). A third fact is host-local and no
+pin captures it: the effective placement of the `writ/session/*` anchor in
+the main ruleset. A `pass in quick` in `/etc/pf.conf` ahead of that anchor
+means no session rule is ever consulted, while every child-anchor readback
+still succeeds. The helper therefore reads the main ruleset back and reports
+whether the anchor is present and precedes any `quick` pass, and that report
+is admission evidence too. Both are exact-match pins against a
 list the proof maintains, so a host update closes the profile until the proof
 is re-run there. The list starts empty and a platform enters it only in the
 same change that records the proof passing on it, so the code that can admit

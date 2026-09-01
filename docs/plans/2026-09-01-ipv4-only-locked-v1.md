@@ -94,8 +94,11 @@ profile and its tests from `codex/ipv4-lock-stage-1-gate`
   asserts the record is unchanged.
 - The wait is armed before the record is published: the integration test
   sends `USR1` the instant it reads the record, repeatedly across many runs,
-  and the probe command runs every time; a variant that sends `USR1` before
-  the record is read observes no release and no termination.
+  and the probe command runs every time, never a terminated PID 1. (A signal
+  that arrives after arming and before the host reads the record is simply
+  pending and released next; the guest cannot observe when the host read the
+  line, so ordering on the host side is the trusted host's job, and it sends
+  only after reading.)
 
 ---
 
@@ -108,6 +111,9 @@ profile and its tests from `codex/ipv4-lock-stage-1-gate`
 
 The Nix image sets the initializer as PID 1, fixes UID/GID 1000 with a
 writable home, workspace, and Nix store owned by it, and stamps the label.
+The label is self-asserted, so it is a *compatibility* signal (an old image
+is refused for the right reason), not an identity: any image can carry it.
+Identity is the image's resolved digest, which Stage D reads and E3 pins.
 Salvage the label constant, `parse_image_inspect_isolation_abi_v1`, and the
 bounded `container inspect` reader from the stage-1 branch; the host side
 lands in Stage D.
@@ -162,6 +168,13 @@ against the arguments today. Without this, "locked_v1 admits on protocol v2"
 would open the profile while the helper still took its own bounds from the
 unprivileged caller.
 
+A `preflight` command reads the *main* ruleset (`pfctl -sr` without an
+anchor) and reports whether `anchor "writ/session/*"` is present and no
+`pass ... quick` rule precedes it; the proof script's existing anchor check
+moves into it. This is host-local state no version pin captures, and a
+matching `pass in quick` ahead of the anchor would let every child-anchor
+readback succeed while no session rule is ever consulted.
+
 `install` and `--deny-guest-ipv6` then run: precheck, resolve, `pfctl -n`
 syntax check, load, `pfctl -sr` readback parsed to the ruleset type and
 compared for equality with the intended one, resolve again and compare
@@ -170,6 +183,9 @@ so the helper's result says which phase failed and the daemon treats the
 session as unreleasable (it is already fail-closed on any helper error).
 
 **Correctness oracle:**
+- `preflight` over generated main rulesets: reports present-and-first iff
+  the anchor line exists and every earlier rule is not a `quick` pass; a
+  `quick` pass after the anchor, or a non-quick pass before it, is accepted.
 - Policy loading is a library function taking a path: a temp-dir test covers
   each refusal (missing, symlink, wrong owner, group-writable, world-writable,
   unparseable) and the one acceptance; a property asserts a session fact
@@ -196,15 +212,20 @@ The renderer scopes the IPv4 allow and deny to the resolved bridge and
 members, with `block return in quick on <iface> inet from any to any` as the
 default, so an out-of-subnet source has nothing to fall through to. Because
 this changes the anchor the legacy profile installs, it lands behind the
-existing `--deny-guest-ipv6` step (the interfaces are known there) and the
-subnet-scoped rules stay in front of it as today; the property that the two
-placements will share one renderer applies here first.
+existing `--deny-guest-ipv6` step (the interfaces are known there). The
+subnet-scoped rules that `InstallFirewall` loads before the VM exists are a
+bootstrap anchor only: the post-attach load *replaces* them, because a
+`quick` rule matched on the session `/24` would otherwise fire first for a
+frame with that source arriving on an unrelated interface, and the anchor
+would be deciding traffic it has no business deciding. The property that the
+two placements will share one renderer applies here first.
 
 **Correctness oracle:**
-- Property over generated session facts and interface sets: the rendered
-  anchor's rule list, in order, is the subnet-scoped allow and deny, then per
-  interface an IPv4 allow for the broker tuple, an IPv4 default deny, and the
-  IPv6 deny; render → parse is the identity.
+- Property over generated session facts and interface sets: the post-attach
+  anchor's rule list, in order, is per interface an IPv4 allow for the broker
+  tuple, an IPv4 default deny, and the IPv6 deny, and contains no rule
+  without an `on <iface>`; the bootstrap anchor is the subnet-scoped pair as
+  today; render → parse is the identity for both.
 - A pure packet-decision model over the rendered rules: for every generated
   IPv4 packet on a resolved interface, only the intended broker tuple passes,
   regardless of source; on an unrelated interface the anchor decides nothing.
@@ -252,11 +273,16 @@ which is the one thing the profile promises not to do.
 
 Add `LockedV1RuntimeEvidence`, a struct of parsed, host-observed facts: the
 helper's protocol probe (C1, reporting v2 only once C2 including its policy
-file has landed), the image's ABI label read via bounded `container inspect`
-(B3), the Apple `container` CLI version line, and the macOS build from
-`sw_vers`. Add `ConfiguredIpv6Profile::admit_locked(evidence)`, the pure
-decision, and the daemon-side gatherer that produces the evidence by running
-the probes with bounded output. `ConfiguredIpv6Profile::admit` is unchanged
+file has landed), the helper's `preflight` report on the main ruleset (C2),
+the image's ABI label *and resolved manifest digest* read via bounded
+`container inspect` (B3), the Apple `container` CLI version line, and the
+macOS build from `sw_vers`. The digest is what `container run` is later
+given, never the tag, so the image inspected is the image started. Add
+`ConfiguredIpv6Profile::admit_locked(evidence, allowlist)`, the pure decision
+over an explicit allowlist of proven (CLI, macOS build, image digest)
+records, and the daemon-side gatherer that produces the evidence by running
+the probes with bounded output. Production passes the shipped allowlist,
+empty until E3; tests pass synthetic ones. `ConfiguredIpv6Profile::admit` is unchanged
 and still refuses `Ipv4OnlyLockedV1`; nothing calls `admit_locked` yet.
 `Ipv6IsolationMode` does *not* yet gain a variant: no session can run in the
 mode until E2, and the state store must not be able to say one does. Salvage
@@ -264,11 +290,13 @@ the three parsers from the stage-1 branch; do not salvage
 `decide_agent_vm_start`, and do not add a bypass field to the plan.
 
 **Correctness oracle:**
-- Exhaustive over `admit_locked`: every combination of {helper v1, v2,
-  unparseable} × {label absent, 0, 1, unknown} × {CLI pinned, other,
-  unparseable} × {macOS build pinned, other, unparseable} is tested, and only
-  the one admitting combination yields `Ok`; each refusal names the wrong
-  fact.
+- Exhaustive over `admit_locked` with a synthetic allowlist: every
+  combination of {helper v1, v2, unparseable} × {preflight ok, anchor absent,
+  quick pass ahead} × {label absent, 0, 1, unknown} × {digest listed, other,
+  unparseable} × {CLI listed, other, unparseable} × {macOS build listed,
+  other, unparseable} is tested, and only the one admitting combination
+  yields `Ok`; each refusal names the wrong fact. With the empty production
+  allowlist, every combination refuses.
 - The gatherer with a fake tool: each probe's output is bounded and a probe
   that hangs, over-produces, or exits non-zero yields the corresponding
   "unparseable" evidence, never a panic or an admit.
@@ -347,8 +375,9 @@ With that in place, `Ipv6IsolationMode` gains `Ipv4OnlyLockedV1`, the state
 schema gains its mode spelling, and `admit` calls D's `admit_locked` for the
 locked profile. The host-placement pin list ships **empty**, so at the end of
 this stage the profile still admits on no real host; E3 adds the first (CLI,
-macOS build) pair in the same change that records its proof passing. That is
-what keeps a stage landing on its own from exposing an unproven path. Both
+macOS build, image digest) record in the same change that records its proof
+passing. That is what keeps a stage landing on its own from exposing an
+unproven path. Both
 front doors open together: `writ-agent-vm-runner start` and `managed-start` call the same
 library gatherer as the daemon and pass its evidence to the same `admit`, so
 the runner cannot start a locked session on a host the daemon would refuse.
@@ -358,7 +387,8 @@ fake tool, with every step's failure leaving the workload unreleased.
 
 **Correctness oracle:**
 - Fake-tool daemon tests: the recorded `container run` argv contains exactly
-  the B1 profile; `USR1` is sent iff the ready record was observed, the broker
+  the B1 profile and names the image by the digest that was inspected, never
+  by tag; `USR1` is sent iff the ready record was observed, the broker
   is ready, and the deny readback succeeded; a missing, malformed, duplicated,
   or over-long ready record, a `logs` timeout, or a helper readback failure
   each leave the session in a phase before `ReleaseAttempted` and trigger
@@ -417,8 +447,8 @@ setuid, file capability, child process); do not build a schedule language.
   protected session's listener accepts nothing and its deny counters are
   zero; the pre-release `/proc/<pid>/status` read matches B1's acceptance
   type. The change that records this passing is the change that adds the
-  host's (CLI, macOS build) pair to the host-placement pin list; the pin list
-  test asserts every entry names a proof record.
+  host's (CLI, macOS build, image digest) record to the host-placement
+  allowlist; the allowlist test asserts every entry names a proof record.
 - The proof fails, each with a distinct message, when the positive control
   does not reach its listener (observer broken), when the listener tool is
   missing, when the legacy run's RA route never returns, and when a locked
@@ -465,8 +495,17 @@ E3's proof is where the answers get recorded, as pinned facts about the
    C3 are written against the documented format; the proof confirms it.
 
 When E3 has recorded those, the next plan revision adds stages for vm
-placement with oracles that reference the recorded facts, and a stage that
-closes `ipv4_only_no_guest_ipv6` and `dual_stack_required` to new sessions
-(both still run the root prelaunch; invariant 9 admits neither once the
-handoff exists). Until then vm placement keeps refusing new sessions, the
-unlocked profiles keep admitting, and the parked harness branch stays parked.
+placement with oracles that reference the recorded facts. Until then vm
+placement keeps refusing new sessions and the parked harness branch stays
+parked.
+
+The two unlocked profiles are not left for that revision. Both still run the
+root prelaunch, and invariant 9 admits neither on a host where the handoff
+exists, so they close *per host* in the same decision that opens the locked
+profile there: `admit` for `ipv4_only_no_guest_ipv6` or `dual_stack_required`
+refuses whenever the locked evidence on this host would admit, and admits
+otherwise. That lands in E2 as part of `admit`, so E3's first allowlist entry
+closes the legacy profiles on that host in the same change, and no host is
+ever left with nothing startable, which is the #397 failure. The oracle is
+E2's existing exhaustive one, extended: for every evidence combination,
+exactly one of {locked admits, legacy admits} holds.
