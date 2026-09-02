@@ -70,6 +70,10 @@ Requires:
   - macOS with Apple container installed and `container system start` already run
   - root privileges through sudo for pfctl and tcpdump
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
+  - no other writ session anchor loaded: every child of that wildcard is
+    evaluated for every bridge, so another session's source-scoped deny
+    (above all one on the sibling /24) would confound both guests. The
+    script refuses to start while any exists.
   - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
     and a BusyBox nc that supports `-u` and `-s ADDR` (alpine:latest does)
 
@@ -396,6 +400,14 @@ require_guest_tooling() {
     || die "guest nc does not support -s ADDR; the probe needs a source-selectable sender"
 }
 
+# Child anchors currently loaded under writ/session, one per line. Both
+# listings are consulted because pfctl prints nested anchors differently
+# across macOS releases.
+existing_session_anchors() {
+  { sudo pfctl -a writ/session -sA 2>/dev/null; sudo pfctl -sA 2>/dev/null; } \
+    | grep -Eo 'writ/session/[0-9a-f-]+' | sort -u
+}
+
 # The bridge the interface-scoped IPv6 deny was installed on, read from the
 # session anchor: the same interface the session's IPv4 frames traverse.
 session_bridge() {
@@ -563,6 +575,13 @@ sudo -v
 sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' || die "PF is not enabled"
 sudo pfctl -sr 2>/dev/null | grep -q 'anchor "writ/session/\*"' \
   || die 'missing top-level PF anchor; add `anchor "writ/session/*"` to /etc/pf.conf and reload PF'
+# Every child anchor of the wildcard is consulted for every packet on every
+# interface, so a concurrent session's `block ... from <its /24>` would deny
+# our sibling-source datagram on the unconfined bridge as well, and the run
+# would pin that as a vmnet fact. Refuse rather than reason around it.
+EXISTING_ANCHORS="$(existing_session_anchors)"
+[[ -z "$EXISTING_ANCHORS" ]] \
+  || die "other writ session anchors are loaded and would confound the measurement; stop those sessions first: $(tr '\n' ' ' <<<"$EXISTING_ANCHORS")"
 
 log "building PF helper and lifecycle runner"
 "${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper --bin writ-agent-vm-runner
@@ -738,8 +757,10 @@ verdict() {
     log "VERDICT ${name}: LIVE GAP — under the session anchor the spoofed-source datagram reached a host socket the session may not reach. The source-scoped IPv4 rules do not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
   elif [[ "$fwd" == "yes" && "$u_reached" == "yes" ]]; then
     log "VERDICT ${name}: UNEXPLAINED — forwarded but not delivered under the session, yet delivered unconfined. The session anchor is the only difference and its source-scoped rules cannot match this source. Do not pin either way; inspect PF state and the top-level rules.${counter_note}"
-  elif [[ "$fwd" == "yes" ]]; then
+  elif [[ "$fwd" == "yes" && "$u_fwd" == "yes" ]]; then
     log "VERDICT ${name}: forwarded onto the session bridge, not delivered, matching the unconfined control — dropped by the host stack outside the session rules; the confinement is not the reason it stopped. C2b still applies as the session's own guarantee.${counter_note}"
+  elif [[ "$fwd" == "yes" ]]; then
+    log "VERDICT ${name}: UNEXPLAINED — forwarded on the session bridge but the same source never appeared on the unconfined bridge. vmnet behaved differently per bridge; the platform line above cannot be pinned from this run. Rerun before recording anything.${counter_note}"
   elif [[ "$u_fwd" == "yes" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE — not seen on the session bridge although the same source was forwarded unconfined. Either the emission witness (guest TX counter) misled, or the two bridges differ; the guest-side evidence is too coarse to pin this. Rerun before recording anything.${counter_note}"
   else
