@@ -564,7 +564,8 @@ start_capture() {
 # consumer is a single `read`:
 #   <name> <emitted> <forwarded> <reached> <delta> <bridge src> <listener src> <rewritten>
 # where the sources are what the observers saw ("-" if nothing) and rewritten
-# is "yes" when an observed source differs from the one requested.
+# is no | bridge | host | bridge+host, saying where an observed source first
+# differed from the one before it (requested -> bridge -> listener).
 probe() {
   local target="$1" name="$2" source="$3" add_address="$4"
   local vm="${TARGET_VM[$target]}" gateway="${TARGET_GATEWAY[$target]}"
@@ -622,9 +623,17 @@ probe() {
   if [[ -n "$reach_src" ]]; then
     reached="yes"
   fi
-  if [[ ( -n "$fwd_src" && "$fwd_src" != "$source" ) || ( -n "$reach_src" && "$reach_src" != "$source" ) ]]; then
-    rewritten="yes"
-    log "  SOURCE REWRITTEN: requested ${source}, bridge saw ${fwd_src:--}, listener saw ${reach_src:--}"
+  # Where a rewrite happened matters: on the bridge it is vmnet's doing and
+  # PF judged the rewritten source; after the bridge (listener differs from
+  # what the bridge carried) it is a host-side transformation and PF saw the
+  # source the bridge carried.
+  if [[ -n "$fwd_src" && "$fwd_src" != "$source" ]]; then
+    rewritten="bridge"
+    log "  SOURCE REWRITTEN on the bridge: requested ${source}, bridge saw ${fwd_src}"
+  fi
+  if [[ -n "$reach_src" && "$reach_src" != "${fwd_src:-$source}" ]]; then
+    rewritten="$([[ "$rewritten" == "no" ]] && echo host || echo bridge+host)"
+    log "  SOURCE REWRITTEN after the bridge: bridge carried ${fwd_src:-$source}, listener saw ${reach_src}"
   fi
   local delta=0 counter_text=""
   if [[ "$target" == "session" ]]; then
@@ -848,37 +857,48 @@ verdict() {
   local name="$1" source="$2"
   local u_fwd="$3" u_reached="$4" u_fwd_src="$5" u_reach_src="$6"
   local emitted="$7" fwd="$8" reached="$9" delta="${10}" fwd_src="${11}" reach_src="${12}"
-  local u_rewritten="no" rewritten="no"
-  if [[ ( "$u_fwd_src" != "-" && "$u_fwd_src" != "$source" ) || ( "$u_reach_src" != "-" && "$u_reach_src" != "$source" ) ]]; then
-    u_rewritten="yes"
-  fi
-  if [[ ( "$fwd_src" != "-" && "$fwd_src" != "$source" ) || ( "$reach_src" != "-" && "$reach_src" != "$source" ) ]]; then
-    rewritten="yes"
-  fi
+  # A rewrite seen on the bridge is vmnet's doing and is what PF judged. A
+  # listener source that differs from what the bridge carried is a host-side
+  # transformation after the bridge (PF nat/rdr or similar): the bridge
+  # observation proves vmnet forwarded the frame as it was, so that is a
+  # fact about this host's configuration, not about vmnet.
+  local u_bridge_rw="no" u_host_rw="no" bridge_rw="no" host_rw="no"
+  if [[ "$u_fwd_src" != "-" && "$u_fwd_src" != "$source" ]]; then u_bridge_rw="yes"; fi
+  if [[ "$u_reach_src" != "-" && "$u_reach_src" != "$([[ "$u_fwd_src" != "-" ]] && echo "$u_fwd_src" || echo "$source")" ]]; then u_host_rw="yes"; fi
+  if [[ "$fwd_src" != "-" && "$fwd_src" != "$source" ]]; then bridge_rw="yes"; fi
+  if [[ "$reach_src" != "-" && "$reach_src" != "$([[ "$fwd_src" != "-" ]] && echo "$fwd_src" || echo "$source")" ]]; then host_rw="yes"; fi
   # The IPv4 deny is `from <session /24>`; an out-of-subnet source cannot
   # match it, so any movement in its counter during this window is other
   # in-subnet traffic (DHCP, ARP-triggered retries, ...), not this datagram.
-  # Unless the source was rewritten: then PF judged the rewritten source,
-  # and the counter may well be about this datagram.
+  # Unless the bridge carried a rewritten source: then PF judged that one,
+  # and the counter may well be about this datagram. A host-side rewrite
+  # after the bridge does not change what PF's `in` rules saw.
   local counter_note=""
-  if [[ "$delta" -gt 0 && "$rewritten" == "no" ]]; then
+  if [[ "$delta" -gt 0 && "$bridge_rw" == "no" ]]; then
     counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; the source-scoped rule cannot have matched this source, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
-  elif [[ "$rewritten" == "yes" ]]; then
+  elif [[ "$bridge_rw" == "yes" ]]; then
     counter_note=" ('writ deny agent v4' moved by ${delta} during the session window; PF saw source ${fwd_src}, so the counter may be about this datagram.)"
   fi
-  # The platform line is pinned only when the session bridge saw the same
-  # outcome; two bridges disagreeing is a fact about this run, not about
-  # vmnet, and must not be recorded as either.
-  if [[ "$emitted" == "yes" && ( "$fwd" != "$u_fwd" || "$rewritten" != "$u_rewritten" ) ]]; then
-    log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd} rewritten=${u_rewritten}, session forwarded=${fwd} rewritten=${rewritten}); no platform fact can be pinned from this run. See the verdict below."
-  elif [[ "$u_rewritten" == "yes" ]]; then
-    log "PLATFORM ${name}: unconfined, the datagram was forwarded with its source REWRITTEN (requested ${source}; bridge saw ${u_fwd_src}, listener saw ${u_reach_src}; delivered=${u_reached}). vmnet anti-spoofs by rewriting, not dropping: the frame reaches the host, but PF judges the rewritten source. Record this as a pinned platform fact (plan 'Beyond E3' question 4), distinct from both 'forwards as-is' and 'does not forward'."
+  local host_rw_note=""
+  if [[ "$host_rw" == "yes" ]]; then
+    host_rw_note=" The listener saw source ${reach_src} although the bridge carried ${fwd_src}: a host-side rewrite after the bridge, not vmnet's."
+  fi
+  # The platform line is pinned only when the session guest emitted and the
+  # session bridge saw the same outcome; a session that sent nothing cannot
+  # corroborate, and two bridges disagreeing is a fact about this run, not
+  # about vmnet. Neither may be recorded as a platform fact.
+  if [[ "$emitted" != "yes" ]]; then
+    log "PLATFORM ${name}: unconfined observed forwarded=${u_fwd} (bridge src ${u_fwd_src}) delivered=${u_reached} (listener src ${u_reach_src}), but the session guest did not emit its copy, so the session bridge cannot corroborate; not pinned. See the verdict below."
+  elif [[ "$fwd" != "$u_fwd" || "$bridge_rw" != "$u_bridge_rw" ]]; then
+    log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd} bridge-rewritten=${u_bridge_rw}, session forwarded=${fwd} bridge-rewritten=${bridge_rw}); no platform fact can be pinned from this run. See the verdict below."
+  elif [[ "$u_bridge_rw" == "yes" ]]; then
+    log "PLATFORM ${name}: unconfined, the datagram crossed the bridge with its source REWRITTEN by vmnet (requested ${source}, bridge saw ${u_fwd_src}; listener saw ${u_reach_src}, delivered=${u_reached}). vmnet anti-spoofs by rewriting, not dropping: the frame reaches the host, but PF judges the rewritten source. Record this as a pinned platform fact (plan 'Beyond E3' question 4), distinct from both 'forwards as-is' and 'does not forward'."
+  elif [[ "$u_host_rw" == "yes" ]]; then
+    log "PLATFORM ${name}: unconfined, vmnet forwarded the spoofed source as sent (bridge saw ${u_fwd_src}) and the host DELIVERED it with source ${u_reach_src}: a host-side rewrite after the bridge (PF nat/rdr or similar on this host). vmnet forwards spoofed IPv4 sources; the rewrite is this host's configuration, not a vmnet fact, and only PF stands between such a frame and a host socket."
   elif [[ "$u_reached" == "yes" ]]; then
     log "PLATFORM ${name}: unconfined, the spoofed-source datagram was forwarded and DELIVERED to the host socket. vmnet forwards spoofed IPv4 sources and the host accepts them; only PF stands between such a frame and a host socket."
   elif [[ "$u_fwd" == "yes" ]]; then
     log "PLATFORM ${name}: unconfined, the spoofed-source datagram was forwarded onto the bridge but not delivered. vmnet forwards spoofed IPv4 sources; something in the host stack (default PF policy, reverse-path check) drops them before a socket, independent of any session anchor."
-  elif [[ "$emitted" != "yes" ]]; then
-    log "PLATFORM ${name}: unconfined, the spoofed-source datagram never appeared on the bridge, but the session guest did not emit its copy, so the session bridge cannot corroborate; not pinned. See the verdict below."
   else
     log "PLATFORM ${name}: neither bridge saw the spoofed-source datagram although the unconfined guest's own-address datagram was delivered. vmnet does not forward spoofed IPv4 sources. Record this as a pinned platform fact (plan 'Beyond E3' question 4); C2b becomes hardening rather than a live fix."
   fi
@@ -886,9 +906,9 @@ verdict() {
   if [[ "$emitted" != "yes" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE — the session guest did not emit the datagram (see the nc stderr and TX counter lines above), so the session observers' silence says nothing. Fix the sender and rerun."
   elif [[ "$reached" == "yes" ]]; then
-    log "VERDICT ${name}: LIVE GAP — under the session anchor a datagram from the session guest reached a host socket the session may not reach (requested source ${source}, listener saw ${reach_src}). The source-scoped IPv4 rules did not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
-  elif [[ "$rewritten" == "yes" ]]; then
-    log "VERDICT ${name}: REWRITTEN — under the session the datagram was forwarded with source ${fwd_src} instead of ${source} and not delivered. PF judged the rewritten source, not the spoofed one; if ${fwd_src} is inside the session /24 the source-scoped deny matched it legitimately. The confinement held, but because the platform rewrote the source, not because the rules address spoofing. C2b still applies as the session's own guarantee.${counter_note}"
+    log "VERDICT ${name}: LIVE GAP — under the session anchor a datagram from the session guest reached a host socket the session may not reach (requested source ${source}, bridge carried ${fwd_src}, listener saw ${reach_src}). The source-scoped IPv4 rules did not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${host_rw_note}${counter_note}"
+  elif [[ "$bridge_rw" == "yes" ]]; then
+    log "VERDICT ${name}: REWRITTEN — under the session the datagram crossed the bridge with source ${fwd_src} instead of ${source} and was not delivered. PF judged the rewritten source, not the spoofed one; if ${fwd_src} is inside the session /24 the source-scoped deny matched it legitimately. The confinement held, but because vmnet rewrote the source, not because the rules address spoofing. C2b still applies as the session's own guarantee.${counter_note}"
   elif [[ "$fwd" == "yes" && "$u_reached" == "yes" ]]; then
     log "VERDICT ${name}: UNEXPLAINED — forwarded but not delivered under the session, yet delivered unconfined. The session anchor is the only difference and its source-scoped rules cannot match this source. Do not pin either way; inspect PF state and the top-level rules.${counter_note}"
   elif [[ "$fwd" == "yes" && "$u_fwd" == "yes" ]]; then
