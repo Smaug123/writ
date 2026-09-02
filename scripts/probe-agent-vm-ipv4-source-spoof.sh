@@ -61,9 +61,12 @@ by source address, and report the source they actually saw: a platform that
 anti-spoofs by REWRITING the source rather than dropping the frame is a
 distinct outcome, not a drop.
 
-One guest-side fact gates whether host silence means anything: eth0's TX
-packet counter must rise and nc must print no error, or the guest emitted
-nothing. Guest facts can withhold a verdict, never award one: a session
+One guest-side fact gates whether host silence means anything: when no host
+observer saw the datagram, eth0's TX packet counter must have risen and nc
+must have printed nothing, or the guest is taken to have emitted nothing. A
+datagram a host observer did see was emitted whatever nc said afterwards (PF's
+`block return` answers with ICMP, which nc may report as an error after the
+frame has already left). Guest facts can withhold a verdict, never award one: a session
 result whose unconfined twin was forwarded but which was itself not seen on
 the bridge is reported INCONCLUSIVE, not as a platform fact. The IPv4 deny is
 source-scoped to the session /24, so for the foreign and sibling probes it
@@ -266,6 +269,11 @@ for candidate in (index + 1, index - 1):
         print(candidate)
         break
 PY
+}
+
+# Succeeds iff address $2 lies inside network $1.
+addr_in_cidr() {
+  ! require_outside "$1" "$2" 2>/dev/null
 }
 
 # Fails unless address $2 lies outside network $1.
@@ -603,13 +611,13 @@ probe() {
   sleep 2
   tx_after="$(guest_tx_packets "$vm")"
 
-  local emitted="yes"
+  local guest_says_emitted="yes"
   if [[ -s "$nc_err" ]]; then
-    emitted="no"
+    guest_says_emitted="no"
     log "  guest nc wrote to stderr: $(tr '\n' ' ' <"$nc_err")"
   fi
   if (( tx_after <= tx_before )); then
-    emitted="no"
+    guest_says_emitted="no"
     log "  guest eth0 TX packet counter did not rise (${tx_before} -> ${tx_after})"
   fi
 
@@ -622,6 +630,17 @@ probe() {
   fi
   if [[ -n "$reach_src" ]]; then
     reached="yes"
+  fi
+  # Host evidence outranks the guest's: a datagram a host observer saw was
+  # emitted, whatever nc printed afterwards (PF's `block return` answers
+  # with ICMP, which nc may report as an error once the frame has left).
+  # The guest-side witness only decides when the host saw nothing.
+  local emitted="$guest_says_emitted"
+  if [[ "$forwarded" == "yes" || "$reached" == "yes" ]]; then
+    emitted="yes"
+    if [[ "$guest_says_emitted" == "no" ]]; then
+      log "  (host observers saw the datagram, so it was emitted; the guest-side error above is diagnostic)"
+    fi
   fi
   # Where a rewrite happened matters: on the bridge it is vmnet's doing and
   # PF judged the rewritten source; after the bridge (listener differs from
@@ -874,10 +893,17 @@ verdict() {
   # and the counter may well be about this datagram. A host-side rewrite
   # after the bridge does not change what PF's `in` rules saw.
   local counter_note=""
-  if [[ "$delta" -gt 0 && "$bridge_rw" == "no" ]]; then
-    counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; the source-scoped rule cannot have matched this source, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
-  elif [[ "$bridge_rw" == "yes" ]]; then
-    counter_note=" ('writ deny agent v4' moved by ${delta} during the session window; PF saw source ${fwd_src}, so the counter may be about this datagram.)"
+  if [[ "$fwd_src" != "-" ]] && addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then
+    counter_note=" ('writ deny agent v4' moved by ${delta} during the session window; PF saw the in-subnet source ${fwd_src}, so the counter may be about this datagram.)"
+  elif [[ "$delta" -gt 0 ]]; then
+    counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; the source-scoped rule cannot have matched ${fwd_src}, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
+  fi
+  # Which rules cover a bridge-rewritten source depends on where it landed:
+  # inside the session /24 the source-scoped deny applies to it; outside,
+  # nothing in the anchor can match it and the host path decides.
+  local src_in_session="no"
+  if [[ "$fwd_src" != "-" ]] && addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then
+    src_in_session="yes"
   fi
   local host_rw_note=""
   if [[ "$host_rw" == "yes" ]]; then
@@ -905,10 +931,14 @@ verdict() {
 
   if [[ "$emitted" != "yes" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE — the session guest did not emit the datagram (see the nc stderr and TX counter lines above), so the session observers' silence says nothing. Fix the sender and rerun."
+  elif [[ "$reached" == "yes" && "$src_in_session" == "yes" ]]; then
+    log "VERDICT ${name}: LIVE GAP (ANCHOR) — a datagram from the session guest reached a host socket the session may not reach, and the bridge carried an IN-SUBNET source (${fwd_src}, rewritten from ${source}) that the session deny should have matched. This is not the source-scoping gap: the anchor failed to deny an in-subnet frame. Investigate the anchor (rule order, interface, state) before attributing anything to C2b.${host_rw_note}${counter_note}"
   elif [[ "$reached" == "yes" ]]; then
-    log "VERDICT ${name}: LIVE GAP — under the session anchor a datagram from the session guest reached a host socket the session may not reach (requested source ${source}, bridge carried ${fwd_src}, listener saw ${reach_src}). The source-scoped IPv4 rules did not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${host_rw_note}${counter_note}"
+    log "VERDICT ${name}: LIVE GAP — under the session anchor a datagram from the session guest reached a host socket the session may not reach (requested source ${source}, bridge carried ${fwd_src}, listener saw ${reach_src}); the source on the bridge lies outside the session /24, so nothing in the source-scoped rules could match it. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${host_rw_note}${counter_note}"
+  elif [[ "$bridge_rw" == "yes" && "$src_in_session" == "yes" ]]; then
+    log "VERDICT ${name}: REWRITTEN INTO THE SUBNET — under the session the datagram crossed the bridge with the in-subnet source ${fwd_src} instead of ${source} and was not delivered. PF judged the rewritten source, and the source-scoped deny matched it legitimately (the counter note says whether it counted). The confinement held, but because vmnet rewrote the source into the session /24, not because the rules address spoofing. C2b still applies as the session's own guarantee.${counter_note}"
   elif [[ "$bridge_rw" == "yes" ]]; then
-    log "VERDICT ${name}: REWRITTEN — under the session the datagram crossed the bridge with source ${fwd_src} instead of ${source} and was not delivered. PF judged the rewritten source, not the spoofed one; if ${fwd_src} is inside the session /24 the source-scoped deny matched it legitimately. The confinement held, but because vmnet rewrote the source, not because the rules address spoofing. C2b still applies as the session's own guarantee.${counter_note}"
+    log "VERDICT ${name}: REWRITTEN, STILL FOREIGN — under the session the datagram crossed the bridge with source ${fwd_src} instead of ${source}, which is still outside the session /24, and was not delivered. Nothing in the source-scoped rules can match it, so the drop came from the host path outside the session rules, exactly as for an as-is spoof that is forwarded but not delivered. The confinement is not the reason it stopped; C2b still applies.${counter_note}"
   elif [[ "$fwd" == "yes" && "$u_reached" == "yes" ]]; then
     log "VERDICT ${name}: UNEXPLAINED — forwarded but not delivered under the session, yet delivered unconfined. The session anchor is the only difference and its source-scoped rules cannot match this source. Do not pin either way; inspect PF state and the top-level rules.${counter_note}"
   elif [[ "$fwd" == "yes" && "$u_fwd" == "yes" ]]; then
