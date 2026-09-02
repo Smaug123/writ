@@ -522,8 +522,9 @@ pub enum PrecedenceViolation {
     /// IPv6 absence was verified before `disable_ipv6` was written for every
     /// scope.
     VerifyNoIpv6BeforeDisable,
-    /// The final verification is not the last step, is not the only one, or
-    /// a step it depends on is missing.
+    /// The final verification is not the last step, is not the only one, a
+    /// step it depends on is missing, or the UID or GID the plan ends with
+    /// is not the locked one.
     VerifyLockedIdentityNotLast,
 }
 
@@ -600,8 +601,10 @@ pub fn precedence_violations(
                 && has(&|s| *s == HandoffStep::ClearInheritableAndAmbient)
                 && has(&|s| *s == HandoffStep::SetNoNewPrivs)
                 && has(&|s| *s == HandoffStep::ClearSupplementaryGroups)
-                && has(&|s| *s == HandoffStep::SetResgid(LOCKED_GID))
-                && has(&|s| *s == HandoffStep::SetResuid(LOCKED_UID))
+                // The identity the plan *ends* with, not whether some step
+                // once set it: a later `setresgid` can move it again.
+                && gid == LOCKED_GID
+                && uid == LOCKED_UID
         };
     if !is_last_and_complete {
         violations.push(PrecedenceViolation::VerifyLockedIdentityNotLast);
@@ -745,6 +748,14 @@ mod tests {
             from: usize,
             to: usize,
         },
+        /// Rewrite the id argument of the `nth` `setresgid`/`setresuid` step
+        /// (modulo how many there are; a no-op if there are none). The only
+        /// edit that reaches ids other than the locked one: back to 0, or to
+        /// some other identity entirely.
+        Retarget {
+            nth: usize,
+            id: u32,
+        },
     }
 
     fn arb_mutation(len: usize) -> impl Strategy<Value = Mutation> {
@@ -757,6 +768,16 @@ mod tests {
             (0..len, 0..len).prop_map(|(from, to)| Mutation::Relocate { from, to }),
             (0..len).prop_map(Mutation::Drop),
             (0..len, 0..=len).prop_map(|(from, to)| Mutation::Duplicate { from, to }),
+            (
+                0..len,
+                prop_oneof![
+                    Just(0u32),
+                    Just(LOCKED_GID),
+                    Just(LOCKED_GID + 1),
+                    any::<u32>()
+                ]
+            )
+                .prop_map(|(nth, id)| Mutation::Retarget { nth, id }),
         ]
     }
 
@@ -810,6 +831,25 @@ mod tests {
                 let mut out = steps.to_vec();
                 let step = out[at(*from)].clone();
                 out.insert(to % (len + 1), step);
+                out
+            }
+            Mutation::Retarget { nth, id } => {
+                let mut out = steps.to_vec();
+                let id_steps: Vec<usize> = out
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        matches!(s, HandoffStep::SetResgid(_) | HandoffStep::SetResuid(_))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(&i) = id_steps.get(nth % id_steps.len().max(1)) {
+                    out[i] = match &out[i] {
+                        HandoffStep::SetResgid(_) => HandoffStep::SetResgid(*id),
+                        HandoffStep::SetResuid(_) => HandoffStep::SetResuid(*id),
+                        _ => unreachable!(),
+                    };
+                }
                 out
             }
         }
@@ -893,6 +933,44 @@ mod tests {
             precedence_violations(&twice, &[])
                 .contains(&PrecedenceViolation::VerifyLockedIdentityNotLast)
         );
+    }
+
+    /// The third review's finding: the rules checked that a
+    /// `SetResgid(LOCKED_GID)` step *exists*, so a later `SetResgid(0)`,
+    /// still before the UID change and so still permitted, left the final
+    /// GID unlocked while the rules saw nothing. The rules must judge the
+    /// final identity, not the presence of a step that once set it.
+    #[test]
+    fn an_id_changed_back_after_being_locked_is_refused_by_both_oracles() {
+        let plan = handoff_plan(&[]);
+        let resgid = plan
+            .iter()
+            .position(|s| *s == HandoffStep::SetResgid(LOCKED_GID))
+            .unwrap();
+        let resuid = plan
+            .iter()
+            .position(|s| *s == HandoffStep::SetResuid(LOCKED_UID))
+            .unwrap();
+        for (label, step, at) in [
+            ("gid back to 0", HandoffStep::SetResgid(0), resgid + 1),
+            (
+                "gid to another id",
+                HandoffStep::SetResgid(LOCKED_GID + 1),
+                resgid + 1,
+            ),
+            (
+                "uid to another id",
+                HandoffStep::SetResuid(LOCKED_UID + 1),
+                resuid,
+            ),
+        ] {
+            let mut steps = plan.clone();
+            steps.insert(at, step);
+            let simulated = simulate(&steps, &[]);
+            let violations = precedence_violations(&steps, &[]);
+            assert!(simulated.is_err(), "{label}: model accepted {steps:?}");
+            assert!(!violations.is_empty(), "{label}: rules accepted {steps:?}");
+        }
     }
 
     /// Every mandatory step is mandatory in *both* oracles: dropping any one
@@ -996,7 +1074,7 @@ mod tests {
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(4000));
         // Per kind: (accepted, refused), for single-edit cases only, so each
         // count is attributable to its kind.
-        let counts: [(std::cell::Cell<u32>, std::cell::Cell<u32>); 5] =
+        let counts: [(std::cell::Cell<u32>, std::cell::Cell<u32>); 6] =
             std::array::from_fn(|_| (std::cell::Cell::new(0), std::cell::Cell::new(0)));
         let kind = |m: &Mutation| match m {
             Mutation::Shuffle(_) => 0,
@@ -1004,6 +1082,7 @@ mod tests {
             Mutation::Relocate { .. } => 2,
             Mutation::Drop(_) => 3,
             Mutation::Duplicate { .. } => 4,
+            Mutation::Retarget { .. } => 5,
         };
         runner
             .run(
@@ -1024,19 +1103,21 @@ mod tests {
             )
             .unwrap();
         let counts = counts.map(|(a, r)| (a.get(), r.get()));
-        // ~800 cases per kind. A uniform shuffle of a ~24-step plan is
+        // ~670 cases per kind. A uniform shuffle of a ~24-step plan is
         // essentially never accepted, so Shuffle is held only to refusals.
-        // For the rest: adjacent swaps are mostly harmless; relocating,
-        // dropping, or duplicating one of the ~12 optional sysctl writes (of
-        // ~24 steps) is accepted, and doing so to a mandatory step is
-        // refused, so both sides are in the hundreds.
+        // For the rest, the rarer side is measured at roughly 15% (a single
+        // swap, relocation, or duplication is refused only when it touches
+        // one of the few order-sensitive steps; a retarget is accepted only
+        // for the locked id), which is ~100 of ~670 with a standard
+        // deviation of ~9. Forty is more than six standard deviations below
+        // that, so a miss here is a generator change, not a seed.
         assert!(counts[0].1 >= 200, "shuffle refused only {counts:?}");
-        for (name, (accepted, refused)) in ["swaps", "relocate", "drop", "duplicate"]
+        for (name, (accepted, refused)) in ["swaps", "relocate", "drop", "duplicate", "retarget"]
             .iter()
             .zip(&counts[1..])
         {
             assert!(
-                *accepted >= 100 && *refused >= 100,
+                *accepted >= 40 && *refused >= 40,
                 "{name}: accepted {accepted}, refused {refused}: {counts:?}"
             );
         }
