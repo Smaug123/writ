@@ -1153,8 +1153,12 @@ broker `BrokerVmPlan`/`BrokerSessionSpec`/`GuestAbsPath` (`broker_vm.rs:190`,
 `broker_session.rs:63,24`).
 
 **Guarantees.** No egress except the broker: host placement via PF default-deny
-(whitelist broker ports, then `block return`); VM placement by topology
-(`--internal`, no NAT). IPv6 is confined for host placement by the host PF
+(whitelist broker ports, then `block return`), with one qualification — the
+IPv4 rules are matched on the session subnet as source, so a frame the guest
+sends with an out-of-subnet source is not covered by them (whether vmnet
+forwards such a frame is unmeasured; `ipv4-only-network-confinement.md`
+records this as a known delta and the interface-scoped fix); VM placement by
+topology (`--internal`, no NAT). IPv6 is confined for host placement by the host PF
 rule (`block return in quick on <iface> inet6 all`,
 `agent_vm_firewall.rs:705`), with a guest deny in front of it that is a
 precondition rather than an authority boundary — the root workload can
@@ -1216,7 +1220,9 @@ persisted as a versioned record under a single-owner file lock.
 
 **Neighbours.** Hosts the §5.6 HTTP endpoints; feeds the git-push pipeline;
 shares the audit log. Design detail (empirical isolation findings, PF strategy)
-lives in the `apple-container-agent-vm.md` journal.
+lives in the `apple-container-agent-vm.md` journal; the IPv6-confinement
+security argument and the target state behind `ipv4_only_locked_v1` are in
+`ipv4-only-network-confinement.md`.
 
 ### 5.6 VM broker HTTP surface & Nix provisioning
 
@@ -2026,6 +2032,7 @@ rationale in a dated `docs/plans/` slice and update §5 here.
 |---|---|---|
 | [`broker.md`](./broker.md) | The original "why this shape": capability model, why-a-DU, the audit rationale, XDG path conventions. | §1, §4, §5.1–5.4 (its file layout and 4-table schema are stale). |
 | [`apple-container-agent-vm.md`](./apple-container-agent-vm.md) | Empirical VM-isolation findings, PF strategy, the no-egress proof spikes, the Nix-in-VM reasoning. | §5.5, §5.6. |
+| [`ipv4-only-network-confinement.md`](./ipv4-only-network-confinement.md) | The IPv6-confinement security argument: why the deny is interface-scoped, the unbuilt guest handoff and broker-ingress layers behind `ipv4_only_locked_v1`, and the evidence protocol for proving any of it. Not a journal: it is the target state, with layer 1 described as shipped. | §5.5 for what exists; the plan is `docs/plans/2026-09-01-ipv4-only-locked-v1.md`. |
 | [`vm-mediated-push.md`](./vm-mediated-push.md) | The trust-boundary argument and ancestry-validation reasoning behind the push pipeline. | §5.7. |
 | [`approve_state_machine.md`](./approve_state_machine.md) | The approve/reject state model and boot-reconcile design (schema "v5" is a snapshot). | §5.4, §5.7. |
 | [`approve-crash-injection-harness.md`](./approve-crash-injection-harness.md) | The deterministic crash-injection test design (fake GitHub, fake origin, crash points). | Still current as a *test* design; not superseded. |
