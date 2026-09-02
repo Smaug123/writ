@@ -206,6 +206,20 @@ for candidate in (index + 1, index - 1):
 PY
 }
 
+# Fails unless address $2 lies outside network $1.
+require_outside() {
+  python3 - "$1" "$2" <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=True)
+address = ipaddress.ip_address(sys.argv[2])
+if address in network:
+    print(f"{address} is inside {network}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 cidr_host() {
   # The n-th usable host of a network.
   python3 - "$1" "$2" <<'PY'
@@ -331,7 +345,12 @@ probe() {
   log "probe '${name}': source ${source} -> ${IPV4_GATEWAY}:${PROBE_PORT} (${nonce})"
 
   if [[ "$add_address" == "yes" ]]; then
+    # Tolerate an alias that already exists, then insist it is there: a
+    # silently missing alias would make nc fail to bind, no frame would be
+    # sent, and every observer's silence would read as a platform verdict.
     guest "ip addr add ${source}/32 dev eth0 2>/dev/null || true" || true
+    guest "ip -4 -o addr show dev eth0 | grep -q 'inet ${source}/32 '" \
+      || die "guest did not configure ${source}/32 on eth0; the ${name} probe would send nothing"
   fi
 
   local before after
@@ -339,12 +358,18 @@ probe() {
   local tcpdump_lines_before
   tcpdump_lines_before="$(wc -l <"$TCPDUMP_LOG" | tr -d ' ')"
 
-  # -w 1: BusyBox nc otherwise waits for a reply that never comes.
+  # -w 1: BusyBox nc otherwise waits for a reply that never comes. Its exit
+  # status is diagnostic (a reply timeout is the expected outcome), but a
+  # bind failure means no frame was ever sent, and that must not be scored.
+  local nc_err="${TMP_DIR}/nc-${name}.err"
   set +e
-  guest "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}"
+  guest "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}" 2>"$nc_err"
   local guest_status=$?
   set -e
   log "  guest nc exit status ${guest_status} (diagnostic only)"
+  if grep -qiE 'bind|assign' "$nc_err"; then
+    die "guest nc could not bind ${source}: $(cat "$nc_err")"
+  fi
   sleep 2
 
   after="$(anchor_counters)"
@@ -375,6 +400,11 @@ choose_cargo
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 IPV4_GATEWAY="$(cidr_host "$IPV4_CIDR" 1)"
+# A "foreign" source inside the pool is not foreign: inside the session /24 the
+# source-scoped deny matches it legitimately, and in another /24 it is the
+# sibling case. Either way the verdict would be about the wrong thing.
+require_outside "$IPV4_POOL" "$FOREIGN_SOURCE" \
+  || die "WRIT_PROBE_FOREIGN_SOURCE=${FOREIGN_SOURCE} lies inside the pool ${IPV4_POOL}; the foreign probe needs an out-of-pool source"
 SIBLING_INDEX="$(sibling_subnet_index "$IPV4_POOL" "$SUBNET_INDEX")"
 if [[ -n "$SIBLING_INDEX" ]]; then
   SIBLING_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SIBLING_INDEX")"
@@ -399,9 +429,17 @@ RUNNER="${ROOT_DIR}/target/debug/writ-agent-vm-runner"
 
 BROKER_PORT="$(pick_port tcp "$BROKER_PORT_MIN" "$BROKER_PORT_MAX")"
 PROBE_PORT="$(pick_port udp "$BROKER_PORT_MIN" "$BROKER_PORT_MAX")"
-while [[ "$PROBE_PORT" == "$BROKER_PORT" ]]; do
+# Prefer a distinct probe port so the log reads unambiguously, but the probe
+# listener is UDP and the broker allow is TCP-only, so sharing the number is
+# harmless. A one-port range (min == max) is valid and must not spin here.
+for _ in {1..20}; do
+  [[ "$PROBE_PORT" != "$BROKER_PORT" ]] && break
+  [[ "$BROKER_PORT_MIN" == "$BROKER_PORT_MAX" ]] && break
   PROBE_PORT="$(pick_port udp "$BROKER_PORT_MIN" "$BROKER_PORT_MAX")"
 done
+if [[ "$PROBE_PORT" == "$BROKER_PORT" ]]; then
+  log "probe UDP port shares its number with the TCP broker port ${BROKER_PORT} (range has no free alternative)"
+fi
 BROKER_PID="$(start_http_server "$BROKER_DIR" "$BROKER_PORT" "${TMP_DIR}/broker.log")"
 start_udp_listener "$PROBE_PORT" "$LISTENER_LOG"
 for _ in {1..50}; do
