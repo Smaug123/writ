@@ -170,15 +170,21 @@ against the arguments today. Without this, "locked_v1 admits on protocol v2"
 would open the profile while the helper still took its own bounds from the
 unprivileged caller.
 
-A `preflight` command reads the *main* ruleset (`pfctl -sr` without an
-anchor) and reports whether `anchor "writ/session/*"` is present and is
-preceded by neither a `pass ... quick` rule nor *any other filter anchor*;
-the proof script's existing anchor check moves into it. The second condition
+The placement check itself is already on `main`: the helper's install
+precheck (`session_anchor_placement`) refuses to load a session's rules
+unless `anchor "writ/session/*"` is present and preceded by neither a
+`pass ... quick` rule nor *any other filter anchor*. What C2 adds is the
+`preflight` command that reports that same classification as bounded JSON
+without loading anything, so Stage D can use it as admission evidence. The second condition
 is the important one: a main-ruleset readback shows an earlier anchor only as
 its invocation line, not the rules loaded inside it, and a `quick` pass
 inside `com.apple/*` is just as final as one in `pf.conf`. So the only
 placement preflight can vouch for is writ's anchor ahead of everything else
-that filters, and the installation docs say to put it there. This is
+that filters, and the installation docs say to put it there. The precheck
+also refuses any loaded translation rule with the `pass` modifier
+(`ensure_no_pass_translation_rules`): translation runs before filtering,
+and such a rule passes matching packets without consulting any filter rule,
+so it bypasses the session anchor wherever the anchor sits. This is
 host-local state no version pin captures.
 
 `install` and `--deny-guest-ipv6` then run: precheck, resolve, `pfctl -n`
