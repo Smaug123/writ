@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/probe-agent-vm-ipv4-source-spoof.sh
+
+Measures, on real hardware, what happens to an IPv4 frame the agent guest
+sends with a source address outside its session subnet.
+
+Why: the session PF anchor's IPv4 rules are matched on the session /24 as
+*source* (`pass in quick inet proto tcp from <agent /24> to <broker> ...` and
+`block return in quick inet from <agent /24> to any`). A frame whose source is
+not in that /24 matches neither rule and falls through to whatever the host's
+default PF policy is. Whether Apple's vmnet forwards such a frame at all is
+unknown; this script finds out. See docs/design/ipv4-only-network-confinement.md,
+"Known deltas from the target rules", and docs/plans/2026-09-01-ipv4-only-locked-v1.md,
+stage C2b.
+
+This is a measurement, not a proof: it reports what it observed and a verdict,
+and its exit status is 0 whenever the measurement itself completed. It runs a
+session under the legacy ipv4-only profile exactly as prove-agent-vm-lifecycle.sh
+does, then from the root guest sends UDP datagrams to a host listener on the
+session gateway, with three sources:
+
+  control   the guest's own address (inside the /24): expected DENIED by PF
+  foreign   an address outside the broker's whole pool (10.77.0.5/32, added to
+            eth0 by the root guest)
+  sibling   an address in a *different* session subnet of the same pool (index
+            SUBNET_INDEX+1), the cross-session case
+
+For each, the host observes three things, none of them reported by the guest:
+  - tcpdump on the session bridge: was the frame forwarded onto the host side?
+  - a host UDP listener on the gateway: did the datagram reach a host socket?
+  - the session anchor's labelled rule counters: did PF count it?
+
+Requires:
+  - macOS with Apple container installed and `container system start` already run
+  - root privileges through sudo for pfctl and tcpdump
+  - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
+  - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
+    and a BusyBox nc that supports `-u` and `-s ADDR` (alpine:latest does)
+
+Environment overrides (same as prove-agent-vm-lifecycle.sh):
+  WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
+  WRIT_PROVE_IPV4_POOL   broker-owned IPv4 pool, default 192.168.0.0/16
+  WRIT_PROVE_IPV6_POOL   broker-owned IPv6 pool, default fd83:b6f2:e57::/48
+  WRIT_PROVE_SUBNET_INDEX  session subnet index, default 252
+  WRIT_PROVE_BROKER_PORT_MIN  minimum allowed broker port, default 49152
+  WRIT_PROVE_BROKER_PORT_MAX  maximum allowed broker port, default 65535
+  WRIT_PROBE_FOREIGN_SOURCE   out-of-pool source to spoof, default 10.77.0.5
+EOF
+}
+
+log() {
+  printf '[probe-ipv4-spoof] %s\n' "$*"
+}
+
+die() {
+  printf '[probe-ipv4-spoof] error: %s\n' "$*" >&2
+  exit 1
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/writ-ipv4-spoof-probe.XXXXXX")"
+IMAGE="${WRIT_PROVE_IMAGE:-alpine:latest}"
+IPV4_POOL="${WRIT_PROVE_IPV4_POOL:-192.168.0.0/16}"
+IPV6_POOL="${WRIT_PROVE_IPV6_POOL:-fd83:b6f2:e57::/48}"
+SUBNET_INDEX="${WRIT_PROVE_SUBNET_INDEX:-252}"
+BROKER_PORT_MIN="${WRIT_PROVE_BROKER_PORT_MIN:-49152}"
+BROKER_PORT_MAX="${WRIT_PROVE_BROKER_PORT_MAX:-65535}"
+FOREIGN_SOURCE="${WRIT_PROBE_FOREIGN_SOURCE:-10.77.0.5}"
+IPV6_MODE="ipv4-only-no-guest-ipv6"
+SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+NETWORK_NAME="writ-agent-net-${SESSION_ID}"
+VM_NAME="writ-agent-vm-${SESSION_ID}"
+PF_ANCHOR="writ/session/${SESSION_ID}"
+BROKER_DIR="${TMP_DIR}/broker"
+START_OUTPUT="${TMP_DIR}/runner-start.txt"
+LISTENER_LOG="${TMP_DIR}/listener.log"
+TCPDUMP_LOG="${TMP_DIR}/tcpdump.log"
+RUNNER=""
+HELPER=""
+BROKER_PID=""
+LISTENER_PID=""
+TCPDUMP_PID=""
+BROKER_PORT=""
+PROBE_PORT=""
+IPV4_CIDR=""
+IPV4_GATEWAY=""
+SIBLING_CIDR=""
+SIBLING_SOURCE=""
+GUEST_IPV4=""
+BRIDGE=""
+CARGO_CMD=()
+STOP_DONE=0
+cleanup_started=0
+
+cleanup() {
+  if [[ "$cleanup_started" -eq 1 ]]; then
+    return
+  fi
+  cleanup_started=1
+  log "cleaning up VM, network, listeners, capture, and PF anchor"
+
+  if [[ -n "$TCPDUMP_PID" ]]; then
+    sudo kill "$TCPDUMP_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$LISTENER_PID" ]]; then
+    kill "$LISTENER_PID" >/dev/null 2>&1 || true
+    wait "$LISTENER_PID" 2>/dev/null || true
+  fi
+
+  if [[ "$STOP_DONE" -eq 0 && -x "$RUNNER" ]]; then
+    "$RUNNER" \
+      --pf-helper "$HELPER" \
+      stop \
+      --session-id "$SESSION_ID" \
+      --ipv4-pool "$IPV4_POOL" \
+      --ipv6-pool "$IPV6_POOL" \
+      --ipv6-mode "$IPV6_MODE" \
+      --subnet-index "$SUBNET_INDEX" >/dev/null 2>&1 || true
+  fi
+
+  container rm -f "$VM_NAME" >/dev/null 2>&1 || true
+  container stop "$VM_NAME" >/dev/null 2>&1 || true
+  container delete "$VM_NAME" >/dev/null 2>&1 || true
+
+  if [[ -n "$HELPER" && -n "$IPV4_CIDR" ]]; then
+    sudo "$HELPER" remove \
+      --session-id "$SESSION_ID" \
+      --ipv4-pool "$IPV4_POOL" \
+      --ipv6-pool "$IPV6_POOL" \
+      --ipv4-cidr "$IPV4_CIDR" >/dev/null 2>&1 || true
+  fi
+
+  container network rm "$NETWORK_NAME" >/dev/null 2>&1 || \
+    container network delete "$NETWORK_NAME" >/dev/null 2>&1 || true
+
+  if [[ -n "$BROKER_PID" ]]; then
+    kill "$BROKER_PID" >/dev/null 2>&1 || true
+    wait "$BROKER_PID" 2>/dev/null || true
+  fi
+
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+choose_cargo() {
+  if command -v cargo >/dev/null 2>&1; then
+    CARGO_CMD=(cargo)
+    return
+  fi
+  if command -v nix >/dev/null 2>&1; then
+    CARGO_CMD=(nix develop -c cargo)
+    return
+  fi
+  die "missing required command: cargo, or nix for the repo development shell"
+}
+
+cidr_alloc_subnet() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import ipaddress
+import sys
+
+base = ipaddress.ip_network(sys.argv[1], strict=True)
+new_prefix = int(sys.argv[2])
+index = int(sys.argv[3])
+size = 1 << (base.max_prefixlen - new_prefix)
+subnet = ipaddress.ip_network((int(base.network_address) + index * size, new_prefix))
+if not subnet.subnet_of(base):
+    print(f"subnet index {index} is outside {base}", file=sys.stderr)
+    raise SystemExit(1)
+print(subnet)
+PY
+}
+
+cidr_host() {
+  # The n-th usable host of a network.
+  python3 - "$1" "$2" <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=True)
+hosts = network.hosts()
+for _ in range(int(sys.argv[2]) - 1):
+    next(hosts)
+print(next(hosts))
+PY
+}
+
+pick_port() {
+  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+
+start_http_server() {
+  python3 -m http.server "$2" --bind 0.0.0.0 --directory "$1" >"$3" 2>&1 &
+  echo "$!"
+}
+
+# A UDP listener on every host address, logging one line per datagram:
+# "<source ip> <source port> <payload>". This, not anything the guest says,
+# is what decides "reached the host".
+start_udp_listener() {
+  python3 - "$1" "$2" <<'PY' &
+import socket
+import sys
+
+port = int(sys.argv[1])
+log_path = sys.argv[2]
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("0.0.0.0", port))
+with open(log_path, "a", buffering=1) as log:
+    log.write("listening\n")
+    while True:
+        data, (host, sport) = sock.recvfrom(4096)
+        log.write(f"{host} {sport} {data.decode('ascii', 'replace')}\n")
+PY
+  echo "$!"
+}
+
+guest() {
+  container exec "$VM_NAME" sh -lc "$1"
+}
+
+wait_for_released_guest_command() {
+  for _ in {1..50}; do
+    if guest 'test "$(cat /tmp/writ-agent-vm-released 2>/dev/null)" = probe-released' \
+      >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "released guest command did not write its marker"
+}
+
+guest_ipv4_addr() {
+  guest "ip -4 -o addr show scope global | awk '{print \$4}' | head -n 1 | cut -d/ -f1"
+}
+
+# The bridge the interface-scoped IPv6 deny was installed on, read from the
+# session anchor: the same interface the IPv4 frames traverse.
+session_bridge() {
+  sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null \
+    | grep -Eo 'on bridge[0-9]+' | head -n 1 | awk '{print $2}'
+}
+
+# Per-label packet counters of the session anchor, as "label count" lines.
+anchor_counters() {
+  sudo pfctl -a "$PF_ANCHOR" -vsr 2>/dev/null | python3 -c '
+import re, sys
+label = None
+for line in sys.stdin:
+    m = re.search(r"label \"([^\"]+)\"", line)
+    if m:
+        label = m.group(1)
+        continue
+    m = re.search(r"Packets: (\d+)", line)
+    if m and label is not None:
+        print(f"{label} {m.group(1)}")
+        label = None
+'
+}
+
+counter_of() {
+  # $1 = counters text, $2 = label
+  printf '%s\n' "$1" | awk -v l="$2" '$0 ~ "^"l" " {print $NF}' | head -n 1
+}
+
+# Send one UDP datagram from the guest with a chosen source address, and
+# report what the host saw. The guest's exit status is logged and ignored.
+probe() {
+  local name="$1" source="$2" add_address="$3"
+  local nonce="writ-spoof-${name}-${RANDOM}${RANDOM}"
+  log "probe '${name}': source ${source} -> ${IPV4_GATEWAY}:${PROBE_PORT} (${nonce})"
+
+  if [[ "$add_address" == "yes" ]]; then
+    guest "ip addr add ${source}/32 dev eth0 2>/dev/null || true" || true
+  fi
+
+  local before after
+  before="$(anchor_counters)"
+  local tcpdump_lines_before
+  tcpdump_lines_before="$(wc -l <"$TCPDUMP_LOG" | tr -d ' ')"
+
+  # -w 1: BusyBox nc otherwise waits for a reply that never comes.
+  set +e
+  guest "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}"
+  local guest_status=$?
+  set -e
+  log "  guest nc exit status ${guest_status} (diagnostic only)"
+  sleep 2
+
+  after="$(anchor_counters)"
+  local forwarded="no" reached="no"
+  if tail -n +"$((tcpdump_lines_before + 1))" "$TCPDUMP_LOG" | grep -q "${source}\.[0-9]* > ${IPV4_GATEWAY}\.${PROBE_PORT}"; then
+    forwarded="yes"
+  fi
+  if grep -q "^${source} [0-9]* ${nonce}\$" "$LISTENER_LOG"; then
+    reached="yes"
+  fi
+  local v4_before v4_after delta
+  v4_before="$(counter_of "$before" "writ deny agent v4")"
+  v4_after="$(counter_of "$after" "writ deny agent v4")"
+  delta=$(( ${v4_after:-0} - ${v4_before:-0} ))
+
+  log "  forwarded onto ${BRIDGE}: ${forwarded}; reached host socket: ${reached}; 'writ deny agent v4' counter +${delta}"
+  RESULTS+=("${name} source=${source} forwarded=${forwarded} reached=${reached} deny_v4_delta=${delta}")
+  printf '%s\n' "$name" "$forwarded" "$reached" "$delta" >"${TMP_DIR}/result-${name}"
+}
+
+require_cmd container
+require_cmd python3
+require_cmd curl
+require_cmd uuidgen
+require_cmd tcpdump
+choose_cargo
+
+IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
+IPV4_GATEWAY="$(cidr_host "$IPV4_CIDR" 1)"
+SIBLING_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$((SUBNET_INDEX + 1))")"
+SIBLING_SOURCE="$(cidr_host "$SIBLING_CIDR" 7)"
+
+mkdir -p "$BROKER_DIR"
+printf 'broker-ok\n' >"${BROKER_DIR}/broker.txt"
+
+log "requesting sudo credentials for pfctl and tcpdump"
+sudo -v
+sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' || die "PF is not enabled"
+sudo pfctl -sr 2>/dev/null | grep -q 'anchor "writ/session/\*"' \
+  || die 'missing top-level PF anchor; add `anchor "writ/session/*"` to /etc/pf.conf and reload PF'
+
+log "building PF helper and lifecycle runner"
+"${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper --bin writ-agent-vm-runner
+HELPER="${ROOT_DIR}/target/debug/writ-agent-vm-pf-helper"
+RUNNER="${ROOT_DIR}/target/debug/writ-agent-vm-runner"
+
+BROKER_PORT="$(pick_port)"
+PROBE_PORT="$(pick_port)"
+while [[ "$PROBE_PORT" == "$BROKER_PORT" ]]; do PROBE_PORT="$(pick_port)"; done
+BROKER_PID="$(start_http_server "$BROKER_DIR" "$BROKER_PORT" "${TMP_DIR}/broker.log")"
+LISTENER_PID="$(start_udp_listener "$PROBE_PORT" "$LISTENER_LOG")"
+for _ in {1..50}; do
+  grep -q '^listening$' "$LISTENER_LOG" 2>/dev/null && break
+  sleep 0.1
+done
+grep -q '^listening$' "$LISTENER_LOG" || die "UDP listener did not start"
+log "host listeners are up: broker=${BROKER_PORT}, probe target (forbidden)=${PROBE_PORT}"
+
+log "starting runner-managed VM ${VM_NAME} on ${IPV4_CIDR} under ${IPV6_MODE}"
+"$RUNNER" \
+  --pf-helper "$HELPER" \
+  start \
+  --session-id "$SESSION_ID" \
+  --ipv4-pool "$IPV4_POOL" \
+  --ipv6-pool "$IPV6_POOL" \
+  --subnet-index "$SUBNET_INDEX" \
+  --broker-port "$BROKER_PORT" \
+  --broker-port-min "$BROKER_PORT_MIN" \
+  --broker-port-max "$BROKER_PORT_MAX" \
+  --image "$IMAGE" \
+  --ipv6-mode "$IPV6_MODE" \
+  -- sh -c 'printf probe-released >/tmp/writ-agent-vm-released; sleep 600' \
+  | tee "$START_OUTPUT"
+grep -Fxq "session_id=${SESSION_ID}" "$START_OUTPUT" || die "runner did not print expected session ID"
+wait_for_released_guest_command
+
+guest 'command -v ip >/dev/null && command -v nc >/dev/null' \
+  || die "guest image lacks ip or nc (use WRIT_PROVE_IMAGE with BusyBox nc)"
+guest 'nc 2>&1 | grep -q -- "-s ADDR"' \
+  || die "guest nc does not support -s ADDR; the probe needs a source-selectable sender"
+
+GUEST_IPV4="$(guest_ipv4_addr)"
+[[ -n "$GUEST_IPV4" ]] || die "could not determine guest IPv4 address"
+BRIDGE="$(session_bridge)"
+[[ -n "$BRIDGE" ]] || die "could not find the session bridge in the PF anchor (is the IPv6 interface deny installed?)"
+log "guest is ${GUEST_IPV4}; session bridge is ${BRIDGE}"
+
+log "capturing UDP to port ${PROBE_PORT} on ${BRIDGE}"
+# The redirects are deliberately the unprivileged shell's: the log lives in the
+# user-owned TMP_DIR, and only the capture itself needs root.
+# shellcheck disable=SC2024
+sudo tcpdump -i "$BRIDGE" -n -l -q "udp and dst port ${PROBE_PORT}" >"$TCPDUMP_LOG" 2>"${TMP_DIR}/tcpdump.err" &
+TCPDUMP_PID=$!
+sleep 2
+kill -0 "$TCPDUMP_PID" 2>/dev/null || die "tcpdump did not start: $(cat "${TMP_DIR}/tcpdump.err")"
+
+log "session anchor rules:"
+sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | sed 's/^/    /'
+
+RESULTS=()
+# Calibration: the guest's own address. If tcpdump does not see even this
+# frame, the observers are not working and nothing below means anything.
+probe control "$GUEST_IPV4" no
+read -r _ ctl_forwarded _ <"${TMP_DIR}/result-control"
+[[ "$ctl_forwarded" == "yes" ]] \
+  || die "the control datagram from the guest's own address was not seen on ${BRIDGE}; the capture is not observing the session bridge, so no spoof result would be meaningful"
+
+probe foreign "$FOREIGN_SOURCE" yes
+probe sibling "$SIBLING_SOURCE" yes
+
+log "stopping session through lifecycle runner"
+"$RUNNER" \
+  --pf-helper "$HELPER" \
+  stop \
+  --session-id "$SESSION_ID" \
+  --ipv4-pool "$IPV4_POOL" \
+  --ipv6-pool "$IPV6_POOL" \
+  --ipv6-mode "$IPV6_MODE" \
+  --subnet-index "$SUBNET_INDEX" >/dev/null
+STOP_DONE=1
+
+log "results (host-observed; guest output was diagnostic only):"
+for r in "${RESULTS[@]}"; do
+  log "  ${r}"
+done
+
+# Verdict: read from the host-observed facts, never from the guest.
+read -r _ f_fwd f_reached f_delta <"${TMP_DIR}/result-foreign"
+read -r _ s_fwd s_reached s_delta <"${TMP_DIR}/result-sibling"
+verdict() {
+  local name="$1" fwd="$2" reached="$3" delta="$4"
+  if [[ "$reached" == "yes" ]]; then
+    log "VERDICT ${name}: LIVE GAP — a spoofed-source datagram reached a host socket the session may not reach. The source-scoped IPv4 rules do not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile."
+  elif [[ "$fwd" == "yes" && "$delta" -gt 0 ]]; then
+    log "VERDICT ${name}: forwarded and counted by 'writ deny agent v4' — the deny matched it after all; check the rule text above, this contradicts the source-scoped reading."
+  elif [[ "$fwd" == "yes" ]]; then
+    log "VERDICT ${name}: forwarded onto the bridge, not counted by the session anchor, not delivered — dropped by something outside the session rules (host default policy, reverse-path check, or the listener's bind); the confinement is not the reason it stopped. C2b still applies."
+  else
+    log "VERDICT ${name}: not forwarded — vmnet did not put the spoofed-source frame on the host bridge. Record this as a pinned platform fact (see the plan's 'Beyond E3' question 4); C2b becomes hardening rather than a live fix."
+  fi
+}
+verdict foreign "$f_fwd" "$f_reached" "$f_delta"
+verdict sibling "$s_fwd" "$s_reached" "$s_delta"
+
+cleanup
+trap - EXIT INT TERM
+log "measurement complete"
