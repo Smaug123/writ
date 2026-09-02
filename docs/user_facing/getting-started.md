@@ -239,6 +239,13 @@ Before that block does anything useful you need four things on disk:
    session otherwise, naming the lines in the way; an anchor merely
    *appended* to the file is refused, because `com.apple/*` holds
    nested anchors whose contents a main-ruleset readback cannot see.
+   The helper also refuses if any loaded translation rule carries the
+   `pass` modifier (`rdr pass ...`, `nat pass ...`, `binat pass ...`), in
+   the main ruleset or in any anchor: PF translates before it filters,
+   and `pass` there sends matching packets past every filter rule,
+   including the session anchor. Such rules are common in local
+   port-forwarding recipes; drop the `pass` and add an ordinary filter
+   `pass` rule instead, then reload.
 2. **`image`** — `writ-agent-vm-guest:latest` is just a tag. Apple's
    `container` won't find it until you build the guest image (e.g.
    `nix build .#agent-vm-guest-image-aarch64-linux`) and load the

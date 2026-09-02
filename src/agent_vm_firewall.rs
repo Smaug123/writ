@@ -158,6 +158,18 @@ pub enum PfctlError {
         .0.join(" | ")
     )]
     BootstrapAnchorNotFirst(Vec<String>),
+    /// Translation rules carrying PF's `pass` modifier are loaded somewhere.
+    /// PF translates before it filters, and `pass` on a translation rule
+    /// passes every matching packet without consulting a single filter rule,
+    /// so the session anchor never sees them no matter where it sits.
+    #[error(
+        "PF has translation rules with the `pass` modifier, which pass matching packets without \
+         consulting any filter rule, so no session anchor can confine them; remove `pass` from \
+         each (a plain `nat`/`rdr` plus an ordinary filter `pass` keeps the translation without \
+         the bypass), reload that anchor or /etc/pf.conf, then retry. Offending rules: {}",
+        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ")
+    )]
+    PassTranslationRules(Vec<PassTranslationRule>),
     #[error("PF is not enabled")]
     PfDisabled,
     #[error("PF session anchor {anchor} still contains rules after removal: {rules}")]
@@ -430,6 +442,10 @@ fn capture_output_with_timeout(
 /// Translation anchors (`scrub-anchor`, `nat-anchor`, `rdr-anchor`,
 /// `dummynet-anchor`) do not filter, and a non-`quick` pass is overridden by
 /// a later match, so both may precede it.
+///
+/// Placement is necessary, not sufficient: a translation rule with the `pass`
+/// modifier bypasses the filter stage altogether, from any anchor and in any
+/// position. [`ensure_no_pass_translation_rules`] covers that separately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionAnchorPlacement {
     /// Present, and nothing ahead of it can pass a packet first.
@@ -475,6 +491,56 @@ pub fn session_anchor_placement(rules: &str) -> SessionAnchorPlacement {
     SessionAnchorPlacement::Absent
 }
 
+/// A `nat`, `rdr`, or `binat` rule carrying PF's `pass` modifier, and the
+/// anchor it was read from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassTranslationRule {
+    /// `None` for the main ruleset.
+    pub anchor: Option<String>,
+    /// The rule as `pfctl -sn` printed it.
+    pub rule: String,
+}
+
+impl std::fmt::Display for PassTranslationRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.anchor {
+            None => write!(f, "main ruleset: {}", self.rule),
+            Some(anchor) => write!(f, "anchor \"{anchor}\": {}", self.rule),
+        }
+    }
+}
+
+/// Whether a `pfctl -sn` line is a translation rule with the `pass`
+/// modifier. pfctl prints the action first (`nat`, `rdr`, `binat`; `no nat`
+/// and the `*-anchor` calls never carry the modifier) and ` pass` directly
+/// after it.
+fn is_pass_translation_rule(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    matches!(words.next(), Some("nat" | "rdr" | "binat")) && words.next() == Some("pass")
+}
+
+/// The lines of a `pfctl -sn` dump that are translation rules with the
+/// `pass` modifier, in order. Nothing else is validated.
+pub fn pass_translation_rules(rules: &str) -> Vec<String> {
+    rules
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_pass_translation_rule(line))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The anchor paths in a `pfctl -v -sA` listing: one per line, indented, and
+/// with `-v` every anchor under the main ruleset recursively by full path.
+pub fn listed_anchors(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn pf_info_says_enabled(info: &str) -> bool {
     info.lines().any(|line| {
         let line = line.trim();
@@ -511,6 +577,46 @@ pub fn ensure_session_bootstrap_anchor(pfctl: &Path) -> Result<(), PfctlError> {
     }
 }
 
+/// Refuse if any loaded translation rule carries the `pass` modifier.
+///
+/// PF runs translation before filtering, and `pass` on a `nat`/`rdr`/`binat`
+/// rule passes matching packets without consulting the filter rules at all,
+/// so such a rule bypasses the session anchor wherever the anchor sits. The
+/// main ruleset readback shows only the translation *anchor* calls, not what
+/// the anchors hold, so this reads the main translation ruleset and then every
+/// anchor `pfctl -v -sA` lists. Whether a given rule could match an agent VM's
+/// packets is not reasoned about: any `pass` translation rule is refused,
+/// because the operator can always drop the modifier and keep the translation.
+pub fn ensure_no_pass_translation_rules(pfctl: &Path) -> Result<(), PfctlError> {
+    let mut found = Vec::new();
+    let main = PfctlInvocation::new(["-sn"]).run(pfctl)?;
+    found.extend(
+        pass_translation_rules(&String::from_utf8_lossy(&main.stdout))
+            .into_iter()
+            .map(|rule| PassTranslationRule { anchor: None, rule }),
+    );
+    let listing = PfctlInvocation::new(["-v", "-sA"]).run(pfctl)?;
+    for anchor in listed_anchors(&String::from_utf8_lossy(&listing.stdout)) {
+        // `.run()`: an anchor that vanished between the listing and this read
+        // means the ruleset is changing underneath us, and an empty stdout
+        // from a failed read must not pass as "no such rules".
+        let output = PfctlInvocation::new(["-a", anchor.as_str(), "-sn"]).run(pfctl)?;
+        found.extend(
+            pass_translation_rules(&String::from_utf8_lossy(&output.stdout))
+                .into_iter()
+                .map(|rule| PassTranslationRule {
+                    anchor: Some(anchor.clone()),
+                    rule,
+                }),
+        );
+    }
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(PfctlError::PassTranslationRules(found))
+    }
+}
+
 /// Read back the session anchor and fail if it still lists rules. A flush that
 /// exits 0 but leaves rules (a wrong anchor name, a pfctl edge case) would
 /// otherwise leak this session's rules under the catch-all `writ/session/*`
@@ -543,6 +649,7 @@ pub fn install_session_firewall(
 ) -> Result<(), PfctlError> {
     ensure_pf_enabled(pfctl)?;
     ensure_session_bootstrap_anchor(pfctl)?;
+    ensure_no_pass_translation_rules(pfctl)?;
     let rendered_rules = install.rendered_rules();
     let rules_file = TempRulesFile::create(&rendered_rules)?;
     install.validate_invocation(rules_file.path()).run(pfctl)?;
@@ -1168,6 +1275,303 @@ mod tests {
         let removal =
             SessionFirewallRemoval::new(session_id(), pool(), ipv4(), Some(ipv6())).unwrap();
         remove_session_firewall(&pfctl, &removal).unwrap();
+    }
+
+    // ---- `pass` translation rules ----
+
+    #[test]
+    fn a_translation_rule_with_pass_is_reported_from_a_nat_dump() {
+        assert_eq!(
+            pass_translation_rules(
+                r#"
+                nat-anchor "com.apple/*" all
+                rdr-anchor "com.apple/*" all
+                nat on en0 inet from 192.168.64.0/24 to any -> (en0)
+                rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port = 80 -> 127.0.0.1 port 8080
+                no rdr on en0 all
+                binat pass on en0 inet from 10.0.0.1 to any -> 203.0.113.1
+                nat pass on en0 inet from 10.0.0.0/24 to any -> (en0)
+                "#
+            ),
+            vec![
+                "rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port = 80 -> 127.0.0.1 port 8080"
+                    .to_string(),
+                "binat pass on en0 inet from 10.0.0.1 to any -> 203.0.113.1".to_string(),
+                "nat pass on en0 inet from 10.0.0.0/24 to any -> (en0)".to_string(),
+            ]
+        );
+    }
+
+    /// `pfctl -v -sA` prints one anchor path per line, indented, nested
+    /// anchors by full path.
+    #[test]
+    fn an_anchor_listing_yields_full_paths_in_order() {
+        assert_eq!(
+            listed_anchors(
+                "  com.apple\n  com.apple/250.ApplicationFirewall\n  com.apple.internet-sharing\n  writ\n  writ/session\n\n"
+            ),
+            vec![
+                "com.apple".to_string(),
+                "com.apple/250.ApplicationFirewall".to_string(),
+                "com.apple.internet-sharing".to_string(),
+                "writ".to_string(),
+                "writ/session".to_string(),
+            ]
+        );
+    }
+
+    /// One line of a generated `pfctl -sn` dump, with what the classifier
+    /// must make of it decided at generation time.
+    #[derive(Clone, Debug)]
+    enum TranslationLine {
+        /// Translation without `pass`, `no` rules, translation anchor calls,
+        /// blank lines: the filter rules still see these packets.
+        Harmless(String),
+        /// A `nat`/`rdr`/`binat` rule with the `pass` modifier.
+        Pass(String),
+    }
+
+    fn arb_translation_line() -> impl Strategy<Value = TranslationLine> {
+        let name = "[a-z][a-z0-9.]{0,10}";
+        let iface = "(en0|lo0|bridge[0-9]{1,3}|utun[0-9])";
+        let port = 1u16..=65535;
+        prop_oneof![
+            // Harmless.
+            name.prop_map(|n| TranslationLine::Harmless(format!("nat-anchor \"{n}/*\" all"))),
+            name.prop_map(|n| TranslationLine::Harmless(format!("rdr-anchor \"{n}/*\" all"))),
+            name.prop_map(|n| TranslationLine::Harmless(format!("binat-anchor \"{n}\" all"))),
+            iface.prop_map(|i| TranslationLine::Harmless(format!(
+                "nat on {i} inet from 192.168.64.0/24 to any -> ({i})"
+            ))),
+            (iface, port.clone()).prop_map(|(i, p)| TranslationLine::Harmless(format!(
+                "rdr on {i} inet proto tcp from any to any port = {p} -> 127.0.0.1 port 8080"
+            ))),
+            iface.prop_map(|i| TranslationLine::Harmless(format!(
+                "binat on {i} inet from 10.0.0.1 to any -> 203.0.113.1"
+            ))),
+            iface.prop_map(|i| TranslationLine::Harmless(format!("no nat on {i} all"))),
+            iface.prop_map(|i| TranslationLine::Harmless(format!("no rdr on {i} all"))),
+            // A filter line never appears in a nat dump, but `pass` as the
+            // first word must not be mistaken for the modifier.
+            iface.prop_map(|i| TranslationLine::Harmless(format!("pass in quick on {i} all"))),
+            Just(TranslationLine::Harmless(String::new())),
+            // Pass.
+            iface.prop_map(|i| TranslationLine::Pass(format!(
+                "nat pass on {i} inet from 192.168.64.0/24 to any -> ({i})"
+            ))),
+            (iface, port).prop_map(|(i, p)| TranslationLine::Pass(format!(
+                "rdr pass on {i} inet proto tcp from any to any port = {p} -> 127.0.0.1 port 8080"
+            ))),
+            iface.prop_map(|i| TranslationLine::Pass(format!(
+                "binat pass on {i} inet from 10.0.0.1 to any -> 203.0.113.1"
+            ))),
+            Just(TranslationLine::Pass(
+                "rdr pass all -> 127.0.0.1".to_string()
+            )),
+        ]
+    }
+
+    fn arb_translation_dump() -> impl Strategy<Value = (String, Vec<String>)> {
+        proptest::collection::vec(arb_translation_line(), 0..10).prop_map(|lines| {
+            let text: String = lines
+                .iter()
+                .map(|l| match l {
+                    TranslationLine::Harmless(s) | TranslationLine::Pass(s) => format!("{s}\n"),
+                })
+                .collect();
+            let expected = lines
+                .iter()
+                .filter_map(|l| match l {
+                    TranslationLine::Pass(s) => Some(s.clone()),
+                    TranslationLine::Harmless(_) => None,
+                })
+                .collect();
+            (text, expected)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// The classifier reports exactly the `pass` translation rules, in
+        /// order, as the generator's own bookkeeping says.
+        #[test]
+        fn pass_translation_rules_are_exactly_the_pass_modified_ones((text, expected) in arb_translation_dump()) {
+            prop_assert_eq!(pass_translation_rules(&text), expected);
+        }
+    }
+
+    /// A fake `pfctl` that answers each argument vector (joined by single
+    /// spaces) with the paired stdout and exit 0, answers anything else with
+    /// empty stdout and exit 0, and appends every argument vector it sees to
+    /// `calls.log` beside itself.
+    fn write_fake_pfctl_responses(dir: &Path, responses: &[(&str, &str)]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-pfctl");
+        let log = dir.join("calls.log");
+        let mut script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n",
+            log.display()
+        );
+        for (args, stdout) in responses {
+            script.push_str(&format!(
+                "  '{}') printf '%s' '{}'; exit 0;;\n",
+                args.replace('\'', r"'\''"),
+                stdout.replace('\'', r"'\''"),
+            ));
+        }
+        script.push_str("esac\nexit 0\n");
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn fake_pfctl_calls(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    const CLEAN_MAIN_NAT: &str = "nat-anchor \"com.apple/*\" all\nrdr-anchor \"com.apple/*\" all\n";
+    const ANCHOR_LISTING: &str = "  com.apple\n  com.apple/250.ApplicationFirewall\n  com.apple.internet-sharing\n  writ\n  writ/session\n";
+
+    #[test]
+    fn pass_translation_check_accepts_a_ruleset_without_pass_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = write_fake_pfctl_responses(
+            dir.path(),
+            &[
+                ("-sn", CLEAN_MAIN_NAT),
+                ("-v -sA", ANCHOR_LISTING),
+                (
+                    "-a com.apple.internet-sharing -sn",
+                    "nat on en0 inet from 192.168.64.0/24 to any -> (en0)\n",
+                ),
+                (
+                    "-a com.apple/250.ApplicationFirewall -sn",
+                    "rdr on lo0 inet proto tcp from any to any port = 80 -> 127.0.0.1 port 8080\n",
+                ),
+            ],
+        );
+        ensure_no_pass_translation_rules(&pfctl).unwrap();
+    }
+
+    /// Every anchor the listing names is read back, not just the ones that
+    /// happen to hold translation rules: a `pass` could be in any of them.
+    #[test]
+    fn pass_translation_check_reads_every_listed_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = write_fake_pfctl_responses(
+            dir.path(),
+            &[("-sn", CLEAN_MAIN_NAT), ("-v -sA", ANCHOR_LISTING)],
+        );
+        ensure_no_pass_translation_rules(&pfctl).unwrap();
+        let calls = fake_pfctl_calls(dir.path());
+        for anchor in listed_anchors(ANCHOR_LISTING) {
+            assert!(
+                calls.contains(&format!("-a {anchor} -sn")),
+                "anchor {anchor} was never read back; calls: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pass_translation_check_rejects_a_pass_in_the_main_ruleset() {
+        let dir = tempfile::tempdir().unwrap();
+        let rule =
+            "rdr pass on lo0 inet proto tcp from any to any port = 80 -> 127.0.0.1 port 8080";
+        let pfctl = write_fake_pfctl_responses(
+            dir.path(),
+            &[
+                ("-sn", &format!("{CLEAN_MAIN_NAT}{rule}\n")),
+                ("-v -sA", ANCHOR_LISTING),
+            ],
+        );
+        let err = ensure_no_pass_translation_rules(&pfctl).unwrap_err();
+        match err {
+            PfctlError::PassTranslationRules(found) => assert_eq!(
+                found,
+                vec![PassTranslationRule {
+                    anchor: None,
+                    rule: rule.to_string(),
+                }]
+            ),
+            other => panic!("expected PassTranslationRules, got {other:?}"),
+        }
+    }
+
+    /// The main ruleset is clean; the `pass` hides in a nested anchor that a
+    /// main-ruleset readback never shows.
+    #[test]
+    fn pass_translation_check_rejects_a_pass_in_a_nested_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let rule = "nat pass on bridge100 inet from 192.168.252.0/24 to any -> (en0)";
+        let pfctl = write_fake_pfctl_responses(
+            dir.path(),
+            &[
+                ("-sn", CLEAN_MAIN_NAT),
+                ("-v -sA", ANCHOR_LISTING),
+                ("-a com.apple.internet-sharing -sn", &format!("{rule}\n")),
+            ],
+        );
+        let err = ensure_no_pass_translation_rules(&pfctl).unwrap_err();
+        match err {
+            PfctlError::PassTranslationRules(found) => assert_eq!(
+                found,
+                vec![PassTranslationRule {
+                    anchor: Some("com.apple.internet-sharing".to_string()),
+                    rule: rule.to_string(),
+                }]
+            ),
+            other => panic!("expected PassTranslationRules, got {other:?}"),
+        }
+    }
+
+    /// The install path refuses before loading anything: a correctly placed
+    /// session anchor does not help when a `pass` translation bypasses it.
+    #[test]
+    fn install_session_firewall_refuses_a_pass_translation_rule_without_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = write_fake_pfctl_responses(
+            dir.path(),
+            &[
+                ("-s info", "Status: Enabled for 0 days 00:00:01\n"),
+                (
+                    "-sr",
+                    "anchor \"writ/session/*\" all\nanchor \"com.apple/*\" all\n",
+                ),
+                (
+                    "-sn",
+                    "rdr pass on lo0 inet proto tcp from any to any port = 80 -> 127.0.0.1 port 8080\n",
+                ),
+                ("-v -sA", ""),
+            ],
+        );
+        let install = SessionFirewallInstall::new(
+            session_id(),
+            pool(),
+            ipv4(),
+            None,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let err = install_session_firewall(&pfctl, &install).unwrap_err();
+        assert!(
+            matches!(err, PfctlError::PassTranslationRules(_)),
+            "expected PassTranslationRules, got {err:?}"
+        );
+        let calls = fake_pfctl_calls(dir.path());
+        assert!(
+            !calls.iter().any(|c| c.contains("-f ")),
+            "session rules must not be loaded after a refused precheck; calls: {calls:?}"
+        );
     }
 
     fn write_fake_ifconfig(dir: &Path, output: &str) -> PathBuf {

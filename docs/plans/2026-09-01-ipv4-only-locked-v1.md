@@ -180,7 +180,11 @@ is the important one: a main-ruleset readback shows an earlier anchor only as
 its invocation line, not the rules loaded inside it, and a `quick` pass
 inside `com.apple/*` is just as final as one in `pf.conf`. So the only
 placement preflight can vouch for is writ's anchor ahead of everything else
-that filters, and the installation docs say to put it there. This is
+that filters, and the installation docs say to put it there. The precheck
+also refuses any loaded translation rule with the `pass` modifier
+(`ensure_no_pass_translation_rules`): translation runs before filtering,
+and such a rule passes matching packets without consulting any filter rule,
+so it bypasses the session anchor wherever the anchor sits. This is
 host-local state no version pin captures.
 
 `install` and `--deny-guest-ipv6` then run: precheck, resolve, `pfctl -n`
