@@ -219,7 +219,13 @@ cleanup() {
 
   rm -rf "$TMP_DIR"
 }
-trap cleanup EXIT INT TERM
+on_signal() {
+  cleanup
+  trap - EXIT
+  exit 130
+}
+trap cleanup EXIT
+trap on_signal INT TERM
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
@@ -550,6 +556,27 @@ listener_source_for_nonce() {
   awk -v nonce="$1" 'NF >= 3 && $3 == nonce { print $1; exit }' "$LISTENER_LOG"
 }
 
+# Die unless every packet observer (the UDP listener and both captures) is
+# still running. An observer that died mid-window returns empty lookups,
+# which would grade as "not forwarded" / "not reached" and pin a false
+# drop. `ps` rather than `kill -0`: the captures run under sudo, and kill -0
+# on a root process from here fails whether or not it exists. And ps's
+# *output* rather than its exit status: on recent macOS `ps -p` can exit 1
+# with "ps: time: requires entitlement" while still listing the process.
+process_alive() {
+  [[ -n "$(ps -p "$1" -o pid= 2>/dev/null)" ]]
+}
+
+require_observers_alive() {
+  local moment="$1" target
+  process_alive "$LISTENER_PID" \
+    || die "the host UDP listener was not running ${moment}; its silence would have been graded, so nothing is graded"
+  for target in "${!TARGET_CAPTURE_PID[@]}"; do
+    process_alive "${TARGET_CAPTURE_PID[$target]}" \
+      || die "the ${target} bridge capture was not running ${moment}; its silence would have been graded, so nothing is graded"
+  done
+}
+
 # Start capturing UDP to the probe port on target $1's bridge.
 start_capture() {
   local target="$1" bridge="${TARGET_BRIDGE[$1]}"
@@ -845,9 +872,11 @@ if [[ -n "$SIBLING_SOURCE" ]]; then
 fi
 # A session that appeared during the probe windows would have had its rules
 # consulted for our datagrams; if one is here now, or the watch saw one pass
-# through, nothing above is graded.
+# through, nothing above is graded. Likewise an observer that died: every
+# empty lookup above would then be a lie.
 require_no_other_anchors "after the probes"
 stop_anchor_watch
+require_observers_alive "after the probes"
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
@@ -881,11 +910,18 @@ verdict() {
   # transformation after the bridge (PF nat/rdr or similar): the bridge
   # observation proves vmnet forwarded the frame as it was, so that is a
   # fact about this host's configuration, not about vmnet.
+  # A delivery the bridge capture did not see is observer disagreement:
+  # without the bridge source there is no telling a vmnet rewrite from a
+  # host-side one, or an in-subnet source from a foreign one, so such a
+  # result is inconclusive rather than substituted.
+  local u_observers_disagree="no" observers_disagree="no"
+  if [[ "$u_reached" == "yes" && "$u_fwd_src" == "-" ]]; then u_observers_disagree="yes"; fi
+  if [[ "$reached" == "yes" && "$fwd_src" == "-" ]]; then observers_disagree="yes"; fi
   local u_bridge_rw="no" u_host_rw="no" bridge_rw="no" host_rw="no"
   if [[ "$u_fwd_src" != "-" && "$u_fwd_src" != "$source" ]]; then u_bridge_rw="yes"; fi
-  if [[ "$u_reach_src" != "-" && "$u_reach_src" != "$([[ "$u_fwd_src" != "-" ]] && echo "$u_fwd_src" || echo "$source")" ]]; then u_host_rw="yes"; fi
+  if [[ "$u_reach_src" != "-" && "$u_fwd_src" != "-" && "$u_reach_src" != "$u_fwd_src" ]]; then u_host_rw="yes"; fi
   if [[ "$fwd_src" != "-" && "$fwd_src" != "$source" ]]; then bridge_rw="yes"; fi
-  if [[ "$reach_src" != "-" && "$reach_src" != "$([[ "$fwd_src" != "-" ]] && echo "$fwd_src" || echo "$source")" ]]; then host_rw="yes"; fi
+  if [[ "$reach_src" != "-" && "$fwd_src" != "-" && "$reach_src" != "$fwd_src" ]]; then host_rw="yes"; fi
   # The IPv4 deny is `from <session /24>`; an out-of-subnet source cannot
   # match it, so any movement in its counter during this window is other
   # in-subnet traffic (DHCP, ARP-triggered retries, ...), not this datagram.
@@ -913,7 +949,9 @@ verdict() {
   # session bridge saw the same outcome; a session that sent nothing cannot
   # corroborate, and two bridges disagreeing is a fact about this run, not
   # about vmnet. Neither may be recorded as a platform fact.
-  if [[ "$emitted" != "yes" ]]; then
+  if [[ "$u_observers_disagree" == "yes" ]]; then
+    log "PLATFORM ${name}: unconfined, the listener received the datagram (source ${u_reach_src}) but the bridge capture never saw it; the observers disagree, so nothing about forwarding or rewriting can be pinned from this run. Check the capture (interface, filter, tcpdump errors) and rerun."
+  elif [[ "$emitted" != "yes" ]]; then
     log "PLATFORM ${name}: unconfined observed forwarded=${u_fwd} (bridge src ${u_fwd_src}) delivered=${u_reached} (listener src ${u_reach_src}), but the session guest did not emit its copy, so the session bridge cannot corroborate; not pinned. See the verdict below."
   elif [[ "$fwd" != "$u_fwd" || "$bridge_rw" != "$u_bridge_rw" ]]; then
     log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd} bridge-rewritten=${u_bridge_rw}, session forwarded=${fwd} bridge-rewritten=${bridge_rw}); no platform fact can be pinned from this run. See the verdict below."
@@ -929,7 +967,9 @@ verdict() {
     log "PLATFORM ${name}: neither bridge saw the spoofed-source datagram although the unconfined guest's own-address datagram was delivered. vmnet does not forward spoofed IPv4 sources. Record this as a pinned platform fact (plan 'Beyond E3' question 4); C2b becomes hardening rather than a live fix."
   fi
 
-  if [[ "$emitted" != "yes" ]]; then
+  if [[ "$observers_disagree" == "yes" ]]; then
+    log "VERDICT ${name}: INCONCLUSIVE — under the session the listener received the datagram (source ${reach_src}) but the bridge capture never saw it. A datagram from the session guest did reach a host socket, which is alarming, but without the bridge source it cannot be attributed to the source-scoping gap, a rewrite, or an anchor failure. Check the capture and rerun before recording anything.${counter_note}"
+  elif [[ "$emitted" != "yes" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE — the session guest did not emit the datagram (see the nc stderr and TX counter lines above), so the session observers' silence says nothing. Fix the sender and rerun."
   elif [[ "$reached" == "yes" && "$src_in_session" == "yes" ]]; then
     log "VERDICT ${name}: LIVE GAP (ANCHOR) — a datagram from the session guest reached a host socket the session may not reach, and the bridge carried an IN-SUBNET source (${fwd_src}, rewritten from ${source}) that the session deny should have matched. This is not the source-scoping gap: the anchor failed to deny an in-subnet frame. Investigate the anchor (rule order, interface, state) before attributing anything to C2b.${host_rw_note}${counter_note}"
