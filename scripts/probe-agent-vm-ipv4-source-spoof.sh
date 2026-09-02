@@ -73,7 +73,11 @@ Requires:
   - no other writ session anchor loaded: every child of that wildcard is
     evaluated for every bridge, so another session's source-scoped deny
     (above all one on the sibling /24) would confound both guests. The
-    script refuses to start while any exists.
+    script refuses to start while any exists, and polls the anchor list
+    every 0.2s across the probe windows, failing the run if one appears.
+    An anchor that comes and goes within one poll interval is the residual
+    gap: PF offers no exclusivity primitive, so do not run this alongside
+    anything that starts writ sessions.
   - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
     and a BusyBox nc that supports `-u` and `-s ADDR` (alpine:latest does)
 
@@ -128,6 +132,8 @@ RUNNER=""
 HELPER=""
 BROKER_PID=""
 LISTENER_PID=""
+ANCHOR_WATCH_PID=""
+ANCHOR_INTRUSIONS=""
 BROKER_PORT=""
 PROBE_PORT=""
 IPV4_CIDR=""
@@ -150,8 +156,14 @@ cleanup() {
   cleanup_started=1
   log "cleaning up VMs, networks, listeners, captures, and PF anchor"
 
+  if [[ -n "$ANCHOR_WATCH_PID" ]]; then
+    kill "$ANCHOR_WATCH_PID" >/dev/null 2>&1 || true
+    wait "$ANCHOR_WATCH_PID" 2>/dev/null || true
+  fi
+  # `${arr[@]+"${arr[@]}"}`: an empty array under `set -u` is an error on
+  # bash 4.0-4.3, and this runs from the EXIT trap after early failures.
   local pid
-  for pid in "${TARGET_CAPTURE_PID[@]}"; do
+  for pid in ${TARGET_CAPTURE_PID[@]+"${TARGET_CAPTURE_PID[@]}"}; do
     sudo kill "$pid" >/dev/null 2>&1 || true
   done
   if [[ -n "$LISTENER_PID" ]]; then
@@ -424,6 +436,35 @@ require_no_other_anchors() {
     || die "other writ session anchors are loaded (${1}) and would confound the measurement; stop those sessions first: $(tr '\n' ' ' <<<"$others")"
 }
 
+# Poll the anchor list in the background for the whole probe window, noting
+# every foreign anchor seen with a timestamp. The snapshot checks cannot see
+# a session that comes and goes between them; this narrows that to one poll
+# interval, which is the best PF's tooling allows. `sudo -n`: the background
+# loop must never block on a password prompt.
+start_anchor_watch() {
+  ANCHOR_INTRUSIONS="${TMP_DIR}/anchor-intrusions.log"
+  : >"$ANCHOR_INTRUSIONS"
+  (
+    while true; do
+      others="$( { sudo -n pfctl -a writ/session -sA 2>/dev/null; sudo -n pfctl -sA 2>/dev/null; } \
+        | { grep -Eo 'writ/session/[0-9a-f-]+' || true; } | sort -u | { grep -Fxv "$PF_ANCHOR" || true; })"
+      if [[ -n "$others" ]]; then
+        printf '%s %s\n' "$(date +%H:%M:%S)" "$(tr '\n' ' ' <<<"$others")" >>"$ANCHOR_INTRUSIONS"
+      fi
+      sleep 0.2
+    done
+  ) &
+  ANCHOR_WATCH_PID=$!
+}
+
+stop_anchor_watch() {
+  kill "$ANCHOR_WATCH_PID" >/dev/null 2>&1 || true
+  wait "$ANCHOR_WATCH_PID" 2>/dev/null || true
+  ANCHOR_WATCH_PID=""
+  [[ ! -s "$ANCHOR_INTRUSIONS" ]] \
+    || die "another writ session anchor was loaded during the probe windows; its rules were consulted for our datagrams, so nothing is graded. Seen: $(sort -u "$ANCHOR_INTRUSIONS" | tr '\n' ';')"
+}
+
 # The bridge the interface-scoped IPv6 deny was installed on, read from the
 # session anchor: the same interface the session's IPv4 frames traverse.
 session_bridge() {
@@ -674,6 +715,7 @@ log "session guest is ${GUEST_IPV4} behind ${IPV4_GATEWAY} on ${TARGET_BRIDGE[se
 start_capture unconfined
 start_capture session
 require_no_other_anchors "after both guests started"
+start_anchor_watch
 
 log "session anchor rules:"
 sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | sed 's/^/    /'
@@ -724,8 +766,10 @@ if [[ -n "$SIBLING_SOURCE" ]]; then
   probe session sibling "$SIBLING_SOURCE" yes
 fi
 # A session that appeared during the probe windows would have had its rules
-# consulted for our datagrams; if one is here now, nothing above is graded.
+# consulted for our datagrams; if one is here now, or the watch saw one pass
+# through, nothing above is graded.
 require_no_other_anchors "after the probes"
+stop_anchor_watch
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
@@ -757,12 +801,19 @@ verdict() {
   if [[ "$delta" -gt 0 ]]; then
     counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; the source-scoped rule cannot have matched this source, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
   fi
-  if [[ "$u_reached" == "yes" ]]; then
+  # The platform line is pinned only when the session bridge saw the same
+  # forwarding outcome; two bridges disagreeing is a fact about this run,
+  # not about vmnet, and must not be recorded as either.
+  if [[ "$emitted" == "yes" && "$fwd" != "$u_fwd" ]]; then
+    log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd}, session forwarded=${fwd}); no platform fact can be pinned from this run. See the verdict below."
+  elif [[ "$u_reached" == "yes" ]]; then
     log "PLATFORM ${name}: unconfined, the spoofed-source datagram was forwarded and DELIVERED to the host socket. vmnet forwards spoofed IPv4 sources and the host accepts them; only PF stands between such a frame and a host socket."
   elif [[ "$u_fwd" == "yes" ]]; then
     log "PLATFORM ${name}: unconfined, the spoofed-source datagram was forwarded onto the bridge but not delivered. vmnet forwards spoofed IPv4 sources; something in the host stack (default PF policy, reverse-path check) drops them before a socket, independent of any session anchor."
+  elif [[ "$emitted" != "yes" ]]; then
+    log "PLATFORM ${name}: unconfined, the spoofed-source datagram never appeared on the bridge, but the session guest did not emit its copy, so the session bridge cannot corroborate; not pinned. See the verdict below."
   else
-    log "PLATFORM ${name}: unconfined, the spoofed-source datagram never appeared on the bridge although the same guest's own-address datagram did. vmnet does not forward spoofed IPv4 sources. Record this as a pinned platform fact (plan 'Beyond E3' question 4); C2b becomes hardening rather than a live fix."
+    log "PLATFORM ${name}: neither bridge saw the spoofed-source datagram although the unconfined guest's own-address datagram was delivered. vmnet does not forward spoofed IPv4 sources. Record this as a pinned platform fact (plan 'Beyond E3' question 4); C2b becomes hardening rather than a live fix."
   fi
 
   if [[ "$emitted" != "yes" ]]; then
