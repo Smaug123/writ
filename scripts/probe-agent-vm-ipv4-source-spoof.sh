@@ -38,6 +38,13 @@ For each, the host observes three things, none of them reported by the guest:
   - a host UDP listener on the gateway: did the datagram reach a host socket?
   - the session anchor's labelled rule counters: did PF count it?
 
+One guest-side fact gates whether host silence means anything: eth0's TX
+packet counter must rise and nc must print no error, or the guest emitted
+nothing and the probe is reported INCONCLUSIVE rather than graded. The IPv4
+deny is source-scoped to the session /24, so for the foreign and sibling
+probes it cannot match by construction; a rise in its counter during those
+windows is unrelated in-subnet traffic and is reported as such.
+
 Requires:
   - macOS with Apple container installed and `container system start` already run
   - root privileges through sudo for pfctl and tcpdump
@@ -308,6 +315,16 @@ guest_ipv4_addr() {
   guest "ip -4 -o addr show scope global | awk '{print \$4}' | head -n 1 | cut -d/ -f1"
 }
 
+# eth0's transmitted-packet counter, as the guest kernel reports it. Guest
+# reported, so it never decides a verdict; it only decides whether there was
+# a frame for the host observers to see at all.
+guest_tx_packets() {
+  local n
+  n="$(guest 'cat /sys/class/net/eth0/statistics/tx_packets' 2>/dev/null | tr -d '[:space:]')"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "could not read the guest's eth0 tx_packets counter (got '${n}')"
+  printf '%s\n' "$n"
+}
+
 # The bridge the interface-scoped IPv6 deny was installed on, read from the
 # session anchor: the same interface the IPv4 frames traverse.
 session_bridge() {
@@ -353,24 +370,35 @@ probe() {
       || die "guest did not configure ${source}/32 on eth0; the ${name} probe would send nothing"
   fi
 
-  local before after
+  local before after tx_before tx_after
   before="$(anchor_counters)"
+  tx_before="$(guest_tx_packets)"
   local tcpdump_lines_before
   tcpdump_lines_before="$(wc -l <"$TCPDUMP_LOG" | tr -d ' ')"
 
   # -w 1: BusyBox nc otherwise waits for a reply that never comes. Its exit
-  # status is diagnostic (a reply timeout is the expected outcome), but a
-  # bind failure means no frame was ever sent, and that must not be scored.
+  # status is diagnostic (a reply timeout is the expected outcome). Whether a
+  # frame left the guest at all is decided below from eth0's TX counter and
+  # nc's stderr, not from this status: host silence about a frame that was
+  # never emitted must not be graded as a platform fact.
   local nc_err="${TMP_DIR}/nc-${name}.err"
   set +e
   guest "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}" 2>"$nc_err"
   local guest_status=$?
   set -e
   log "  guest nc exit status ${guest_status} (diagnostic only)"
-  if grep -qiE 'bind|assign' "$nc_err"; then
-    die "guest nc could not bind ${source}: $(cat "$nc_err")"
-  fi
   sleep 2
+  tx_after="$(guest_tx_packets)"
+
+  local emitted="yes"
+  if [[ -s "$nc_err" ]]; then
+    emitted="no"
+    log "  guest nc wrote to stderr: $(tr '\n' ' ' <"$nc_err")"
+  fi
+  if (( tx_after <= tx_before )); then
+    emitted="no"
+    log "  guest eth0 TX packet counter did not rise (${tx_before} -> ${tx_after})"
+  fi
 
   after="$(anchor_counters)"
   local forwarded="no" reached="no"
@@ -385,10 +413,10 @@ probe() {
   v4_after="$(counter_of "$after" "writ deny agent v4")"
   delta=$(( ${v4_after:-0} - ${v4_before:-0} ))
 
-  log "  forwarded onto ${BRIDGE}: ${forwarded}; reached host socket: ${reached}; 'writ deny agent v4' counter +${delta}"
-  RESULTS+=("${name} source=${source} forwarded=${forwarded} reached=${reached} deny_v4_delta=${delta}")
+  log "  guest emitted a frame: ${emitted}; forwarded onto ${BRIDGE}: ${forwarded}; reached host socket: ${reached}; 'writ deny agent v4' counter +${delta}"
+  RESULTS+=("${name} source=${source} emitted=${emitted} forwarded=${forwarded} reached=${reached} deny_v4_delta=${delta}")
   # One line, because every consumer is a single `read`.
-  printf '%s %s %s %s\n' "$name" "$forwarded" "$reached" "$delta" >"${TMP_DIR}/result-${name}"
+  printf '%s %s %s %s %s\n' "$name" "$emitted" "$forwarded" "$reached" "$delta" >"${TMP_DIR}/result-${name}"
 }
 
 require_cmd container
@@ -498,7 +526,9 @@ RESULTS=()
 # blind capture, a broken counter parser, or an anchor that is not actually
 # denying would each let a later delivery be misattributed to spoofing.
 probe control "$GUEST_IPV4" no
-read -r _ ctl_forwarded ctl_reached ctl_delta <"${TMP_DIR}/result-control"
+read -r _ ctl_emitted ctl_forwarded ctl_reached ctl_delta <"${TMP_DIR}/result-control"
+[[ "$ctl_emitted" == "yes" ]] \
+  || die "the guest did not emit the control datagram (nc error or no TX); the sender is not working, so nothing below would be measuring anything"
 [[ "$ctl_forwarded" == "yes" ]] \
   || die "the control datagram from the guest's own address was not seen on ${BRIDGE}; the capture is not observing the session bridge, so no spoof result would be meaningful"
 [[ "$ctl_reached" == "no" ]] \
@@ -527,24 +557,32 @@ for r in "${RESULTS[@]}"; do
   log "  ${r}"
 done
 
-# Verdict: read from the host-observed facts, never from the guest.
-read -r _ f_fwd f_reached f_delta <"${TMP_DIR}/result-foreign"
+# Verdict: graded from the host-observed facts. The guest contributes only
+# the emission check, which can withhold a verdict but never award one.
+read -r _ f_emitted f_fwd f_reached f_delta <"${TMP_DIR}/result-foreign"
 verdict() {
-  local name="$1" fwd="$2" reached="$3" delta="$4"
-  if [[ "$reached" == "yes" ]]; then
-    log "VERDICT ${name}: LIVE GAP — a spoofed-source datagram reached a host socket the session may not reach. The source-scoped IPv4 rules do not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile."
-  elif [[ "$fwd" == "yes" && "$delta" -gt 0 ]]; then
-    log "VERDICT ${name}: forwarded and counted by 'writ deny agent v4' — the deny matched it after all; check the rule text above, this contradicts the source-scoped reading."
+  local name="$1" emitted="$2" fwd="$3" reached="$4" delta="$5"
+  # The IPv4 deny is `from <session /24>`; an out-of-subnet source cannot
+  # match it, so any movement in its counter during this window is other
+  # in-subnet traffic (DHCP, ARP-triggered retries, ...), not this datagram.
+  local counter_note=""
+  if [[ "$delta" -gt 0 ]]; then
+    counter_note=" ('writ deny agent v4' rose by ${delta} during the window; the source-scoped rule cannot have matched this source, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
+  fi
+  if [[ "$emitted" != "yes" ]]; then
+    log "VERDICT ${name}: INCONCLUSIVE — the guest did not emit the datagram (see the nc stderr and TX counter lines above), so the host observers' silence says nothing about vmnet or PF. Fix the sender and rerun."
+  elif [[ "$reached" == "yes" ]]; then
+    log "VERDICT ${name}: LIVE GAP — a spoofed-source datagram reached a host socket the session may not reach. The source-scoped IPv4 rules do not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
   elif [[ "$fwd" == "yes" ]]; then
-    log "VERDICT ${name}: forwarded onto the bridge, not counted by the session anchor, not delivered — dropped by something outside the session rules (host default policy, reverse-path check, or the listener's bind); the confinement is not the reason it stopped. C2b still applies."
+    log "VERDICT ${name}: forwarded onto the bridge, not delivered — dropped by something outside the session rules (host default policy, reverse-path check, or the listener's bind); the confinement is not the reason it stopped. C2b still applies.${counter_note}"
   else
-    log "VERDICT ${name}: not forwarded — vmnet did not put the spoofed-source frame on the host bridge. Record this as a pinned platform fact (see the plan's 'Beyond E3' question 4); C2b becomes hardening rather than a live fix."
+    log "VERDICT ${name}: not forwarded — the guest emitted the frame but vmnet did not put it on the host bridge. Record this as a pinned platform fact (see the plan's 'Beyond E3' question 4); C2b becomes hardening rather than a live fix.${counter_note}"
   fi
 }
-verdict foreign "$f_fwd" "$f_reached" "$f_delta"
+verdict foreign "$f_emitted" "$f_fwd" "$f_reached" "$f_delta"
 if [[ -n "$SIBLING_SOURCE" ]]; then
-  read -r _ s_fwd s_reached s_delta <"${TMP_DIR}/result-sibling"
-  verdict sibling "$s_fwd" "$s_reached" "$s_delta"
+  read -r _ s_emitted s_fwd s_reached s_delta <"${TMP_DIR}/result-sibling"
+  verdict sibling "$s_emitted" "$s_fwd" "$s_reached" "$s_delta"
 else
   log "VERDICT sibling: not measured — ${IPV4_POOL} holds a single /24, so there is no other session subnet to spoof from."
 fi
