@@ -928,9 +928,21 @@ verdict() {
   # Unless the bridge carried a rewritten source: then PF judged that one,
   # and the counter may well be about this datagram. A host-side rewrite
   # after the bridge does not change what PF's `in` rules saw.
-  local counter_note=""
-  if [[ "$fwd_src" != "-" ]] && addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then
-    counter_note=" ('writ deny agent v4' moved by ${delta} during the session window; PF saw the in-subnet source ${fwd_src}, so the counter may be about this datagram.)"
+  # The deny counter and the bridge capture are both host-owned; when they
+  # contradict each other the run cannot say which one to believe. A rise
+  # with nothing on the bridge may be unrelated in-subnet traffic or a
+  # rewrite into the subnet that the capture missed; an in-subnet source on
+  # the bridge that the deny did not count means the anchor did not match
+  # what it should have. Either withholds a verdict.
+  local counter_note="" counter_contradiction="no"
+  if [[ "$emitted" == "yes" && "$fwd_src" == "-" && "$delta" -gt 0 ]]; then
+    counter_contradiction="yes"
+    counter_note=" ('writ deny agent v4' rose by ${delta} during the session window although the bridge capture saw nothing: unrelated in-subnet traffic, or a rewrite into the subnet the capture missed; the two cannot be told apart.)"
+  elif [[ "$src_in_session" == "yes" && "$delta" -eq 0 ]]; then
+    counter_contradiction="yes"
+    counter_note=" (the bridge carried the in-subnet source ${fwd_src} but 'writ deny agent v4' did not count it; the anchor did not match a frame it should have.)"
+  elif [[ "$src_in_session" == "yes" ]]; then
+    counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; PF saw the in-subnet source ${fwd_src}, so the counter is consistent with the deny matching this datagram.)"
   elif [[ "$delta" -gt 0 ]]; then
     counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; the source-scoped rule cannot have matched ${fwd_src}, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
   fi
@@ -953,6 +965,8 @@ verdict() {
     log "PLATFORM ${name}: unconfined, the listener received the datagram (source ${u_reach_src}) but the bridge capture never saw it; the observers disagree, so nothing about forwarding or rewriting can be pinned from this run. Check the capture (interface, filter, tcpdump errors) and rerun."
   elif [[ "$observers_disagree" == "yes" ]]; then
     log "PLATFORM ${name}: under the session the listener received the datagram (source ${reach_src}) but the session bridge capture never saw it; the session bridge cannot corroborate anything, so nothing is pinned from this run. Check the capture and rerun."
+  elif [[ "$counter_contradiction" == "yes" ]]; then
+    log "PLATFORM ${name}: the session's PF counter and bridge capture contradict each other${counter_note}; the session cannot corroborate anything, so nothing is pinned from this run."
   elif [[ "$emitted" != "yes" ]]; then
     log "PLATFORM ${name}: unconfined observed forwarded=${u_fwd} (bridge src ${u_fwd_src}) delivered=${u_reached} (listener src ${u_reach_src}), but the session guest did not emit its copy, so the session bridge cannot corroborate; not pinned. See the verdict below."
   elif [[ "$fwd" != "$u_fwd" || "$bridge_rw" != "$u_bridge_rw" ]]; then
@@ -979,6 +993,8 @@ verdict() {
     log "VERDICT ${name}: LIVE GAP (ANCHOR) — a datagram from the session guest reached a host socket the session may not reach, and the bridge carried an IN-SUBNET source (${fwd_src}, rewritten from ${source}) that the session deny should have matched. This is not the source-scoping gap: the anchor failed to deny an in-subnet frame. Investigate the anchor (rule order, interface, state) before attributing anything to C2b.${host_rw_note}${counter_note}"
   elif [[ "$reached" == "yes" ]]; then
     log "VERDICT ${name}: LIVE GAP — under the session anchor a datagram from the session guest reached a host socket the session may not reach (requested source ${source}, bridge carried ${fwd_src}, listener saw ${reach_src}); the source on the bridge lies outside the session /24, so nothing in the source-scoped rules could match it. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${host_rw_note}${counter_note}"
+  elif [[ "$counter_contradiction" == "yes" ]]; then
+    log "VERDICT ${name}: INCONCLUSIVE — the session's PF counter and bridge capture contradict each other${counter_note} Rerun before recording anything."
   elif [[ "$u_observers_disagree" == "yes" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE — the positive control's observers disagreed (its listener received the datagram, its bridge capture did not), so the unconfined result cannot serve as the control this session result needs. Check the capture and rerun before recording anything.${counter_note}"
   elif [[ "$bridge_rw" == "yes" && "$src_in_session" == "yes" ]]; then
