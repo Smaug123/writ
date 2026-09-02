@@ -402,10 +402,26 @@ require_guest_tooling() {
 
 # Child anchors currently loaded under writ/session, one per line. Both
 # listings are consulted because pfctl prints nested anchors differently
-# across macOS releases.
+# across macOS releases. An empty listing is success (grep's 1 must not
+# trip errexit through pipefail): no anchors is the state we want.
 existing_session_anchors() {
   { sudo pfctl -a writ/session -sA 2>/dev/null; sudo pfctl -sA 2>/dev/null; } \
-    | grep -Eo 'writ/session/[0-9a-f-]+' | sort -u
+    | { grep -Eo 'writ/session/[0-9a-f-]+' || true; } | sort -u
+}
+
+# Die if any session anchor other than this run's own is loaded. Every child
+# of the `writ/session/*` wildcard is consulted for every packet on every
+# interface, so a concurrent session's `block ... from <its /24>` would deny
+# our sibling-source datagram on the unconfined bridge as well, and the run
+# would pin that as a vmnet fact. Checked before anything starts, again once
+# both guests are up, and again after the last probe, so a session that
+# appears during the build or startup or mid-window is caught, not reasoned
+# around. $1 names the moment for the message.
+require_no_other_anchors() {
+  local others
+  others="$(existing_session_anchors | { grep -Fxv "$PF_ANCHOR" || true; })"
+  [[ -z "$others" ]] \
+    || die "other writ session anchors are loaded (${1}) and would confound the measurement; stop those sessions first: $(tr '\n' ' ' <<<"$others")"
 }
 
 # The bridge the interface-scoped IPv6 deny was installed on, read from the
@@ -575,13 +591,7 @@ sudo -v
 sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' || die "PF is not enabled"
 sudo pfctl -sr 2>/dev/null | grep -q 'anchor "writ/session/\*"' \
   || die 'missing top-level PF anchor; add `anchor "writ/session/*"` to /etc/pf.conf and reload PF'
-# Every child anchor of the wildcard is consulted for every packet on every
-# interface, so a concurrent session's `block ... from <its /24>` would deny
-# our sibling-source datagram on the unconfined bridge as well, and the run
-# would pin that as a vmnet fact. Refuse rather than reason around it.
-EXISTING_ANCHORS="$(existing_session_anchors)"
-[[ -z "$EXISTING_ANCHORS" ]] \
-  || die "other writ session anchors are loaded and would confound the measurement; stop those sessions first: $(tr '\n' ' ' <<<"$EXISTING_ANCHORS")"
+require_no_other_anchors "before start"
 
 log "building PF helper and lifecycle runner"
 "${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper --bin writ-agent-vm-runner
@@ -663,6 +673,7 @@ log "session guest is ${GUEST_IPV4} behind ${IPV4_GATEWAY} on ${TARGET_BRIDGE[se
 
 start_capture unconfined
 start_capture session
+require_no_other_anchors "after both guests started"
 
 log "session anchor rules:"
 sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | sed 's/^/    /'
@@ -712,6 +723,9 @@ probe session foreign "$FOREIGN_SOURCE" yes
 if [[ -n "$SIBLING_SOURCE" ]]; then
   probe session sibling "$SIBLING_SOURCE" yes
 fi
+# A session that appeared during the probe windows would have had its rules
+# consulted for our datagrams; if one is here now, nothing above is graded.
+require_no_other_anchors "after the probes"
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
