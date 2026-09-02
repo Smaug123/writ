@@ -1142,7 +1142,18 @@ that ran, took effect, and was then killed matches the same signature. Replay
 safety is therefore a fact about the command, decided at the call site
 (`notes_repo::OnBornDead`), not a boolean the supervisor hands out.
 
-**Primitives.** `AgentVmSessionPlan`/`StopPlan`
+**Primitives.** The locked profile's guest handoff lives in its own pure
+crate, `crates/writ-guest-init` (no host deps): the `container run`
+capability profile and its exact parser (`capability_argv`), the ordered
+`HandoffStep` plan with `simulate`, a reference model of the Linux privilege
+rules that accepts a plan iff every step could succeed and it ends, once, in
+a verification that finds the locked state (`handoff`), and the
+`/proc/<pid>/status` acceptance types (`proc_status`): `LockedAwaitingRelease`,
+which the host checks before release while PID 1 is parked in `sigwait` with
+`SIGUSR1` blocked, and `LockedReleased`, which the Linux CI oracle checks of
+the `exec`ed workload, where `SIGUSR1` must be unblocked. The Linux-only interpreter that performs the
+plan is not yet built; see `ipv4-only-network-confinement.md`, layer 2.
+`AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`
 (`agent_vm_lifecycle/state_store.rs`); the start-step state machine
 `AgentVmStartStep` (ProbeNetworkAbsent → CreateNetwork → InspectAndValidate →

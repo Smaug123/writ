@@ -1,0 +1,16 @@
+[package]
+name = "writ-guest-init"
+version = "0.1.0"
+edition = "2024"
+
+# The guest-side one-way handoff, as data: what the initializer that will run
+# as PID 1 inside the agent VM must do before it releases the workload, and
+# what the host is entitled to expect afterwards. This crate is pure. It has no
+# host dependency and performs no effect; the binary that interprets these
+# plans (Linux-only) lands separately. See
+# docs/design/ipv4-only-network-confinement.md, "Enforcement layer 2".
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

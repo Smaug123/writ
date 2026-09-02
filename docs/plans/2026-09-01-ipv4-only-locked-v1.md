@@ -51,7 +51,9 @@ description; the fixed `container run` capability argv.
 Add a Linux-only crate (`crates/writ-guest-init`, no host deps) holding: the
 ordered handoff plan as a DU of steps (chown, sysctl write, verify-no-ipv6,
 drop-caps, set-no-new-privs, setgroups, setresgid, setresuid, re-verify), the
-expected post-handoff `/proc/self/status` shape as a parsed type, and the
+expected post-handoff `/proc/self/status` shape as a parsed type with two
+acceptance proofs (awaiting release, `USR1` blocked because PID 1 is parked
+in `sigwait`; released, `USR1` unblocked in the `exec`ed workload), and the
 `LOCKED_CAPABILITY_ARGV_PROFILE` constant with its parser. Salvage the argv
 profile and its tests from `codex/ipv4-lock-stage-1-gate`
 (`src/agent_vm_start_gate.rs`).
@@ -61,8 +63,10 @@ profile and its tests from `codex/ipv4-lock-stage-1-gate`
   design lists, and any argv that adds, drops, or reorders a `--cap-add`
   fails to parse.
 - Property: a `/proc/self/status` document is accepted iff every capability
-  field is zero, `NoNewPrivs` is 1, Uid/Gid are all 1000, and Groups is empty;
-  generators mutate one field at a time and each mutation is rejected.
+  field is zero, `NoNewPrivs` is 1, Uid/Gid are all 1000, Groups is empty, and
+  `SigBlk` has `USR1` set (awaiting release) or clear (released); generators
+  mutate one field at a time and each mutation is rejected by the proof for
+  its phase, and no document satisfies both proofs.
 - The step sequence is exhaustive and ordered: a property asserts that the
   sysctl steps precede the bounding-set drop, that the bounding-set drop,
   inheritable/ambient clear, and `NoNewPrivs` all precede the identity change
@@ -83,8 +87,8 @@ profile and its tests from `codex/ipv4-lock-stage-1-gate`
 - Integration test on the Linux CI runner: run the binary in a container
   launched with the B1 argv profile, wrapping a probe command that prints
   `/proc/self/status`, `ip -6 addr`, and `ip -6 route`; after sending USR1 the
-  output satisfies B1's acceptance type. This is host-observed and pre-release,
-  so it is trusted evidence.
+  output satisfies B1's released acceptance type (`LockedReleased`). This is
+  host-observed, so it is trusted evidence.
 - Every injected failure (chown of a missing dir, a sysctl that cannot be
   written, an address that survives step 3, a bounding-set entry that survives
   step 5, an identity change refused with `EPERM`) prevents `exec`: the probe
@@ -96,7 +100,9 @@ profile and its tests from `codex/ipv4-lock-stage-1-gate`
   sends `USR1` the instant it reads the record, repeatedly across many runs,
   and the probe command runs every time, never a terminated PID 1. The probe
   command also prints its signal mask (`SigBlk` in `/proc/self/status`), and
-  B1's acceptance type requires `USR1` unblocked in it. (A signal
+  B1's released acceptance type requires `USR1` unblocked in it, while its
+  awaiting-release type, the one the host's gate applies to PID 1 before
+  sending `USR1`, requires it blocked. (A signal
   that arrives after arming and before the host reads the record is simply
   pending and released next; the guest cannot observe when the host read the
   line, so ordering on the host side is the trusted host's job, and it sends
@@ -458,8 +464,8 @@ setuid, file capability, child process); do not build a schedule language.
   at least the commanded probe count.
 - On hardware, locked profile: the positive control reaches its listener; the
   protected session's listener accepts nothing and its deny counters are
-  zero; the pre-release `/proc/<pid>/status` read matches B1's acceptance
-  type. The change that records this passing is the change that adds the
+  zero; the pre-release `/proc/<pid>/status` read matches B1's
+  awaiting-release acceptance type (`LockedAwaitingRelease`). The change that records this passing is the change that adds the
   host's (CLI, macOS build, image digest) record to the host-placement
   allowlist; the allowlist test asserts every entry names a proof record.
 - The proof fails, each with a distinct message, when the positive control

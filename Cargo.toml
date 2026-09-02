@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/writ-audit", "crates/bailiff"]
+members = ["crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/writ-audit", "crates/writ-guest-init", "crates/bailiff"]
 # Without this, root-level `cargo clippy/test/doc` (as run by CI) select only
 # the root `writ` package, silently skipping member crates' own test targets
 # and rustdoc. Keep every member in the default gate set.
-default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/writ-audit", "crates/bailiff"]
+default-members = [".", "crates/writ-core", "crates/writ-vm-git", "crates/writ-agent-run", "crates/writ-vm-client", "crates/writ-audit", "crates/writ-guest-init", "crates/bailiff"]
 resolver = "3"
 
 [features]
