@@ -56,6 +56,10 @@ For each datagram the host observes three things, none reported by a guest:
   - tcpdump on that guest's bridge: was the frame forwarded to the host side?
   - a host UDP listener bound on every address: did it reach a host socket?
   - (session only) the anchor's labelled rule counters: did PF count it?
+Both packet observers correlate by the host-minted nonce in the payload, not
+by source address, and report the source they actually saw: a platform that
+anti-spoofs by REWRITING the source rather than dropping the frame is a
+distinct outcome, not a drop.
 
 One guest-side fact gates whether host silence means anything: eth0's TX
 packet counter must rise and nc must print no error, or the guest emitted
@@ -444,10 +448,20 @@ require_no_other_anchors() {
 start_anchor_watch() {
   ANCHOR_INTRUSIONS="${TMP_DIR}/anchor-intrusions.log"
   : >"$ANCHOR_INTRUSIONS"
+  # The loop must not inherit errexit: a transient pfctl or sudo failure
+  # would end it silently and the run would grade without its protection.
+  # A poll whose both listings fail is recorded as POLL-FAILURE, and the
+  # stop below treats that, or a dead watcher, as a failed run.
   (
+    set +e
     while true; do
-      others="$( { sudo -n pfctl -a writ/session -sA 2>/dev/null; sudo -n pfctl -sA 2>/dev/null; } \
-        | { grep -Eo 'writ/session/[0-9a-f-]+' || true; } | sort -u | { grep -Fxv "$PF_ANCHOR" || true; })"
+      listing_a="$(sudo -n pfctl -a writ/session -sA 2>/dev/null)"; status_a=$?
+      listing_b="$(sudo -n pfctl -sA 2>/dev/null)"; status_b=$?
+      if (( status_a != 0 && status_b != 0 )); then
+        printf '%s POLL-FAILURE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
+      fi
+      others="$(printf '%s\n%s\n' "$listing_a" "$listing_b" \
+        | grep -Eo 'writ/session/[0-9a-f-]+' | sort -u | grep -Fxv "$PF_ANCHOR")"
       if [[ -n "$others" ]]; then
         printf '%s %s\n' "$(date +%H:%M:%S)" "$(tr '\n' ' ' <<<"$others")" >>"$ANCHOR_INTRUSIONS"
       fi
@@ -458,9 +472,16 @@ start_anchor_watch() {
 }
 
 stop_anchor_watch() {
+  local alive=1
+  kill -0 "$ANCHOR_WATCH_PID" 2>/dev/null || alive=0
   kill "$ANCHOR_WATCH_PID" >/dev/null 2>&1 || true
   wait "$ANCHOR_WATCH_PID" 2>/dev/null || true
   ANCHOR_WATCH_PID=""
+  [[ "$alive" -eq 1 ]] \
+    || die "the anchor watcher was not running at the end of the probe windows; the concurrency check lapsed, so nothing is graded"
+  if grep -q 'POLL-FAILURE' "$ANCHOR_INTRUSIONS"; then
+    die "the anchor watcher could not list PF anchors during the probe windows ($(grep -c POLL-FAILURE "$ANCHOR_INTRUSIONS") failed polls); the concurrency check lapsed, so nothing is graded"
+  fi
   [[ ! -s "$ANCHOR_INTRUSIONS" ]] \
     || die "another writ session anchor was loaded during the probe windows; its rules were consulted for our datagrams, so nothing is graded. Seen: $(sort -u "$ANCHOR_INTRUSIONS" | tr '\n' ';')"
 }
@@ -503,6 +524,24 @@ counter_of() {
   printf '%s\n' "$1" | awk -v l="$2" '$0 ~ "^"l" " {print $NF}' | head -n 1
 }
 
+# Source address of the first packet, from line $2 onward of capture $1,
+# addressed to $3:$4 whose payload carries nonce $5; empty if none. tcpdump
+# -A prints the header line, then the payload as text, so the nonce line is
+# attributed to the most recent header for our destination.
+bridge_source_for_nonce() {
+  sed -n "$(($2 + 1)),\$p" "$1" | awk -v dst=" > $3.$4: " -v nonce="$5" '
+    / IP [0-9.]+ > [0-9.]+: / { hdr = (index($0, dst) ? $0 : "") ; next }
+    hdr != "" && index($0, nonce) {
+      sub(/.* IP /, "", hdr); sub(/\.[0-9]+ > .*/, "", hdr); print hdr; exit
+    }
+  '
+}
+
+# Source address the host listener logged for nonce $1; empty if none.
+listener_source_for_nonce() {
+  awk -v nonce="$1" 'NF >= 3 && $3 == nonce { print $1; exit }' "$LISTENER_LOG"
+}
+
 # Start capturing UDP to the probe port on target $1's bridge.
 start_capture() {
   local target="$1" bridge="${TARGET_BRIDGE[$1]}"
@@ -511,7 +550,7 @@ start_capture() {
   # The redirects are deliberately the unprivileged shell's: the log lives in
   # the user-owned TMP_DIR, and only the capture itself needs root.
   # shellcheck disable=SC2024
-  sudo tcpdump -i "$bridge" -n -l -q "udp and dst port ${PROBE_PORT}" >"$capture" 2>"$err" &
+  sudo tcpdump -i "$bridge" -n -l -q -A "udp and dst port ${PROBE_PORT}" >"$capture" 2>"$err" &
   TARGET_CAPTURE_PID[$target]=$!
   TARGET_CAPTURE[$target]="$capture"
   sleep 2
@@ -521,8 +560,11 @@ start_capture() {
 
 # Send one UDP datagram from target $1's guest with source $3 to that guest's
 # gateway, and report what the host saw. The guest's exit status is logged
-# and ignored. Writes one line "<name> <emitted> <forwarded> <reached> <delta>"
-# to result-<target>-<name>, because every consumer is a single `read`.
+# and ignored. Writes one line to result-<target>-<name>, because every
+# consumer is a single `read`:
+#   <name> <emitted> <forwarded> <reached> <delta> <bridge src> <listener src> <rewritten>
+# where the sources are what the observers saw ("-" if nothing) and rewritten
+# is "yes" when an observed source differs from the one requested.
 probe() {
   local target="$1" name="$2" source="$3" add_address="$4"
   local vm="${TARGET_VM[$target]}" gateway="${TARGET_GATEWAY[$target]}"
@@ -570,12 +612,19 @@ probe() {
     log "  guest eth0 TX packet counter did not rise (${tx_before} -> ${tx_after})"
   fi
 
-  local forwarded="no" reached="no"
-  if sed -n "$((capture_lines_before + 1)),\$p" "$capture" | grep -q "${source}\.[0-9]* > ${gateway}\.${PROBE_PORT}"; then
+  # Correlate by nonce only; the source is an observation, not a filter.
+  local fwd_src reach_src forwarded="no" reached="no" rewritten="no"
+  fwd_src="$(bridge_source_for_nonce "$capture" "$capture_lines_before" "$gateway" "$PROBE_PORT" "$nonce")"
+  reach_src="$(listener_source_for_nonce "$nonce")"
+  if [[ -n "$fwd_src" ]]; then
     forwarded="yes"
   fi
-  if grep -q "^${source} [0-9]* ${nonce}\$" "$LISTENER_LOG"; then
+  if [[ -n "$reach_src" ]]; then
     reached="yes"
+  fi
+  if [[ ( -n "$fwd_src" && "$fwd_src" != "$source" ) || ( -n "$reach_src" && "$reach_src" != "$source" ) ]]; then
+    rewritten="yes"
+    log "  SOURCE REWRITTEN: requested ${source}, bridge saw ${fwd_src:--}, listener saw ${reach_src:--}"
   fi
   local delta=0 counter_text=""
   if [[ "$target" == "session" ]]; then
@@ -587,9 +636,10 @@ probe() {
     counter_text="; 'writ deny agent v4' counter +${delta}"
   fi
 
-  log "  guest emitted a frame: ${emitted}; forwarded onto ${bridge}: ${forwarded}; reached host socket: ${reached}${counter_text}"
-  RESULTS+=("${target}/${name} source=${source} emitted=${emitted} forwarded=${forwarded} reached=${reached} deny_v4_delta=${delta}")
-  printf '%s %s %s %s %s\n' "$name" "$emitted" "$forwarded" "$reached" "$delta" >"${TMP_DIR}/result-${target}-${name}"
+  log "  guest emitted a frame: ${emitted}; forwarded onto ${bridge}: ${forwarded} (src ${fwd_src:--}); reached host socket: ${reached} (src ${reach_src:--})${counter_text}"
+  RESULTS+=("${target}/${name} source=${source} emitted=${emitted} forwarded=${forwarded} bridge_src=${fwd_src:--} reached=${reached} listener_src=${reach_src:--} rewritten=${rewritten} deny_v4_delta=${delta}")
+  printf '%s %s %s %s %s %s %s %s\n' "$name" "$emitted" "$forwarded" "$reached" "$delta" \
+    "${fwd_src:--}" "${reach_src:--}" "$rewritten" >"${TMP_DIR}/result-${target}-${name}"
 }
 
 require_cmd container
@@ -727,7 +777,7 @@ RESULTS=()
 # the run can be graded. Its spoofed sends must at least be emitted, or the
 # sender cannot spoof and the session's silence would be about nc, not vmnet.
 probe unconfined control "$CONTROL_GUEST_IPV4" no
-read -r _ uc_emitted uc_forwarded uc_reached _ <"${TMP_DIR}/result-unconfined-control"
+read -r _ uc_emitted uc_forwarded uc_reached _ _ _ _ <"${TMP_DIR}/result-unconfined-control"
 [[ "$uc_emitted" == "yes" ]] \
   || die "the unconfined guest did not emit its own-address datagram (nc error or no TX); the sender is not working"
 [[ "$uc_forwarded" == "yes" ]] \
@@ -736,12 +786,12 @@ read -r _ uc_emitted uc_forwarded uc_reached _ <"${TMP_DIR}/result-unconfined-co
   || die "the unconfined own-address datagram did not reach the host listener; with no anchor in the way the listener or host path is broken, so no silence below would mean anything"
 
 probe unconfined foreign "$FOREIGN_SOURCE" yes
-read -r _ uf_emitted uf_fwd uf_reached _ <"${TMP_DIR}/result-unconfined-foreign"
+read -r _ uf_emitted uf_fwd uf_reached _ uf_fwd_src uf_reach_src _ <"${TMP_DIR}/result-unconfined-foreign"
 [[ "$uf_emitted" == "yes" ]] \
   || die "the unconfined guest did not emit the foreign-source datagram; the spoofing sender does not work even without confinement"
 if [[ -n "$SIBLING_SOURCE" ]]; then
   probe unconfined sibling "$SIBLING_SOURCE" yes
-  read -r _ us_emitted us_fwd us_reached _ <"${TMP_DIR}/result-unconfined-sibling"
+  read -r _ us_emitted us_fwd us_reached _ us_fwd_src us_reach_src _ <"${TMP_DIR}/result-unconfined-sibling"
   [[ "$us_emitted" == "yes" ]] \
     || die "the unconfined guest did not emit the sibling-source datagram; the spoofing sender does not work even without confinement"
 fi
@@ -751,7 +801,7 @@ fi
 # counter parser, or an anchor that is not denying would each let a later
 # delivery be misattributed to spoofing.
 probe session control "$GUEST_IPV4" no
-read -r _ ctl_emitted ctl_forwarded ctl_reached ctl_delta <"${TMP_DIR}/result-session-control"
+read -r _ ctl_emitted ctl_forwarded ctl_reached ctl_delta _ _ _ <"${TMP_DIR}/result-session-control"
 [[ "$ctl_emitted" == "yes" ]] \
   || die "the session guest did not emit the control datagram (nc error or no TX); the sender is not working"
 [[ "$ctl_forwarded" == "yes" ]] \
@@ -790,22 +840,39 @@ done
 # Verdict per spoofed source, graded from host-observed facts with the
 # unconfined result for the same source as the positive control. Guest facts
 # (emission) can withhold a verdict but never award one.
-#   $1 name; $2 $3 unconfined forwarded/reached;
-#   $4..$7 session emitted/forwarded/reached/deny delta.
+#   $1 name; $2 requested source;
+#   $3..$6 unconfined forwarded/reached/bridge source/listener source;
+#   $7..$12 session emitted/forwarded/reached/deny delta/bridge source/listener source.
+# Observed sources are "-" when that observer saw nothing.
 verdict() {
-  local name="$1" u_fwd="$2" u_reached="$3" emitted="$4" fwd="$5" reached="$6" delta="$7"
+  local name="$1" source="$2"
+  local u_fwd="$3" u_reached="$4" u_fwd_src="$5" u_reach_src="$6"
+  local emitted="$7" fwd="$8" reached="$9" delta="${10}" fwd_src="${11}" reach_src="${12}"
+  local u_rewritten="no" rewritten="no"
+  if [[ ( "$u_fwd_src" != "-" && "$u_fwd_src" != "$source" ) || ( "$u_reach_src" != "-" && "$u_reach_src" != "$source" ) ]]; then
+    u_rewritten="yes"
+  fi
+  if [[ ( "$fwd_src" != "-" && "$fwd_src" != "$source" ) || ( "$reach_src" != "-" && "$reach_src" != "$source" ) ]]; then
+    rewritten="yes"
+  fi
   # The IPv4 deny is `from <session /24>`; an out-of-subnet source cannot
   # match it, so any movement in its counter during this window is other
   # in-subnet traffic (DHCP, ARP-triggered retries, ...), not this datagram.
+  # Unless the source was rewritten: then PF judged the rewritten source,
+  # and the counter may well be about this datagram.
   local counter_note=""
-  if [[ "$delta" -gt 0 ]]; then
+  if [[ "$delta" -gt 0 && "$rewritten" == "no" ]]; then
     counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; the source-scoped rule cannot have matched this source, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
+  elif [[ "$rewritten" == "yes" ]]; then
+    counter_note=" ('writ deny agent v4' moved by ${delta} during the session window; PF saw source ${fwd_src}, so the counter may be about this datagram.)"
   fi
   # The platform line is pinned only when the session bridge saw the same
-  # forwarding outcome; two bridges disagreeing is a fact about this run,
-  # not about vmnet, and must not be recorded as either.
-  if [[ "$emitted" == "yes" && "$fwd" != "$u_fwd" ]]; then
-    log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd}, session forwarded=${fwd}); no platform fact can be pinned from this run. See the verdict below."
+  # outcome; two bridges disagreeing is a fact about this run, not about
+  # vmnet, and must not be recorded as either.
+  if [[ "$emitted" == "yes" && ( "$fwd" != "$u_fwd" || "$rewritten" != "$u_rewritten" ) ]]; then
+    log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd} rewritten=${u_rewritten}, session forwarded=${fwd} rewritten=${rewritten}); no platform fact can be pinned from this run. See the verdict below."
+  elif [[ "$u_rewritten" == "yes" ]]; then
+    log "PLATFORM ${name}: unconfined, the datagram was forwarded with its source REWRITTEN (requested ${source}; bridge saw ${u_fwd_src}, listener saw ${u_reach_src}; delivered=${u_reached}). vmnet anti-spoofs by rewriting, not dropping: the frame reaches the host, but PF judges the rewritten source. Record this as a pinned platform fact (plan 'Beyond E3' question 4), distinct from both 'forwards as-is' and 'does not forward'."
   elif [[ "$u_reached" == "yes" ]]; then
     log "PLATFORM ${name}: unconfined, the spoofed-source datagram was forwarded and DELIVERED to the host socket. vmnet forwards spoofed IPv4 sources and the host accepts them; only PF stands between such a frame and a host socket."
   elif [[ "$u_fwd" == "yes" ]]; then
@@ -819,7 +886,9 @@ verdict() {
   if [[ "$emitted" != "yes" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE — the session guest did not emit the datagram (see the nc stderr and TX counter lines above), so the session observers' silence says nothing. Fix the sender and rerun."
   elif [[ "$reached" == "yes" ]]; then
-    log "VERDICT ${name}: LIVE GAP — under the session anchor the spoofed-source datagram reached a host socket the session may not reach. The source-scoped IPv4 rules do not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
+    log "VERDICT ${name}: LIVE GAP — under the session anchor a datagram from the session guest reached a host socket the session may not reach (requested source ${source}, listener saw ${reach_src}). The source-scoped IPv4 rules did not confine it; stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
+  elif [[ "$rewritten" == "yes" ]]; then
+    log "VERDICT ${name}: REWRITTEN — under the session the datagram was forwarded with source ${fwd_src} instead of ${source} and not delivered. PF judged the rewritten source, not the spoofed one; if ${fwd_src} is inside the session /24 the source-scoped deny matched it legitimately. The confinement held, but because the platform rewrote the source, not because the rules address spoofing. C2b still applies as the session's own guarantee.${counter_note}"
   elif [[ "$fwd" == "yes" && "$u_reached" == "yes" ]]; then
     log "VERDICT ${name}: UNEXPLAINED — forwarded but not delivered under the session, yet delivered unconfined. The session anchor is the only difference and its source-scoped rules cannot match this source. Do not pin either way; inspect PF state and the top-level rules.${counter_note}"
   elif [[ "$fwd" == "yes" && "$u_fwd" == "yes" ]]; then
@@ -832,11 +901,15 @@ verdict() {
     log "VERDICT ${name}: not forwarded, consistent with the unconfined control — the platform fact above holds under the session too.${counter_note}"
   fi
 }
-read -r _ f_emitted f_fwd f_reached f_delta <"${TMP_DIR}/result-session-foreign"
-verdict foreign "$uf_fwd" "$uf_reached" "$f_emitted" "$f_fwd" "$f_reached" "$f_delta"
+read -r _ f_emitted f_fwd f_reached f_delta f_fwd_src f_reach_src _ <"${TMP_DIR}/result-session-foreign"
+verdict foreign "$FOREIGN_SOURCE" \
+  "$uf_fwd" "$uf_reached" "$uf_fwd_src" "$uf_reach_src" \
+  "$f_emitted" "$f_fwd" "$f_reached" "$f_delta" "$f_fwd_src" "$f_reach_src"
 if [[ -n "$SIBLING_SOURCE" ]]; then
-  read -r _ s_emitted s_fwd s_reached s_delta <"${TMP_DIR}/result-session-sibling"
-  verdict sibling "$us_fwd" "$us_reached" "$s_emitted" "$s_fwd" "$s_reached" "$s_delta"
+  read -r _ s_emitted s_fwd s_reached s_delta s_fwd_src s_reach_src _ <"${TMP_DIR}/result-session-sibling"
+  verdict sibling "$SIBLING_SOURCE" \
+    "$us_fwd" "$us_reached" "$us_fwd_src" "$us_reach_src" \
+    "$s_emitted" "$s_fwd" "$s_reached" "$s_delta" "$s_fwd_src" "$s_reach_src"
 else
   log "VERDICT sibling: not measured — ${IPV4_POOL} holds a single /24, so there is no other session subnet to spoof from."
 fi
