@@ -23,11 +23,15 @@ session under the legacy ipv4-only profile exactly as prove-agent-vm-lifecycle.s
 does, then from the root guest sends UDP datagrams to a host listener on the
 session gateway, with three sources:
 
-  control   the guest's own address (inside the /24): expected DENIED by PF
+  control   the guest's own address (inside the /24): must be forwarded onto
+            the bridge, counted by the labelled IPv4 deny, and NOT delivered;
+            anything else means the observers are broken and the run aborts
   foreign   an address outside the broker's whole pool (10.77.0.5/32, added to
             eth0 by the root guest)
-  sibling   an address in a *different* session subnet of the same pool (index
-            SUBNET_INDEX+1), the cross-session case
+  sibling   an address in a *different* session /24 of the same pool (index
+            SUBNET_INDEX+1, or SUBNET_INDEX-1 when the session holds the
+            pool's last /24), the cross-session case; skipped, and said so,
+            when the pool has only one /24
 
 For each, the host observes three things, none of them reported by the guest:
   - tcpdump on the session bridge: was the frame forwarded onto the host side?
@@ -93,6 +97,7 @@ BROKER_PORT=""
 PROBE_PORT=""
 IPV4_CIDR=""
 IPV4_GATEWAY=""
+SIBLING_INDEX=""
 SIBLING_CIDR=""
 SIBLING_SOURCE=""
 GUEST_IPV4=""
@@ -184,6 +189,23 @@ print(subnet)
 PY
 }
 
+# The index of a /24 in the pool other than $2, preferring $2+1 and falling
+# back to $2-1; prints nothing when the pool holds a single /24.
+sibling_subnet_index() {
+  python3 - "$1" "$2" <<'PY'
+import ipaddress
+import sys
+
+base = ipaddress.ip_network(sys.argv[1], strict=True)
+index = int(sys.argv[2])
+count = 1 << max(0, 24 - base.prefixlen)
+for candidate in (index + 1, index - 1):
+    if 0 <= candidate < count:
+        print(candidate)
+        break
+PY
+}
+
 cidr_host() {
   # The n-th usable host of a network.
   python3 - "$1" "$2" <<'PY'
@@ -198,8 +220,30 @@ print(next(hosts))
 PY
 }
 
+# A free port in [MIN, MAX] for PROTO (tcp|udp), tested on the wildcard
+# address the host listeners bind. The broker port must lie inside the range
+# the runner is told about, or it refuses to start (BrokerPortOutsideRange).
 pick_port() {
-  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+  python3 - "$1" "$2" "$3" <<'PY'
+import random
+import socket
+import sys
+
+proto, lo, hi = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+kind = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
+candidates = list(range(lo, hi + 1))
+random.shuffle(candidates)
+for port in candidates[:512]:
+    with socket.socket(socket.AF_INET, kind) as s:
+        try:
+            s.bind(("0.0.0.0", port))
+        except OSError:
+            continue
+        print(port)
+        raise SystemExit(0)
+print(f"no free {proto} port in {lo}-{hi}", file=sys.stderr)
+raise SystemExit(1)
+PY
 }
 
 start_http_server() {
@@ -209,9 +253,11 @@ start_http_server() {
 
 # A UDP listener on every host address, logging one line per datagram:
 # "<source ip> <source port> <payload>". This, not anything the guest says,
-# is what decides "reached the host".
+# is what decides "reached the host". Sets LISTENER_PID rather than echoing
+# it: launched inside a `$(...)` the listener would inherit the substitution's
+# pipe and its receive loop would hold it open forever.
 start_udp_listener() {
-  python3 - "$1" "$2" <<'PY' &
+  python3 - "$1" "$2" <<'PY' >"${TMP_DIR}/listener.err" 2>&1 &
 import socket
 import sys
 
@@ -226,7 +272,7 @@ with open(log_path, "a", buffering=1) as log:
         data, (host, sport) = sock.recvfrom(4096)
         log.write(f"{host} {sport} {data.decode('ascii', 'replace')}\n")
 PY
-  echo "$!"
+  LISTENER_PID=$!
 }
 
 guest() {
@@ -303,7 +349,7 @@ probe() {
 
   after="$(anchor_counters)"
   local forwarded="no" reached="no"
-  if tail -n +"$((tcpdump_lines_before + 1))" "$TCPDUMP_LOG" | grep -q "${source}\.[0-9]* > ${IPV4_GATEWAY}\.${PROBE_PORT}"; then
+  if sed -n "$((tcpdump_lines_before + 1)),\$p" "$TCPDUMP_LOG" | grep -q "${source}\.[0-9]* > ${IPV4_GATEWAY}\.${PROBE_PORT}"; then
     forwarded="yes"
   fi
   if grep -q "^${source} [0-9]* ${nonce}\$" "$LISTENER_LOG"; then
@@ -316,7 +362,8 @@ probe() {
 
   log "  forwarded onto ${BRIDGE}: ${forwarded}; reached host socket: ${reached}; 'writ deny agent v4' counter +${delta}"
   RESULTS+=("${name} source=${source} forwarded=${forwarded} reached=${reached} deny_v4_delta=${delta}")
-  printf '%s\n' "$name" "$forwarded" "$reached" "$delta" >"${TMP_DIR}/result-${name}"
+  # One line, because every consumer is a single `read`.
+  printf '%s %s %s %s\n' "$name" "$forwarded" "$reached" "$delta" >"${TMP_DIR}/result-${name}"
 }
 
 require_cmd container
@@ -328,8 +375,13 @@ choose_cargo
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 IPV4_GATEWAY="$(cidr_host "$IPV4_CIDR" 1)"
-SIBLING_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$((SUBNET_INDEX + 1))")"
-SIBLING_SOURCE="$(cidr_host "$SIBLING_CIDR" 7)"
+SIBLING_INDEX="$(sibling_subnet_index "$IPV4_POOL" "$SUBNET_INDEX")"
+if [[ -n "$SIBLING_INDEX" ]]; then
+  SIBLING_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SIBLING_INDEX")"
+  SIBLING_SOURCE="$(cidr_host "$SIBLING_CIDR" 7)"
+else
+  log "pool ${IPV4_POOL} holds a single /24: the sibling-subnet probe is unavailable and will be skipped"
+fi
 
 mkdir -p "$BROKER_DIR"
 printf 'broker-ok\n' >"${BROKER_DIR}/broker.txt"
@@ -345,16 +397,19 @@ log "building PF helper and lifecycle runner"
 HELPER="${ROOT_DIR}/target/debug/writ-agent-vm-pf-helper"
 RUNNER="${ROOT_DIR}/target/debug/writ-agent-vm-runner"
 
-BROKER_PORT="$(pick_port)"
-PROBE_PORT="$(pick_port)"
-while [[ "$PROBE_PORT" == "$BROKER_PORT" ]]; do PROBE_PORT="$(pick_port)"; done
+BROKER_PORT="$(pick_port tcp "$BROKER_PORT_MIN" "$BROKER_PORT_MAX")"
+PROBE_PORT="$(pick_port udp "$BROKER_PORT_MIN" "$BROKER_PORT_MAX")"
+while [[ "$PROBE_PORT" == "$BROKER_PORT" ]]; do
+  PROBE_PORT="$(pick_port udp "$BROKER_PORT_MIN" "$BROKER_PORT_MAX")"
+done
 BROKER_PID="$(start_http_server "$BROKER_DIR" "$BROKER_PORT" "${TMP_DIR}/broker.log")"
-LISTENER_PID="$(start_udp_listener "$PROBE_PORT" "$LISTENER_LOG")"
+start_udp_listener "$PROBE_PORT" "$LISTENER_LOG"
 for _ in {1..50}; do
   grep -q '^listening$' "$LISTENER_LOG" 2>/dev/null && break
   sleep 0.1
 done
-grep -q '^listening$' "$LISTENER_LOG" || die "UDP listener did not start"
+grep -q '^listening$' "$LISTENER_LOG" \
+  || die "UDP listener did not start: $(cat "${TMP_DIR}/listener.err" 2>/dev/null)"
 log "host listeners are up: broker=${BROKER_PORT}, probe target (forbidden)=${PROBE_PORT}"
 
 log "starting runner-managed VM ${VM_NAME} on ${IPV4_CIDR} under ${IPV6_MODE}"
@@ -399,15 +454,24 @@ log "session anchor rules:"
 sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | sed 's/^/    /'
 
 RESULTS=()
-# Calibration: the guest's own address. If tcpdump does not see even this
-# frame, the observers are not working and nothing below means anything.
+# Calibration: the guest's own address. All three observers must agree with
+# the known behaviour of an in-subnet frame (forwarded, counted by the
+# labelled IPv4 deny, never delivered), or nothing below means anything: a
+# blind capture, a broken counter parser, or an anchor that is not actually
+# denying would each let a later delivery be misattributed to spoofing.
 probe control "$GUEST_IPV4" no
-read -r _ ctl_forwarded _ <"${TMP_DIR}/result-control"
+read -r _ ctl_forwarded ctl_reached ctl_delta <"${TMP_DIR}/result-control"
 [[ "$ctl_forwarded" == "yes" ]] \
   || die "the control datagram from the guest's own address was not seen on ${BRIDGE}; the capture is not observing the session bridge, so no spoof result would be meaningful"
+[[ "$ctl_reached" == "no" ]] \
+  || die "the control datagram from the guest's own address REACHED the host listener; the session anchor is not denying in-subnet traffic, so a spoof result could not be told apart from an unconfined session"
+[[ "$ctl_delta" -gt 0 ]] \
+  || die "the control datagram did not raise the 'writ deny agent v4' counter (delta ${ctl_delta}); either the anchor did not match it or the counter parser is broken, so counter-based verdicts below would be meaningless"
 
 probe foreign "$FOREIGN_SOURCE" yes
-probe sibling "$SIBLING_SOURCE" yes
+if [[ -n "$SIBLING_SOURCE" ]]; then
+  probe sibling "$SIBLING_SOURCE" yes
+fi
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
@@ -427,7 +491,6 @@ done
 
 # Verdict: read from the host-observed facts, never from the guest.
 read -r _ f_fwd f_reached f_delta <"${TMP_DIR}/result-foreign"
-read -r _ s_fwd s_reached s_delta <"${TMP_DIR}/result-sibling"
 verdict() {
   local name="$1" fwd="$2" reached="$3" delta="$4"
   if [[ "$reached" == "yes" ]]; then
@@ -441,7 +504,12 @@ verdict() {
   fi
 }
 verdict foreign "$f_fwd" "$f_reached" "$f_delta"
-verdict sibling "$s_fwd" "$s_reached" "$s_delta"
+if [[ -n "$SIBLING_SOURCE" ]]; then
+  read -r _ s_fwd s_reached s_delta <"${TMP_DIR}/result-sibling"
+  verdict sibling "$s_fwd" "$s_reached" "$s_delta"
+else
+  log "VERDICT sibling: not measured — ${IPV4_POOL} holds a single /24, so there is no other session subnet to spoof from."
+fi
 
 cleanup
 trap - EXIT INT TERM
