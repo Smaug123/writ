@@ -81,7 +81,8 @@ Requires:
     evaluated for every bridge, so another session's source-scoped deny
     (above all one on the sibling /24) would confound both guests. The
     script refuses to start while any exists, and polls the anchor list
-    every 0.2s across the probe windows, failing the run if one appears.
+    every 0.2s across the probe windows, failing the run if one appears
+    or if this run's own anchor loses its IPv4 deny.
     An anchor that comes and goes within one poll interval is the residual
     gap: PF offers no exclusivity primitive, so do not run this alongside
     anything that starts writ sessions.
@@ -432,11 +433,20 @@ require_guest_tooling() {
 
 # Child anchors currently loaded under writ/session, one per line. Both
 # listings are consulted because pfctl prints nested anchors differently
-# across macOS releases. An empty listing is success (grep's 1 must not
-# trip errexit through pipefail): no anchors is the state we want.
+# across macOS releases. Every child name counts, not only UUID-shaped
+# ones: the wildcard evaluates `writ/session/manual` too. An empty listing
+# is success (grep's 1 must not trip errexit through pipefail): no anchors
+# is the state we want.
 existing_session_anchors() {
   { sudo pfctl -a writ/session -sA 2>/dev/null; sudo pfctl -sA 2>/dev/null; } \
-    | { grep -Eo 'writ/session/[0-9a-f-]+' || true; } | sort -u
+    | { grep -Eo 'writ/session/[^[:space:]]+' || true; } | sort -u
+}
+
+# Die unless this run's own anchor is loaded with its labelled IPv4 deny.
+# A verdict about "what the session rules do" is vacuous if they are gone.
+require_own_anchor_loaded() {
+  sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q 'writ deny agent v4' \
+    || die "this run's anchor ${PF_ANCHOR} is not loaded with its IPv4 deny (${1}); the session rules are not in place, so nothing is graded"
 }
 
 # Die if any session anchor other than this run's own is loaded. Every child
@@ -475,9 +485,15 @@ start_anchor_watch() {
         printf '%s POLL-FAILURE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
       fi
       others="$(printf '%s\n%s\n' "$listing_a" "$listing_b" \
-        | grep -Eo 'writ/session/[0-9a-f-]+' | sort -u | grep -Fxv "$PF_ANCHOR")"
+        | grep -Eo 'writ/session/[^[:space:]]+' | sort -u | grep -Fxv "$PF_ANCHOR")"
       if [[ -n "$others" ]]; then
         printf '%s %s\n' "$(date +%H:%M:%S)" "$(tr '\n' ' ' <<<"$others")" >>"$ANCHOR_INTRUSIONS"
+      fi
+      # Our own anchor must stay loaded with its deny for the whole window,
+      # or a later delivery would be graded against rules that were not
+      # there.
+      if ! sudo -n pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q 'writ deny agent v4'; then
+        printf '%s OWN-ANCHOR-MISSING\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
       fi
       sleep 0.2
     done
@@ -493,6 +509,9 @@ stop_anchor_watch() {
   ANCHOR_WATCH_PID=""
   [[ "$alive" -eq 1 ]] \
     || die "the anchor watcher was not running at the end of the probe windows; the concurrency check lapsed, so nothing is graded"
+  if grep -q 'OWN-ANCHOR-MISSING' "$ANCHOR_INTRUSIONS"; then
+    die "this run's anchor ${PF_ANCHOR} was missing its IPv4 deny at some point during the probe windows ($(grep -c OWN-ANCHOR-MISSING "$ANCHOR_INTRUSIONS") polls); the session rules were not in place throughout, so nothing is graded"
+  fi
   if grep -q 'POLL-FAILURE' "$ANCHOR_INTRUSIONS"; then
     die "the anchor watcher could not list PF anchors during the probe windows ($(grep -c POLL-FAILURE "$ANCHOR_INTRUSIONS") failed polls); the concurrency check lapsed, so nothing is graded"
   fi
@@ -820,6 +839,7 @@ log "session guest is ${GUEST_IPV4} behind ${IPV4_GATEWAY} on ${TARGET_BRIDGE[se
 start_capture unconfined
 start_capture session
 require_no_other_anchors "after both guests started"
+require_own_anchor_loaded "after both guests started"
 start_anchor_watch
 
 log "session anchor rules:"
@@ -875,6 +895,7 @@ fi
 # through, nothing above is graded. Likewise an observer that died: every
 # empty lookup above would then be a lie.
 require_no_other_anchors "after the probes"
+require_own_anchor_loaded "after the probes"
 stop_anchor_watch
 require_observers_alive "after the probes"
 
