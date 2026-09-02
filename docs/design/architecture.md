@@ -1146,9 +1146,12 @@ safety is therefore a fact about the command, decided at the call site
 crate, `crates/writ-guest-init` (no host deps): the `container run`
 capability profile and its exact parser (`capability_argv`), the ordered
 `HandoffStep` plan with `simulate`, a reference model of the Linux privilege
-rules that accepts an order iff every step could succeed (`handoff`), and the
-`/proc/<pid>/status` acceptance type `LockedIdentity` the host will check
-before release (`proc_status`). The Linux-only interpreter that performs the
+rules that accepts a plan iff every step could succeed and it ends, once, in
+a verification that finds the locked state (`handoff`), and the
+`/proc/<pid>/status` acceptance types (`proc_status`): `LockedAwaitingRelease`,
+which the host checks before release while PID 1 is parked in `sigwait` with
+`SIGUSR1` blocked, and `LockedReleased`, which the Linux CI oracle checks of
+the `exec`ed workload, where `SIGUSR1` must be unblocked. The Linux-only interpreter that performs the
 plan is not yet built; see `ipv4-only-network-confinement.md`, layer 2.
 `AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`

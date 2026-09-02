@@ -8,8 +8,10 @@
 //! that too. So the privileged steps must all precede the identity change,
 //! and an earlier draft of this design got that wrong in prose. Rather than
 //! trust prose again, [`simulate`] is a small reference model of those rules:
-//! it accepts an order iff the kernel would let every step succeed, and the
-//! tests hold the canonical plan and every precedence rule against it.
+//! it accepts a plan iff the kernel would let every step succeed *and* the
+//! plan ends, exactly once, in a verification that finds the locked state.
+//! The tests hold the canonical plan and every precedence rule against it,
+//! over plans that reorder, drop, and duplicate the canonical steps.
 
 use std::collections::BTreeSet;
 
@@ -256,12 +258,24 @@ pub struct ProcessModel {
     disable_ipv6_written: BTreeSet<SysctlScope>,
     ipv6_verified: bool,
     owned: BTreeSet<OwnedDirectory>,
+    /// Set by [`HandoffStep::VerifyLockedIdentity`]. The verification is the
+    /// last thing the initializer does before parking, so no step may follow
+    /// it in the model, and a plan that never sets this is not a handoff.
+    handed_off: bool,
 }
 
 impl ProcessModel {
     /// PID 1 as `container run` with the locked argv profile starts it: UID 0,
     /// the temporary capabilities in the effective, permitted, and bounding
-    /// sets, nothing inheritable or ambient.
+    /// sets.
+    ///
+    /// The profile pins nothing about the inheritable and ambient sets (what
+    /// a launcher puts there varies by runtime), so the model takes the worst
+    /// case and starts them full. That is what makes
+    /// [`HandoffStep::ClearInheritableAndAmbient`] load-bearing rather than
+    /// decorative: a plan without it leaves the inheritable set non-empty,
+    /// and the final verification refuses it, as the real one would if the
+    /// launcher had populated the set.
     pub fn at_launch() -> Self {
         let temporary: BTreeSet<_> = TemporaryCapability::ALL.into_iter().collect();
         Self {
@@ -270,13 +284,14 @@ impl ProcessModel {
             supplementary_groups_cleared: false,
             effective: temporary.clone(),
             permitted: temporary.clone(),
-            inheritable: BTreeSet::new(),
-            ambient: BTreeSet::new(),
+            inheritable: temporary.clone(),
+            ambient: temporary.clone(),
             bounding: temporary,
             no_new_privs: false,
             disable_ipv6_written: BTreeSet::new(),
             ipv6_verified: false,
             owned: BTreeSet::new(),
+            handed_off: false,
         }
     }
 
@@ -352,10 +367,16 @@ pub enum StepRefusal {
     Ipv6NotYetDisabled,
     #[error("the locked identity is not established: {0}")]
     NotLocked(#[from] LockedStateViolation),
-    /// The plan ended without [`HandoffStep::VerifyLockedIdentity`] as its
-    /// last step. Reported at index `steps.len()`, the step that is missing.
+    /// The plan ended without ever reaching
+    /// [`HandoffStep::VerifyLockedIdentity`]. Reported at index
+    /// `steps.len()`, the step that is missing.
     #[error("the plan does not end with the locked-identity verification")]
     NotTerminal,
+    /// A step came after [`HandoffStep::VerifyLockedIdentity`], which is the
+    /// last thing the initializer does before parking. A second verification
+    /// is refused the same way.
+    #[error("the locked-identity verification already ran; nothing runs after it")]
+    AfterVerification,
 }
 
 /// The step at which a simulation stopped, and why.
@@ -368,10 +389,14 @@ pub struct SimulationFailure {
 }
 
 /// Run the steps against the model from launch, stopping at the first the
-/// kernel rules would refuse. Success means every step ran *and* the last
-/// step was [`HandoffStep::VerifyLockedIdentity`] and it found the locked
-/// state: a plan that runs out without verifying, or verifies and then keeps
-/// going, is not a handoff.
+/// kernel rules would refuse. Success means every step ran and the model
+/// ended handed off: [`HandoffStep::VerifyLockedIdentity`] ran exactly once,
+/// as the last step, and found the locked state. A plan that runs out
+/// without verifying, verifies and then keeps going, verifies twice, or
+/// omits a step the verification depends on is not a handoff. The
+/// verification sees every mandatory step because the model starts with
+/// every set the handoff must empty non-empty (see
+/// [`ProcessModel::at_launch`]), so omitting any of them leaves a trace.
 pub fn simulate(
     steps: &[HandoffStep],
     interfaces: &[InterfaceName],
@@ -386,13 +411,14 @@ pub fn simulate(
                 reason,
             })?;
     }
-    match steps.last() {
-        Some(HandoffStep::VerifyLockedIdentity) => Ok(model),
-        _ => Err(SimulationFailure {
+    if model.handed_off {
+        Ok(model)
+    } else {
+        Err(SimulationFailure {
             index: steps.len(),
             step: HandoffStep::VerifyLockedIdentity,
             reason: StepRefusal::NotTerminal,
-        }),
+        })
     }
 }
 
@@ -410,6 +436,9 @@ impl ProcessModel {
         step: &HandoffStep,
         interfaces: &[InterfaceName],
     ) -> Result<(), StepRefusal> {
+        if self.handed_off {
+            return Err(StepRefusal::AfterVerification);
+        }
         match step {
             HandoffStep::PrepareOwnedDirectory(dir) => {
                 self.require(TemporaryCapability::Chown)?;
@@ -469,6 +498,7 @@ impl ProcessModel {
             }
             HandoffStep::VerifyLockedIdentity => {
                 self.is_locked(interfaces)?;
+                self.handed_off = true;
             }
         }
         Ok(())
@@ -484,13 +514,16 @@ impl ProcessModel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrecedenceViolation {
     /// A step that needs a capability or UID 0 came after the identity
-    /// change, which discards both.
+    /// change, which discards both. Preparing a directory, writing a sysctl,
+    /// dropping the bounding set, and clearing groups always need one;
+    /// `setresgid`/`setresuid` need one only when they actually change the
+    /// id, since the kernel lets any process re-assert the ids it holds.
     PrivilegedStepAfterIdentityChange(HandoffStep),
     /// IPv6 absence was verified before `disable_ipv6` was written for every
     /// scope.
     VerifyNoIpv6BeforeDisable,
-    /// The final verification is not the last step, or a step it depends on
-    /// is missing.
+    /// The final verification is not the last step, is not the only one, or
+    /// a step it depends on is missing.
     VerifyLockedIdentityNotLast,
 }
 
@@ -501,25 +534,35 @@ pub fn precedence_violations(
 ) -> Vec<PrecedenceViolation> {
     let mut violations = Vec::new();
 
-    let identity_change = steps
-        .iter()
-        .position(|s| matches!(s, HandoffStep::SetResuid(uid) if *uid != 0));
-    if let Some(at) = identity_change {
-        for step in &steps[at + 1..] {
-            let privileged = matches!(
-                step,
-                HandoffStep::PrepareOwnedDirectory(_)
-                    | HandoffStep::WriteSysctl { .. }
-                    | HandoffStep::DropBoundingSet
-                    | HandoffStep::ClearSupplementaryGroups
-                    | HandoffStep::SetResgid(_)
-                    | HandoffStep::SetResuid(_)
-            );
-            if privileged {
-                violations.push(PrecedenceViolation::PrivilegedStepAfterIdentityChange(
-                    step.clone(),
-                ));
+    let (mut uid, mut gid) = (0u32, 0u32);
+    let mut identity_changed = false;
+    for step in steps {
+        let privileged = match step {
+            HandoffStep::PrepareOwnedDirectory(_)
+            | HandoffStep::WriteSysctl { .. }
+            | HandoffStep::DropBoundingSet
+            | HandoffStep::ClearSupplementaryGroups => true,
+            HandoffStep::SetResgid(g) => *g != gid,
+            HandoffStep::SetResuid(u) => *u != uid,
+            HandoffStep::VerifyNoIpv6
+            | HandoffStep::ClearInheritableAndAmbient
+            | HandoffStep::SetNoNewPrivs
+            | HandoffStep::VerifyLockedIdentity => false,
+        };
+        if identity_changed && privileged {
+            violations.push(PrecedenceViolation::PrivilegedStepAfterIdentityChange(
+                step.clone(),
+            ));
+        }
+        match step {
+            HandoffStep::SetResgid(g) => gid = *g,
+            HandoffStep::SetResuid(u) => {
+                if uid == 0 && *u != 0 {
+                    identity_changed = true;
+                }
+                uid = *u;
             }
+            _ => {}
         }
     }
 
@@ -672,77 +715,218 @@ mod tests {
         }
     }
 
-    /// One way of reordering the canonical plan. A uniformly random
-    /// permutation almost always violates something, so half the cases
-    /// instead apply a few adjacent swaps to the canonical order, which
-    /// keeps the accepting side of the property populated.
+    /// One edit to a plan. A uniformly random permutation almost always
+    /// violates something, so some kinds are small: a few adjacent swaps, or
+    /// one step relocated, dropped, or duplicated, which keeps the accepting
+    /// side of the agreement property populated (dropping an `accept_ra`
+    /// write, say, or duplicating a no-op, is still a handoff). Drop and
+    /// Duplicate are what the first generator lacked: it only ever permuted
+    /// the canonical plan, so a model that checked the last step alone
+    /// agreed with the rules on everything it was shown.
+    ///
+    /// Indices are reduced modulo the plan's current length when applied, so
+    /// a sequence of edits never goes out of bounds and none is filtered.
     #[derive(Clone, Debug)]
-    enum Reorder {
+    enum Mutation {
         Shuffle(Vec<usize>),
         AdjacentSwaps(Vec<usize>),
         /// Take the step at one position and re-insert it at another,
-        /// leaving everything else in order. This is the shape the other two
-        /// almost never produce: a single step far out of place, such as an
-        /// unprivileged step moved after the final verification, or the
-        /// verification moved into the middle.
+        /// leaving everything else in order: a single step far out of place,
+        /// such as an unprivileged step moved after the final verification,
+        /// or the verification moved into the middle.
         Relocate {
+            from: usize,
+            to: usize,
+        },
+        /// Remove the step at a position.
+        Drop(usize),
+        /// Insert a copy of the step at `from` so that it lands at `to`.
+        Duplicate {
             from: usize,
             to: usize,
         },
     }
 
-    fn arb_reorder(len: usize) -> impl Strategy<Value = Reorder> {
+    fn arb_mutation(len: usize) -> impl Strategy<Value = Mutation> {
         prop_oneof![
             Just((0..len).collect::<Vec<_>>())
                 .prop_shuffle()
-                .prop_map(Reorder::Shuffle),
+                .prop_map(Mutation::Shuffle),
             proptest::collection::vec(0..len.saturating_sub(1), 0..4)
-                .prop_map(Reorder::AdjacentSwaps),
-            (0..len, 0..len).prop_map(|(from, to)| Reorder::Relocate { from, to }),
+                .prop_map(Mutation::AdjacentSwaps),
+            (0..len, 0..len).prop_map(|(from, to)| Mutation::Relocate { from, to }),
+            (0..len).prop_map(Mutation::Drop),
+            (0..len, 0..=len).prop_map(|(from, to)| Mutation::Duplicate { from, to }),
         ]
     }
 
-    fn apply_reorder(steps: &[HandoffStep], reorder: &Reorder) -> Vec<HandoffStep> {
-        match reorder {
-            Reorder::Shuffle(perm) => perm.iter().map(|&i| steps[i].clone()).collect(),
-            Reorder::AdjacentSwaps(swaps) => {
+    /// Between one and three edits, applied in order.
+    fn arb_mutations(len: usize) -> impl Strategy<Value = Vec<Mutation>> {
+        proptest::collection::vec(arb_mutation(len), 1..=3)
+    }
+
+    fn apply_mutation(steps: &[HandoffStep], mutation: &Mutation) -> Vec<HandoffStep> {
+        let len = steps.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let at = |i: usize| i % len;
+        match mutation {
+            Mutation::Shuffle(perm) => {
+                // A permutation of the generator's length; over a shorter
+                // plan, reduce and keep first occurrences, then append the
+                // positions it missed, so the result is still a permutation.
+                let mut seen = BTreeSet::new();
+                let mut order: Vec<usize> = perm
+                    .iter()
+                    .map(|&i| at(i))
+                    .filter(|i| seen.insert(*i))
+                    .collect();
+                order.extend((0..len).filter(|i| !seen.contains(i)));
+                order.iter().map(|&i| steps[i].clone()).collect()
+            }
+            Mutation::AdjacentSwaps(swaps) => {
                 let mut out = steps.to_vec();
-                for &i in swaps {
-                    out.swap(i, i + 1);
+                if len >= 2 {
+                    for &i in swaps {
+                        let i = i % (len - 1);
+                        out.swap(i, i + 1);
+                    }
                 }
                 out
             }
-            Reorder::Relocate { from, to } => {
+            Mutation::Relocate { from, to } => {
                 let mut out = steps.to_vec();
-                let step = out.remove(*from);
-                out.insert(*to, step);
+                let step = out.remove(at(*from));
+                out.insert(at(*to), step);
+                out
+            }
+            Mutation::Drop(i) => {
+                let mut out = steps.to_vec();
+                out.remove(at(*i));
+                out
+            }
+            Mutation::Duplicate { from, to } => {
+                let mut out = steps.to_vec();
+                let step = out[at(*from)].clone();
+                out.insert(to % (len + 1), step);
                 out
             }
         }
     }
 
-    /// The two shapes the earlier generator never produced, spelled out:
-    /// a plan that runs out before verifying, and one that verifies early
-    /// and keeps going. Both are refused by the model and by the rules.
+    fn apply_mutations(steps: &[HandoffStep], mutations: &[Mutation]) -> Vec<HandoffStep> {
+        mutations
+            .iter()
+            .fold(steps.to_vec(), |plan, m| apply_mutation(&plan, m))
+    }
+
+    /// The shapes the first generator never produced, spelled out: a plan
+    /// that runs out before verifying, and one that verifies and keeps
+    /// going. Both are refused by the model and by the rules.
     #[test]
     fn a_plan_that_does_not_end_in_verification_is_refused() {
         let failure = simulate(&[], &[]).expect_err("an empty plan is not a handoff");
         assert_eq!(failure.reason, StepRefusal::NotTerminal);
         assert_eq!(failure.index, 0);
 
-        let mut early = handoff_plan(&[]);
-        let clear = early
-            .iter()
-            .position(|s| *s == HandoffStep::ClearInheritableAndAmbient)
-            .unwrap();
-        let step = early.remove(clear);
-        early.push(step); // ..., VerifyLockedIdentity, ClearInheritableAndAmbient
-        let failure = simulate(&early, &[]).expect_err("verification must be last");
+        let mut unverified = handoff_plan(&[]);
+        assert_eq!(unverified.pop(), Some(HandoffStep::VerifyLockedIdentity));
+        let failure = simulate(&unverified, &[]).expect_err("the plan must verify");
         assert_eq!(failure.reason, StepRefusal::NotTerminal);
+        assert_eq!(failure.index, unverified.len());
+        assert!(
+            precedence_violations(&unverified, &[])
+                .contains(&PrecedenceViolation::VerifyLockedIdentityNotLast)
+        );
+
+        // A harmless step after the verification: the verification itself
+        // passes (nothing it checks is missing), and the step after it is
+        // refused for coming after the handoff.
+        let mut early = handoff_plan(&[]);
+        let harmless = HandoffStep::WriteSysctl {
+            scope: SysctlScope::All,
+            sysctl: Ipv6Sysctl::AcceptRa,
+        };
+        let at = early.iter().position(|s| *s == harmless).unwrap();
+        let step = early.remove(at);
+        early.push(step); // ..., VerifyLockedIdentity, WriteSysctl(all, accept_ra)
+        let failure = simulate(&early, &[]).expect_err("verification must be last");
+        assert_eq!(failure.reason, StepRefusal::AfterVerification);
+        assert_eq!(failure.index, early.len() - 1);
         assert!(
             precedence_violations(&early, &[])
                 .contains(&PrecedenceViolation::VerifyLockedIdentityNotLast)
         );
+    }
+
+    /// The second review's finding: a model that checked only the last step
+    /// accepted a plan without `ClearInheritableAndAmbient` (nothing in the
+    /// model showed its absence) and a plan ending in two verifications,
+    /// while the rules refused both. Now the model refuses both too, and for
+    /// the reason the kernel would.
+    #[test]
+    fn a_plan_missing_a_mandatory_step_or_verifying_twice_is_refused() {
+        let mut without_clear = handoff_plan(&[]);
+        let at = without_clear
+            .iter()
+            .position(|s| *s == HandoffStep::ClearInheritableAndAmbient)
+            .unwrap();
+        without_clear.remove(at);
+        let failure = simulate(&without_clear, &[]).expect_err("the inheritable set survives");
+        assert_eq!(failure.step, HandoffStep::VerifyLockedIdentity);
+        assert_eq!(
+            failure.reason,
+            StepRefusal::NotLocked(LockedStateViolation::CapabilitySetNotEmpty("inheritable"))
+        );
+        assert!(
+            precedence_violations(&without_clear, &[])
+                .contains(&PrecedenceViolation::VerifyLockedIdentityNotLast)
+        );
+
+        let mut twice = handoff_plan(&[]);
+        twice.push(HandoffStep::VerifyLockedIdentity);
+        let failure = simulate(&twice, &[]).expect_err("verification runs once");
+        assert_eq!(failure.reason, StepRefusal::AfterVerification);
+        assert_eq!(failure.index, twice.len() - 1);
+        assert!(
+            precedence_violations(&twice, &[])
+                .contains(&PrecedenceViolation::VerifyLockedIdentityNotLast)
+        );
+    }
+
+    /// Every mandatory step is mandatory in *both* oracles: dropping any one
+    /// of them from the canonical plan is refused by the model and by the
+    /// rules. Spelled out per step so a regression names the step.
+    #[test]
+    fn every_mandatory_step_is_load_bearing_in_both_oracles() {
+        let plan = handoff_plan(&[]);
+        for (index, step) in plan.iter().enumerate() {
+            let mut without = plan.clone();
+            without.remove(index);
+            let optional = matches!(
+                step,
+                HandoffStep::WriteSysctl {
+                    sysctl: Ipv6Sysctl::AcceptRa
+                        | Ipv6Sysctl::Autoconf
+                        | Ipv6Sysctl::RouterSolicitations,
+                    ..
+                }
+            );
+            let simulated = simulate(&without, &[]);
+            let violations = precedence_violations(&without, &[]);
+            assert_eq!(
+                simulated.is_ok(),
+                optional,
+                "dropping {step:?}: model says {:?}",
+                simulated.as_ref().map(|_| ()).map_err(|e| e.to_string())
+            );
+            assert_eq!(
+                violations.is_empty(),
+                optional,
+                "dropping {step:?}: rules say {violations:?}"
+            );
+        }
     }
 
     proptest! {
@@ -759,43 +943,77 @@ mod tests {
         }
 
         /// The model and the precedence rules are two statements of one
-        /// constraint: an order runs to completion in the model iff it
-        /// breaks no precedence rule.
+        /// constraint: a plan runs to completion in the model iff it breaks
+        /// no precedence rule. Over reorderings, drops, and duplications of
+        /// the canonical plan, composed up to three deep.
         #[test]
         fn the_model_and_the_precedence_rules_agree(
-            (interfaces, reorder) in arb_interfaces().prop_flat_map(|i| {
+            (interfaces, mutations) in arb_interfaces().prop_flat_map(|i| {
                 let len = handoff_plan(&i).len();
-                (Just(i), arb_reorder(len))
+                (Just(i), arb_mutations(len))
             }),
         ) {
-            let steps = apply_reorder(&handoff_plan(&interfaces), &reorder);
+            let steps = apply_mutations(&handoff_plan(&interfaces), &mutations);
             let simulated = simulate(&steps, &interfaces);
             let violations = precedence_violations(&steps, &interfaces);
             prop_assert_eq!(
                 simulated.is_ok(),
                 violations.is_empty(),
-                "model says {:?} but precedence rules say {:?} for {:?}",
+                "model says {:?} but precedence rules say {:?} for {:?} (from {:?})",
                 simulated.as_ref().map(|_| ()).map_err(|e| e.to_string()),
                 violations,
-                steps
+                steps,
+                mutations
             );
+        }
+
+        /// A plan the model accepts is locked at the end, whatever was done
+        /// to it: acceptance is never vacuous.
+        #[test]
+        fn an_accepted_plan_ends_locked(
+            (interfaces, mutations) in arb_interfaces().prop_flat_map(|i| {
+                let len = handoff_plan(&i).len();
+                (Just(i), arb_mutations(len))
+            }),
+        ) {
+            let steps = apply_mutations(&handoff_plan(&interfaces), &mutations);
+            if let Ok(model) = simulate(&steps, &interfaces) {
+                prop_assert_eq!(model.is_locked(&interfaces), Ok(()));
+                prop_assert_eq!(steps.last(), Some(&HandoffStep::VerifyLockedIdentity));
+                prop_assert_eq!(
+                    steps.iter().filter(|s| **s == HandoffStep::VerifyLockedIdentity).count(),
+                    1
+                );
+            }
         }
     }
 
-    /// The agreement property must see both outcomes, or it is only testing
-    /// one half of the equivalence. Measured on the generator directly.
+    /// The agreement property must see both outcomes, and see them from
+    /// each kind of edit, or it is only testing one half of the equivalence
+    /// on the shapes that matter. Measured on the generator directly.
     #[test]
-    fn the_reorder_generator_reaches_both_outcomes() {
-        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(2000));
-        let (accepted, refused) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+    fn the_mutation_generator_reaches_both_outcomes_for_every_kind() {
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(4000));
+        // Per kind: (accepted, refused), for single-edit cases only, so each
+        // count is attributable to its kind.
+        let counts: [(std::cell::Cell<u32>, std::cell::Cell<u32>); 5] =
+            std::array::from_fn(|_| (std::cell::Cell::new(0), std::cell::Cell::new(0)));
+        let kind = |m: &Mutation| match m {
+            Mutation::Shuffle(_) => 0,
+            Mutation::AdjacentSwaps(_) => 1,
+            Mutation::Relocate { .. } => 2,
+            Mutation::Drop(_) => 3,
+            Mutation::Duplicate { .. } => 4,
+        };
         runner
             .run(
                 &arb_interfaces().prop_flat_map(|i| {
                     let len = handoff_plan(&i).len();
-                    (Just(i), arb_reorder(len))
+                    (Just(i), arb_mutation(len))
                 }),
-                |(interfaces, reorder)| {
-                    let steps = apply_reorder(&handoff_plan(&interfaces), &reorder);
+                |(interfaces, mutation)| {
+                    let steps = apply_mutation(&handoff_plan(&interfaces), &mutation);
+                    let (accepted, refused) = &counts[kind(&mutation)];
                     if simulate(&steps, &interfaces).is_ok() {
                         accepted.set(accepted.get() + 1);
                     } else {
@@ -805,11 +1023,22 @@ mod tests {
                 },
             )
             .unwrap();
-        // Half the cases are 0..3 adjacent swaps of a ~24-step plan, of which
-        // most are harmless; a uniformly random permutation is essentially
-        // never accepted. Both sides should be in the hundreds.
-        let (accepted, refused) = (accepted.get(), refused.get());
-        assert!(accepted >= 200, "accepted only {accepted} of 2000");
-        assert!(refused >= 200, "refused only {refused} of 2000");
+        let counts = counts.map(|(a, r)| (a.get(), r.get()));
+        // ~800 cases per kind. A uniform shuffle of a ~24-step plan is
+        // essentially never accepted, so Shuffle is held only to refusals.
+        // For the rest: adjacent swaps are mostly harmless; relocating,
+        // dropping, or duplicating one of the ~12 optional sysctl writes (of
+        // ~24 steps) is accepted, and doing so to a mandatory step is
+        // refused, so both sides are in the hundreds.
+        assert!(counts[0].1 >= 200, "shuffle refused only {counts:?}");
+        for (name, (accepted, refused)) in ["swaps", "relocate", "drop", "duplicate"]
+            .iter()
+            .zip(&counts[1..])
+        {
+            assert!(
+                *accepted >= 100 && *refused >= 100,
+                "{name}: accepted {accepted}, refused {refused}: {counts:?}"
+            );
+        }
     }
 }

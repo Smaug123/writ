@@ -1,13 +1,28 @@
-//! What `/proc/<pid>/status` must say about a released workload.
+//! What `/proc/<pid>/status` must say about a locked process, at each of the
+//! two moments the host judges it.
 //!
-//! The host reads the initializer's status file, via a bounded
-//! `container exec` *before* release while the only code in the guest is
-//! still trusted, and refuses to release unless it parses to
-//! [`LockedIdentity`]. This is the one place the locked identity's shape is
-//! written down: every capability set zero, `NoNewPrivs` set, UID and GID
-//! all [`LOCKED_UID`]/[`LOCKED_GID`], no supplementary groups, and `SIGUSR1`
-//! not blocked (the initializer blocks it to wait on it, and must unblock it
-//! before `exec` or the workload inherits a blocked signal).
+//! The locked identity itself is one shape: every capability set zero,
+//! `NoNewPrivs` set, UID and GID all [`LOCKED_UID`]/[`LOCKED_GID`], no
+//! supplementary groups. But the `SIGUSR1` bit of `SigBlk` must read
+//! *differently* at the two moments a status document is read, and a single
+//! acceptance check would reject one of them:
+//!
+//! - **Awaiting release.** The host reads PID 1's status via a bounded
+//!   `container exec` after it sees `security-ready` and before it sends
+//!   `SIGUSR1`, while the only code in the guest is still trusted. PID 1 is
+//!   parked in `sigwait` on a set that blocks `SIGUSR1`, so the bit must be
+//!   *set*: a clear bit means the wait is not armed, and a signal sent now
+//!   would kill PID 1 or be lost. This is [`LockedAwaitingRelease`], the proof
+//!   the host's release gate requires.
+//! - **Released.** After release the initializer restores the mask and
+//!   `exec`s the workload, which inherits the mask as it stands. Here the bit
+//!   must be *clear*, or the workload has silently lost a signal it may use.
+//!   This is [`LockedReleased`], the proof the Linux CI oracle requires of the
+//!   process the initializer `exec`ed.
+//!
+//! The two proofs are distinct types so the release gate cannot be handed a
+//! post-exec proof, nor the CI oracle a pre-release one; every other field is
+//! judged identically by both.
 
 use std::collections::BTreeMap;
 
@@ -15,6 +30,9 @@ use crate::{LOCKED_GID, LOCKED_UID};
 
 /// The Linux signal number of `SIGUSR1`; bit `SIGUSR1 - 1` in `SigBlk`.
 pub const SIGUSR1: u32 = 10;
+
+/// The `SigBlk` bit that says `SIGUSR1` is blocked.
+const USR1_BIT: u64 = 1u64 << (SIGUSR1 - 1);
 
 /// The fields of `/proc/<pid>/status` the locked identity is judged on.
 ///
@@ -184,9 +202,41 @@ impl ProcStatus {
             self.sig_blk,
         )
     }
+
+    /// Whether `SigBlk` has the `SIGUSR1` bit set.
+    pub fn usr1_blocked(&self) -> bool {
+        self.sig_blk & USR1_BIT != 0
+    }
 }
 
-/// One way a status document fails to be the locked identity.
+/// The two moments a locked process's status is read, distinguished by what
+/// the `SIGUSR1` bit of `SigBlk` must say.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub enum SignalWaitPhase {
+    /// PID 1 has emitted `security-ready` and is parked in `sigwait`; the
+    /// bit must be set, or the wait is not armed.
+    AwaitingRelease,
+    /// The initializer has restored the mask and `exec`ed the workload; the
+    /// bit must be clear, or the workload inherited a blocked signal.
+    Released,
+}
+
+impl SignalWaitPhase {
+    pub const ALL: [Self; 2] = [Self::AwaitingRelease, Self::Released];
+
+    /// The `SIGUSR1` violation this phase finds in a mask, if any.
+    fn usr1_violation(self, sig_blk: u64) -> Option<IdentityViolation> {
+        let blocked = sig_blk & USR1_BIT != 0;
+        match (self, blocked) {
+            (Self::AwaitingRelease, false) => Some(IdentityViolation::Usr1NotBlocked(sig_blk)),
+            (Self::Released, true) => Some(IdentityViolation::Usr1Blocked(sig_blk)),
+            _ => None,
+        }
+    }
+}
+
+/// One way a status document fails to be the locked identity at the phase
+/// it was judged for.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum IdentityViolation {
     #[error("Uid slot {slot} is {value}, not {LOCKED_UID}")]
@@ -199,57 +249,66 @@ pub enum IdentityViolation {
     Capability { set: &'static str, value: u64 },
     #[error("NoNewPrivs is {0}, not 1")]
     NoNewPrivs(u8),
+    /// Only [`SignalWaitPhase::Released`] reports this.
     #[error("SIGUSR1 is blocked (SigBlk {0:#x}); the initializer must unblock it before exec")]
     Usr1Blocked(u64),
+    /// Only [`SignalWaitPhase::AwaitingRelease`] reports this.
+    #[error("SIGUSR1 is not blocked (SigBlk {0:#x}); the release wait is not armed")]
+    Usr1NotBlocked(u64),
 }
 
-/// Proof that a status document describes the locked identity.
-///
-/// Constructible only through [`LockedIdentity::verify`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LockedIdentity(());
+/// Every way `status` departs from the locked identity as judged at `phase`.
+fn violations(status: &ProcStatus, phase: SignalWaitPhase) -> Vec<IdentityViolation> {
+    let mut violations = Vec::new();
+    for (slot, value) in status.uid.iter().enumerate() {
+        if *value != LOCKED_UID {
+            violations.push(IdentityViolation::Uid {
+                slot,
+                value: *value,
+            });
+        }
+    }
+    for (slot, value) in status.gid.iter().enumerate() {
+        if *value != LOCKED_GID {
+            violations.push(IdentityViolation::Gid {
+                slot,
+                value: *value,
+            });
+        }
+    }
+    if !status.groups.is_empty() {
+        violations.push(IdentityViolation::Groups(status.groups.clone()));
+    }
+    for (set, value) in [
+        ("CapInh", status.cap_inh),
+        ("CapPrm", status.cap_prm),
+        ("CapEff", status.cap_eff),
+        ("CapBnd", status.cap_bnd),
+        ("CapAmb", status.cap_amb),
+    ] {
+        if value != 0 {
+            violations.push(IdentityViolation::Capability { set, value });
+        }
+    }
+    if status.no_new_privs != 1 {
+        violations.push(IdentityViolation::NoNewPrivs(status.no_new_privs));
+    }
+    violations.extend(phase.usr1_violation(status.sig_blk));
+    violations
+}
 
-impl LockedIdentity {
-    /// Every way the document departs from the locked identity, or the
-    /// proof that it does not.
+/// Proof that a status document describes the locked identity parked in the
+/// release wait, with `SIGUSR1` blocked. What the host's release gate needs.
+///
+/// Constructible only through [`LockedAwaitingRelease::verify`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedAwaitingRelease(());
+
+impl LockedAwaitingRelease {
+    /// Every way the document departs from the locked identity awaiting
+    /// release, or the proof that it does not.
     pub fn verify(status: &ProcStatus) -> Result<Self, Vec<IdentityViolation>> {
-        let mut violations = Vec::new();
-        for (slot, value) in status.uid.iter().enumerate() {
-            if *value != LOCKED_UID {
-                violations.push(IdentityViolation::Uid {
-                    slot,
-                    value: *value,
-                });
-            }
-        }
-        for (slot, value) in status.gid.iter().enumerate() {
-            if *value != LOCKED_GID {
-                violations.push(IdentityViolation::Gid {
-                    slot,
-                    value: *value,
-                });
-            }
-        }
-        if !status.groups.is_empty() {
-            violations.push(IdentityViolation::Groups(status.groups.clone()));
-        }
-        for (set, value) in [
-            ("CapInh", status.cap_inh),
-            ("CapPrm", status.cap_prm),
-            ("CapEff", status.cap_eff),
-            ("CapBnd", status.cap_bnd),
-            ("CapAmb", status.cap_amb),
-        ] {
-            if value != 0 {
-                violations.push(IdentityViolation::Capability { set, value });
-            }
-        }
-        if status.no_new_privs != 1 {
-            violations.push(IdentityViolation::NoNewPrivs(status.no_new_privs));
-        }
-        if status.sig_blk & (1u64 << (SIGUSR1 - 1)) != 0 {
-            violations.push(IdentityViolation::Usr1Blocked(status.sig_blk));
-        }
+        let violations = violations(status, SignalWaitPhase::AwaitingRelease);
         if violations.is_empty() {
             Ok(Self(()))
         } else {
@@ -258,9 +317,30 @@ impl LockedIdentity {
     }
 }
 
-/// The status document the locked identity produces, with every judged
-/// field at its required value.
-pub fn locked_status() -> ProcStatus {
+/// Proof that a status document describes the locked identity after release,
+/// with `SIGUSR1` unblocked. What the CI oracle needs of the `exec`ed
+/// workload.
+///
+/// Constructible only through [`LockedReleased::verify`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockedReleased(());
+
+impl LockedReleased {
+    /// Every way the document departs from the released locked identity, or
+    /// the proof that it does not.
+    pub fn verify(status: &ProcStatus) -> Result<Self, Vec<IdentityViolation>> {
+        let violations = violations(status, SignalWaitPhase::Released);
+        if violations.is_empty() {
+            Ok(Self(()))
+        } else {
+            Err(violations)
+        }
+    }
+}
+
+/// The status document the locked identity produces at `phase`, with every
+/// judged field at its required value.
+pub fn locked_status(phase: SignalWaitPhase) -> ProcStatus {
     ProcStatus {
         uid: [LOCKED_UID; 4],
         gid: [LOCKED_GID; 4],
@@ -271,7 +351,10 @@ pub fn locked_status() -> ProcStatus {
         cap_bnd: 0,
         cap_amb: 0,
         no_new_privs: 1,
-        sig_blk: 0,
+        sig_blk: match phase {
+            SignalWaitPhase::AwaitingRelease => USR1_BIT,
+            SignalWaitPhase::Released => 0,
+        },
     }
 }
 
@@ -279,6 +362,17 @@ pub fn locked_status() -> ProcStatus {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Judge at a phase, returning the violation list either way.
+    fn verify_at(
+        status: &ProcStatus,
+        phase: SignalWaitPhase,
+    ) -> Result<(), Vec<IdentityViolation>> {
+        match phase {
+            SignalWaitPhase::AwaitingRelease => LockedAwaitingRelease::verify(status).map(|_| ()),
+            SignalWaitPhase::Released => LockedReleased::verify(status).map(|_| ()),
+        }
+    }
 
     /// A document as the kernel prints it for a root process at container
     /// launch, with the unrelated lines the kernel also prints.
@@ -308,21 +402,55 @@ Threads:\t1\n";
         assert_eq!(status.groups, Vec::<u32>::new());
         assert_eq!(status.cap_eff, 0x10c1);
         assert_eq!(status.sig_blk, 0x200);
-        let violations = LockedIdentity::verify(&status).unwrap_err();
-        // 4 uid + 4 gid + 3 non-zero cap sets + NoNewPrivs + SIGUSR1 blocked.
-        assert_eq!(violations.len(), 13, "{violations:?}");
-        assert!(violations.contains(&IdentityViolation::Usr1Blocked(0x200)));
-        assert!(violations.contains(&IdentityViolation::Capability {
+        assert!(status.usr1_blocked());
+
+        // Judged as a released workload: 4 uid + 4 gid + 3 non-zero cap sets
+        // + NoNewPrivs + SIGUSR1 blocked.
+        let released = LockedReleased::verify(&status).unwrap_err();
+        assert_eq!(released.len(), 13, "{released:?}");
+        assert!(released.contains(&IdentityViolation::Usr1Blocked(0x200)));
+        assert!(released.contains(&IdentityViolation::Capability {
             set: "CapBnd",
             value: 0x10c1
         }));
+
+        // Judged as awaiting release: the same, minus the signal, which is
+        // exactly as it should be for a process parked in sigwait.
+        let awaiting = LockedAwaitingRelease::verify(&status).unwrap_err();
+        assert_eq!(awaiting.len(), 12, "{awaiting:?}");
+        assert!(!awaiting.iter().any(|v| matches!(
+            v,
+            IdentityViolation::Usr1Blocked(_) | IdentityViolation::Usr1NotBlocked(_)
+        )));
     }
 
+    /// The bug the second review found: the host reads the status *before*
+    /// release, while PID 1 is parked in sigwait with SIGUSR1 blocked, so the
+    /// gate must accept that state and refuse the unblocked one; the
+    /// post-exec oracle wants the opposite.
     #[test]
-    fn the_locked_document_is_accepted_and_round_trips() {
-        let locked = locked_status();
-        assert!(LockedIdentity::verify(&locked).is_ok());
-        assert_eq!(ProcStatus::parse(&locked.render()).unwrap(), locked);
+    fn each_phase_accepts_its_own_locked_document_and_refuses_the_others() {
+        let parked = locked_status(SignalWaitPhase::AwaitingRelease);
+        let released = locked_status(SignalWaitPhase::Released);
+        assert!(parked.usr1_blocked());
+        assert!(!released.usr1_blocked());
+
+        assert!(LockedAwaitingRelease::verify(&parked).is_ok());
+        assert_eq!(
+            LockedAwaitingRelease::verify(&released),
+            Err(vec![IdentityViolation::Usr1NotBlocked(0)])
+        );
+
+        assert!(LockedReleased::verify(&released).is_ok());
+        assert_eq!(
+            LockedReleased::verify(&parked),
+            Err(vec![IdentityViolation::Usr1Blocked(USR1_BIT)])
+        );
+
+        for phase in SignalWaitPhase::ALL {
+            let locked = locked_status(phase);
+            assert_eq!(ProcStatus::parse(&locked.render()).unwrap(), locked);
+        }
     }
 
     #[test]
@@ -398,8 +526,12 @@ Threads:\t1\n";
             )
     }
 
-    /// One field of the locked document, edited to a value that is not the
-    /// locked one. Constructed to differ, never filtered.
+    fn arb_phase() -> impl Strategy<Value = SignalWaitPhase> {
+        proptest::sample::select(SignalWaitPhase::ALL.to_vec())
+    }
+
+    /// One field of a phase's locked document, edited to a value that is not
+    /// the locked one for that phase. Constructed to differ, never filtered.
     #[derive(Clone, Debug)]
     enum Edit {
         Uid(usize, u32),
@@ -407,12 +539,18 @@ Threads:\t1\n";
         Groups(Vec<u32>),
         Cap(&'static str, u64),
         NoNewPrivs,
-        BlockUsr1(u64),
+        /// A `SigBlk` mask with the SIGUSR1 bit at the wrong value for the
+        /// phase: clear when awaiting release, set when released.
+        Usr1(u64),
     }
 
-    fn arb_edit() -> impl Strategy<Value = Edit> {
+    fn arb_edit(phase: SignalWaitPhase) -> impl Strategy<Value = Edit> {
         let non_locked_id = any::<u32>().prop_map(|v| if v == LOCKED_UID { v + 1 } else { v });
         let non_zero_u64 = any::<u64>().prop_map(|v| if v == 0 { 1 } else { v });
+        let wrong_usr1 = any::<u64>().prop_map(move |v| match phase {
+            SignalWaitPhase::AwaitingRelease => v & !USR1_BIT,
+            SignalWaitPhase::Released => v | USR1_BIT,
+        });
         prop_oneof![
             (0..4usize, non_locked_id.clone()).prop_map(|(s, v)| Edit::Uid(s, v)),
             (0..4usize, non_locked_id).prop_map(|(s, v)| Edit::Gid(s, v)),
@@ -423,8 +561,7 @@ Threads:\t1\n";
             )
                 .prop_map(|(s, v)| Edit::Cap(s, v)),
             Just(Edit::NoNewPrivs),
-            // Any mask with the SIGUSR1 bit set.
-            any::<u64>().prop_map(|v| Edit::BlockUsr1(v | (1 << (SIGUSR1 - 1)))),
+            wrong_usr1.prop_map(Edit::Usr1),
         ]
     }
 
@@ -443,11 +580,11 @@ Threads:\t1\n";
                     _ => unreachable!(),
                 },
                 Edit::NoNewPrivs => status.no_new_privs = 0,
-                Edit::BlockUsr1(mask) => status.sig_blk = *mask,
+                Edit::Usr1(mask) => status.sig_blk = *mask,
             }
         }
 
-        fn names_itself(&self, violation: &IdentityViolation) -> bool {
+        fn names_itself(&self, phase: SignalWaitPhase, violation: &IdentityViolation) -> bool {
             match (self, violation) {
                 (Edit::Uid(s, v), IdentityViolation::Uid { slot, value }) => {
                     s == slot && v == value
@@ -460,7 +597,12 @@ Threads:\t1\n";
                     s == set && v == value
                 }
                 (Edit::NoNewPrivs, IdentityViolation::NoNewPrivs(0)) => true,
-                (Edit::BlockUsr1(m), IdentityViolation::Usr1Blocked(seen)) => m == seen,
+                (Edit::Usr1(m), IdentityViolation::Usr1NotBlocked(seen)) => {
+                    phase == SignalWaitPhase::AwaitingRelease && m == seen
+                }
+                (Edit::Usr1(m), IdentityViolation::Usr1Blocked(seen)) => {
+                    phase == SignalWaitPhase::Released && m == seen
+                }
                 _ => false,
             }
         }
@@ -477,53 +619,91 @@ Threads:\t1\n";
             prop_assert_eq!(ProcStatus::parse(&status.render()).unwrap(), status);
         }
 
-        /// Editing one field of the locked document away from its locked
-        /// value produces exactly one violation, and it names that field and
-        /// the value it saw.
+        /// Editing one field of a phase's locked document away from its
+        /// locked value produces exactly one violation under that phase, and
+        /// it names that field and the value it saw.
         #[test]
-        fn one_edit_yields_exactly_the_violation_that_names_it(edit in arb_edit()) {
-            let mut status = locked_status();
+        fn one_edit_yields_exactly_the_violation_that_names_it(
+            (phase, edit) in arb_phase().prop_flat_map(|p| (Just(p), arb_edit(p))),
+        ) {
+            let mut status = locked_status(phase);
             edit.apply(&mut status);
-            let violations = LockedIdentity::verify(&status)
+            let violations = verify_at(&status, phase)
                 .expect_err("an edited locked document must not verify");
-            prop_assert_eq!(violations.len(), 1, "{:?} -> {:?}", edit, violations);
-            prop_assert!(edit.names_itself(&violations[0]), "{:?} -> {:?}", edit, violations);
+            prop_assert_eq!(violations.len(), 1, "{:?} at {:?} -> {:?}", edit, phase, violations);
+            prop_assert!(
+                edit.names_itself(phase, &violations[0]),
+                "{:?} at {:?} -> {:?}", edit, phase, violations
+            );
             // And it survives the wire: the parsed rendering says the same.
             let reparsed = ProcStatus::parse(&status.render()).unwrap();
-            prop_assert_eq!(LockedIdentity::verify(&reparsed), Err(violations));
+            prop_assert_eq!(verify_at(&reparsed, phase), Err(violations));
+        }
+
+        /// The two phases judge every field except the SIGUSR1 bit
+        /// identically, and judge that bit oppositely: for any document,
+        /// exactly one phase reports a SIGUSR1 violation, and the two
+        /// violation lists are otherwise equal. So no document is accepted
+        /// by both proofs, and the split changes nothing but the signal.
+        #[test]
+        fn the_phases_differ_only_in_the_usr1_bit(status in arb_status()) {
+            let is_usr1 = |v: &IdentityViolation| matches!(
+                v,
+                IdentityViolation::Usr1Blocked(_) | IdentityViolation::Usr1NotBlocked(_)
+            );
+            let awaiting = violations(&status, SignalWaitPhase::AwaitingRelease);
+            let released = violations(&status, SignalWaitPhase::Released);
+            let usr1_awaiting: Vec<IdentityViolation> =
+                awaiting.iter().filter(|v| is_usr1(v)).cloned().collect();
+            let usr1_released: Vec<IdentityViolation> =
+                released.iter().filter(|v| is_usr1(v)).cloned().collect();
+            if status.usr1_blocked() {
+                prop_assert_eq!(usr1_awaiting, Vec::new());
+                prop_assert_eq!(usr1_released, vec![IdentityViolation::Usr1Blocked(status.sig_blk)]);
+            } else {
+                prop_assert_eq!(usr1_awaiting, vec![IdentityViolation::Usr1NotBlocked(status.sig_blk)]);
+                prop_assert_eq!(usr1_released, Vec::new());
+            }
+            let rest = |vs: &[IdentityViolation]| -> Vec<IdentityViolation> {
+                vs.iter().filter(|v| !is_usr1(v)).cloned().collect()
+            };
+            prop_assert_eq!(rest(&awaiting), rest(&released));
         }
     }
 
-    /// The edit generator must reach every judged field.
+    /// The edit generator must reach every judged field, at each phase.
     #[test]
     fn the_edit_generator_reaches_every_field() {
-        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(2000));
-        let counts: [std::cell::Cell<u32>; 6] = [const { std::cell::Cell::new(0) }; 6];
-        runner
-            .run(&arb_edit(), |edit| {
-                let slot = &counts[match edit {
-                    Edit::Uid(..) => 0,
-                    Edit::Gid(..) => 1,
-                    Edit::Groups(_) => 2,
-                    Edit::Cap(..) => 3,
-                    Edit::NoNewPrivs => 4,
-                    Edit::BlockUsr1(_) => 5,
-                }];
-                slot.set(slot.get() + 1);
-                Ok(())
-            })
-            .unwrap();
-        let counts = counts.map(|c| c.get());
-        // Six kinds drawn uniformly over 2000 cases; fewer than 150 of any
-        // one kind has probability far below 1e-11.
-        for (kind, count) in ["uid", "gid", "groups", "cap", "nnp", "usr1"]
-            .iter()
-            .zip(counts)
-        {
-            assert!(
-                count >= 150,
-                "edit kind {kind} seen only {count} times: {counts:?}"
-            );
+        for phase in SignalWaitPhase::ALL {
+            let mut runner =
+                proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(2000));
+            let counts: [std::cell::Cell<u32>; 6] = [const { std::cell::Cell::new(0) }; 6];
+            runner
+                .run(&arb_edit(phase), |edit| {
+                    let slot = &counts[match edit {
+                        Edit::Uid(..) => 0,
+                        Edit::Gid(..) => 1,
+                        Edit::Groups(_) => 2,
+                        Edit::Cap(..) => 3,
+                        Edit::NoNewPrivs => 4,
+                        Edit::Usr1(_) => 5,
+                    }];
+                    slot.set(slot.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            let counts = counts.map(|c| c.get());
+            // Six kinds drawn uniformly over 2000 cases; fewer than 150 of
+            // any one kind has probability far below 1e-11.
+            for (kind, count) in ["uid", "gid", "groups", "cap", "nnp", "usr1"]
+                .iter()
+                .zip(counts)
+            {
+                assert!(
+                    count >= 150,
+                    "edit kind {kind} seen only {count} times at {phase:?}: {counts:?}"
+                );
+            }
         }
     }
 }
