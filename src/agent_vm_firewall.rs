@@ -144,6 +144,20 @@ pub enum PfctlError {
     },
     #[error("PF ruleset is missing required bootstrap anchor: {0}")]
     MissingBootstrapAnchor(&'static str),
+    /// The bootstrap anchor is present but something earlier in the main
+    /// ruleset can take a packet before it: another filter anchor (whose
+    /// contents this check cannot see, and which may hold a `quick` pass) or
+    /// a `quick` pass in the main ruleset itself. Every session rule would
+    /// then be consulted only for packets nothing else claimed first, which
+    /// is not a confinement boundary.
+    #[error(
+        "PF main ruleset has rules ahead of `anchor \"writ/session/*\"` that could pass a packet \
+         before the session anchor is consulted; in /etc/pf.conf move the writ anchor line after \
+         the translation anchors and before `anchor \"com.apple/*\"`, then reload PF. \
+         Offending lines: {}",
+        .0.join(" | ")
+    )]
+    BootstrapAnchorNotFirst(Vec<String>),
     #[error("PF is not enabled")]
     PfDisabled,
     #[error("PF session anchor {anchor} still contains rules after removal: {rules}")]
@@ -404,11 +418,61 @@ fn capture_output_with_timeout(
     }
 }
 
-pub fn pf_rules_contain_session_bootstrap(rules: &str) -> bool {
-    rules.lines().any(|line| {
-        let line = line.trim();
-        line == SESSION_BOOTSTRAP_ANCHOR || line == r#"anchor "writ/session/*" all"#
-    })
+/// Where the bootstrap anchor sits in the main ruleset, as `pfctl -sr` prints
+/// it.
+///
+/// PF consults the main ruleset top to bottom. A `quick` rule that matches
+/// ends evaluation, and a filter anchor's rules are evaluated in place, so a
+/// `quick` pass inside `anchor "com.apple/*"` is just as final as one written
+/// in `pf.conf`, and a main-ruleset readback shows only the anchor line, not
+/// what it holds. The only placement this check can therefore vouch for is
+/// the writ anchor ahead of every other filter anchor and every `quick` pass.
+/// Translation anchors (`scrub-anchor`, `nat-anchor`, `rdr-anchor`,
+/// `dummynet-anchor`) do not filter, and a non-`quick` pass is overridden by
+/// a later match, so both may precede it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionAnchorPlacement {
+    /// Present, and nothing ahead of it can pass a packet first.
+    First,
+    /// Present, but these earlier lines could: the filter anchors and `quick`
+    /// passes that precede it, in order.
+    Preceded(Vec<String>),
+    /// Not present.
+    Absent,
+}
+
+fn is_session_bootstrap_anchor_line(line: &str) -> bool {
+    line == SESSION_BOOTSTRAP_ANCHOR || line == r#"anchor "writ/session/*" all"#
+}
+
+/// Whether a main-ruleset line could pass a packet before a later anchor is
+/// consulted: any other filter anchor, or a `pass` with `quick`.
+fn line_can_preempt_session_anchor(line: &str) -> bool {
+    if line.starts_with("anchor ") {
+        return true;
+    }
+    let mut words = line.split_whitespace();
+    words.next() == Some("pass") && words.any(|w| w == "quick")
+}
+
+/// Classify a `pfctl -sr` dump of the main ruleset by where the bootstrap
+/// anchor sits. Blank lines are ignored; nothing else is validated, because
+/// the question is only what precedes the anchor.
+pub fn session_anchor_placement(rules: &str) -> SessionAnchorPlacement {
+    let mut preceding = Vec::new();
+    for line in rules.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if is_session_bootstrap_anchor_line(line) {
+            return if preceding.is_empty() {
+                SessionAnchorPlacement::First
+            } else {
+                SessionAnchorPlacement::Preceded(preceding)
+            };
+        }
+        if line_can_preempt_session_anchor(line) {
+            preceding.push(line.to_string());
+        }
+    }
+    SessionAnchorPlacement::Absent
 }
 
 pub fn pf_info_says_enabled(info: &str) -> bool {
@@ -438,10 +502,12 @@ pub fn ensure_pf_enabled(pfctl: &Path) -> Result<(), PfctlError> {
 pub fn ensure_session_bootstrap_anchor(pfctl: &Path) -> Result<(), PfctlError> {
     let output = PfctlInvocation::new(["-sr"]).run(pfctl)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if pf_rules_contain_session_bootstrap(&stdout) {
-        Ok(())
-    } else {
-        Err(PfctlError::MissingBootstrapAnchor(SESSION_BOOTSTRAP_ANCHOR))
+    match session_anchor_placement(&stdout) {
+        SessionAnchorPlacement::First => Ok(()),
+        SessionAnchorPlacement::Preceded(lines) => Err(PfctlError::BootstrapAnchorNotFirst(lines)),
+        SessionAnchorPlacement::Absent => {
+            Err(PfctlError::MissingBootstrapAnchor(SESSION_BOOTSTRAP_ANCHOR))
+        }
     }
 }
 
@@ -547,6 +613,8 @@ impl Drop for TempRulesFile {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use proptest::prelude::*;
 
     use super::*;
     use crate::core::{BrokerPort, BrokerPorts};
@@ -733,20 +801,192 @@ mod tests {
         ));
     }
 
+    /// The default macOS `pf.conf` with the writ anchor appended: the shape
+    /// every install had until now, and the one this check now refuses,
+    /// because `com.apple/*` is a filter anchor whose contents a
+    /// main-ruleset readback cannot see.
     #[test]
-    fn bootstrap_check_requires_direct_session_anchor() {
-        assert!(pf_rules_contain_session_bootstrap(
-            r#"
-            anchor "com.apple/*" all
-            anchor "writ/session/*" all
-            "#
-        ));
-        assert!(!pf_rules_contain_session_bootstrap(
-            r#"
-            anchor "com.apple/*" all
-            anchor "writ/*" all
-            "#
-        ));
+    fn an_appended_session_anchor_is_preceded_by_apples() {
+        assert_eq!(
+            session_anchor_placement(
+                r#"
+                scrub-anchor "com.apple/*" all fragment reassemble
+                nat-anchor "com.apple/*" all
+                rdr-anchor "com.apple/*" all
+                dummynet-anchor "com.apple/*" all
+                anchor "com.apple/*" all
+                anchor "writ/session/*" all
+                "#
+            ),
+            SessionAnchorPlacement::Preceded(vec![r#"anchor "com.apple/*" all"#.to_string()])
+        );
+    }
+
+    /// The placement the install docs now prescribe.
+    #[test]
+    fn a_session_anchor_after_translation_anchors_and_before_apples_is_first() {
+        assert_eq!(
+            session_anchor_placement(
+                r#"
+                scrub-anchor "com.apple/*" all fragment reassemble
+                nat-anchor "com.apple/*" all
+                rdr-anchor "com.apple/*" all
+                dummynet-anchor "com.apple/*" all
+                anchor "writ/session/*" all
+                anchor "com.apple/*" all
+                "#
+            ),
+            SessionAnchorPlacement::First
+        );
+    }
+
+    #[test]
+    fn the_wildcard_writ_anchor_does_not_count() {
+        assert_eq!(
+            session_anchor_placement(
+                r#"
+                anchor "writ/*" all
+                "#
+            ),
+            SessionAnchorPlacement::Absent
+        );
+    }
+
+    /// One line of a generated main ruleset, with what the classifier must
+    /// make of it decided at generation time.
+    #[derive(Clone, Debug)]
+    enum RulesetLine {
+        /// Cannot preempt: translation anchors, non-quick passes, blocks,
+        /// blank lines.
+        Harmless(String),
+        /// Can preempt: another filter anchor or a `quick` pass.
+        Preempting(String),
+        /// The bootstrap anchor, in either spelling `pfctl -sr` uses.
+        Session(String),
+    }
+
+    fn arb_ruleset_line() -> impl Strategy<Value = RulesetLine> {
+        let name = "[a-z][a-z0-9.]{0,10}";
+        let iface = "(en0|lo0|bridge[0-9]{1,3}|utun[0-9])";
+        prop_oneof![
+            // Harmless.
+            name.prop_map(|n| RulesetLine::Harmless(format!(
+                "scrub-anchor \"{n}/*\" all fragment reassemble"
+            ))),
+            name.prop_map(|n| RulesetLine::Harmless(format!("nat-anchor \"{n}/*\" all"))),
+            name.prop_map(|n| RulesetLine::Harmless(format!("rdr-anchor \"{n}/*\" all"))),
+            name.prop_map(|n| RulesetLine::Harmless(format!("dummynet-anchor \"{n}/*\" all"))),
+            iface.prop_map(|i| RulesetLine::Harmless(format!("pass in on {i} all"))),
+            iface.prop_map(|i| RulesetLine::Harmless(format!("pass out on {i} inet all"))),
+            iface.prop_map(|i| RulesetLine::Harmless(format!("block drop in quick on {i} all"))),
+            Just(RulesetLine::Harmless("block return all".to_string())),
+            Just(RulesetLine::Harmless(String::new())),
+            // Preempting.
+            name.prop_map(|n| RulesetLine::Preempting(format!("anchor \"{n}/*\" all"))),
+            name.prop_map(|n| RulesetLine::Preempting(format!("anchor \"{n}\" all"))),
+            iface.prop_map(|i| RulesetLine::Preempting(format!("pass in quick on {i} all"))),
+            iface.prop_map(|i| RulesetLine::Preempting(format!(
+                "pass out quick on {i} inet proto tcp from any to any port 22 flags S/SA keep state"
+            ))),
+            Just(RulesetLine::Preempting("pass quick all".to_string())),
+        ]
+    }
+
+    fn arb_session_line() -> impl Strategy<Value = RulesetLine> {
+        prop_oneof![
+            Just(RulesetLine::Session(SESSION_BOOTSTRAP_ANCHOR.to_string())),
+            Just(RulesetLine::Session(
+                r#"anchor "writ/session/*" all"#.to_string()
+            )),
+        ]
+    }
+
+    /// A main ruleset with the session anchor absent, or present at a chosen
+    /// position, and the classification it must receive, computed while
+    /// generating rather than by a second implementation of the classifier.
+    fn arb_lines() -> impl Strategy<Value = Vec<RulesetLine>> {
+        proptest::collection::vec(arb_ruleset_line(), 0..8)
+    }
+
+    fn arb_ruleset() -> impl Strategy<Value = (String, SessionAnchorPlacement)> {
+        prop_oneof![
+            arb_lines().prop_map(|lines| {
+                let text = render_lines(&lines);
+                (text, SessionAnchorPlacement::Absent)
+            }),
+            (
+                arb_lines(),
+                arb_session_line(),
+                any::<proptest::sample::Index>()
+            )
+                .prop_map(|(mut lines, session, at)| {
+                    let at = at.index(lines.len() + 1);
+                    let preceding: Vec<String> = lines[..at]
+                        .iter()
+                        .filter_map(|l| match l {
+                            RulesetLine::Preempting(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    lines.insert(at, session);
+                    let expected = if preceding.is_empty() {
+                        SessionAnchorPlacement::First
+                    } else {
+                        SessionAnchorPlacement::Preceded(preceding)
+                    };
+                    (render_lines(&lines), expected)
+                }),
+        ]
+    }
+
+    fn render_lines(lines: &[RulesetLine]) -> String {
+        lines
+            .iter()
+            .map(|l| match l {
+                RulesetLine::Harmless(s) | RulesetLine::Preempting(s) | RulesetLine::Session(s) => {
+                    // pfctl indents nothing, but the check trims, so vary it.
+                    format!("{s}\n")
+                }
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// The classifier agrees with the generator's own bookkeeping of
+        /// which lines precede the anchor and can preempt it.
+        #[test]
+        fn placement_is_decided_by_what_precedes_the_anchor((text, expected) in arb_ruleset()) {
+            prop_assert_eq!(session_anchor_placement(&text), expected);
+        }
+    }
+
+    /// The ruleset generator must reach all three placements. Absent is half
+    /// the draws; of the rest, First needs no preempting line ahead of the
+    /// anchor, which is common for short rulesets and early positions.
+    #[test]
+    fn the_ruleset_generator_reaches_every_placement() {
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(2000));
+        let counts = [const { std::cell::Cell::new(0u32) }; 3];
+        runner
+            .run(&arb_ruleset(), |(_, expected)| {
+                let slot = &counts[match expected {
+                    SessionAnchorPlacement::First => 0,
+                    SessionAnchorPlacement::Preceded(_) => 1,
+                    SessionAnchorPlacement::Absent => 2,
+                }];
+                slot.set(slot.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        let counts = counts.map(|c| c.get());
+        for (name, count) in ["first", "preceded", "absent"].iter().zip(counts) {
+            assert!(
+                count >= 150,
+                "placement {name} seen only {count} times: {counts:?}"
+            );
+        }
     }
 
     #[test]
