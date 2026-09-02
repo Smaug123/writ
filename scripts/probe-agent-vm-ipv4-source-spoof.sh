@@ -589,7 +589,7 @@ start_capture() {
   TARGET_CAPTURE_PID[$target]=$!
   TARGET_CAPTURE[$target]="$capture"
   sleep 2
-  kill -0 "${TARGET_CAPTURE_PID[$target]}" 2>/dev/null \
+  process_alive "${TARGET_CAPTURE_PID[$target]}" \
     || die "tcpdump did not start on ${bridge}: $(cat "$err")"
 }
 
@@ -951,6 +951,8 @@ verdict() {
   # about vmnet. Neither may be recorded as a platform fact.
   if [[ "$u_observers_disagree" == "yes" ]]; then
     log "PLATFORM ${name}: unconfined, the listener received the datagram (source ${u_reach_src}) but the bridge capture never saw it; the observers disagree, so nothing about forwarding or rewriting can be pinned from this run. Check the capture (interface, filter, tcpdump errors) and rerun."
+  elif [[ "$observers_disagree" == "yes" ]]; then
+    log "PLATFORM ${name}: under the session the listener received the datagram (source ${reach_src}) but the session bridge capture never saw it; the session bridge cannot corroborate anything, so nothing is pinned from this run. Check the capture and rerun."
   elif [[ "$emitted" != "yes" ]]; then
     log "PLATFORM ${name}: unconfined observed forwarded=${u_fwd} (bridge src ${u_fwd_src}) delivered=${u_reached} (listener src ${u_reach_src}), but the session guest did not emit its copy, so the session bridge cannot corroborate; not pinned. See the verdict below."
   elif [[ "$fwd" != "$u_fwd" || "$bridge_rw" != "$u_bridge_rw" ]]; then
@@ -971,10 +973,14 @@ verdict() {
     log "VERDICT ${name}: INCONCLUSIVE — under the session the listener received the datagram (source ${reach_src}) but the bridge capture never saw it. A datagram from the session guest did reach a host socket, which is alarming, but without the bridge source it cannot be attributed to the source-scoping gap, a rewrite, or an anchor failure. Check the capture and rerun before recording anything.${counter_note}"
   elif [[ "$emitted" != "yes" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE — the session guest did not emit the datagram (see the nc stderr and TX counter lines above), so the session observers' silence says nothing. Fix the sender and rerun."
+  # Deliveries under the session stand on the session's own observers and
+  # are graded before the positive control's reliability is considered.
   elif [[ "$reached" == "yes" && "$src_in_session" == "yes" ]]; then
     log "VERDICT ${name}: LIVE GAP (ANCHOR) — a datagram from the session guest reached a host socket the session may not reach, and the bridge carried an IN-SUBNET source (${fwd_src}, rewritten from ${source}) that the session deny should have matched. This is not the source-scoping gap: the anchor failed to deny an in-subnet frame. Investigate the anchor (rule order, interface, state) before attributing anything to C2b.${host_rw_note}${counter_note}"
   elif [[ "$reached" == "yes" ]]; then
     log "VERDICT ${name}: LIVE GAP — under the session anchor a datagram from the session guest reached a host socket the session may not reach (requested source ${source}, bridge carried ${fwd_src}, listener saw ${reach_src}); the source on the bridge lies outside the session /24, so nothing in the source-scoped rules could match it. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${host_rw_note}${counter_note}"
+  elif [[ "$u_observers_disagree" == "yes" ]]; then
+    log "VERDICT ${name}: INCONCLUSIVE — the positive control's observers disagreed (its listener received the datagram, its bridge capture did not), so the unconfined result cannot serve as the control this session result needs. Check the capture and rerun before recording anything.${counter_note}"
   elif [[ "$bridge_rw" == "yes" && "$src_in_session" == "yes" ]]; then
     log "VERDICT ${name}: REWRITTEN INTO THE SUBNET — under the session the datagram crossed the bridge with the in-subnet source ${fwd_src} instead of ${source} and was not delivered. PF judged the rewritten source, and the source-scoped deny matched it legitimately (the counter note says whether it counted). The confinement held, but because vmnet rewrote the source into the session /24, not because the rules address spoofing. C2b still applies as the session's own guarantee.${counter_note}"
   elif [[ "$bridge_rw" == "yes" ]]; then
