@@ -928,6 +928,13 @@ verdict() {
   # Unless the bridge carried a rewritten source: then PF judged that one,
   # and the counter may well be about this datagram. A host-side rewrite
   # after the bridge does not change what PF's `in` rules saw.
+  # Which rules cover a bridge-rewritten source depends on where it landed:
+  # inside the session /24 the source-scoped deny applies to it; outside,
+  # nothing in the anchor can match it and the host path decides.
+  local src_in_session="no"
+  if [[ "$fwd_src" != "-" ]] && addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then
+    src_in_session="yes"
+  fi
   # The deny counter and the bridge capture are both host-owned; when they
   # contradict each other the run cannot say which one to believe. A rise
   # with nothing on the bridge may be unrelated in-subnet traffic or a
@@ -945,13 +952,6 @@ verdict() {
     counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; PF saw the in-subnet source ${fwd_src}, so the counter is consistent with the deny matching this datagram.)"
   elif [[ "$delta" -gt 0 ]]; then
     counter_note=" ('writ deny agent v4' rose by ${delta} during the session window; the source-scoped rule cannot have matched ${fwd_src}, so that is unrelated in-subnet traffic, not evidence about this datagram.)"
-  fi
-  # Which rules cover a bridge-rewritten source depends on where it landed:
-  # inside the session /24 the source-scoped deny applies to it; outside,
-  # nothing in the anchor can match it and the host path decides.
-  local src_in_session="no"
-  if [[ "$fwd_src" != "-" ]] && addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then
-    src_in_session="yes"
   fi
   local host_rw_note=""
   if [[ "$host_rw" == "yes" ]]; then
