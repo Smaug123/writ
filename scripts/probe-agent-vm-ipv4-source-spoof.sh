@@ -64,6 +64,16 @@ answer it, neither reported by a guest:
     source cannot match it; a spoofed frame forwarded onto the bridge and not
     counted is loose on the host side — the source-scoping gap C2b closes.
 
+The result is deliberately asymmetric. The one trusted observer, the bridge
+capture, sits after vmnet, so a POSITIVE result (the spoofed frame on the
+bridge) is conclusive and proves the frame was emitted, but a NEGATIVE result
+is not: capture silence cannot be told apart from a guest that never emitted
+the spoofed source, since emission of a spoofed frame rests only on the
+aggregate, guest-reported TX counter. The probe therefore pins a live gap
+when it sees one, and reports "not forwarded" as INCONCLUSIVE rather than as
+a reassuring platform fact. C2b stays warranted until a trusted pre-vmnet
+observer (which this platform does not offer) could pin the negative.
+
 Note: an earlier draft also bound a host UDP listener at the gateway, but
 Apple's vmnet does not deliver guest UDP addressed to the gateway into host
 sockets (TCP to the broker works; UDP does not), so socket delivery could
@@ -901,7 +911,7 @@ verdict() {
   elif [[ "$u_fwd" == "yes" ]]; then
     log "PLATFORM ${name}: vmnet forwards the spoofed source as sent onto the host bridge. Record this as a pinned platform fact (plan 'Beyond E3' question 4): the source-scoped IPv4 rules face a real frame, so C2b (interface-scoped rules) is a live fix, not hardening."
   else
-    log "PLATFORM ${name}: vmnet does not put the spoofed-source frame on the host bridge at all (neither bridge saw it, though each guest's own-address frame was). Record this as a pinned platform fact (plan 'Beyond E3' question 4); C2b becomes hardening rather than a live fix."
+    log "PLATFORM ${name}: neither bridge saw the spoofed-source frame, but no trusted observer confirms the spoofed frame was emitted at all — the bridge capture is the only host-owned observer and it sits after vmnet, so a guest that silently failed to emit the spoofed source and a vmnet that dropped it look identical here (the TX counter is aggregate and guest-reported). Consistent with vmnet dropping spoofed sources, but NOT pinnable. See the verdict below. To pin 'does not forward' you would need a trusted pre-vmnet observer, which this platform does not offer; treat C2b as warranted meanwhile."
   fi
 
   # --- the confinement verdict: what the session anchor did with the frame.
@@ -912,7 +922,7 @@ verdict() {
   elif [[ "$fwd" == "no" && "$u_fwd" == "yes" ]]; then
     log "VERDICT ${name}: UNEXPLAINED — the frame was forwarded on the unconfined bridge but not the session bridge, yet tcpdump taps before PF, so the anchor cannot account for the difference. Inspect the captures and rerun; do not pin either way."
   elif [[ "$fwd" == "no" ]]; then
-    log "VERDICT ${name}: not forwarded — vmnet put the spoofed-source frame on neither bridge, matching the control. The source-scoped rules never face it; C2b is hardening rather than a live fix."
+    log "VERDICT ${name}: INCONCLUSIVE — neither bridge saw the spoofed-source frame, but the only trusted observer sits after vmnet, so this cannot be told apart from a guest that never emitted the spoofed frame (its emission rests on the aggregate, guest-reported TX counter). A forwarded result would be conclusive; a silent one is not. Do not record 'vmnet does not forward' from this; C2b stays warranted. Rerun, or add an (untrusted) guest-side eth0 capture as corroboration, if you must characterise this."
   elif [[ "$src_in_session" == "yes" && "$delta" -eq 0 ]]; then
     log "VERDICT ${name}: LIVE GAP (ANCHOR) — the bridge carried an IN-SUBNET source (${fwd_src}, rewritten from ${source}) that the session deny should have matched, yet 'writ deny agent v4' did not count it. This is not the source-scoping gap: the anchor failed to deny an in-subnet frame. Investigate the anchor (rule order, interface, state) before attributing anything to C2b."
   elif [[ "$src_in_session" == "yes" ]]; then
