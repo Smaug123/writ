@@ -163,6 +163,8 @@ HELPER=""
 BROKER_PID=""
 ANCHOR_WATCH_PID=""
 ANCHOR_INTRUSIONS=""
+ANCHOR_HEARTBEAT=""
+WATCH_START=""
 BROKER_PORT=""
 PROBE_PORT=""
 IPV4_CIDR=""
@@ -485,7 +487,11 @@ require_no_translations() {
   fi
   ! grep -Eq '^(nat|rdr|binat) ' <<<"$main" \
     || die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset (${moment}); they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
-  if ! anchors="$(sudo pfctl -sA 2>/dev/null)"; then
+  # `-v -sA`, like the production helper (ensure_no_pass_translation_rules):
+  # it lists every anchor recursively by full path, whereas plain `-sA` lists
+  # only anchors directly attached to the main ruleset, missing a rule under a
+  # second-level anchor such as com.apple.internet-sharing.
+  if ! anchors="$(sudo pfctl -v -sA 2>/dev/null)"; then
     die "could not list PF anchors (${moment}); cannot rule out a nested translation, so nothing is graded"
   fi
   while IFS= read -r anchor; do
@@ -506,7 +512,10 @@ require_no_translations() {
 # loop must never block on a password prompt.
 start_anchor_watch() {
   ANCHOR_INTRUSIONS="${TMP_DIR}/anchor-intrusions.log"
+  ANCHOR_HEARTBEAT="${TMP_DIR}/anchor-heartbeat.log"
   : >"$ANCHOR_INTRUSIONS"
+  : >"$ANCHOR_HEARTBEAT"
+  WATCH_START="$(date +%s)"
   # The loop must not inherit errexit: a transient pfctl or sudo failure
   # would end it silently and the run would grade without its protection.
   # The targeted query is the one that can see children (root -sA lists only
@@ -536,6 +545,11 @@ start_anchor_watch() {
       if ! sudo -n pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q 'writ deny agent v4'; then
         printf '%s OWN-ANCHOR-MISSING\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
       fi
+      # Heartbeat AFTER the checks: a timestamp here means this poll's queries
+      # all completed, so a blocked pfctl or a descheduled watcher shows up as
+      # a gap in coverage below, not as a silently empty intrusion log that
+      # kill -0 would call healthy.
+      printf '%s\n' "$(date +%s)" >>"$ANCHOR_HEARTBEAT"
       sleep 0.2
     done
   ) &
@@ -543,13 +557,28 @@ start_anchor_watch() {
 }
 
 stop_anchor_watch() {
-  local alive=1
+  local now alive=1
+  now="$(date +%s)"
   kill -0 "$ANCHOR_WATCH_PID" 2>/dev/null || alive=0
   kill "$ANCHOR_WATCH_PID" >/dev/null 2>&1 || true
   wait "$ANCHOR_WATCH_PID" 2>/dev/null || true
   ANCHOR_WATCH_PID=""
   [[ "$alive" -eq 1 ]] \
     || die "the anchor watcher was not running at the end of the probe windows; the concurrency check lapsed, so nothing is graded"
+  # kill -0 only says the process exists, not that it polled. Require the
+  # heartbeats to cover the whole window with no gap over 2s (10x the 0.2s
+  # interval): a blocked pfctl or a descheduled watcher leaves a gap, and an
+  # empty log then means nothing. Checked before the intrusion greps, whose
+  # emptiness is only meaningful once coverage is proven.
+  local prev="$WATCH_START" maxgap=0 t
+  while IFS= read -r t; do
+    [[ "$t" =~ ^[0-9]+$ ]] || continue
+    (( t - prev > maxgap )) && maxgap=$(( t - prev ))
+    prev="$t"
+  done <"$ANCHOR_HEARTBEAT"
+  (( now - prev > maxgap )) && maxgap=$(( now - prev ))
+  (( maxgap <= 2 )) \
+    || die "the anchor watcher left a ${maxgap}s gap in coverage during the probe windows (a blocked pfctl or a descheduled watcher); the concurrency and translation checks lapsed, so nothing is graded"
   if grep -q 'OWN-ANCHOR-MISSING' "$ANCHOR_INTRUSIONS"; then
     die "this run's anchor ${PF_ANCHOR} was missing its IPv4 deny at some point during the probe windows ($(grep -c OWN-ANCHOR-MISSING "$ANCHOR_INTRUSIONS") polls); the session rules were not in place throughout, so nothing is graded"
   fi
