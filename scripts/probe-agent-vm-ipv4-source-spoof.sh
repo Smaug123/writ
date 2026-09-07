@@ -463,6 +463,23 @@ require_no_other_anchors() {
     || die "other writ session anchors are loaded (${1}) and would confound the measurement; stop those sessions first: $(tr '\n' ' ' <<<"$others")"
 }
 
+# Die if any nat/rdr/binat rule is loaded in the main ruleset. PF translation
+# runs before the filter rules, so such a rule could rewrite the probe's
+# source and make the source-scoped deny judge a different source than the
+# pre-PF capture saw. Anchor lines (`nat-anchor ...`) are declarations, not
+# rules. `-sn` output is searched via a here-string, not a producer pipe: a
+# `grep -q` that exits early on a match would SIGPIPE the producer and, under
+# pipefail, the pipeline would go nonzero and mask the match. $1 names the
+# moment.
+require_no_translations() {
+  local rules status
+  rules="$(sudo pfctl -sn 2>/dev/null)"; status=$?
+  (( status == 0 )) \
+    || die "could not read PF translation rules (${1}); cannot confirm no nat/rdr/binat would rewrite the probe's source, so nothing is graded"
+  ! grep -Eq '^(nat|rdr|binat) ' <<<"$rules" \
+    || die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset (${1}); they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
+}
+
 # Poll the anchor list in the background for the whole probe window, noting
 # every foreign anchor seen with a timestamp. The snapshot checks cannot see
 # a session that comes and goes between them; this narrows that to one poll
@@ -481,13 +498,19 @@ start_anchor_watch() {
     while true; do
       listing_a="$(sudo -n pfctl -a writ/session -sA 2>/dev/null)"; status_a=$?
       listing_b="$(sudo -n pfctl -sA 2>/dev/null)"
-      if (( status_a != 0 )); then
+      nat_rules="$(sudo -n pfctl -sn 2>/dev/null)"; status_n=$?
+      if (( status_a != 0 || status_n != 0 )); then
         printf '%s POLL-FAILURE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
       fi
       others="$(printf '%s\n%s\n' "$listing_a" "$listing_b" \
         | grep -Eo 'writ/session/[^[:space:]]+' | sort -u | grep -Fxv "$PF_ANCHOR")"
       if [[ -n "$others" ]]; then
         printf '%s %s\n' "$(date +%H:%M:%S)" "$(tr '\n' ' ' <<<"$others")" >>"$ANCHOR_INTRUSIONS"
+      fi
+      # A translation rule appearing mid-window is as invalidating as one at
+      # the start: it could rewrite the source PF evaluates.
+      if grep -Eq '^(nat|rdr|binat) ' <<<"$nat_rules"; then
+        printf '%s TRANSLATION-RULE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
       fi
       # Our own anchor must stay loaded with its deny for the whole window,
       # or a later result would be graded against rules that were not there.
@@ -512,7 +535,10 @@ stop_anchor_watch() {
     die "this run's anchor ${PF_ANCHOR} was missing its IPv4 deny at some point during the probe windows ($(grep -c OWN-ANCHOR-MISSING "$ANCHOR_INTRUSIONS") polls); the session rules were not in place throughout, so nothing is graded"
   fi
   if grep -q 'POLL-FAILURE' "$ANCHOR_INTRUSIONS"; then
-    die "the anchor watcher could not list PF anchors during the probe windows ($(grep -c POLL-FAILURE "$ANCHOR_INTRUSIONS") failed polls); the concurrency check lapsed, so nothing is graded"
+    die "the anchor watcher could not list PF anchors or translation rules during the probe windows ($(grep -c POLL-FAILURE "$ANCHOR_INTRUSIONS") failed polls); the concurrency check lapsed, so nothing is graded"
+  fi
+  if grep -q 'TRANSLATION-RULE' "$ANCHOR_INTRUSIONS"; then
+    die "a PF translation rule (nat/rdr/binat) was loaded during the probe windows ($(grep -c TRANSLATION-RULE "$ANCHOR_INTRUSIONS") polls); it could rewrite the probe's source before filtering, so nothing is graded"
   fi
   [[ ! -s "$ANCHOR_INTRUSIONS" ]] \
     || die "another writ session anchor was loaded during the probe windows; its rules were consulted for our datagrams, so nothing is graded. Seen: $(sort -u "$ANCHOR_INTRUSIONS" | tr '\n' ';')"
@@ -754,13 +780,7 @@ require_no_other_anchors "before start"
 # a manual nat, ...). Anchor lines (`nat-anchor ...`) are declarations, not
 # rules, so they are exempt; nested-anchor translations are out of scope, like
 # the anchor-exclusivity check — do not run this alongside them.
-# Capture and status-check first: a failed `pfctl -sn` piped into grep would
-# read as "no translations" and let the run proceed unsound. Fail closed.
-translation_rules="$(sudo pfctl -sn 2>/dev/null)" \
-  || die "could not read PF translation rules (pfctl -sn failed); cannot confirm no nat/rdr/binat would rewrite the probe's source, so nothing is graded"
-if printf '%s\n' "$translation_rules" | grep -Eq '^(nat|rdr|binat) '; then
-  die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset; they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
-fi
+require_no_translations "before start"
 
 log "building PF helper and lifecycle runner"
 "${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper --bin writ-agent-vm-runner
@@ -837,6 +857,7 @@ log "session guest is ${GUEST_IPV4} behind ${IPV4_GATEWAY} on ${TARGET_BRIDGE[se
 start_capture unconfined
 start_capture session
 require_no_other_anchors "after both guests started"
+require_no_translations "after both guests started"
 require_own_anchor_loaded "after both guests started"
 start_anchor_watch
 
@@ -891,6 +912,7 @@ fi
 # through, nothing above is graded. Likewise an observer that died: every
 # empty lookup above would then be a lie.
 require_no_other_anchors "after the probes"
+require_no_translations "after the probes"
 require_own_anchor_loaded "after the probes"
 stop_anchor_watch
 require_observers_alive "after the probes"
