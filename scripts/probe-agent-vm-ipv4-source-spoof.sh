@@ -59,20 +59,29 @@ answer it, neither reported by a guest:
     independent of any anchor. It correlates by the host-minted nonce in the
     payload, not by source, and reports the source it saw: a platform that
     anti-spoofs by REWRITING the source is a distinct outcome, not a drop.
-  - (session only) the anchor's labelled deny counter: did PF deny it? The
-    IPv4 deny is source-scoped to the session /24, so a genuinely foreign
-    source cannot match it; a spoofed frame forwarded onto the bridge and not
-    counted is loose on the host side — the source-scoping gap C2b closes.
+  - (session only) the anchor's labelled deny counter: it is aggregate and
+    not correlated to the probe's nonce, so it is diagnostic only — reported,
+    never decisive. A rise is at most consistent with this frame being denied.
 
-The result is deliberately asymmetric. The one trusted observer, the bridge
-capture, sits after vmnet, so a POSITIVE result (the spoofed frame on the
-bridge) is conclusive and proves the frame was emitted, but a NEGATIVE result
-is not: capture silence cannot be told apart from a guest that never emitted
-the spoofed source, since emission of a spoofed frame rests only on the
-aggregate, guest-reported TX counter. The probe therefore pins a live gap
-when it sees one, and reports "not forwarded" as INCONCLUSIVE rather than as
-a reassuring platform fact. C2b stays warranted until a trusted pre-vmnet
-observer (which this platform does not offer) could pin the negative.
+The result is deliberately asymmetric, because that one capture sits after
+vmnet and before PF and is the only trusted observer. The single conclusive,
+pinnable outcome is an out-of-/24 source physically on the host bridge: the
+source-scoped rules cannot match it, so that is the live gap C2b closes, and
+it holds however the source got there. Everything else is weaker:
+  - capture silent: cannot be told apart from a guest that never emitted the
+    spoof (emission of a spoofed frame rests only on the aggregate,
+    guest-reported TX counter), so it is INCONCLUSIVE, never "vmnet drops
+    spoofed sources".
+  - an in-subnet source on the bridge: the deny covers it and no out-of-subnet
+    frame was seen, but whether the guest failed to spoof (an nc that ignores
+    -s, guest-side rewriting) or vmnet rewrote the source in cannot be told
+    from a post-vmnet observer, so it is NO GAP OBSERVED, never proof that
+    vmnet anti-spoofs.
+C2b stays warranted unless a live gap is pinned; a trusted pre-vmnet observer,
+which this platform does not offer, would be needed to pin the reassuring
+readings. To keep even the gap reading sound, the probe refuses to run while
+any nat/rdr/binat rule is loaded in the main ruleset, since PF translation
+before the filter could rewrite the source the deny evaluates.
 
 Note: an earlier draft also bound a host UDP listener at the gateway, but
 Apple's vmnet does not deliver guest UDP addressed to the gateway into host
@@ -415,14 +424,20 @@ require_guest_tooling() {
     || die "guest nc does not support -s ADDR; the probe needs a source-selectable sender"
 }
 
-# Child anchors currently loaded under writ/session, one per line. Both
-# listings are consulted because pfctl prints nested anchors differently
-# across macOS releases. Every child name counts, not only UUID-shaped
-# ones: the wildcard evaluates `writ/session/manual` too. An empty listing
-# is success (grep's 1 must not trip errexit through pipefail): no anchors
-# is the state we want.
+# Child anchors currently loaded under writ/session, one per line. The
+# targeted `-a writ/session -sA` query is the one that can see children:
+# root `pfctl -sA` lists only directly-attached top-level anchors, not
+# `writ/session/<child>`. So its failure is fatal, not ignorable — a missed
+# child would let a concurrent session contaminate the run. The root listing
+# is a belt-and-braces extra. Every child name counts, not only UUID-shaped
+# ones: the wildcard evaluates `writ/session/manual` too. An empty listing is
+# success (grep's 1 must not trip errexit through pipefail).
 existing_session_anchors() {
-  { sudo pfctl -a writ/session -sA 2>/dev/null; sudo pfctl -sA 2>/dev/null; } \
+  local targeted status
+  targeted="$(sudo pfctl -a writ/session -sA 2>/dev/null)"; status=$?
+  (( status == 0 )) \
+    || die "could not list child anchors under writ/session (pfctl -a writ/session -sA failed); a concurrent session cannot be ruled out, so nothing is graded"
+  { printf '%s\n' "$targeted"; sudo pfctl -sA 2>/dev/null; } \
     | { grep -Eo 'writ/session/[^[:space:]]+' || true; } | sort -u
 }
 
@@ -458,14 +473,15 @@ start_anchor_watch() {
   : >"$ANCHOR_INTRUSIONS"
   # The loop must not inherit errexit: a transient pfctl or sudo failure
   # would end it silently and the run would grade without its protection.
-  # A poll whose both listings fail is recorded as POLL-FAILURE, and the
-  # stop below treats that, or a dead watcher, as a failed run.
+  # The targeted query is the one that can see children (root -sA lists only
+  # top-level anchors), so its failure is a POLL-FAILURE the stop below treats,
+  # like a dead watcher, as a failed run.
   (
     set +e
     while true; do
       listing_a="$(sudo -n pfctl -a writ/session -sA 2>/dev/null)"; status_a=$?
-      listing_b="$(sudo -n pfctl -sA 2>/dev/null)"; status_b=$?
-      if (( status_a != 0 && status_b != 0 )); then
+      listing_b="$(sudo -n pfctl -sA 2>/dev/null)"
+      if (( status_a != 0 )); then
         printf '%s POLL-FAILURE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
       fi
       others="$(printf '%s\n%s\n' "$listing_a" "$listing_b" \
@@ -670,7 +686,14 @@ probe() {
     local v4_before v4_after
     v4_before="$(counter_of "$before" "writ deny agent v4")"
     v4_after="$(counter_of "$after" "writ deny agent v4")"
-    delta=$(( ${v4_after:-0} - ${v4_before:-0} ))
+    # No `${x:-0}` fabrication: an absent label means the anchor is not loaded
+    # as expected, and a backwards count means it was reloaded or reset
+    # mid-probe. Either way the delta would be a lie, so abort.
+    [[ -n "$v4_before" && -n "$v4_after" ]] \
+      || die "the 'writ deny agent v4' label was absent from a counter snapshot; the anchor is not loaded as expected, so nothing is graded"
+    (( v4_after >= v4_before )) \
+      || die "the 'writ deny agent v4' counter went backwards (${v4_before} -> ${v4_after}); the anchor was reloaded or reset mid-probe, so nothing is graded"
+    delta=$(( v4_after - v4_before ))
     counter_text="; 'writ deny agent v4' counter +${delta}"
   fi
 
@@ -721,6 +744,19 @@ sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' || die "PF is not ena
 sudo pfctl -sr 2>/dev/null | grep -q 'anchor "writ/session/\*"' \
   || die 'missing top-level PF anchor; add `anchor "writ/session/*"` to /etc/pf.conf and reload PF'
 require_no_other_anchors "before start"
+
+# PF translation (nat/rdr/binat) runs before the filter rules, so a rule that
+# rewrites the probe's source would make the source-scoped deny judge a
+# different source than the bridge capture (which taps before PF) saw, and a
+# "loose on the host" reading could be wrong. The runner preflight already
+# forbids `pass`-modifier translations; the probe additionally refuses to run
+# while any translation rule is loaded in the main ruleset (Internet Sharing,
+# a manual nat, ...). Anchor lines (`nat-anchor ...`) are declarations, not
+# rules, so they are exempt; nested-anchor translations are out of scope, like
+# the anchor-exclusivity check — do not run this alongside them.
+if sudo pfctl -sn 2>/dev/null | grep -Eq '^(nat|rdr|binat) '; then
+  die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset; they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
+fi
 
 log "building PF helper and lifecycle runner"
 "${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper --bin writ-agent-vm-runner
@@ -871,14 +907,16 @@ for r in "${RESULTS[@]}"; do
   log "  ${r}"
 done
 
-# Verdict per spoofed source, from host-owned facts: the session bridge
-# capture (did vmnet put the frame on the host bridge?) and the labelled deny
-# counter (did the session anchor deny it?). The unconfined result for the
-# same source is the positive control that vmnet forwards a spoofed source at
-# all. tcpdump taps the interface before PF filters, so a frame on the bridge
-# is a vmnet fact independent of the anchor, and the two bridges should agree
-# on forwarding; the counter is the PF fact. Guest facts (emission) can
-# withhold a verdict but never award one.
+# Verdict per spoofed source. The one trusted observer is the bridge capture:
+# it sits after vmnet and before PF (BPF taps the interface), so it can prove
+# a frame with a given source reached the host bridge, but it cannot say who
+# set that source (vmnet, or the untrusted guest / an nc that ignores -s),
+# nor, since the deny counter is aggregate and not nonce-correlated, whether
+# that counter moved for THIS frame. So exactly one thing is pinnable: an
+# out-of-/24 source physically on the host bridge, which the source-scoped
+# rules cannot match. Everything else is a no-gap observation or inconclusive.
+# The unconfined result is the positive control that vmnet forwards a spoofed
+# source at all. Guest facts (emission) can withhold a verdict, never award one.
 #   $1 name; $2 requested source;
 #   $3 $4 unconfined forwarded / bridge source;
 #   $5..$8 session emitted / forwarded / deny delta / bridge source.
@@ -888,51 +926,38 @@ verdict() {
   local u_fwd="$3" u_fwd_src="$4"
   local emitted="$5" fwd="$6" delta="$7" fwd_src="$8"
 
-  # vmnet may rewrite a spoofed source as it forwards (anti-spoof by rewrite,
-  # not drop). Where a rewritten source lands decides which rules cover it:
-  # inside the session /24 the source-scoped deny applies; outside, nothing in
-  # the anchor can match it.
-  local u_bridge_rw="no" bridge_rw="no" src_in_session="no"
-  if [[ "$u_fwd_src" != "-" && "$u_fwd_src" != "$source" ]]; then u_bridge_rw="yes"; fi
-  if [[ "$fwd_src" != "-" && "$fwd_src" != "$source" ]]; then bridge_rw="yes"; fi
-  if [[ "$fwd_src" != "-" ]] && addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then src_in_session="yes"; fi
+  # Was the source that reached the host bridge inside the session /24?
+  # "unknown" when the capture saw nothing (the fwd==no branches never use it).
+  local src_in_session="unknown"
+  if [[ "$fwd_src" != "-" ]]; then
+    if addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then src_in_session="yes"; else src_in_session="no"; fi
+  fi
+  # The deny counter is aggregate and not nonce-correlated: a rise is only
+  # consistent with this frame being denied, never proof, and unrelated
+  # in-subnet traffic can raise it. Report it; decide nothing on it.
+  local counter_note=" ('writ deny agent v4' moved by ${delta} in the window; not correlated to this datagram, so diagnostic only)"
 
-  # --- the platform fact: does vmnet forward a spoofed source onto a host
-  # bridge, and as-sent or rewritten? Pinned only when the two bridges agree,
-  # since BPF is pre-PF and both bridges are the same kind.
+  # --- platform fact: only "an out-of-/24 source reached the host bridge" is
+  # pinnable, and it is the answer to Beyond-E3 question 4.
   if [[ "$emitted" != "yes" ]]; then
-    log "PLATFORM ${name}: the session guest did not emit its copy (see the nc stderr and TX lines above), so the session bridge cannot corroborate the control; not pinned. See the verdict below."
-  elif [[ "$fwd" == "no" && "$delta" -gt 0 ]]; then
-    log "PLATFORM ${name}: the session bridge capture saw no frame yet 'writ deny agent v4' rose by ${delta}; a rewrite into the subnet the capture missed cannot be ruled out, so no forwarding fact (least of all 'does not forward') can be pinned from this run. See the verdict below."
-  elif [[ "$fwd" != "$u_fwd" || "$bridge_rw" != "$u_bridge_rw" ]]; then
-    log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd} bridge-rewritten=${u_bridge_rw}, session forwarded=${fwd} bridge-rewritten=${bridge_rw}); tcpdump taps before PF, so they should agree — no platform fact can be pinned from this run. See the verdict below."
-  elif [[ "$u_bridge_rw" == "yes" ]]; then
-    log "PLATFORM ${name}: vmnet forwards the spoofed source but REWRITES it (requested ${source}, bridge saw ${u_fwd_src}). It anti-spoofs by rewriting, not dropping. Record this as a pinned platform fact (plan 'Beyond E3' question 4), distinct from both 'forwards as-is' and 'does not forward'."
-  elif [[ "$u_fwd" == "yes" ]]; then
-    log "PLATFORM ${name}: vmnet forwards the spoofed source as sent onto the host bridge. Record this as a pinned platform fact (plan 'Beyond E3' question 4): the source-scoped IPv4 rules face a real frame, so C2b (interface-scoped rules) is a live fix, not hardening."
+    log "PLATFORM ${name}: the session guest did not emit its copy, and the only observer is post-vmnet, so nothing about forwarding is pinnable. See the verdict below."
+  elif [[ "$fwd" == "yes" && "$src_in_session" == "no" ]]; then
+    log "PLATFORM ${name}: a frame with an out-of-/24 source (${fwd_src}) reached the host bridge (control: forwarded=${u_fwd}, source ${u_fwd_src}). Whether that source was set by vmnet or by the guest cannot be told from a post-vmnet observer, but either way an out-of-subnet frame reached the host side. Pinned platform fact (plan 'Beyond E3' question 4): the source-scoped IPv4 rules face a real out-of-subnet frame, so C2b is a live fix."
   else
-    log "PLATFORM ${name}: neither bridge saw the spoofed-source frame, but no trusted observer confirms the spoofed frame was emitted at all — the bridge capture is the only host-owned observer and it sits after vmnet, so a guest that silently failed to emit the spoofed source and a vmnet that dropped it look identical here (the TX counter is aggregate and guest-reported). Consistent with vmnet dropping spoofed sources, but NOT pinnable. See the verdict below. To pin 'does not forward' you would need a trusted pre-vmnet observer, which this platform does not offer; treat C2b as warranted meanwhile."
+    log "PLATFORM ${name}: no out-of-/24 frame was observed on the host bridge for this source (bridge saw ${fwd_src}). With only a post-vmnet observer, neither 'vmnet drops spoofed sources' nor 'vmnet rewrites them' can be pinned. Not a platform fact. See the verdict below."
   fi
 
-  # --- the confinement verdict: what the session anchor did with the frame.
+  # --- confinement verdict.
   if [[ "$emitted" != "yes" ]]; then
-    log "VERDICT ${name}: INCONCLUSIVE — the session guest did not emit the datagram (see the nc stderr and TX counter lines above), so its bridge's silence says nothing. Fix the sender and rerun."
-  elif [[ "$fwd" == "no" && "$delta" -gt 0 ]]; then
-    log "VERDICT ${name}: INCONCLUSIVE — 'writ deny agent v4' rose by ${delta} during the window but the bridge capture saw no frame; a rewrite into the subnet the capture missed, or unrelated in-subnet traffic, cannot be told apart. Rerun before recording anything."
+    log "VERDICT ${name}: INCONCLUSIVE - the session guest did not emit the datagram (nc stderr / TX counter above), and the only observer is post-vmnet, so its silence says nothing. Fix the sender and rerun."
   elif [[ "$fwd" == "no" && "$u_fwd" == "yes" ]]; then
-    log "VERDICT ${name}: UNEXPLAINED — the frame was forwarded on the unconfined bridge but not the session bridge, yet tcpdump taps before PF, so the anchor cannot account for the difference. Inspect the captures and rerun; do not pin either way."
+    log "VERDICT ${name}: UNEXPLAINED - forwarded on the unconfined bridge but not the session bridge, yet the capture taps before PF, so the anchor cannot account for it. Inspect the captures and rerun.${counter_note}"
   elif [[ "$fwd" == "no" ]]; then
-    log "VERDICT ${name}: INCONCLUSIVE — neither bridge saw the spoofed-source frame, but the only trusted observer sits after vmnet, so this cannot be told apart from a guest that never emitted the spoofed frame (its emission rests on the aggregate, guest-reported TX counter). A forwarded result would be conclusive; a silent one is not. Do not record 'vmnet does not forward' from this; C2b stays warranted. Rerun, or add an (untrusted) guest-side eth0 capture as corroboration, if you must characterise this."
-  elif [[ "$src_in_session" == "yes" && "$delta" -eq 0 ]]; then
-    log "VERDICT ${name}: LIVE GAP (ANCHOR) — the bridge carried an IN-SUBNET source (${fwd_src}, rewritten from ${source}) that the session deny should have matched, yet 'writ deny agent v4' did not count it. This is not the source-scoping gap: the anchor failed to deny an in-subnet frame. Investigate the anchor (rule order, interface, state) before attributing anything to C2b."
-  elif [[ "$src_in_session" == "yes" ]]; then
-    log "VERDICT ${name}: REWRITTEN INTO THE SUBNET — vmnet rewrote the source to the in-subnet ${fwd_src} and the session deny counted it (+${delta}). The confinement held, but because vmnet rewrote the source into the session /24, not because the source-scoped rules address spoofing. C2b still applies as the session's own guarantee."
-  elif [[ "$delta" -gt 0 ]]; then
-    log "VERDICT ${name}: INCONCLUSIVE — the bridge carried the out-of-subnet source ${fwd_src}, which the source-scoped deny cannot match, yet 'writ deny agent v4' rose by ${delta}; that is unrelated in-subnet traffic in the window, or a rewrite the capture missed. Rerun before recording anything."
+    log "VERDICT ${name}: INCONCLUSIVE - neither bridge saw the frame, but the only trusted observer is post-vmnet, so this cannot be told apart from a guest that never emitted the spoof (its emission rests on the aggregate, guest-reported TX counter). A forwarded result would be conclusive; a silent one is not. Do not read it as 'vmnet drops spoofed sources'; C2b stays warranted.${counter_note}"
+  elif [[ "$src_in_session" == "no" ]]; then
+    log "VERDICT ${name}: LIVE GAP - a frame with the out-of-/24 source ${fwd_src} reached the host bridge, which the source-scoped IPv4 rules cannot match; the confinement did not cover it. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
   else
-    local rw_note=""
-    [[ "$bridge_rw" == "yes" ]] && rw_note=" (rewritten from ${source}, but still outside the session /24)"
-    log "VERDICT ${name}: LIVE GAP — vmnet forwarded the frame onto the host bridge with the out-of-subnet source ${fwd_src}${rw_note}, and the session anchor did not deny it ('writ deny agent v4' unchanged); the source-scoped rules cannot match it, so the frame is loose on the host side. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile."
+    log "VERDICT ${name}: NO GAP OBSERVED - the frame that reached the host bridge carried the in-subnet source ${fwd_src}, which the source-scoped deny does cover, and no out-of-subnet frame was seen for this source. Whether the guest failed to spoof (nc/-s, guest networking) or vmnet rewrote the source into the subnet cannot be told from a post-vmnet observer, so this is not proof that vmnet anti-spoofs; C2b stays warranted.${counter_note}"
   fi
 }
 read -r _ f_emitted f_fwd f_delta f_fwd_src _ <"${TMP_DIR}/result-session-foreign"
