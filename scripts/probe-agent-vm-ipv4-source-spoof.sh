@@ -433,10 +433,12 @@ require_guest_tooling() {
 # ones: the wildcard evaluates `writ/session/manual` too. An empty listing is
 # success (grep's 1 must not trip errexit through pipefail).
 existing_session_anchors() {
-  local targeted status
-  targeted="$(sudo pfctl -a writ/session -sA 2>/dev/null)"; status=$?
-  (( status == 0 )) \
-    || die "could not list child anchors under writ/session (pfctl -a writ/session -sA failed); a concurrent session cannot be ruled out, so nothing is graded"
+  local targeted
+  # `if !` context, not `x=$(...); status=$?`: under set -e a failing command
+  # substitution aborts the assignment before the next line runs.
+  if ! targeted="$(sudo pfctl -a writ/session -sA 2>/dev/null)"; then
+    die "could not list child anchors under writ/session (pfctl -a writ/session -sA failed); a concurrent session cannot be ruled out, so nothing is graded"
+  fi
   { printf '%s\n' "$targeted"; sudo pfctl -sA 2>/dev/null; } \
     | { grep -Eo 'writ/session/[^[:space:]]+' || true; } | sort -u
 }
@@ -463,21 +465,38 @@ require_no_other_anchors() {
     || die "other writ session anchors are loaded (${1}) and would confound the measurement; stop those sessions first: $(tr '\n' ' ' <<<"$others")"
 }
 
-# Die if any nat/rdr/binat rule is loaded in the main ruleset. PF translation
-# runs before the filter rules, so such a rule could rewrite the probe's
-# source and make the source-scoped deny judge a different source than the
-# pre-PF capture saw. Anchor lines (`nat-anchor ...`) are declarations, not
-# rules. `-sn` output is searched via a here-string, not a producer pipe: a
-# `grep -q` that exits early on a match would SIGPIPE the producer and, under
-# pipefail, the pipeline would go nonzero and mask the match. $1 names the
-# moment.
+# Die if any nat/rdr/binat rule is loaded, in the main ruleset or in any
+# anchor. PF translation runs before the filter rules, so such a rule could
+# rewrite the probe's source and make the source-scoped deny judge a different
+# source than the pre-PF capture saw. Internet Sharing and similar load their
+# NAT under an anchor (com.apple/*), which a main-ruleset `-sn` shows only as a
+# `nat-anchor` declaration, so every anchor pfctl lists is queried too. This is
+# the defence-in-depth layer for `pass`-modifier translations (which bypass the
+# deny); the load-bearing soundness for ordinary translations is the deny-
+# counter gate on the LIVE GAP verdict (a rewrite into the session /24 trips
+# the quick deny). `-sn` output is searched via a here-string, not a producer
+# pipe: a `grep -q` that exits early on a match would SIGPIPE the producer and,
+# under pipefail, mask the match. `if !`, not `x=$(...); status=$?`: a failing
+# substitution aborts the assignment under set -e. $1 names the moment.
 require_no_translations() {
-  local rules status
-  rules="$(sudo pfctl -sn 2>/dev/null)"; status=$?
-  (( status == 0 )) \
-    || die "could not read PF translation rules (${1}); cannot confirm no nat/rdr/binat would rewrite the probe's source, so nothing is graded"
-  ! grep -Eq '^(nat|rdr|binat) ' <<<"$rules" \
-    || die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset (${1}); they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
+  local moment="$1" main anchors anchor rules
+  if ! main="$(sudo pfctl -sn 2>/dev/null)"; then
+    die "could not read PF translation rules (${moment}); cannot confirm no nat/rdr/binat would rewrite the probe's source, so nothing is graded"
+  fi
+  ! grep -Eq '^(nat|rdr|binat) ' <<<"$main" \
+    || die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset (${moment}); they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
+  if ! anchors="$(sudo pfctl -sA 2>/dev/null)"; then
+    die "could not list PF anchors (${moment}); cannot rule out a nested translation, so nothing is graded"
+  fi
+  while IFS= read -r anchor; do
+    anchor="$(printf '%s' "$anchor" | tr -d '[:space:]')"
+    [[ -n "$anchor" ]] || continue
+    if ! rules="$(sudo pfctl -a "$anchor" -sn 2>/dev/null)"; then
+      die "could not read translation rules in anchor '${anchor}' (${moment}); cannot rule out a nested translation, so nothing is graded"
+    fi
+    ! grep -Eq '^(nat|rdr|binat) ' <<<"$rules" \
+      || die "PF translation rules (nat/rdr/binat) are loaded in anchor '${anchor}' (${moment}); they could rewrite the probe's source before filtering. Remove them (e.g. turn off Internet Sharing) and rerun."
+  done <<<"$anchors"
 }
 
 # Poll the anchor list in the background for the whole probe window, noting
@@ -958,10 +977,15 @@ verdict() {
   if [[ "$fwd_src" != "-" ]]; then
     if addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then src_in_session="yes"; else src_in_session="no"; fi
   fi
-  # The deny counter is aggregate and not nonce-correlated: a rise is only
-  # consistent with this frame being denied, never proof, and unrelated
-  # in-subnet traffic can raise it. Report it; decide nothing on it.
-  local counter_note=" ('writ deny agent v4' moved by ${delta} in the window; not correlated to this datagram, so diagnostic only)"
+  # The deny counter is aggregate and not nonce-correlated, so it never AWARDS
+  # a reassuring verdict. It is used only to WITHHOLD the alarming LIVE GAP
+  # claim: a translation (anywhere, nested anchors included) that rewrote our
+  # out-of-/24 frame into the session /24 before filtering would trip the quick
+  # labelled deny and raise this counter, so delta==0 is a sound necessary
+  # condition for "the source-scoped rules did not cover it". A nonzero delta
+  # may be that, or merely unrelated in-subnet traffic in the window; either
+  # way it downgrades LIVE GAP to inconclusive rather than upgrading anything.
+  local counter_note=" ('writ deny agent v4' moved by ${delta} in the window; not correlated to this datagram)"
 
   # --- platform fact: only "an out-of-/24 source reached the host bridge" is
   # pinnable, and it is the answer to Beyond-E3 question 4.
@@ -980,8 +1004,10 @@ verdict() {
     log "VERDICT ${name}: UNEXPLAINED - forwarded on the unconfined bridge but not the session bridge, yet the capture taps before PF, so the anchor cannot account for it. Inspect the captures and rerun.${counter_note}"
   elif [[ "$fwd" == "no" ]]; then
     log "VERDICT ${name}: INCONCLUSIVE - neither bridge saw the frame, but the only trusted observer is post-vmnet, so this cannot be told apart from a guest that never emitted the spoof (its emission rests on the aggregate, guest-reported TX counter). A forwarded result would be conclusive; a silent one is not. Do not read it as 'vmnet drops spoofed sources'; C2b stays warranted.${counter_note}"
+  elif [[ "$src_in_session" == "no" && "$delta" -eq 0 ]]; then
+    log "VERDICT ${name}: LIVE GAP - a frame with the out-of-/24 source ${fwd_src} reached the host bridge and the labelled deny did not fire (counter unmoved), so no translation rewrote it into the session /24 to be caught; the source-scoped IPv4 rules cannot match it and did not cover it. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
   elif [[ "$src_in_session" == "no" ]]; then
-    log "VERDICT ${name}: LIVE GAP - a frame with the out-of-/24 source ${fwd_src} reached the host bridge, which the source-scoped IPv4 rules cannot match; the confinement did not cover it. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
+    log "VERDICT ${name}: INCONCLUSIVE - an out-of-/24 source (${fwd_src}) reached the host bridge, but the labelled deny counter also moved (+${delta}) in the window, so a translation may have rewritten this frame into the session /24 where the quick deny caught it (no gap), or unrelated in-subnet traffic moved the counter (real gap). The two cannot be told apart. Rerun in a quiet window before recording anything.${counter_note}"
   else
     log "VERDICT ${name}: NO GAP OBSERVED - the frame that reached the host bridge carried the in-subnet source ${fwd_src}, which the source-scoped deny does cover, and no out-of-subnet frame was seen for this source. Whether the guest failed to spoof (nc/-s, guest networking) or vmnet rewrote the source into the subnet cannot be told from a post-vmnet observer, so this is not proof that vmnet anti-spoofs; C2b stays warranted.${counter_note}"
   fi
