@@ -892,6 +892,8 @@ verdict() {
   # since BPF is pre-PF and both bridges are the same kind.
   if [[ "$emitted" != "yes" ]]; then
     log "PLATFORM ${name}: the session guest did not emit its copy (see the nc stderr and TX lines above), so the session bridge cannot corroborate the control; not pinned. See the verdict below."
+  elif [[ "$fwd" == "no" && "$delta" -gt 0 ]]; then
+    log "PLATFORM ${name}: the session bridge capture saw no frame yet 'writ deny agent v4' rose by ${delta}; a rewrite into the subnet the capture missed cannot be ruled out, so no forwarding fact (least of all 'does not forward') can be pinned from this run. See the verdict below."
   elif [[ "$fwd" != "$u_fwd" || "$bridge_rw" != "$u_bridge_rw" ]]; then
     log "PLATFORM ${name}: the two bridges disagree (unconfined forwarded=${u_fwd} bridge-rewritten=${u_bridge_rw}, session forwarded=${fwd} bridge-rewritten=${bridge_rw}); tcpdump taps before PF, so they should agree — no platform fact can be pinned from this run. See the verdict below."
   elif [[ "$u_bridge_rw" == "yes" ]]; then
