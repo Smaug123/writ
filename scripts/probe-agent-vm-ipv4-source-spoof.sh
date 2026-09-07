@@ -754,7 +754,11 @@ require_no_other_anchors "before start"
 # a manual nat, ...). Anchor lines (`nat-anchor ...`) are declarations, not
 # rules, so they are exempt; nested-anchor translations are out of scope, like
 # the anchor-exclusivity check — do not run this alongside them.
-if sudo pfctl -sn 2>/dev/null | grep -Eq '^(nat|rdr|binat) '; then
+# Capture and status-check first: a failed `pfctl -sn` piped into grep would
+# read as "no translations" and let the run proceed unsound. Fail closed.
+translation_rules="$(sudo pfctl -sn 2>/dev/null)" \
+  || die "could not read PF translation rules (pfctl -sn failed); cannot confirm no nat/rdr/binat would rewrite the probe's source, so nothing is graded"
+if printf '%s\n' "$translation_rules" | grep -Eq '^(nat|rdr|binat) '; then
   die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset; they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
 fi
 
