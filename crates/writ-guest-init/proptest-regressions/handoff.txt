@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 50cbbb6c15bc4bb7fe88bcf082211f2fe25bebcfc88eb27589f3b05fac056e5e # shrinks to (interfaces, mutations) = ([], [Duplicate { from: 19, to: 19 }])
+cc 3792509c41eefdbfaa4f98a385d1ab7b1fbc3051d27ced2ed43a82c33b2cb071 # shrinks to (interfaces, mutations) = ([InterfaceName("ikg"), InterfaceName("j4"), InterfaceName("sfh770qa")], [Drop(4), Duplicate { from: 30, to: 30 }])

@@ -1142,7 +1142,18 @@ that ran, took effect, and was then killed matches the same signature. Replay
 safety is therefore a fact about the command, decided at the call site
 (`notes_repo::OnBornDead`), not a boolean the supervisor hands out.
 
-**Primitives.** `AgentVmSessionPlan`/`StopPlan`
+**Primitives.** The locked profile's guest handoff lives in its own pure
+crate, `crates/writ-guest-init` (no host deps): the `container run`
+capability profile and its exact parser (`capability_argv`), the ordered
+`HandoffStep` plan with `simulate`, a reference model of the Linux privilege
+rules that accepts a plan iff every step could succeed and it ends, once, in
+a verification that finds the locked state (`handoff`), and the
+`/proc/<pid>/status` acceptance types (`proc_status`): `LockedAwaitingRelease`,
+which the host checks before release while PID 1 is parked in `sigwait` with
+`SIGUSR1` blocked, and `LockedReleased`, which the Linux CI oracle checks of
+the `exec`ed workload, where `SIGUSR1` must be unblocked. The Linux-only interpreter that performs the
+plan is not yet built; see `ipv4-only-network-confinement.md`, layer 2.
+`AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`
 (`agent_vm_lifecycle/state_store.rs`); the start-step state machine
 `AgentVmStartStep` (ProbeNetworkAbsent → CreateNetwork → InspectAndValidate →
@@ -1158,7 +1169,19 @@ IPv4 rules are matched on the session subnet as source, so a frame the guest
 sends with an out-of-subnet source is not covered by them (whether vmnet
 forwards such a frame is unmeasured; `ipv4-only-network-confinement.md`
 records this as a known delta and the interface-scoped fix); VM placement by
-topology (`--internal`, no NAT). IPv6 is confined for host placement by the host PF
+topology (`--internal`, no NAT). Before any session rules are loaded, the helper
+reads the main ruleset back and refuses unless `anchor "writ/session/*"`
+precedes every other filter anchor and every `quick` pass
+(`session_anchor_placement`, `agent_vm_firewall.rs`): a `quick` pass ahead of
+it, including one inside `com.apple/*` that a main-ruleset readback cannot
+see, would pass a packet before the session's rules were consulted. Placement
+alone is not enough, because PF translates before it filters and a `nat`,
+`rdr`, or `binat` rule with the `pass` modifier passes matching packets
+without consulting any filter rule, from any anchor and in any position; so
+the helper also reads the main translation ruleset and every anchor
+`pfctl -v -sA` lists, and refuses if any of them holds such a rule
+(`ensure_no_pass_translation_rules`). IPv6 is
+confined for host placement by the host PF
 rule (`block return in quick on <iface> inet6 all`,
 `agent_vm_firewall.rs:705`), with a guest deny in front of it that is a
 precondition rather than an authority boundary — the root workload can

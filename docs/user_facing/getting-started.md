@@ -218,7 +218,34 @@ Before that block does anything useful you need four things on disk:
 1. **`pf_helper`** — `writ-agent-vm-pf-helper` from `agent-infra`. The
    daemon shells out to it via `sudo` to bring up PF anchors, so make
    sure you have a sudoers entry (or are happy to type your password
-   each session).
+   each session). The helper loads each session's rules under a
+   bootstrap anchor that must already be in the main ruleset, and its
+   *position* matters: PF consults the main ruleset top to bottom, a
+   `quick` rule ends evaluation, and a filter anchor's rules run in place,
+   so anything the session anchor sits behind can pass a packet before
+   the session's rules are ever consulted. Put it in `/etc/pf.conf` after
+   the translation anchors and **before** `anchor "com.apple/*"`:
+   ```pf
+   scrub-anchor "com.apple/*"
+   nat-anchor "com.apple/*"
+   rdr-anchor "com.apple/*"
+   dummynet-anchor "com.apple/*"
+   anchor "writ/session/*"
+   anchor "com.apple/*"
+   load anchor "com.apple" from "/etc/pf.anchors/com.apple"
+   ```
+   then `sudo pfctl -f /etc/pf.conf`. The helper checks this placement
+   every time it installs a session's rules and refuses to start the
+   session otherwise, naming the lines in the way; an anchor merely
+   *appended* to the file is refused, because `com.apple/*` holds
+   nested anchors whose contents a main-ruleset readback cannot see.
+   The helper also refuses if any loaded translation rule carries the
+   `pass` modifier (`rdr pass ...`, `nat pass ...`, `binat pass ...`), in
+   the main ruleset or in any anchor: PF translates before it filters,
+   and `pass` there sends matching packets past every filter rule,
+   including the session anchor. Such rules are common in local
+   port-forwarding recipes; drop the `pass` and add an ordinary filter
+   `pass` rule instead, then reload.
 2. **`image`** — `writ-agent-vm-guest:latest` is just a tag. Apple's
    `container` won't find it until you build the guest image (e.g.
    `nix build .#agent-vm-guest-image-aarch64-linux`) and load the
