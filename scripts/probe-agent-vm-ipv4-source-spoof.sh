@@ -94,6 +94,15 @@ Environment overrides:
   WRIT_PROVE_BROKER_PORT_MIN  broker/probe port range floor (default 49152)
   WRIT_PROVE_BROKER_PORT_MAX  broker/probe port range ceiling (default 65535)
   WRIT_PROBE_FOREIGN_SOURCE   out-of-pool source to attempt (default 10.77.0.5)
+
+Threat model of this probe: the guest's *runtime* behaviour is treated as
+untrusted (it may lie in /proc, forge payloads, or emit terminal-escape
+diagnostics — the measurement is hardened against all of that), but the guest
+IMAGE is assumed to be a non-adversarial build (the default alpine:latest, or
+another trusted image via WRIT_PROVE_IMAGE). The host-side deadline and the
+byte caps on buffered reads are best-effort, not a guarantee against a
+deliberately resource-exhausting image; pointing WRIT_PROVE_IMAGE at a
+malicious build is out of scope, and only self-DoSes the operator's own host.
 EOF
 }
 
@@ -359,18 +368,25 @@ bridge_for_gateway() {
 # prints the header line, then the payload as text, so the nonce line is
 # attributed to the most recent header for our destination.
 bridge_source_for_nonce() {
-  # Real IPv4 source of the first captured UDP packet whose destination is
-  # $2:$3 and whose payload contains nonce $4, parsed from the pcap $1 by header
-  # STRUCTURE. Unlike a `tcpdump -A` text scan, payload bytes cannot masquerade
-  # as a header line here: the source is read from the IP header, the nonce is
-  # matched only in the UDP payload. Empty if no such packet. Tolerates a
-  # truncated final record (tcpdump writes concurrently).
-  python3 - "$1" "$2" "$3" "$4" <<'PY'
+  # Real IPv4 source of a captured UDP packet whose destination is $2:$3 and
+  # whose payload contains nonce $4, parsed from the pcap $1 by header STRUCTURE.
+  # Unlike a `tcpdump -A` text scan, payload bytes cannot masquerade as a header
+  # line: the source is read from the IP header, the nonce is matched only in the
+  # UDP payload. Among ALL matching packets it prefers one whose source is
+  # outside the session CIDR $5, so a decoy in-subnet packet carrying the nonce
+  # cannot hide a later genuine spoof; absent any out-of-subnet source it returns
+  # the first in-subnet match. Empty if no match. Tolerates a truncated final
+  # record (tcpdump writes concurrently).
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import ipaddress
 import socket
 import struct
 import sys
 
 path, dst_ip, dst_port, nonce = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].encode()
+session = ipaddress.ip_network(sys.argv[5], strict=True)
+first_match = None
+out_of_subnet = None
 try:
     data = open(path, "rb").read()
 except OSError:
@@ -425,8 +441,15 @@ while off + 16 <= len(data):
     dport = struct.unpack(">H", pkt[udp + 2:udp + 4])[0]
     payload = pkt[udp + 8:]
     if dip == dst_ip and dport == dst_port and nonce in payload:
-        print(src)
-        sys.exit(0)
+        if first_match is None:
+            first_match = src
+        if ipaddress.ip_address(src) not in session:
+            out_of_subnet = src
+            break  # a genuine out-of-subnet source is the strongest evidence
+if out_of_subnet is not None:
+    print(out_of_subnet)
+elif first_match is not None:
+    print(first_match)
 sys.exit(0)
 PY
 }
@@ -538,8 +561,9 @@ send_datagram() {
     # Capture the add's merged output: a real failure (EPERM from a missing
     # CAP_NET_ADMIN) is the whole point of the measurement, and `|| true` keeps
     # its non-zero exit (or a benign already-exists) from tripping errexit.
-    # sanitize: the add's stderr is guest-controlled and gets logged.
-    RESULT_ADD_OUT="$(sanitize "$(guest_in "$VM_NAME" "ip addr add ${source}/32 dev eth0" 2>&1)")" || true
+    # sanitize: the add's stderr is guest-controlled and gets logged. head -c
+    # bounds a hostile image that floods stdout before the timeout fires.
+    RESULT_ADD_OUT="$(sanitize "$(guest_in "$VM_NAME" "ip addr add ${source}/32 dev eth0" 2>&1 | head -c 65536)")" || true
     if guest_in "$VM_NAME" "ip -4 -o addr show dev eth0 | grep -q 'inet ${source}/32 '"; then
       RESULT_ADD_OK="yes"
       log "  alias ${source}/32 configured on eth0 (CAP_NET_ADMIN present)"
@@ -560,16 +584,19 @@ send_datagram() {
   # (raw-socket) one — the capability readout, not this send, is what shows the
   # NET_RAW route. So an nc that sent nothing here is not evidence the guest
   # cannot spoof by other means; the verdict keys on the caps for that.
-  local nc_err="${TMP_DIR}/nc-${name}.err"
+  # Both nc streams go to a file, never the terminal: a hostile guest `nc` could
+  # otherwise emit CSI/OSC sequences on stdout to rewrite the verdict transcript.
+  # We never read them (the frame is judged from the capture and TX counter).
+  local nc_out="${TMP_DIR}/nc-${name}.out"
   set +e
-  guest_in "$VM_NAME" "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}" 2>"$nc_err"
+  guest_in "$VM_NAME" "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}" >"$nc_out" 2>&1
   local guest_status=$?
   set -e
   log "  guest nc exit status ${guest_status} (diagnostic only)"
   sleep 2
   tx_after="$(guest_tx_packets "$VM_NAME")"
 
-  RESULT_BRIDGE_SRC="$(bridge_source_for_nonce "$CAPTURE_FILE" "$IPV4_GATEWAY" "$PROBE_PORT" "$nonce")"
+  RESULT_BRIDGE_SRC="$(bridge_source_for_nonce "$CAPTURE_FILE" "$IPV4_GATEWAY" "$PROBE_PORT" "$nonce" "$IPV4_CIDR")"
   RESULT_BRIDGE_SRC="${RESULT_BRIDGE_SRC:--}"
 
   if [[ "$RESULT_BRIDGE_SRC" != "-" ]]; then
@@ -677,9 +704,11 @@ STATUS_FILE="${TMP_DIR}/guest-status.txt"
 # `container exec` sibling and not the spawned `cat` (/proc/self would be cat's
 # own), either of whose capability sets could differ; the agent runs as this
 # workload shell, so these are the caps that matter.
-guest_in "$VM_NAME" 'cat /tmp/writ-workload-status' >"$STATUS_FILE" 2>/dev/null \
-  || die "could not read the workload's captured /proc/self/status"
-[[ -s "$STATUS_FILE" ]] || die "the workload's captured /proc/self/status is empty"
+# head -c bounds a hostile image that floods this read; the -s check below is
+# the real success test, so the pipeline's exit (head may SIGPIPE the producer)
+# is not load-bearing.
+guest_in "$VM_NAME" 'cat /tmp/writ-workload-status' 2>/dev/null | head -c 65536 >"$STATUS_FILE" || true
+[[ -s "$STATUS_FILE" ]] || die "could not read the workload's captured /proc/self/status (empty or unreadable)"
 GUEST_UID="$(awk '/^Uid:/{print $3; exit}' "$STATUS_FILE")"
 log "guest workload capability posture (effective uid ${GUEST_UID:-?}, from the workload's own /proc/self/status; decoded on the host):"
 # decode_caps prints the per-set human lines to stderr (shown above the verdict)
