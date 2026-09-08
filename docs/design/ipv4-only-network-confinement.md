@@ -167,29 +167,35 @@ not rediscovered. None reopens the bypass #288 closed.
   anchor is `pass in quick inet proto tcp from <agent /24> to <broker> port
   $broker_ports` and `block return in quick inet from <agent /24> to any`. A
   packet whose IPv4 source is outside the session subnet matches neither, and
-  falls through to whatever the host's default PF policy is. Linux lets even
-  an unprivileged process send a one-way UDP datagram with a foreign source
-  via `IP_FREEBIND`, so this does not need `CAP_NET_RAW`; whether such a frame
-  is forwarded by vmnet at all is unknown and must be measured, not assumed.
-  The target rules match the IPv4 allow and a default deny on the resolved
-  interfaces, exactly as the IPv6 deny already does, and the vertical proof
-  sends a spoofed-source probe. This is the one delta that is a possible live
-  gap under the legacy profile today rather than hardening; it is listed here
+  falls through to whatever the host's default PF policy is. Forging an outbound
+  IPv4 source on Linux needs a capability — `CAP_NET_RAW` (raw / AF_PACKET
+  socket) or `CAP_NET_ADMIN` (`IP_TRANSPARENT`, or an address alias). It is NOT
+  achievable unprivileged: `IP_FREEBIND` (and the `ip_nonlocal_bind` sysctl)
+  relaxes `bind(2)` only, and the output route lookup then rejects a nonlocal
+  source with `ENETUNREACH` (verified on Linux 6.18) unless `FLOWI_FLAG_ANYSRC`
+  is set, which only `IP_TRANSPARENT` or a raw socket do. The target rules match
+  the IPv4 allow and a default deny on the resolved interfaces, exactly as the
+  IPv6 deny already does. This is the one delta that is a possible live gap
+  under the legacy profile today rather than hardening; it is listed here
   because the fix is the same interface-scoped renderer the locked profile
   needs, and it is not blocked on any of layers 2 or 3.
 
   Measured 2026-09-08 (`scripts/probe-agent-vm-ipv4-source-spoof.sh`, on
   hardware): the current `ipv4-only-no-guest-ipv6` workload runs with
-  `CapEff`/`CapBnd` `NET_ADMIN=no`, `NET_RAW=yes` (Apple `container`'s default
-  cap set; read from the workload's own `/proc/self/status`). So `ip addr add`
-  is refused, but a raw socket (`NET_RAW`) can forge a source — and, as above,
-  `IP_FREEBIND` can even without it. The sender-side spoof is therefore
-  confirmed feasible on the shipped mode; what remains unmeasured is whether
-  vmnet forwards such a frame onto the host bridge (the probe's alias-based
-  sender needs the absent `NET_ADMIN`, so it establishes the capability posture
-  only — a raw-socket / `IP_FREEBIND` sender is the next step). Note dropping
-  `NET_RAW` would not close the `IP_FREEBIND` route, so the fix remains the
-  interface-scoped renderer (C2b), not capability tightening.
+  `CapEff`/`CapPrm`/`CapBnd` `NET_ADMIN=no`, `NET_RAW=yes` (Apple `container`'s
+  default cap set; read from the workload's own `/proc/$$/status`). So `ip addr
+  add` is refused, but a raw socket (`NET_RAW`) can forge a source: the
+  sender-side spoof is confirmed *capable* on the shipped mode. Two independent
+  mitigations close it, and the locked profile carries both: dropping
+  `NET_RAW`/`NET_ADMIN` (capability_argv.rs never grants `NET_RAW`) means the
+  workload cannot build a forged frame at all — verified, since `IP_FREEBIND` is
+  bind-only — and the interface-scoped renderer (C2b) drops an out-of-subnet
+  frame at the host regardless of how it was produced, covering any future mode
+  that grants a forging cap. Either suffices; the current mode has neither for
+  the IPv4 source, so it is exposed. Still unmeasured: whether vmnet actually
+  forwards such a frame onto the host bridge (a raw-socket sender in the guest
+  is the remaining wire test; the probe's `nc`/alias sender needs the absent
+  `NET_ADMIN`, so today it establishes only the capability posture).
 - **`ifconfig` text.** Resolution parses `ifconfig` output rather than a
   `getifaddrs` snapshot. The parser is pure and property-tested
   (`parse_bridge_for_gateway`); replacing it is not a security item.

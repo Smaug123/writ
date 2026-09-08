@@ -16,24 +16,31 @@ Measures, on real hardware, whether a compromised root agent in a writ session
 guest can emit an IPv4 frame with a *spoofed* source address (one outside the
 address it was assigned).
 
-Why capabilities matter here: the session PF anchor's IPv4 rules match on the
-session /24 as *source*, so a frame whose source is outside that /24 falls
-through them (plan "Beyond E3" question 4). A frame has to exist before vmnet or
-PF can forward or filter it, and how easily the guest can forge an IPv4 source
-bounds the exposure. CAP_NET_RAW opens a raw / AF_PACKET socket that writes the
-header directly (full forgery); CAP_NET_ADMIN adds an address alias so a normal
-socket can bind a foreign source. Crucially, neither is even required: IP_FREEBIND
-(or the ip_nonlocal_bind sysctl) lets an UNPRIVILEGED process bind a foreign
-source. So the capability posture can only ever CONFIRM that spoofing is
-possible; it can never prove it denied. The only durable boundary is host-side:
-interface-scoped PF rules (stage C2b), not the guest's capability set.
+Why capabilities are the sender-side boundary: the session PF anchor's IPv4
+rules match on the session /24 as *source*, so a frame whose source is outside
+that /24 falls through them (plan "Beyond E3" question 4). A frame has to exist
+before vmnet or PF can forward or filter it, and forging an outbound IPv4 source
+on Linux needs a capability: CAP_NET_RAW opens a raw / AF_PACKET socket that
+writes the header directly, or CAP_NET_ADMIN sets IP_TRANSPARENT (or adds an
+address alias) so a normal socket's foreign source survives the output route
+lookup. IP_FREEBIND does NOT suffice: it relaxes bind(2) only, and the output
+route lookup still rejects a nonlocal source with ENETUNREACH without
+FLOWI_FLAG_ANYSRC, which only IP_TRANSPARENT or a raw socket set. Verified on
+Linux 6.18: an IP_FREEBIND-bound UDP send from a nonlocal source returns
+ENETUNREACH. So the capability posture IS a real boundary — both CAP_NET_RAW
+and CAP_NET_ADMIN absent from every held set means the workload cannot forge an
+outbound source at all.
 
 Measured on hardware for the current ipv4-only-no-guest-ipv6 mode: the workload
 runs with CAP_NET_ADMIN absent (so `ip addr add` is refused) but CAP_NET_RAW
 present (Apple `container`'s default cap set) — so the guest CAN forge a source
-via a raw socket today. writ's locked profile drops even that
-(crates/writ-guest-init/src/capability_argv.rs never grants NET_RAW), but that
-still would not close the IP_FREEBIND route, which is why C2b is the fix.
+via a raw socket today. writ's locked profile drops CAP_NET_RAW
+(crates/writ-guest-init/src/capability_argv.rs never grants it), which closes
+the raw-socket route; with CAP_NET_ADMIN also absent, a locked-profile workload
+cannot forge a source, so the cap-drop is itself an effective fix. The
+interface-scoped PF renderer (stage C2b) is the host-side belt to that
+capability suspenders: it drops an out-of-subnet frame regardless of how the
+guest produced it, so it also covers any future mode that grants a forging cap.
 
 It starts one runner-managed guest exactly as prove-agent-vm-lifecycle.sh does
 (so it exercises the real launch path, and would catch a regression in the
@@ -46,9 +53,10 @@ workload's capability set), then gathers three kinds of evidence:
 
   spoof attempt (guest acts, host observes): the guest tries to configure a
       foreign source alias (`ip addr add`, which needs CAP_NET_ADMIN) and then
-      send from it with BusyBox nc. This exercises the NET_ADMIN route only —
-      NOT the unprivileged IP_FREEBIND route — so a silent result never proves
-      inability. The host bridge is watched for any foreign-source frame.
+      send from it with BusyBox nc. This exercises the NET_ADMIN (alias) route;
+      it is NOT a raw sender, so it cannot exercise the NET_RAW route — the
+      capability readout covers that. The host bridge is watched for any
+      foreign-source frame.
 
   capability readout (guest-reported, host-parsed): the workload captures its
       OWN /proc/$$/status at startup (its shell PID, not an exec'd sibling or
@@ -56,13 +64,14 @@ workload's capability set), then gathers three kinds of evidence:
       guest) decodes the CapEff / CapPrm / CapBnd masks for NET_ADMIN and
       NET_RAW. A cap in any set means the guest can forge.
 
-Grading is host-owned and has no "denied" outcome. A foreign source on the
-bridge is SPOOF CONFIRMED. A forging capability in any set is SPOOF CAPABLE. If
-neither holds, the verdict is NOT PROVEN DENIED — because IP_FREEBIND was not
-exercised, so absence of a capability and of a captured frame does not rule
-spoofing out. The `ip addr add` error and the capability masks are
-guest-reported diagnostics; the bridge capture is the one host-owned fact, and
-a guest that forged and sent would be caught on it regardless of what it reports.
+Grading is host-owned. A foreign source on the bridge is SPOOF CONFIRMED. A
+forging capability (NET_RAW or NET_ADMIN) in any held set is SPOOF CAPABLE.
+Neither holds — no forging cap and no captured frame — is CAPABILITY-DENIED,
+which is sound because outbound forgery needs one of those caps (IP_FREEBIND is
+bind-only, so there is no unprivileged route to rule out). The `ip addr add`
+error and the capability masks are guest-reported diagnostics; the bridge
+capture is the one host-owned fact, and a guest that forged and sent would be
+caught on it regardless of what it reports.
 
 This is a measurement, not a proof: exit status is 0 whenever the measurement
 completed, and the verdict is printed. See
@@ -449,10 +458,11 @@ send_datagram() {
   # -w 1: BusyBox nc otherwise waits for a reply that never comes. Its exit
   # status is diagnostic; whether a frame left the guest is decided from the TX
   # counter and the capture, not from nc. A foreign source that was not
-  # configured (the NET_ADMIN alias was denied) fails to bind here — but nc does
-  # NOT set IP_FREEBIND, which would let an unprivileged process bind it anyway,
-  # so this bind failure is not evidence the guest cannot spoof, only that the
-  # NET_ADMIN route is closed. The verdict never reads it as denial.
+  # configured (the NET_ADMIN alias was denied) fails to bind here. nc is a
+  # normal socket, so it can only reach the NET_ADMIN route, not the NET_RAW
+  # (raw-socket) one — the capability readout, not this send, is what shows the
+  # NET_RAW route. So an nc that sent nothing here is not evidence the guest
+  # cannot spoof by other means; the verdict keys on the caps for that.
   local nc_err="${TMP_DIR}/nc-${name}.err"
   set +e
   guest_in "$VM_NAME" "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}" 2>"$nc_err"
@@ -624,19 +634,17 @@ log "  NET_ADMIN eff=${EFF_ADMIN} prm=${PRM_ADMIN} bnd=${BND_ADMIN}; NET_RAW eff
 
 # --- verdict (host-owned). The bridge is the arbiter: it sits after vmnet and
 # before PF, so a foreign source on it is a real spoofed frame regardless of
-# what the guest reports. Crucially, the capability posture can only ever
-# CONFIRM spoofing (a held cap, or a frame on the wire), never DENY it: source
-# forgery needs no capability at all — IP_FREEBIND (or the ip_nonlocal_bind
-# sysctl) lets an unprivileged process bind a foreign source — and this probe's
-# BusyBox nc sender does not enable IP_FREEBIND, so its silence is not evidence
-# of inability. So there is no "denied" verdict; the reassuring end state is
-# only reachable by the host-side interface-scoped rules (C2b), not here.
+# what the guest reports. Outbound IPv4 source forgery needs CAP_NET_RAW (raw
+# socket) or CAP_NET_ADMIN (IP_TRANSPARENT / an address alias): IP_FREEBIND
+# relaxes bind() only and the output route lookup then rejects a nonlocal source
+# (ENETUNREACH, verified on Linux 6.18), so there is no unprivileged route to
+# rule out. Hence a "denied" verdict IS sound when neither cap is held anywhere.
 if [[ "$FOREIGN_ON_BRIDGE" == "yes" ]]; then
   log "VERDICT: SPOOF CONFIRMED — a frame carrying the out-of-subnet source ${FOREIGN_BRIDGE_SRC} reached the host bridge, which the source-scoped IPv4 rules cannot match. Plan 'Beyond E3' question 4 is answered in the affirmative on the wire: stage C2b (interface-scoped rules) is warranted, and this is independent of the capability posture (NET_RAW eff=${EFF_RAW} bnd=${BND_RAW})."
 elif [[ "$forge_cap_held" == "yes" || "$FOREIGN_ADD_OK" == "yes" ]]; then
-  log "VERDICT: SPOOF CAPABLE — the workload holds or can reacquire a source-forging capability (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}, ip-addr-add=${FOREIGN_ADD_OK}), so it can build an out-of-subnet frame via a raw socket even though this run did not observe one escape onto the bridge (nc alone cannot bind a foreign source without NET_ADMIN or IP_FREEBIND). Source spoofing is possible; the source-scoped rules do not cover it, so stage C2b (interface-scoped rules) is warranted. Do NOT read the bridge silence as denial."
+  log "VERDICT: SPOOF CAPABLE — the workload holds or can reacquire a source-forging capability (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}, ip-addr-add=${FOREIGN_ADD_OK}), so it can build an out-of-subnet frame via a raw socket even though this run did not observe one escape onto the bridge (BusyBox nc is not a raw sender, so it cannot exercise the NET_RAW route). Source spoofing is possible; the source-scoped rules do not cover it, so dropping the cap (locked profile) or the interface-scoped renderer (C2b) is warranted. Do NOT read the bridge silence as denial."
 else
-  log "VERDICT: NOT PROVEN DENIED — no forging capability was found in any set (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}) and no spoofed frame reached the bridge, but this is NOT proof the guest cannot spoof: IP_FREEBIND lets an unprivileged process bind a foreign source, and this probe's BusyBox nc sender never enabled it. Re-run the wire test with an IP_FREEBIND (or raw-socket) sender before concluding anything; the only durable fix is the host-side interface-scoped rules (C2b)."
+  log "VERDICT: CAPABILITY-DENIED — no source-forging capability is held or reacquirable (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}), \`ip addr add\` was refused, and no out-of-subnet frame reached the host bridge while the own-source control did. Outbound IPv4 forgery needs NET_RAW or NET_ADMIN (IP_FREEBIND is bind-only — a nonlocal-source send returns ENETUNREACH), so the workload cannot build a spoofed frame and the source-scoped rules never face one. Answer to plan 'Beyond E3' question 4 for this launch path: source spoofing is denied at the sender, below vmnet and PF."
 fi
 
 cleanup
