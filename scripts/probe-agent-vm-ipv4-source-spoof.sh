@@ -61,17 +61,22 @@ workload's capability set), then gathers three kinds of evidence:
   capability readout (guest-reported, host-parsed): the workload captures its
       OWN /proc/$$/status at startup (its shell PID, not an exec'd sibling or
       the spawned cat, whose cap sets could differ), and this script (never the
-      guest) decodes the CapEff / CapPrm / CapBnd masks for NET_ADMIN and
-      NET_RAW. A cap in any set means the guest can forge.
+      guest) decodes the CapEff / CapPrm / CapInh / CapBnd masks for NET_ADMIN
+      and NET_RAW. A cap in effective or permitted is usable now (capset raises
+      permitted into effective); one only in inheritable or bounding is not
+      usable directly but can be raised by an execve of a file with a matching
+      file capability, which a guest controlling userland may arrange.
 
 Grading is host-owned. A foreign source on the bridge is SPOOF CONFIRMED. A
-forging capability (NET_RAW or NET_ADMIN) in any held set is SPOOF CAPABLE.
-Neither holds — no forging cap and no captured frame — is CAPABILITY-DENIED,
-which is sound because outbound forgery needs one of those caps (IP_FREEBIND is
-bind-only, so there is no unprivileged route to rule out). The `ip addr add`
-error and the capability masks are guest-reported diagnostics; the bridge
-capture is the one host-owned fact, and a guest that forged and sent would be
-caught on it regardless of what it reports.
+forging capability (NET_RAW or NET_ADMIN) in effective or permitted is SPOOF
+CAPABLE; one only in inheritable or bounding is SPOOF REACHABLE (raisable via a
+file-capability execve). Absent from all four sets, with no captured frame, is
+CAPABILITY-DENIED — sound because outbound forgery needs one of those caps
+(IP_FREEBIND is bind-only, so there is no unprivileged route), and with the cap
+in no set there is no capset or file-capability-execve route to it either. The
+`ip addr add` error and the capability masks are guest-reported diagnostics; the
+bridge capture is the one host-owned fact, and a guest that forged and sent
+would be caught on it regardless of what it reports.
 
 This is a measurement, not a proof: exit status is 0 whenever the measurement
 completed, and the verdict is printed. See
@@ -370,9 +375,9 @@ start_capture() {
 # in the guest: whether CAP_NET_ADMIN (bit 12) and CAP_NET_RAW (bit 13) are
 # present in the effective, permitted, and bounding sets. Prints, on the last
 # line, a machine verdict: "CAPS <eff_admin> <eff_raw> <prm_admin> <prm_raw>
-# <bnd_admin> <bnd_raw>" with yes/no fields, and the per-set human lines before
-# it on stderr. Fails unless CapEff, CapPrm and CapBnd are all present, so a
-# truncated status cannot be read as "capability absent".
+# <inh_admin> <inh_raw> <bnd_admin> <bnd_raw>" with yes/no fields, and the
+# per-set human lines before it on stderr. Fails unless CapEff, CapPrm, CapInh
+# and CapBnd are all present, so a truncated status cannot be read as "absent".
 decode_caps() {
   python3 - "$1" <<'PY'
 import re
@@ -392,10 +397,13 @@ def has(mask, bit):
     return "yes" if (mask >> bit) & 1 else "no"
 
 
-# Require every verdict-bearing field: a truncated status that dropped CapBnd or
-# CapEff must be an error, not a silent zero that could read as "capability
-# absent" and award a reassuring verdict on unknown evidence.
-required = ("CapEff", "CapPrm", "CapBnd")
+# Require every verdict-bearing field: a truncated status that dropped one must
+# be an error, not a silent zero that could read as "capability absent" and
+# award a reassuring verdict on unknown evidence. CapInh is load-bearing for the
+# "denied" decision — a cap present only there can enter the permitted set on an
+# execve of a file with a matching inheritable file capability (NoNewPrivs
+# unset), so ignoring it could call a reachable capability denied.
+required = ("CapEff", "CapPrm", "CapInh", "CapBnd")
 missing = [name for name in required if name not in sets]
 if missing:
     print(f"missing capability field(s) in the status document: {', '.join(missing)}", file=sys.stderr)
@@ -410,15 +418,18 @@ for name in required:
         f"NET_RAW={has(sets[name], CAP_NET_RAW)}",
         file=sys.stderr,
     )
-# Emit all three held sets, not just the bounding set: a cap in the effective
-# set is usable immediately and one in the permitted set can be raised into
-# effective, so "the guest cannot forge" needs the cap absent from every set —
-# and even that does not prove it (IP_FREEBIND needs no capability; the verdict
-# accounts for that). Order: eff, prm, bnd; NET_ADMIN then NET_RAW in each.
+# Emit all four sets so the caller can model reachability, not just "present":
+# a cap in effective is usable now, in permitted is raisable via capset, but one
+# only in inheritable or bounding is neither — it is reachable solely through a
+# file-capability execve (Inh via P(inh)&F(inh); Bnd via F(perm)&bounding). The
+# caller treats eff/prm as usable-now and inh/bnd as exec-reachable, and calls
+# it denied only when the cap is absent from all four. Order: eff, prm, inh,
+# bnd; NET_ADMIN then NET_RAW in each.
 print(
     "CAPS "
     f"{has(sets['CapEff'], CAP_NET_ADMIN)} {has(sets['CapEff'], CAP_NET_RAW)} "
     f"{has(sets['CapPrm'], CAP_NET_ADMIN)} {has(sets['CapPrm'], CAP_NET_RAW)} "
+    f"{has(sets['CapInh'], CAP_NET_ADMIN)} {has(sets['CapInh'], CAP_NET_RAW)} "
     f"{has(sets['CapBnd'], CAP_NET_ADMIN)} {has(sets['CapBnd'], CAP_NET_RAW)}"
 )
 PY
@@ -578,7 +589,7 @@ log "guest workload capability posture (effective uid ${GUEST_UID:-?}, from the 
 # and exactly the "CAPS ..." machine line to stdout, which we capture and split.
 CAPS_LINE="$(decode_caps "$STATUS_FILE")" \
   || die "could not decode the guest capability masks (missing or garbled Cap* fields); nothing is graded"
-read -r _ EFF_ADMIN EFF_RAW PRM_ADMIN PRM_RAW BND_ADMIN BND_RAW <<<"$CAPS_LINE"
+read -r _ EFF_ADMIN EFF_RAW PRM_ADMIN PRM_RAW INH_ADMIN INH_RAW BND_ADMIN BND_RAW <<<"$CAPS_LINE"
 
 # --- positive control: the guest's own-source frame MUST reach the bridge, or
 # the capture is not observing the wire and no silence below means anything.
@@ -615,22 +626,30 @@ FOREIGN_ON_BRIDGE="no"
 if [[ "$FOREIGN_BRIDGE_SRC" != "-" ]] && ! addr_in_cidr "$IPV4_CIDR" "$FOREIGN_BRIDGE_SRC"; then
   FOREIGN_ON_BRIDGE="yes"
 fi
-# A forging capability is available if NET_ADMIN or NET_RAW is in ANY held set:
-# effective (usable now), permitted (raisable into effective), or bounding
-# (reacquirable after a capset). Keying on the bounding set alone would miss a
-# cap that is effective now but dropped from the bounding set — a legal state.
-forge_cap_held="no"
+# Model reachability, not mere presence. A forging cap (NET_ADMIN or NET_RAW)
+# is USABLE NOW if it is in the effective set (usable directly) or the permitted
+# set (raisable into effective by capset). It is EXEC-REACHABLE if it is only in
+# the inheritable or bounding set: capset cannot promote those, but a subsequent
+# execve of a file carrying a matching file capability can — P(inh)&F(inh) enters
+# permitted (NoNewPrivs unset), and F(perm)&bounding enters permitted — which a
+# guest that controls userland may be able to arrange. It is absent only when in
+# none of the four sets, and only then is denial sound.
+forge_cap_usable_now="no"
 if [[ "$EFF_ADMIN" == "yes" || "$EFF_RAW" == "yes" \
-   || "$PRM_ADMIN" == "yes" || "$PRM_RAW" == "yes" \
+   || "$PRM_ADMIN" == "yes" || "$PRM_RAW" == "yes" ]]; then
+  forge_cap_usable_now="yes"
+fi
+forge_cap_exec_reachable="no"
+if [[ "$INH_ADMIN" == "yes" || "$INH_RAW" == "yes" \
    || "$BND_ADMIN" == "yes" || "$BND_RAW" == "yes" ]]; then
-  forge_cap_held="yes"
+  forge_cap_exec_reachable="yes"
 fi
 
 log "results (host-observed unless noted):"
 log "  positive control: own source ${GUEST_IPV4} seen on ${SESSION_BRIDGE} as ${CONTROL_BRIDGE_SRC}"
 log "  spoof attempt: ip addr add ${FOREIGN_SOURCE}/32 -> ${FOREIGN_ADD_OK} [${FOREIGN_ADD_OUT:-<no output>}] (guest-reported)"
 log "  spoof attempt: foreign source on ${SESSION_BRIDGE} -> ${FOREIGN_BRIDGE_SRC} (host-owned)"
-log "  NET_ADMIN eff=${EFF_ADMIN} prm=${PRM_ADMIN} bnd=${BND_ADMIN}; NET_RAW eff=${EFF_RAW} prm=${PRM_RAW} bnd=${BND_RAW} (workload /proc status, host-decoded)"
+log "  NET_ADMIN eff/prm/inh/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${INH_ADMIN}/${BND_ADMIN}; NET_RAW eff/prm/inh/bnd=${EFF_RAW}/${PRM_RAW}/${INH_RAW}/${BND_RAW} (workload /proc status, host-decoded)"
 
 # --- verdict (host-owned). The bridge is the arbiter: it sits after vmnet and
 # before PF, so a foreign source on it is a real spoofed frame regardless of
@@ -638,13 +657,16 @@ log "  NET_ADMIN eff=${EFF_ADMIN} prm=${PRM_ADMIN} bnd=${BND_ADMIN}; NET_RAW eff
 # socket) or CAP_NET_ADMIN (IP_TRANSPARENT / an address alias): IP_FREEBIND
 # relaxes bind() only and the output route lookup then rejects a nonlocal source
 # (ENETUNREACH, verified on Linux 6.18), so there is no unprivileged route to
-# rule out. Hence a "denied" verdict IS sound when neither cap is held anywhere.
+# rule out. A "denied" verdict is sound only when neither cap is in any of the
+# four sets (effective, permitted, inheritable, bounding).
 if [[ "$FOREIGN_ON_BRIDGE" == "yes" ]]; then
   log "VERDICT: SPOOF CONFIRMED — a frame carrying the out-of-subnet source ${FOREIGN_BRIDGE_SRC} reached the host bridge, which the source-scoped IPv4 rules cannot match. Plan 'Beyond E3' question 4 is answered in the affirmative on the wire: stage C2b (interface-scoped rules) is warranted, and this is independent of the capability posture (NET_RAW eff=${EFF_RAW} bnd=${BND_RAW})."
-elif [[ "$forge_cap_held" == "yes" || "$FOREIGN_ADD_OK" == "yes" ]]; then
-  log "VERDICT: SPOOF CAPABLE — the workload holds or can reacquire a source-forging capability (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}, ip-addr-add=${FOREIGN_ADD_OK}), so it can build an out-of-subnet frame via a raw socket even though this run did not observe one escape onto the bridge (BusyBox nc is not a raw sender, so it cannot exercise the NET_RAW route). Source spoofing is possible; the source-scoped rules do not cover it, so dropping the cap (locked profile) or the interface-scoped renderer (C2b) is warranted. Do NOT read the bridge silence as denial."
+elif [[ "$forge_cap_usable_now" == "yes" || "$FOREIGN_ADD_OK" == "yes" ]]; then
+  log "VERDICT: SPOOF CAPABLE — the workload can use a source-forging capability now (NET_ADMIN eff/prm=${EFF_ADMIN}/${PRM_ADMIN}, NET_RAW eff/prm=${EFF_RAW}/${PRM_RAW}, ip-addr-add=${FOREIGN_ADD_OK}), so it can build an out-of-subnet frame via a raw socket even though this run did not observe one escape onto the bridge (BusyBox nc is not a raw sender, so it cannot exercise the NET_RAW route). Source spoofing is possible; the source-scoped rules do not cover it, so dropping the cap (locked profile) or the interface-scoped renderer (C2b) is warranted. Do NOT read the bridge silence as denial."
+elif [[ "$forge_cap_exec_reachable" == "yes" ]]; then
+  log "VERDICT: SPOOF REACHABLE — a forging capability is not usable by the workload directly, but sits in the inheritable or bounding set (NET_ADMIN inh/bnd=${INH_ADMIN}/${BND_ADMIN}, NET_RAW inh/bnd=${INH_RAW}/${BND_RAW}), from where an execve of a file carrying a matching file capability can raise it into permitted. A guest that controls userland may be able to arrange that (or hold CAP_SETFCAP), so this is NOT denial. Close it by dropping the cap from the bounding/inheritable set too, or with the interface-scoped renderer (C2b)."
 else
-  log "VERDICT: CAPABILITY-DENIED — no source-forging capability is held or reacquirable (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}), \`ip addr add\` was refused, and no out-of-subnet frame reached the host bridge while the own-source control did. Outbound IPv4 forgery needs NET_RAW or NET_ADMIN (IP_FREEBIND is bind-only — a nonlocal-source send returns ENETUNREACH), so the workload cannot build a spoofed frame and the source-scoped rules never face one. Answer to plan 'Beyond E3' question 4 for this launch path: source spoofing is denied at the sender, below vmnet and PF."
+  log "VERDICT: CAPABILITY-DENIED — no source-forging capability is present in any set (NET_ADMIN eff/prm/inh/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${INH_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/inh/bnd=${EFF_RAW}/${PRM_RAW}/${INH_RAW}/${BND_RAW}), \`ip addr add\` was refused, and no out-of-subnet frame reached the host bridge while the own-source control did. Outbound IPv4 forgery needs NET_RAW or NET_ADMIN (IP_FREEBIND is bind-only — a nonlocal-source send returns ENETUNREACH), and with the cap absent from effective, permitted, inheritable and bounding there is no capset or file-capability-execve route to it, so the workload cannot build a spoofed frame and the source-scoped rules never face one. Answer to plan 'Beyond E3' question 4 for this launch path: source spoofing is denied at the sender, below vmnet and PF."
 fi
 
 cleanup
