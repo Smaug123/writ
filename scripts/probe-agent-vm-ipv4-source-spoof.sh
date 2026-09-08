@@ -16,50 +16,53 @@ Measures, on real hardware, whether a compromised root agent in a writ session
 guest can emit an IPv4 frame with a *spoofed* source address (one outside the
 address it was assigned).
 
-Why this, and not "does vmnet forward a spoofed frame": the session PF anchor's
-IPv4 rules match on the session /24 as *source*, so a frame whose source is
-outside that /24 would fall through them (plan "Beyond E3" question 4). But a
-frame has to exist before vmnet or PF can forward or filter it, and forging an
-IPv4 source needs a Linux capability: CAP_NET_ADMIN to add an address alias (or
-change routing) so a normal socket can bind a foreign source, or CAP_NET_RAW to
-open a raw / AF_PACKET socket that writes the header directly. Apple `container`
-runs the guest *workload* without either (writ's own locked profile
-additionally proves this: crates/writ-guest-init/src/capability_argv.rs grants
-NET_ADMIN only to PID 1 for the IPv6-sysctl handoff and drops it before the
-workload, and never grants NET_RAW). So the source-scoped rules never face an
-out-of-subnet frame from this guest: it cannot build one. This probe verifies
-that on hardware.
+Why capabilities matter here: the session PF anchor's IPv4 rules match on the
+session /24 as *source*, so a frame whose source is outside that /24 falls
+through them (plan "Beyond E3" question 4). A frame has to exist before vmnet or
+PF can forward or filter it, and how easily the guest can forge an IPv4 source
+bounds the exposure. CAP_NET_RAW opens a raw / AF_PACKET socket that writes the
+header directly (full forgery); CAP_NET_ADMIN adds an address alias so a normal
+socket can bind a foreign source. Crucially, neither is even required: IP_FREEBIND
+(or the ip_nonlocal_bind sysctl) lets an UNPRIVILEGED process bind a foreign
+source. So the capability posture can only ever CONFIRM that spoofing is
+possible; it can never prove it denied. The only durable boundary is host-side:
+interface-scoped PF rules (stage C2b), not the guest's capability set.
+
+Measured on hardware for the current ipv4-only-no-guest-ipv6 mode: the workload
+runs with CAP_NET_ADMIN absent (so `ip addr add` is refused) but CAP_NET_RAW
+present (Apple `container`'s default cap set) — so the guest CAN forge a source
+via a raw socket today. writ's locked profile drops even that
+(crates/writ-guest-init/src/capability_argv.rs never grants NET_RAW), but that
+still would not close the IP_FREEBIND route, which is why C2b is the fix.
 
 It starts one runner-managed guest exactly as prove-agent-vm-lifecycle.sh does
-(so it exercises the real launch path, and would catch a regression that handed
-the workload NET_ADMIN/NET_RAW), then gathers three kinds of evidence:
+(so it exercises the real launch path, and would catch a regression in the
+workload's capability set), then gathers three kinds of evidence:
 
   positive control (host-owned): the guest sends a UDP datagram from its OWN
       source; tcpdump on the session bridge (BPF, so it taps the interface
       before PF filters) MUST see it. This proves the send path and the capture
-      both work, so the silence in the spoof attempts below means something.
+      both work, so a silent spoof attempt below means something.
 
-  spoof attempts (guest acts, host observes): the guest tries to configure a
+  spoof attempt (guest acts, host observes): the guest tries to configure a
       foreign source alias (`ip addr add`, which needs CAP_NET_ADMIN) and then
-      send from it. The host bridge MUST NOT see any frame carrying the foreign
-      source. The guest's own error is captured as the mechanistic reason.
+      send from it with BusyBox nc. This exercises the NET_ADMIN route only —
+      NOT the unprivileged IP_FREEBIND route — so a silent result never proves
+      inability. The host bridge is watched for any foreign-source frame.
 
   capability readout (guest-reported, host-parsed): the workload captures its
-      OWN /proc/self/status at startup (not an exec'd sibling, whose cap set
-      could differ), and this script (never the guest) decodes the CapEff /
-      CapPrm / CapBnd masks. Both CAP_NET_ADMIN and CAP_NET_RAW absent from the
-      bounding set would mean the agent can never forge a source; measured on
-      the current ipv4-only-no-guest-ipv6 mode, NET_ADMIN is absent but NET_RAW
-      is present (Apple's default cap set), so a raw socket still can, and the
-      verdict says CAPABILITY PRESENT rather than denied.
+      OWN /proc/$$/status at startup (its shell PID, not an exec'd sibling or
+      the spawned cat, whose cap sets could differ), and this script (never the
+      guest) decodes the CapEff / CapPrm / CapBnd masks for NET_ADMIN and
+      NET_RAW. A cap in any set means the guest can forge.
 
-Grading is host-owned. The load-bearing facts are the bridge captures: the
-positive control MUST be forwarded and NO spoofed frame may reach the bridge.
-The `ip addr add` error and the capability masks are guest-reported diagnostics
-that EXPLAIN the silence; they can withhold the reassuring verdict (an absent
-control, or a spoofed frame on the wire, forces INCONCLUSIVE or the alarming
-"spoof possible") but they never award it on their own. A guest that could
-spoof and chose to would be caught on the wire regardless of what it reports.
+Grading is host-owned and has no "denied" outcome. A foreign source on the
+bridge is SPOOF CONFIRMED. A forging capability in any set is SPOOF CAPABLE. If
+neither holds, the verdict is NOT PROVEN DENIED — because IP_FREEBIND was not
+exercised, so absence of a capability and of a captured frame does not rule
+spoofing out. The `ip addr add` error and the capability masks are
+guest-reported diagnostics; the bridge capture is the one host-owned fact, and
+a guest that forged and sent would be caught on it regardless of what it reports.
 
 This is a measurement, not a proof: exit status is 0 whenever the measurement
 completed, and the verdict is printed. See
@@ -357,9 +360,10 @@ start_capture() {
 # Decode a guest's /proc/self/status (read from file $1) HERE on the host, never
 # in the guest: whether CAP_NET_ADMIN (bit 12) and CAP_NET_RAW (bit 13) are
 # present in the effective, permitted, and bounding sets. Prints, on the last
-# line, a machine verdict: "CAPS <net_admin_bnd> <net_raw_bnd> <net_admin_eff>
-# <net_raw_eff>" with yes/no fields, and human lines before it. Fails only if
-# the status text carries no Cap* lines at all (a garbled read).
+# line, a machine verdict: "CAPS <eff_admin> <eff_raw> <prm_admin> <prm_raw>
+# <bnd_admin> <bnd_raw>" with yes/no fields, and the per-set human lines before
+# it on stderr. Fails unless CapEff, CapPrm and CapBnd are all present, so a
+# truncated status cannot be read as "capability absent".
 decode_caps() {
   python3 - "$1" <<'PY'
 import re
@@ -373,33 +377,40 @@ for name in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
     m = re.search(rf"^{name}:\s*([0-9A-Fa-f]+)", text, re.MULTILINE)
     if m:
         sets[name] = int(m.group(1), 16)
-if not sets:
-    print("no Cap* lines in /proc/self/status", file=sys.stderr)
-    raise SystemExit(1)
 
 
 def has(mask, bit):
     return "yes" if (mask >> bit) & 1 else "no"
 
 
+# Require every verdict-bearing field: a truncated status that dropped CapBnd or
+# CapEff must be an error, not a silent zero that could read as "capability
+# absent" and award a reassuring verdict on unknown evidence.
+required = ("CapEff", "CapPrm", "CapBnd")
+missing = [name for name in required if name not in sets]
+if missing:
+    print(f"missing capability field(s) in the status document: {', '.join(missing)}", file=sys.stderr)
+    raise SystemExit(1)
+
 # Human-readable lines to stderr (shown to the operator); only the machine
 # verdict goes to stdout, so the caller captures exactly one line.
-for name in ("CapEff", "CapPrm", "CapBnd"):
-    if name in sets:
-        print(
-            f"  {name}=0x{sets[name]:016x} "
-            f"NET_ADMIN={has(sets[name], CAP_NET_ADMIN)} "
-            f"NET_RAW={has(sets[name], CAP_NET_RAW)}",
-            file=sys.stderr,
-        )
-bnd = sets.get("CapBnd", 0)
-eff = sets.get("CapEff", 0)
-# Absent from the bounding set means the process can never regain the cap, even
-# after a setuid or capset; that is the security-relevant fact.
+for name in required:
+    print(
+        f"  {name}=0x{sets[name]:016x} "
+        f"NET_ADMIN={has(sets[name], CAP_NET_ADMIN)} "
+        f"NET_RAW={has(sets[name], CAP_NET_RAW)}",
+        file=sys.stderr,
+    )
+# Emit all three held sets, not just the bounding set: a cap in the effective
+# set is usable immediately and one in the permitted set can be raised into
+# effective, so "the guest cannot forge" needs the cap absent from every set —
+# and even that does not prove it (IP_FREEBIND needs no capability; the verdict
+# accounts for that). Order: eff, prm, bnd; NET_ADMIN then NET_RAW in each.
 print(
     "CAPS "
-    f"{has(bnd, CAP_NET_ADMIN)} {has(bnd, CAP_NET_RAW)} "
-    f"{has(eff, CAP_NET_ADMIN)} {has(eff, CAP_NET_RAW)}"
+    f"{has(sets['CapEff'], CAP_NET_ADMIN)} {has(sets['CapEff'], CAP_NET_RAW)} "
+    f"{has(sets['CapPrm'], CAP_NET_ADMIN)} {has(sets['CapPrm'], CAP_NET_RAW)} "
+    f"{has(sets['CapBnd'], CAP_NET_ADMIN)} {has(sets['CapBnd'], CAP_NET_RAW)}"
 )
 PY
 }
@@ -437,9 +448,11 @@ send_datagram() {
 
   # -w 1: BusyBox nc otherwise waits for a reply that never comes. Its exit
   # status is diagnostic; whether a frame left the guest is decided from the TX
-  # counter and the capture, not from nc. Sending from an unconfigured source
-  # fails to bind, which is exactly what we want to observe when the alias add
-  # was denied.
+  # counter and the capture, not from nc. A foreign source that was not
+  # configured (the NET_ADMIN alias was denied) fails to bind here — but nc does
+  # NOT set IP_FREEBIND, which would let an unprivileged process bind it anyway,
+  # so this bind failure is not evidence the guest cannot spoof, only that the
+  # NET_ADMIN route is closed. The verdict never reads it as denial.
   local nc_err="${TMP_DIR}/nc-${name}.err"
   set +e
   guest_in "$VM_NAME" "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}" 2>"$nc_err"
@@ -519,7 +532,7 @@ log "starting runner-managed VM ${VM_NAME} on ${IPV4_CIDR} under ${IPV6_MODE}"
   --broker-port-max "$BROKER_PORT_MAX" \
   --image "$IMAGE" \
   --ipv6-mode "$IPV6_MODE" \
-  -- sh -c 'cat /proc/self/status >/tmp/writ-workload-status 2>/dev/null; printf probe-released >/tmp/writ-agent-vm-released; sleep 600' \
+  -- sh -c 'cat /proc/$$/status >/tmp/writ-workload-status 2>/dev/null; printf probe-released >/tmp/writ-agent-vm-released; sleep 600' \
   | tee "$START_OUTPUT"
 grep -Fxq "session_id=${SESSION_ID}" "$START_OUTPUT" || die "runner did not print expected session ID"
 wait_for_released_guest_command
@@ -536,10 +549,11 @@ start_capture
 # --- capability readout: the mechanistic reason the guest cannot spoof. Read
 # the raw status from the guest (untrusted input) and decode it on the host.
 STATUS_FILE="${TMP_DIR}/guest-status.txt"
-# Read the WORKLOAD's own /proc/self/status, captured by the guest command at
-# its startup (see the runner invocation above), not an exec'd process: a
-# `container exec` sibling could in principle carry a different capability set,
-# and the agent runs as this workload, so these are the caps that matter.
+# Read the WORKLOAD's own capabilities: the guest command captured its shell's
+# /proc/$$/status at startup (see the runner invocation above). Not an exec'd
+# `container exec` sibling and not the spawned `cat` (/proc/self would be cat's
+# own), either of whose capability sets could differ; the agent runs as this
+# workload shell, so these are the caps that matter.
 guest_in "$VM_NAME" 'cat /tmp/writ-workload-status' >"$STATUS_FILE" 2>/dev/null \
   || die "could not read the workload's captured /proc/self/status"
 [[ -s "$STATUS_FILE" ]] || die "the workload's captured /proc/self/status is empty"
@@ -548,8 +562,8 @@ log "guest workload capability posture (effective uid ${GUEST_UID:-?}, from the 
 # decode_caps prints the per-set human lines to stderr (shown above the verdict)
 # and exactly the "CAPS ..." machine line to stdout, which we capture and split.
 CAPS_LINE="$(decode_caps "$STATUS_FILE")" \
-  || die "could not decode the guest capability masks"
-read -r _ CAP_NET_ADMIN_BND CAP_NET_RAW_BND CAP_NET_ADMIN_EFF CAP_NET_RAW_EFF <<<"$CAPS_LINE"
+  || die "could not decode the guest capability masks (missing or garbled Cap* fields); nothing is graded"
+read -r _ EFF_ADMIN EFF_RAW PRM_ADMIN PRM_RAW BND_ADMIN BND_RAW <<<"$CAPS_LINE"
 
 # --- positive control: the guest's own-source frame MUST reach the bridge, or
 # the capture is not observing the wire and no silence below means anything.
@@ -586,33 +600,38 @@ FOREIGN_ON_BRIDGE="no"
 if [[ "$FOREIGN_BRIDGE_SRC" != "-" ]] && ! addr_in_cidr "$IPV4_CIDR" "$FOREIGN_BRIDGE_SRC"; then
   FOREIGN_ON_BRIDGE="yes"
 fi
-caps_denied="no"
-if [[ "$CAP_NET_ADMIN_BND" == "no" && "$CAP_NET_RAW_BND" == "no" ]]; then
-  caps_denied="yes"
+# A forging capability is available if NET_ADMIN or NET_RAW is in ANY held set:
+# effective (usable now), permitted (raisable into effective), or bounding
+# (reacquirable after a capset). Keying on the bounding set alone would miss a
+# cap that is effective now but dropped from the bounding set — a legal state.
+forge_cap_held="no"
+if [[ "$EFF_ADMIN" == "yes" || "$EFF_RAW" == "yes" \
+   || "$PRM_ADMIN" == "yes" || "$PRM_RAW" == "yes" \
+   || "$BND_ADMIN" == "yes" || "$BND_RAW" == "yes" ]]; then
+  forge_cap_held="yes"
 fi
 
 log "results (host-observed unless noted):"
 log "  positive control: own source ${GUEST_IPV4} seen on ${SESSION_BRIDGE} as ${CONTROL_BRIDGE_SRC}"
 log "  spoof attempt: ip addr add ${FOREIGN_SOURCE}/32 -> ${FOREIGN_ADD_OK} [${FOREIGN_ADD_OUT:-<no output>}] (guest-reported)"
 log "  spoof attempt: foreign source on ${SESSION_BRIDGE} -> ${FOREIGN_BRIDGE_SRC} (host-owned)"
-log "  CapBnd: NET_ADMIN=${CAP_NET_ADMIN_BND} NET_RAW=${CAP_NET_RAW_BND}; CapEff: NET_ADMIN=${CAP_NET_ADMIN_EFF} NET_RAW=${CAP_NET_RAW_EFF} (guest-reported, host-decoded)"
+log "  NET_ADMIN eff=${EFF_ADMIN} prm=${PRM_ADMIN} bnd=${BND_ADMIN}; NET_RAW eff=${EFF_RAW} prm=${PRM_RAW} bnd=${BND_RAW} (workload /proc status, host-decoded)"
 
 # --- verdict (host-owned). The bridge is the arbiter: it sits after vmnet and
 # before PF, so a foreign source on it is a real spoofed frame regardless of
-# what the guest reports, and its absence (with the control present) means no
-# spoof escaped in this run. The capabilities explain why.
+# what the guest reports. Crucially, the capability posture can only ever
+# CONFIRM spoofing (a held cap, or a frame on the wire), never DENY it: source
+# forgery needs no capability at all — IP_FREEBIND (or the ip_nonlocal_bind
+# sysctl) lets an unprivileged process bind a foreign source — and this probe's
+# BusyBox nc sender does not enable IP_FREEBIND, so its silence is not evidence
+# of inability. So there is no "denied" verdict; the reassuring end state is
+# only reachable by the host-side interface-scoped rules (C2b), not here.
 if [[ "$FOREIGN_ON_BRIDGE" == "yes" ]]; then
-  log "VERDICT: SPOOF POSSIBLE — a frame carrying the out-of-subnet source ${FOREIGN_BRIDGE_SRC} reached the host bridge. The capability model did NOT prevent source forgery here (CapBnd NET_ADMIN=${CAP_NET_ADMIN_BND} NET_RAW=${CAP_NET_RAW_BND}, add=${FOREIGN_ADD_OK}). The source-scoped IPv4 rules face a real out-of-subnet frame: plan 'Beyond E3' question 4 is live and stage C2b (interface-scoped rules) is warranted. Investigate why the workload could spoof."
-elif [[ "$caps_denied" == "yes" && "$FOREIGN_ADD_OK" != "yes" ]]; then
-  log "VERDICT: CAPABILITY-DENIED — the guest workload lacks CAP_NET_ADMIN and CAP_NET_RAW in its bounding set (so root cannot reacquire them), \`ip addr add\` was refused, and no out-of-subnet frame reached the host bridge while the own-source control did. A compromised root agent cannot build an IPv4 frame with a spoofed source, so the source-scoped session rules never face one. This is the answer to plan 'Beyond E3' question 4 for this launch path: source spoofing is prevented below vmnet and PF, at the capability layer."
+  log "VERDICT: SPOOF CONFIRMED — a frame carrying the out-of-subnet source ${FOREIGN_BRIDGE_SRC} reached the host bridge, which the source-scoped IPv4 rules cannot match. Plan 'Beyond E3' question 4 is answered in the affirmative on the wire: stage C2b (interface-scoped rules) is warranted, and this is independent of the capability posture (NET_RAW eff=${EFF_RAW} bnd=${BND_RAW})."
+elif [[ "$forge_cap_held" == "yes" || "$FOREIGN_ADD_OK" == "yes" ]]; then
+  log "VERDICT: SPOOF CAPABLE — the workload holds or can reacquire a source-forging capability (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}, ip-addr-add=${FOREIGN_ADD_OK}), so it can build an out-of-subnet frame via a raw socket even though this run did not observe one escape onto the bridge (nc alone cannot bind a foreign source without NET_ADMIN or IP_FREEBIND). Source spoofing is possible; the source-scoped rules do not cover it, so stage C2b (interface-scoped rules) is warranted. Do NOT read the bridge silence as denial."
 else
-  # Fail-closed catch-all: no spoofed frame was seen this run, but the guest
-  # holds or could reacquire a forging capability (CapBnd shows one, or the
-  # alias add succeeded), or the two disagree (e.g. a forged /proc claiming the
-  # caps absent while the add worked). A post-vmnet observer's silence is not
-  # reassuring here — it may be nc, timing, or vmnet, none of which it can pin —
-  # so this is never read as denied.
-  log "VERDICT: CAPABILITY PRESENT — the guest holds, or could reacquire, a capability that enables source forgery (CapBnd NET_ADMIN=${CAP_NET_ADMIN_BND} NET_RAW=${CAP_NET_RAW_BND}, add=${FOREIGN_ADD_OK}), or the capability readout and the add result disagree, yet no spoofed frame was seen on the bridge this run. Treat source spoofing as possible and re-run the forwarding measurement; do NOT read this as denied."
+  log "VERDICT: NOT PROVEN DENIED — no forging capability was found in any set (NET_ADMIN eff/prm/bnd=${EFF_ADMIN}/${PRM_ADMIN}/${BND_ADMIN}, NET_RAW eff/prm/bnd=${EFF_RAW}/${PRM_RAW}/${BND_RAW}) and no spoofed frame reached the bridge, but this is NOT proof the guest cannot spoof: IP_FREEBIND lets an unprivileged process bind a foreign source, and this probe's BusyBox nc sender never enabled it. Re-run the wire test with an IP_FREEBIND (or raw-socket) sender before concluding anything; the only durable fix is the host-side interface-scoped rules (C2b)."
 fi
 
 cleanup
