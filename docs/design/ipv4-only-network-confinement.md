@@ -23,8 +23,9 @@ subsystem; this document is the security argument and the target state.
 The agent controls arbitrary guest userland code, including code that starts as
 UID 0 under the current image. It may make arbitrary syscalls, spawn children,
 modify network configuration when its capability set permits that, and send raw
-packets when `CAP_NET_RAW` is present. Per `CLAUDE.md`, the guest is treated as
-compromised from the moment the agent command starts.
+packets when `CAP_NET_RAW` is present — which it is under the current image
+(measured; see the source-scoped delta below). Per `CLAUDE.md`, the guest is
+treated as compromised from the moment the agent command starts.
 
 The trusted computing base is:
 
@@ -72,8 +73,10 @@ More concretely:
 Today, `HostFirewallFinal` holds for host placement (layer 1) for IPv6, and
 for IPv4 traffic whose source is inside the session subnet; an out-of-subnet
 IPv4 source is not covered by the shipped rules (see the known deltas below),
-and whether vmnet forwards such a frame is unmeasured, so the current
-no-egress guarantee is qualified by exactly that until C2b lands.
+and the legacy workload can construct such a frame (it holds `CAP_NET_RAW`,
+measured); whether vmnet then forwards it is unmeasured, so the current
+no-egress guarantee is qualified by exactly that until `NET_RAW` is dropped or
+C2b lands.
 `GuestNetworkAuthorityRemoved` does not hold anywhere (layer 2 is unbuilt), and
 `BrokerInternalFirewallFinal` does not hold anywhere (layer 3 is unbuilt), which
 is why vm placement refuses new sessions (#396). `GuestIpv6Absent` is
@@ -167,16 +170,33 @@ not rediscovered. None reopens the bypass #288 closed.
   anchor is `pass in quick inet proto tcp from <agent /24> to <broker> port
   $broker_ports` and `block return in quick inet from <agent /24> to any`. A
   packet whose IPv4 source is outside the session subnet matches neither, and
-  falls through to whatever the host's default PF policy is. Linux lets even
-  an unprivileged process send a one-way UDP datagram with a foreign source
-  via `IP_FREEBIND`, so this does not need `CAP_NET_RAW`; whether such a frame
-  is forwarded by vmnet at all is unknown and must be measured, not assumed.
-  The target rules match the IPv4 allow and a default deny on the resolved
-  interfaces, exactly as the IPv6 deny already does, and the vertical proof
-  sends a spoofed-source probe. This is the one delta that is a possible live
-  gap under the legacy profile today rather than hardening; it is listed here
+  falls through to whatever the host's default PF policy is. Forging an outbound
+  IPv4 source on Linux needs a capability — `CAP_NET_RAW` (raw / AF_PACKET
+  socket) or `CAP_NET_ADMIN` (`IP_TRANSPARENT`, or an address alias). It is NOT
+  achievable unprivileged: `IP_FREEBIND` (and the `ip_nonlocal_bind` sysctl)
+  relaxes `bind(2)` only, and the output route lookup then rejects a nonlocal
+  source with `ENETUNREACH` (verified on Linux 6.18) unless `FLOWI_FLAG_ANYSRC`
+  is set, which only `IP_TRANSPARENT` or a raw socket do. The target rules match
+  the IPv4 allow and a default deny on the resolved interfaces, exactly as the
+  IPv6 deny already does. This is the one delta that is a possible live gap
+  under the legacy profile today rather than hardening; it is listed here
   because the fix is the same interface-scoped renderer the locked profile
   needs, and it is not blocked on any of layers 2 or 3.
+
+  Measured 2026-09-08 (macOS 26.6 build 25G72, Apple `container` 1.0.0,
+  `alpine:latest` digest
+  `sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b`), by
+  a host `container exec` read of the released workload's `/proc/<pid>/status`:
+  `CapEff`/`CapPrm`/`CapBnd` carry `NET_RAW` and not `NET_ADMIN` — Apple
+  `container`'s default capability set, since the legacy launch passes no
+  `--cap-*` flags. So the legacy workload can forge an out-of-subnet source via a
+  raw socket (`IP_FREEBIND` is bind-only — verified, a nonlocal-source UDP send
+  returns `ENETUNREACH` — so `NET_RAW`/`NET_ADMIN` are the sender-side boundary);
+  whether vmnet then forwards such a frame onto the host bridge is still
+  unmeasured. Either mitigation closes it, and the locked profile carries both:
+  `--cap-drop NET_RAW` on the launch (`capability_argv.rs` never grants it), or
+  the interface-scoped renderer (C2b) which drops the frame at the host however
+  it was produced. The legacy launch could drop `NET_RAW` today.
 - **`ifconfig` text.** Resolution parses `ifconfig` output rather than a
   `getifaddrs` snapshot. The parser is pure and property-tested
   (`parse_bridge_for_gateway`); replacing it is not a security item.
