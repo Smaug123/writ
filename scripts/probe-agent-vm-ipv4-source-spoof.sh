@@ -100,11 +100,15 @@ Requires:
   - macOS with Apple container installed and `container system start` already run
   - root privileges through sudo for pfctl and tcpdump
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
-  - no other writ session anchor loaded: every child of that wildcard is
-    evaluated for every bridge, so another session's source-scoped deny
-    (above all one on the sibling /24) would confound both guests. The
-    script refuses to start while any exists, and polls the anchor list
-    every 0.2s across the probe windows, failing the run if one appears
+  - no other writ session anchor with rules loaded: every rule-bearing child
+    of that wildcard is evaluated for every bridge, so another session's
+    source-scoped deny (above all one on the sibling /24) would confound both
+    guests. A bare, rule-less anchor node lingers forever once created (pfctl
+    never deletes an emptied anchor; neither `-F all` nor a ruleset reload
+    removes the node, only disabling PF or a reboot does), and holds no rule
+    to confound anything, so the script keys on rules, not node existence: it
+    refuses to start while any rule-bearing child exists, and polls the anchor
+    list every 0.2s across the probe windows, failing the run if one appears
     or if this run's own anchor loses its IPv4 deny.
     An anchor that comes and goes within one poll interval is the residual
     gap: PF offers no exclusivity primitive, so do not run this alongside
@@ -426,14 +430,40 @@ require_guest_tooling() {
     || die "guest nc does not support -s ADDR; the probe needs a source-selectable sender"
 }
 
-# Child anchors currently loaded under writ/session, one per line. The
-# targeted `-a writ/session -sA` query is the one that can see children:
-# root `pfctl -sA` lists only directly-attached top-level anchors, not
-# `writ/session/<child>`. So its failure is fatal, not ignorable — a missed
-# child would let a concurrent session contaminate the run. The root listing
-# is a belt-and-braces extra. Every child name counts, not only UUID-shaped
-# ones: the wildcard evaluates `writ/session/manual` too. An empty listing is
-# success (grep's 1 must not trip errexit through pipefail).
+# Keep only the writ/session child anchors (read from stdin, one per line)
+# that currently hold a rule; drop the rest. `$@` is the sudo invocation to use
+# (`sudo`, or `sudo -n` for the non-interactive watcher). Keys on stdout, never
+# the exit code: `pfctl -sr` exits non-zero on an empty anchor while printing
+# nothing, exactly as writ's own ensure_session_anchor_empty relies on, so the
+# `|| true` swallows that non-zero without hiding a real read. A bare anchor
+# NODE lingers forever once created — pfctl never deletes an emptied anchor, and
+# neither `pfctl -a <node> -F all` nor a main-ruleset reload removes the node;
+# only disabling PF or a reboot does — so node existence is not evidence of a
+# live session (writ's teardown flushes rules and declares the session gone
+# without removing the node). A rule under the node is what could confound, so
+# that is what we count. The `if`, not `[[ ]] && printf`, keeps a false test
+# from tripping errexit as the loop body's last command.
+filter_anchors_with_rules() {
+  local name rules
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    rules="$("$@" pfctl -a "$name" -sr 2>/dev/null || true)"
+    if [[ "$rules" == *[![:space:]]* ]]; then
+      printf '%s\n' "$name"
+    fi
+  done
+}
+
+# Child anchors under writ/session that hold rules, one per line. The targeted
+# `-a writ/session -sA` query is the one that can see children: root `pfctl -sA`
+# lists only directly-attached top-level anchors, not `writ/session/<child>`.
+# So its failure is fatal, not ignorable — a missed child would let a concurrent
+# session contaminate the run. The root listing is a belt-and-braces extra.
+# Every child name counts, not only UUID-shaped ones: the wildcard evaluates
+# `writ/session/manual` too. Each listed node is then filtered down to those
+# that actually hold rules, since an emptied node lingers forever and cannot
+# confound. An empty listing is success (grep's 1 must not trip errexit through
+# pipefail).
 existing_session_anchors() {
   local targeted
   # `if !` context, not `x=$(...); status=$?`: under set -e a failing command
@@ -442,7 +472,8 @@ existing_session_anchors() {
     die "could not list child anchors under writ/session (pfctl -a writ/session -sA failed); a concurrent session cannot be ruled out, so nothing is graded"
   fi
   { printf '%s\n' "$targeted"; sudo pfctl -sA 2>/dev/null; } \
-    | { grep -Eo 'writ/session/[^[:space:]]+' || true; } | sort -u
+    | { grep -Eo 'writ/session/[^[:space:]]+' || true; } | sort -u \
+    | filter_anchors_with_rules sudo
 }
 
 # Die unless this run's own anchor is loaded with its labelled IPv4 deny.
@@ -530,8 +561,14 @@ start_anchor_watch() {
       if (( status_a != 0 || status_n != 0 )); then
         printf '%s POLL-FAILURE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
       fi
+      # Only a child that holds rules can confound; a bare, rule-less node
+      # lingers forever and is harmless. `sudo -n` here cannot silently
+      # under-report: a creds lapse that empties this read also fails the
+      # enumeration above, which is recorded as POLL-FAILURE.
       others="$(printf '%s\n%s\n' "$listing_a" "$listing_b" \
-        | grep -Eo 'writ/session/[^[:space:]]+' | sort -u | grep -Fxv "$PF_ANCHOR")"
+        | grep -Eo 'writ/session/[^[:space:]]+' | sort -u \
+        | grep -Fxv "$PF_ANCHOR" \
+        | filter_anchors_with_rules sudo -n)"
       if [[ -n "$others" ]]; then
         printf '%s %s\n' "$(date +%H:%M:%S)" "$(tr '\n' ' ' <<<"$others")" >>"$ANCHOR_INTRUSIONS"
       fi
