@@ -26,6 +26,7 @@
 pub mod capability_argv;
 pub mod handoff;
 pub mod proc_status;
+pub mod record;
 
 /// The fixed unprivileged identity every locked workload runs as.
 ///
