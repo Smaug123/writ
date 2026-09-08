@@ -44,10 +44,14 @@ the workload NET_ADMIN/NET_RAW), then gathers three kinds of evidence:
       send from it. The host bridge MUST NOT see any frame carrying the foreign
       source. The guest's own error is captured as the mechanistic reason.
 
-  capability readout (guest-reported, host-parsed): the guest's
-      /proc/self/status is read and this script (never the guest) decodes the
-      CapEff / CapPrm / CapBnd masks, asserting CAP_NET_ADMIN and CAP_NET_RAW
-      are absent from the bounding set (so root cannot reacquire them).
+  capability readout (guest-reported, host-parsed): the workload captures its
+      OWN /proc/self/status at startup (not an exec'd sibling, whose cap set
+      could differ), and this script (never the guest) decodes the CapEff /
+      CapPrm / CapBnd masks. Both CAP_NET_ADMIN and CAP_NET_RAW absent from the
+      bounding set would mean the agent can never forge a source; measured on
+      the current ipv4-only-no-guest-ipv6 mode, NET_ADMIN is absent but NET_RAW
+      is present (Apple's default cap set), so a raw socket still can, and the
+      verdict says CAPABILITY PRESENT rather than denied.
 
 Grading is host-owned. The load-bearing facts are the bridge captures: the
 positive control MUST be forwarded and NO spoofed frame may reach the bridge.
@@ -515,7 +519,7 @@ log "starting runner-managed VM ${VM_NAME} on ${IPV4_CIDR} under ${IPV6_MODE}"
   --broker-port-max "$BROKER_PORT_MAX" \
   --image "$IMAGE" \
   --ipv6-mode "$IPV6_MODE" \
-  -- sh -c 'printf probe-released >/tmp/writ-agent-vm-released; sleep 600' \
+  -- sh -c 'cat /proc/self/status >/tmp/writ-workload-status 2>/dev/null; printf probe-released >/tmp/writ-agent-vm-released; sleep 600' \
   | tee "$START_OUTPUT"
 grep -Fxq "session_id=${SESSION_ID}" "$START_OUTPUT" || die "runner did not print expected session ID"
 wait_for_released_guest_command
@@ -532,10 +536,15 @@ start_capture
 # --- capability readout: the mechanistic reason the guest cannot spoof. Read
 # the raw status from the guest (untrusted input) and decode it on the host.
 STATUS_FILE="${TMP_DIR}/guest-status.txt"
-guest_in "$VM_NAME" 'cat /proc/self/status' >"$STATUS_FILE" 2>/dev/null \
-  || die "could not read /proc/self/status in the guest"
-GUEST_UID="$(guest_in "$VM_NAME" 'id -u' 2>/dev/null | tr -d '[:space:]')"
-log "guest workload capability posture (uid ${GUEST_UID:-?}; decoded on the host):"
+# Read the WORKLOAD's own /proc/self/status, captured by the guest command at
+# its startup (see the runner invocation above), not an exec'd process: a
+# `container exec` sibling could in principle carry a different capability set,
+# and the agent runs as this workload, so these are the caps that matter.
+guest_in "$VM_NAME" 'cat /tmp/writ-workload-status' >"$STATUS_FILE" 2>/dev/null \
+  || die "could not read the workload's captured /proc/self/status"
+[[ -s "$STATUS_FILE" ]] || die "the workload's captured /proc/self/status is empty"
+GUEST_UID="$(awk '/^Uid:/{print $3; exit}' "$STATUS_FILE")"
+log "guest workload capability posture (effective uid ${GUEST_UID:-?}, from the workload's own /proc/self/status; decoded on the host):"
 # decode_caps prints the per-set human lines to stderr (shown above the verdict)
 # and exactly the "CAPS ..." machine line to stdout, which we capture and split.
 CAPS_LINE="$(decode_caps "$STATUS_FILE")" \

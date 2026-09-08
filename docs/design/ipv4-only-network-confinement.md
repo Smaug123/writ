@@ -177,6 +177,19 @@ not rediscovered. None reopens the bypass #288 closed.
   gap under the legacy profile today rather than hardening; it is listed here
   because the fix is the same interface-scoped renderer the locked profile
   needs, and it is not blocked on any of layers 2 or 3.
+
+  Measured 2026-09-08 (`scripts/probe-agent-vm-ipv4-source-spoof.sh`, on
+  hardware): the current `ipv4-only-no-guest-ipv6` workload runs with
+  `CapEff`/`CapBnd` `NET_ADMIN=no`, `NET_RAW=yes` (Apple `container`'s default
+  cap set; read from the workload's own `/proc/self/status`). So `ip addr add`
+  is refused, but a raw socket (`NET_RAW`) can forge a source — and, as above,
+  `IP_FREEBIND` can even without it. The sender-side spoof is therefore
+  confirmed feasible on the shipped mode; what remains unmeasured is whether
+  vmnet forwards such a frame onto the host bridge (the probe's alias-based
+  sender needs the absent `NET_ADMIN`, so it establishes the capability posture
+  only — a raw-socket / `IP_FREEBIND` sender is the next step). Note dropping
+  `NET_RAW` would not close the `IP_FREEBIND` route, so the fix remains the
+  interface-scoped renderer (C2b), not capability tightening.
 - **`ifconfig` text.** Resolution parses `ifconfig` output rather than a
   `getifaddrs` snapshot. The parser is pure and property-tested
   (`parse_bridge_for_gateway`); replacing it is not a security item.
