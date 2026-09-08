@@ -292,7 +292,10 @@ assert_released_workload_lacks_net_admin_and_net_raw() {
   assert_capability_decoder_works
   # Positive control on the target: PID 1 must be the released guest command,
   # not the prelaunch gate or an init shim, or the masks describe the wrong
-  # process.
+  # process. The released command is a `while :; do sleep; done` loop, not a
+  # bare `sleep`, precisely so BusyBox ash does not tail-exec it away and
+  # PID 1's cmdline keeps the marker (capabilities are preserved across any
+  # exec regardless, so /proc/1/status is the workload's posture either way).
   guest 'tr "\0" " " </proc/1/cmdline | grep -q lifecycle-released' \
     || die "guest PID 1 is not the released guest command"
   local status
@@ -360,11 +363,14 @@ assert_pf_anchor_has_ipv6_interface_deny() {
 # reacquire a vmnet-RA ULA after release. Prove the *host* PF interface deny
 # still blocks its IPv6 egress, so the bypass is closed at a layer the guest
 # cannot touch.
-# The packet counter of the session anchor's interface-scoped IPv6 deny, read
-# on the host from `pfctl -vsr`, which renders each rule followed by an indented
-# `[ Evaluations: N Packets: N Bytes: N States: N ]` line. Dies unless exactly
-# that rule renders with a counter, so a format drift fails the proof rather
-# than reading as zero.
+# The summed packet counter of the session anchor's interface-scoped IPv6
+# denies, read on the host from `pfctl -vsr`, which renders each rule followed
+# by an indented `[ Evaluations: N Packets: N Bytes: N States: N ]` line. The
+# firewall installs a separate `block ... inet6 all` per interface (the bridge
+# AND each vmenet member), and PF may drop the probe on any of them, so this
+# aggregates the Packets counters of ALL matching denies. Dies unless at least
+# one such rule renders with a counter, so a format drift fails the proof
+# rather than reading as zero.
 pf_ipv6_iface_deny_packets() {
   local rules
   rules="$(sudo pfctl -a "$PF_ANCHOR" -vsr 2>/dev/null)" \
@@ -372,11 +378,14 @@ pf_ipv6_iface_deny_packets() {
   local count
   count="$(printf '%s\n' "$rules" | awk '
     /^block .* on (bridge|vmenet)[0-9]+ inet6 all/ { rule = 1; next }
-    rule && match($0, /Packets: [0-9]+/) { print substr($0, RSTART + 9, RLENGTH - 9); exit }
+    rule && match($0, /Packets: [0-9]+/) {
+      total += substr($0, RSTART + 9, RLENGTH - 9); matched = 1; rule = 0; next
+    }
     /^[^ \t[]/ { rule = 0 }
+    END { if (matched) print total }
   ')"
   [[ "$count" =~ ^[0-9]+$ ]] \
-    || die "could not read the IPv6 interface deny's packet counter from pfctl -vsr for ${PF_ANCHOR}"
+    || die "no IPv6 interface deny with a packet counter rendered in pfctl -vsr for ${PF_ANCHOR}"
   printf '%s\n' "$count"
 }
 
@@ -546,7 +555,7 @@ log "starting runner-managed VM ${VM_NAME} on ${IPV4_CIDR}"
   --broker-port-max "$BROKER_PORT_MAX" \
   --image "$IMAGE" \
   --ipv6-mode "$IPV6_MODE" \
-  -- sh -c 'printf lifecycle-released >/tmp/writ-agent-vm-released; sleep 600' \
+  -- sh -c 'printf lifecycle-released >/tmp/writ-agent-vm-released; while :; do sleep 600; done' \
   | tee "$START_OUTPUT"
 
 grep -Fxq "session_id=${SESSION_ID}" "$START_OUTPUT" || die "runner did not print expected session ID"
