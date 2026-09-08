@@ -192,9 +192,11 @@ not rediscovered. None reopens the bypass #288 closed.
   bind-only — and the interface-scoped renderer (C2b) drops an out-of-subnet
   frame at the host regardless of how it was produced, covering any future mode
   that grants a forging cap. Either suffices; the current mode has neither for
-  the IPv4 source, so it is exposed. Still unmeasured: whether vmnet actually
-  forwards such a frame onto the host bridge (a raw-socket sender in the guest
-  is the remaining wire test; the probe's `nc`/alias sender needs the absent
+  the IPv4 source, so it is a *possible* live gap — the workload can construct
+  the frame, but whether it is exposed depends on whether vmnet forwards a
+  frame with an out-of-subnet source, which is still unmeasured (a raw-socket
+  sender in the guest is the remaining wire test; the probe's `nc`/alias sender
+  needs the absent
   `NET_ADMIN`, so today it establishes only the capability posture).
 - **`ifconfig` text.** Resolution parses `ifconfig` output rather than a
   `getifaddrs` snapshot. The parser is pure and property-tested
