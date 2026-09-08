@@ -516,8 +516,10 @@ E3's proof is where the answers get recorded, as pinned facts about the
    forwarding: measure it with a raw-socket sender inside
    `scripts/prove-agent-vm-lifecycle.sh` once C3's labelled deny counter exists,
    grading on that counter and/or a pcap-header parse of the bridge, with a
-   positive control. Independently, the legacy launch can `--cap-drop NET_RAW`
-   now to remove the sender-side capability regardless of the vmnet answer.
+   positive control. Independently, the legacy launch now passes `--cap-drop
+   NET_RAW` (#402), removing the sender-side capability regardless of the
+   vmnet answer; a raw-socket sender for that measurement therefore has to run
+   from a separately launched probe container, not the session's workload.
 5. **What does `pfctl -sr` readback look like for a loaded session anchor on
    this platform** (rule order, label rendering, counter formatting)? C2 and
    C3 are written against the documented format; the proof confirms it.

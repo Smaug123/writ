@@ -66,6 +66,26 @@ const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
     "exec \"$@\"",
 );
 
+/// The `container run` capability arguments for the
+/// [`Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6`] launch.
+///
+/// Apple `container`'s default Linux capability set carries `CAP_NET_RAW`
+/// (measured 2026-09-08; see the source-scoped delta in
+/// `docs/design/ipv4-only-network-confinement.md`). The session's PF anchor
+/// scopes its IPv4 rules by *source* subnet, and forging an out-of-subnet IPv4
+/// source on Linux needs `CAP_NET_RAW` (raw / `AF_PACKET` socket) or
+/// `CAP_NET_ADMIN` (`IP_TRANSPARENT`); `IP_FREEBIND` is bind-only. The default
+/// set never holds `NET_ADMIN`, so dropping `NET_RAW` removes the sender-side
+/// capability for that forgery. Nothing the guest runs needs a raw socket: the
+/// boot-time egress gate probes with TCP (`/dev/tcp`), and the agent's own
+/// traffic is TCP to the broker.
+///
+/// This is the legacy profile's one capability edit; the locked profile
+/// (`writ_guest_init::capability_argv`) drops `ALL` and never adds `NET_RAW`
+/// back. The spelling is the one `container run --cap-drop` accepts with or
+/// without a `CAP_` prefix; the locked profile uses the unprefixed form too.
+const IPV4_ONLY_CAPABILITY_ARGV: [&str; 2] = ["--cap-drop", "NET_RAW"];
+
 /// Under [`Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6`], the guest's start sequence
 /// runs this in the guest: it first *enforces* "no guest IPv6" by disabling
 /// IPv6 in the guest kernel, then reports the resulting state for

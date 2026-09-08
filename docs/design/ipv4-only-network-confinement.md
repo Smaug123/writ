@@ -23,9 +23,10 @@ subsystem; this document is the security argument and the target state.
 The agent controls arbitrary guest userland code, including code that starts as
 UID 0 under the current image. It may make arbitrary syscalls, spawn children,
 modify network configuration when its capability set permits that, and send raw
-packets when `CAP_NET_RAW` is present — which it is under the current image
-(measured; see the source-scoped delta below). Per `CLAUDE.md`, the guest is
-treated as compromised from the moment the agent command starts.
+packets when `CAP_NET_RAW` is present — which it was under the platform default
+set until the IPv4-only launch dropped it (#402; see the source-scoped delta
+below). Per `CLAUDE.md`, the guest is treated as compromised from the moment
+the agent command starts.
 
 The trusted computing base is:
 
@@ -72,11 +73,11 @@ More concretely:
 
 Today, `HostFirewallFinal` holds for host placement (layer 1) for IPv6, and
 for IPv4 traffic whose source is inside the session subnet; an out-of-subnet
-IPv4 source is not covered by the shipped rules (see the known deltas below),
-and the legacy workload can construct such a frame (it holds `CAP_NET_RAW`,
-measured); whether vmnet then forwards it is unmeasured, so the current
-no-egress guarantee is qualified by exactly that until `NET_RAW` is dropped or
-C2b lands.
+IPv4 source is not covered by the shipped rules (see the known deltas below).
+The legacy workload could construct such a frame while it held `CAP_NET_RAW`
+(measured); the IPv4-only launch now drops it (#402), so the sender-side
+capability is gone and the remaining question — whether vmnet would forward
+such a frame at all — is defence in depth for C2b rather than a live gap.
 `GuestNetworkAuthorityRemoved` does not hold anywhere (layer 2 is unbuilt), and
 `BrokerInternalFirewallFinal` does not hold anywhere (layer 3 is unbuilt), which
 is why vm placement refuses new sessions (#396). `GuestIpv6Absent` is
@@ -196,7 +197,18 @@ not rediscovered. None reopens the bypass #288 closed.
   unmeasured. Either mitigation closes it, and the locked profile carries both:
   `--cap-drop NET_RAW` on the launch (`capability_argv.rs` never grants it), or
   the interface-scoped renderer (C2b) which drops the frame at the host however
-  it was produced. The legacy launch could drop `NET_RAW` today.
+  it was produced. The legacy launch now carries the first (#402):
+  `IPV4_ONLY_CAPABILITY_ARGV` in `src/agent_vm_lifecycle.rs` adds `--cap-drop
+  NET_RAW` to the `Ipv4OnlyNoGuestIpv6` `container run`, and
+  `scripts/prove-agent-vm-lifecycle.sh` asserts the released workload's
+  `/proc/1/status` holds neither `NET_ADMIN` nor `NET_RAW` in any of its five
+  capability sets. Nothing in the guest needs a raw socket: the egress gate
+  probes over TCP and the agent's traffic is TCP to the broker. The one caller
+  that did was the lifecycle proof's own ICMPv6 backstop probe (busybox
+  `ping6` opens a raw socket, and `container exec` inherits the container's
+  capability set), which now sends a plain IPv6 TCP connect with `wget` and
+  grades it on the host's deny-rule packet counter from `pfctl -vsr` instead of
+  the guest's exit code.
 - **`ifconfig` text.** Resolution parses `ifconfig` output rather than a
   `getifaddrs` snapshot. The parser is pure and property-tested
   (`parse_bridge_for_gateway`); replacing it is not a security item.
