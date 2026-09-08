@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Associative arrays below need bash 4+; macOS's /bin/bash is 3.2. The Nix
-# dev shell (and Homebrew) provide a modern bash on PATH.
+# macOS's /bin/bash is 3.2; run from a modern bash (the Nix dev shell, or
+# Homebrew) so `local -n`-free code below still gets a 4+ `read`/`printf`.
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
   printf '[probe-ipv4-spoof] error: bash %s is too old; run from `nix develop` (bash 4+ required)\n' "$BASH_VERSION" >&2
   exit 1
@@ -12,120 +12,64 @@ usage() {
   cat <<'EOF'
 Usage: scripts/probe-agent-vm-ipv4-source-spoof.sh
 
-Measures, on real hardware, what happens to an IPv4 frame the agent guest
-sends with a source address outside its session subnet.
+Measures, on real hardware, whether a compromised root agent in a writ session
+guest can emit an IPv4 frame with a *spoofed* source address (one outside the
+address it was assigned).
 
-Why: the session PF anchor's IPv4 rules are matched on the session /24 as
-*source* (`pass in quick inet proto tcp from <agent /24> to <broker> ...` and
-`block return in quick inet from <agent /24> to any`). A frame whose source is
-not in that /24 matches neither rule and falls through to whatever the host's
-default PF policy is. Whether Apple's vmnet forwards such a frame at all is
-unknown; this script finds out. See docs/design/ipv4-only-network-confinement.md,
-"Known deltas from the target rules" and "Evidence protocol", and
-docs/plans/2026-09-01-ipv4-only-locked-v1.md, stage C2b and "Beyond E3"
-question 4.
+Why this, and not "does vmnet forward a spoofed frame": the session PF anchor's
+IPv4 rules match on the session /24 as *source*, so a frame whose source is
+outside that /24 would fall through them (plan "Beyond E3" question 4). But a
+frame has to exist before vmnet or PF can forward or filter it, and forging an
+IPv4 source needs a Linux capability: CAP_NET_ADMIN to add an address alias (or
+change routing) so a normal socket can bind a foreign source, or CAP_NET_RAW to
+open a raw / AF_PACKET socket that writes the header directly. Apple `container`
+runs the guest *workload* without either (writ's own locked profile
+additionally proves this: crates/writ-guest-init/src/capability_argv.rs grants
+NET_ADMIN only to PID 1 for the IPv6-sysctl handoff and drops it before the
+workload, and never grants NET_RAW). So the source-scoped rules never face an
+out-of-subnet frame from this guest: it cannot build one. This probe verifies
+that on hardware.
 
-This is a measurement, not a proof: it reports what it observed and a verdict,
-and its exit status is 0 whenever the measurement itself completed. It runs
-two guests from the same image:
+It starts one runner-managed guest exactly as prove-agent-vm-lifecycle.sh does
+(so it exercises the real launch path, and would catch a regression that handed
+the workload NET_ADMIN/NET_RAW), then gathers three kinds of evidence:
 
-  unconfined  a root guest on a network this script creates itself, with no
-              PF anchor. This is the evidence protocol's positive control: a
-              sender whose frames a capture on the same kind of bridge does
-              see, so that a session bridge's silence can mean something.
-  session     a runner-managed guest under the legacy ipv4-only profile,
-              exactly as prove-agent-vm-lifecycle.sh starts it. What it
-              observes is what the session rules do with the same frames.
+  positive control (host-owned): the guest sends a UDP datagram from its OWN
+      source; tcpdump on the session bridge (BPF, so it taps the interface
+      before PF filters) MUST see it. This proves the send path and the capture
+      both work, so the silence in the spoof attempts below means something.
 
-From each guest it sends a UDP datagram toward that guest's gateway, with
-three sources:
+  spoof attempts (guest acts, host observes): the guest tries to configure a
+      foreign source alias (`ip addr add`, which needs CAP_NET_ADMIN) and then
+      send from it. The host bridge MUST NOT see any frame carrying the foreign
+      source. The guest's own error is captured as the mechanistic reason.
 
-  control   the guest's own address: unconfined it MUST be forwarded onto the
-            bridge (the capture works), and under the session it MUST be
-            forwarded AND counted by the labelled IPv4 deny (the anchor is
-            denying in-subnet traffic). Anything else aborts the run.
-  foreign   an address outside every network the script knows about
-            (10.77.0.5/32 by default, added to eth0 by the root guest)
-  sibling   an address in a *different* session /24 of the broker's pool
-            (index SUBNET_INDEX+1, or SUBNET_INDEX-1 when the session holds
-            the pool's last /24), the cross-session case; skipped, and said
-            so, when the pool has only one /24
+  capability readout (guest-reported, host-parsed): the guest's
+      /proc/self/status is read and this script (never the guest) decodes the
+      CapEff / CapPrm / CapBnd masks, asserting CAP_NET_ADMIN and CAP_NET_RAW
+      are absent from the bounding set (so root cannot reacquire them).
 
-The design question ("Beyond E3" question 4) is whether vmnet forwards a
-frame whose IPv4 source is outside the session /24. Two host-owned observers
-answer it, neither reported by a guest:
-  - tcpdump on that guest's bridge: did vmnet put the frame on the host
-    bridge? BPF taps the interface before PF filters, so this is a vmnet fact
-    independent of any anchor. It correlates by the host-minted nonce in the
-    payload, not by source, and reports the source it saw: a platform that
-    anti-spoofs by REWRITING the source is a distinct outcome, not a drop.
-  - (session only) the anchor's labelled deny counter: it is aggregate and
-    not correlated to the probe's nonce, so it is diagnostic only — reported,
-    never decisive. A rise is at most consistent with this frame being denied.
+Grading is host-owned. The load-bearing facts are the bridge captures: the
+positive control MUST be forwarded and NO spoofed frame may reach the bridge.
+The `ip addr add` error and the capability masks are guest-reported diagnostics
+that EXPLAIN the silence; they can withhold the reassuring verdict (an absent
+control, or a spoofed frame on the wire, forces INCONCLUSIVE or the alarming
+"spoof possible") but they never award it on their own. A guest that could
+spoof and chose to would be caught on the wire regardless of what it reports.
 
-The result is deliberately asymmetric, because that one capture sits after
-vmnet and before PF and is the only trusted observer. The single conclusive,
-pinnable outcome is an out-of-/24 source physically on the host bridge: the
-source-scoped rules cannot match it, so that is the live gap C2b closes, and
-it holds however the source got there. Everything else is weaker:
-  - capture silent: cannot be told apart from a guest that never emitted the
-    spoof (emission of a spoofed frame rests only on the aggregate,
-    guest-reported TX counter), so it is INCONCLUSIVE, never "vmnet drops
-    spoofed sources".
-  - an in-subnet source on the bridge: the deny covers it and no out-of-subnet
-    frame was seen, but whether the guest failed to spoof (an nc that ignores
-    -s, guest-side rewriting) or vmnet rewrote the source in cannot be told
-    from a post-vmnet observer, so it is NO GAP OBSERVED, never proof that
-    vmnet anti-spoofs.
-C2b stays warranted unless a live gap is pinned; a trusted pre-vmnet observer,
-which this platform does not offer, would be needed to pin the reassuring
-readings. To keep even the gap reading sound, the probe refuses to run while
-any nat/rdr/binat rule is loaded in the main ruleset, since PF translation
-before the filter could rewrite the source the deny evaluates.
+This is a measurement, not a proof: exit status is 0 whenever the measurement
+completed, and the verdict is printed. See
+docs/design/ipv4-only-network-confinement.md ("Evidence protocol") and
+docs/plans/2026-09-01-ipv4-only-locked-v1.md ("Beyond E3" question 4).
 
-Note: an earlier draft also bound a host UDP listener at the gateway, but
-Apple's vmnet does not deliver guest UDP addressed to the gateway into host
-sockets (TCP to the broker works; UDP does not), so socket delivery could
-never be a signal even unconfined. Forwarding onto the bridge is the signal
-instead, and the design question is about forwarding in any case.
-
-One guest-side fact gates whether the capture's silence means anything:
-eth0's TX packet counter must have risen and nc must have printed nothing, or
-the guest is taken to have emitted nothing. A frame the capture saw was
-emitted whatever nc said afterwards (an ICMP port-unreachable, or PF's `block
-return`, can make nc report an error after the frame has left). Guest facts
-can withhold a verdict, never award one.
-
-Requires:
-  - macOS with Apple container installed and `container system start` already run
-  - root privileges through sudo for pfctl and tcpdump
-  - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
-  - no other writ session anchor with rules loaded: every rule-bearing child
-    of that wildcard is evaluated for every bridge, so another session's
-    source-scoped deny (above all one on the sibling /24) would confound both
-    guests. A bare, rule-less anchor node lingers forever once created (pfctl
-    never deletes an emptied anchor; neither `-F all` nor a ruleset reload
-    removes the node, only disabling PF or a reboot does), and holds no rule
-    to confound anything, so the script keys on rules, not node existence: it
-    refuses to start while any rule-bearing child exists, and polls the anchor
-    list every 0.2s across the probe windows, failing the run if one appears
-    or if this run's own anchor loses its IPv4 deny.
-    An anchor that comes and goes within one poll interval is the residual
-    gap: PF offers no exclusivity primitive, so do not run this alongside
-    anything that starts writ sessions.
-  - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
-    and a BusyBox nc that supports `-u` and `-s ADDR` (alpine:latest does)
-
-Environment overrides (same as prove-agent-vm-lifecycle.sh, plus two):
-  WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
-  WRIT_PROVE_IPV4_POOL   broker-owned IPv4 pool, default 192.168.0.0/16
-  WRIT_PROVE_IPV6_POOL   broker-owned IPv6 pool, default fd83:b6f2:e57::/48
-  WRIT_PROVE_SUBNET_INDEX  session subnet index, default 252
-  WRIT_PROVE_BROKER_PORT_MIN  minimum allowed broker port, default 49152
-  WRIT_PROVE_BROKER_PORT_MAX  maximum allowed broker port, default 65535
-  WRIT_PROBE_FOREIGN_SOURCE   out-of-pool source to spoof, default 10.77.0.5
-  WRIT_PROBE_CONTROL_SUBNET   /24 for the unconfined network, outside the
-                              pool, default 172.31.77.0/24
+Environment overrides:
+  WRIT_PROVE_IMAGE            guest image (default alpine:latest)
+  WRIT_PROVE_IPV4_POOL        session pool (default 192.168.0.0/16)
+  WRIT_PROVE_IPV6_POOL        session IPv6 pool (default fd83:b6f2:e57::/48)
+  WRIT_PROVE_SUBNET_INDEX     /24 index in the pool (default 252)
+  WRIT_PROVE_BROKER_PORT_MIN  broker/probe port range floor (default 49152)
+  WRIT_PROVE_BROKER_PORT_MAX  broker/probe port range ceiling (default 65535)
+  WRIT_PROBE_FOREIGN_SOURCE   out-of-pool source to attempt (default 10.77.0.5)
 EOF
 }
 
@@ -152,55 +96,35 @@ SUBNET_INDEX="${WRIT_PROVE_SUBNET_INDEX:-252}"
 BROKER_PORT_MIN="${WRIT_PROVE_BROKER_PORT_MIN:-49152}"
 BROKER_PORT_MAX="${WRIT_PROVE_BROKER_PORT_MAX:-65535}"
 FOREIGN_SOURCE="${WRIT_PROBE_FOREIGN_SOURCE:-10.77.0.5}"
-CONTROL_SUBNET="${WRIT_PROBE_CONTROL_SUBNET:-172.31.77.0/24}"
 IPV6_MODE="ipv4-only-no-guest-ipv6"
 SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 NETWORK_NAME="writ-agent-net-${SESSION_ID}"
 VM_NAME="writ-agent-vm-${SESSION_ID}"
-PF_ANCHOR="writ/session/${SESSION_ID}"
-CONTROL_NETWORK="writ-probe-ctl-net-${SESSION_ID}"
-CONTROL_VM="writ-probe-ctl-vm-${SESSION_ID}"
 BROKER_DIR="${TMP_DIR}/broker"
 START_OUTPUT="${TMP_DIR}/runner-start.txt"
 RUNNER=""
 HELPER=""
 BROKER_PID=""
-ANCHOR_WATCH_PID=""
-ANCHOR_INTRUSIONS=""
-ANCHOR_HEARTBEAT=""
-WATCH_START=""
 BROKER_PORT=""
 PROBE_PORT=""
 IPV4_CIDR=""
 IPV4_GATEWAY=""
-SIBLING_INDEX=""
-SIBLING_CIDR=""
-SIBLING_SOURCE=""
+GUEST_IPV4=""
+SESSION_BRIDGE=""
+CAPTURE_FILE=""
+CAPTURE_PID=""
 CARGO_CMD=()
 STOP_DONE=0
-CONTROL_STARTED=0
-cleanup_started=0
-# Per-target facts, keyed "session" / "unconfined": the guest, its gateway,
-# the host bridge its frames traverse, and the tcpdump capturing that bridge.
-declare -A TARGET_VM=() TARGET_GATEWAY=() TARGET_BRIDGE=() TARGET_CAPTURE=() TARGET_CAPTURE_PID=()
+CLEANUP_STARTED=0
 
 cleanup() {
-  if [[ "$cleanup_started" -eq 1 ]]; then
-    return
-  fi
-  cleanup_started=1
-  log "cleaning up VMs, networks, captures, and PF anchor"
+  [[ "$CLEANUP_STARTED" -eq 1 ]] && return
+  CLEANUP_STARTED=1
+  log "cleaning up VM, network, capture, broker, and PF anchor"
 
-  if [[ -n "$ANCHOR_WATCH_PID" ]]; then
-    kill "$ANCHOR_WATCH_PID" >/dev/null 2>&1 || true
-    wait "$ANCHOR_WATCH_PID" 2>/dev/null || true
+  if [[ -n "$CAPTURE_PID" ]]; then
+    sudo kill "$CAPTURE_PID" >/dev/null 2>&1 || true
   fi
-  # `${arr[@]+"${arr[@]}"}`: an empty array under `set -u` is an error on
-  # bash 4.0-4.3, and this runs from the EXIT trap after early failures.
-  local pid
-  for pid in ${TARGET_CAPTURE_PID[@]+"${TARGET_CAPTURE_PID[@]}"}; do
-    sudo kill "$pid" >/dev/null 2>&1 || true
-  done
 
   if [[ "$STOP_DONE" -eq 0 && -x "$RUNNER" ]]; then
     "$RUNNER" \
@@ -227,14 +151,6 @@ cleanup() {
 
   container network rm "$NETWORK_NAME" >/dev/null 2>&1 || \
     container network delete "$NETWORK_NAME" >/dev/null 2>&1 || true
-
-  if [[ "$CONTROL_STARTED" -eq 1 ]]; then
-    container rm -f "$CONTROL_VM" >/dev/null 2>&1 || true
-    container stop "$CONTROL_VM" >/dev/null 2>&1 || true
-    container delete "$CONTROL_VM" >/dev/null 2>&1 || true
-    container network rm "$CONTROL_NETWORK" >/dev/null 2>&1 || \
-      container network delete "$CONTROL_NETWORK" >/dev/null 2>&1 || true
-  fi
 
   if [[ -n "$BROKER_PID" ]]; then
     kill "$BROKER_PID" >/dev/null 2>&1 || true
@@ -284,28 +200,6 @@ print(subnet)
 PY
 }
 
-# The index of a /24 in the pool other than $2, preferring $2+1 and falling
-# back to $2-1; prints nothing when the pool holds a single /24.
-sibling_subnet_index() {
-  python3 - "$1" "$2" <<'PY'
-import ipaddress
-import sys
-
-base = ipaddress.ip_network(sys.argv[1], strict=True)
-index = int(sys.argv[2])
-count = 1 << max(0, 24 - base.prefixlen)
-for candidate in (index + 1, index - 1):
-    if 0 <= candidate < count:
-        print(candidate)
-        break
-PY
-}
-
-# Succeeds iff address $2 lies inside network $1.
-addr_in_cidr() {
-  ! require_outside "$1" "$2" 2>/dev/null
-}
-
 # Fails unless address $2 lies outside network $1.
 require_outside() {
   python3 - "$1" "$2" <<'PY'
@@ -320,18 +214,9 @@ if address in network:
 PY
 }
 
-# Fails unless networks $1 and $2 are disjoint.
-require_disjoint() {
-  python3 - "$1" "$2" <<'PY'
-import ipaddress
-import sys
-
-a = ipaddress.ip_network(sys.argv[1], strict=True)
-b = ipaddress.ip_network(sys.argv[2], strict=True)
-if a.overlaps(b):
-    print(f"{a} overlaps {b}", file=sys.stderr)
-    raise SystemExit(1)
-PY
+# Succeeds iff address $2 lies inside network $1.
+addr_in_cidr() {
+  ! require_outside "$1" "$2" 2>/dev/null
 }
 
 cidr_host() {
@@ -349,8 +234,8 @@ PY
 }
 
 # A free port in [MIN, MAX] for PROTO (tcp|udp), tested on the wildcard
-# address. The broker port must lie inside the range the runner is told
-# about, or it refuses to start (BrokerPortOutsideRange).
+# address. The broker port must lie inside the range the runner is told about,
+# or it refuses to start (BrokerPortOutsideRange).
 pick_port() {
   python3 - "$1" "$2" "$3" <<'PY'
 import random
@@ -395,14 +280,11 @@ wait_for_released_guest_command() {
   die "released guest command did not write its marker"
 }
 
-wait_for_guest_shell() {
-  for _ in {1..300}; do
-    if guest_in "$1" true >/dev/null 2>&1; then
-      return
-    fi
-    sleep 0.1
-  done
-  die "guest ${1} did not accept an exec within 30s"
+require_guest_tooling() {
+  guest_in "$1" 'command -v ip >/dev/null && command -v nc >/dev/null' \
+    || die "guest image lacks ip or nc (use WRIT_PROVE_IMAGE with BusyBox nc)"
+  guest_in "$1" 'nc 2>&1 | grep -q -- "-s ADDR"' \
+    || die "guest nc does not support -s ADDR; the probe needs a source-selectable sender"
 }
 
 guest_ipv4_addr() {
@@ -414,226 +296,13 @@ guest_default_gateway() {
 }
 
 # eth0's transmitted-packet counter, as the guest kernel reports it. Guest
-# reported, so it never decides a verdict; it only decides whether there was
-# a frame for the capture to see at all.
+# reported, so it never decides a verdict; it only decides whether there was a
+# frame for the capture to see at all.
 guest_tx_packets() {
   local n
   n="$(guest_in "$1" 'cat /sys/class/net/eth0/statistics/tx_packets' 2>/dev/null | tr -d '[:space:]')"
   [[ "$n" =~ ^[0-9]+$ ]] || die "could not read eth0 tx_packets in ${1} (got '${n}')"
   printf '%s\n' "$n"
-}
-
-require_guest_tooling() {
-  guest_in "$1" 'command -v ip >/dev/null && command -v nc >/dev/null' \
-    || die "guest image lacks ip or nc (use WRIT_PROVE_IMAGE with BusyBox nc)"
-  guest_in "$1" 'nc 2>&1 | grep -q -- "-s ADDR"' \
-    || die "guest nc does not support -s ADDR; the probe needs a source-selectable sender"
-}
-
-# Keep only the writ/session child anchors (read from stdin, one per line)
-# that currently hold a rule; drop the rest. `$@` is the sudo invocation to use
-# (`sudo`, or `sudo -n` for the non-interactive watcher). Keys on stdout, never
-# the exit code: `pfctl -sr` exits non-zero on an empty anchor while printing
-# nothing, exactly as writ's own ensure_session_anchor_empty relies on, so the
-# `|| true` swallows that non-zero without hiding a real read. A bare anchor
-# NODE lingers forever once created — pfctl never deletes an emptied anchor, and
-# neither `pfctl -a <node> -F all` nor a main-ruleset reload removes the node;
-# only disabling PF or a reboot does — so node existence is not evidence of a
-# live session (writ's teardown flushes rules and declares the session gone
-# without removing the node). A rule under the node is what could confound, so
-# that is what we count. The `if`, not `[[ ]] && printf`, keeps a false test
-# from tripping errexit as the loop body's last command.
-filter_anchors_with_rules() {
-  local name rules
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    rules="$("$@" pfctl -a "$name" -sr 2>/dev/null || true)"
-    if [[ "$rules" == *[![:space:]]* ]]; then
-      printf '%s\n' "$name"
-    fi
-  done
-}
-
-# Child anchors under writ/session that hold rules, one per line. The targeted
-# `-a writ/session -sA` query is the one that can see children: root `pfctl -sA`
-# lists only directly-attached top-level anchors, not `writ/session/<child>`.
-# So its failure is fatal, not ignorable — a missed child would let a concurrent
-# session contaminate the run. The root listing is a belt-and-braces extra.
-# Every child name counts, not only UUID-shaped ones: the wildcard evaluates
-# `writ/session/manual` too. Each listed node is then filtered down to those
-# that actually hold rules, since an emptied node lingers forever and cannot
-# confound. An empty listing is success (grep's 1 must not trip errexit through
-# pipefail).
-existing_session_anchors() {
-  local targeted
-  # `if !` context, not `x=$(...); status=$?`: under set -e a failing command
-  # substitution aborts the assignment before the next line runs.
-  if ! targeted="$(sudo pfctl -a writ/session -sA 2>/dev/null)"; then
-    die "could not list child anchors under writ/session (pfctl -a writ/session -sA failed); a concurrent session cannot be ruled out, so nothing is graded"
-  fi
-  { printf '%s\n' "$targeted"; sudo pfctl -sA 2>/dev/null; } \
-    | { grep -Eo 'writ/session/[^[:space:]]+' || true; } | sort -u \
-    | filter_anchors_with_rules sudo
-}
-
-# Die unless this run's own anchor is loaded with its labelled IPv4 deny.
-# A verdict about "what the session rules do" is vacuous if they are gone.
-require_own_anchor_loaded() {
-  sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q 'writ deny agent v4' \
-    || die "this run's anchor ${PF_ANCHOR} is not loaded with its IPv4 deny (${1}); the session rules are not in place, so nothing is graded"
-}
-
-# Die if any session anchor other than this run's own is loaded. Every child
-# of the `writ/session/*` wildcard is consulted for every packet on every
-# interface, so a concurrent session's `block ... from <its /24>` would deny
-# our sibling-source datagram on the unconfined bridge as well, and the run
-# would pin that as a vmnet fact. Checked before anything starts, again once
-# both guests are up, and again after the last probe, so a session that
-# appears during the build or startup or mid-window is caught, not reasoned
-# around. $1 names the moment for the message.
-require_no_other_anchors() {
-  local others
-  others="$(existing_session_anchors | { grep -Fxv "$PF_ANCHOR" || true; })"
-  [[ -z "$others" ]] \
-    || die "other writ session anchors are loaded (${1}) and would confound the measurement; stop those sessions first: $(tr '\n' ' ' <<<"$others")"
-}
-
-# Die if any nat/rdr/binat rule is loaded, in the main ruleset or in any
-# anchor. PF translation runs before the filter rules, so such a rule could
-# rewrite the probe's source and make the source-scoped deny judge a different
-# source than the pre-PF capture saw. Internet Sharing and similar load their
-# NAT under an anchor (com.apple/*), which a main-ruleset `-sn` shows only as a
-# `nat-anchor` declaration, so every anchor pfctl lists is queried too. This is
-# the defence-in-depth layer for `pass`-modifier translations (which bypass the
-# deny); the load-bearing soundness for ordinary translations is the deny-
-# counter gate on the LIVE GAP verdict (a rewrite into the session /24 trips
-# the quick deny). `-sn` output is searched via a here-string, not a producer
-# pipe: a `grep -q` that exits early on a match would SIGPIPE the producer and,
-# under pipefail, mask the match. `if !`, not `x=$(...); status=$?`: a failing
-# substitution aborts the assignment under set -e. $1 names the moment.
-require_no_translations() {
-  local moment="$1" main anchors anchor rules
-  if ! main="$(sudo pfctl -sn 2>/dev/null)"; then
-    die "could not read PF translation rules (${moment}); cannot confirm no nat/rdr/binat would rewrite the probe's source, so nothing is graded"
-  fi
-  ! grep -Eq '^(nat|rdr|binat) ' <<<"$main" \
-    || die "PF translation rules (nat/rdr/binat) are loaded in the main ruleset (${moment}); they could rewrite the probe's source before filtering and invalidate the measurement. Remove them (e.g. turn off Internet Sharing) and rerun."
-  # `-v -sA`, like the production helper (ensure_no_pass_translation_rules):
-  # it lists every anchor recursively by full path, whereas plain `-sA` lists
-  # only anchors directly attached to the main ruleset, missing a rule under a
-  # second-level anchor such as com.apple.internet-sharing.
-  if ! anchors="$(sudo pfctl -v -sA 2>/dev/null)"; then
-    die "could not list PF anchors (${moment}); cannot rule out a nested translation, so nothing is graded"
-  fi
-  while IFS= read -r anchor; do
-    anchor="$(printf '%s' "$anchor" | tr -d '[:space:]')"
-    [[ -n "$anchor" ]] || continue
-    if ! rules="$(sudo pfctl -a "$anchor" -sn 2>/dev/null)"; then
-      die "could not read translation rules in anchor '${anchor}' (${moment}); cannot rule out a nested translation, so nothing is graded"
-    fi
-    ! grep -Eq '^(nat|rdr|binat) ' <<<"$rules" \
-      || die "PF translation rules (nat/rdr/binat) are loaded in anchor '${anchor}' (${moment}); they could rewrite the probe's source before filtering. Remove them (e.g. turn off Internet Sharing) and rerun."
-  done <<<"$anchors"
-}
-
-# Poll the anchor list in the background for the whole probe window, noting
-# every foreign anchor seen with a timestamp. The snapshot checks cannot see
-# a session that comes and goes between them; this narrows that to one poll
-# interval, which is the best PF's tooling allows. `sudo -n`: the background
-# loop must never block on a password prompt.
-start_anchor_watch() {
-  ANCHOR_INTRUSIONS="${TMP_DIR}/anchor-intrusions.log"
-  ANCHOR_HEARTBEAT="${TMP_DIR}/anchor-heartbeat.log"
-  : >"$ANCHOR_INTRUSIONS"
-  : >"$ANCHOR_HEARTBEAT"
-  WATCH_START="$(date +%s)"
-  # The loop must not inherit errexit: a transient pfctl or sudo failure
-  # would end it silently and the run would grade without its protection.
-  # The targeted query is the one that can see children (root -sA lists only
-  # top-level anchors), so its failure is a POLL-FAILURE the stop below treats,
-  # like a dead watcher, as a failed run.
-  (
-    set +e
-    while true; do
-      listing_a="$(sudo -n pfctl -a writ/session -sA 2>/dev/null)"; status_a=$?
-      listing_b="$(sudo -n pfctl -sA 2>/dev/null)"
-      nat_rules="$(sudo -n pfctl -sn 2>/dev/null)"; status_n=$?
-      if (( status_a != 0 || status_n != 0 )); then
-        printf '%s POLL-FAILURE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
-      fi
-      # Only a child that holds rules can confound; a bare, rule-less node
-      # lingers forever and is harmless. `sudo -n` here cannot silently
-      # under-report: a creds lapse that empties this read also fails the
-      # enumeration above, which is recorded as POLL-FAILURE.
-      others="$(printf '%s\n%s\n' "$listing_a" "$listing_b" \
-        | grep -Eo 'writ/session/[^[:space:]]+' | sort -u \
-        | grep -Fxv "$PF_ANCHOR" \
-        | filter_anchors_with_rules sudo -n)"
-      if [[ -n "$others" ]]; then
-        printf '%s %s\n' "$(date +%H:%M:%S)" "$(tr '\n' ' ' <<<"$others")" >>"$ANCHOR_INTRUSIONS"
-      fi
-      # A translation rule appearing mid-window is as invalidating as one at
-      # the start: it could rewrite the source PF evaluates.
-      if grep -Eq '^(nat|rdr|binat) ' <<<"$nat_rules"; then
-        printf '%s TRANSLATION-RULE\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
-      fi
-      # Our own anchor must stay loaded with its deny for the whole window,
-      # or a later result would be graded against rules that were not there.
-      if ! sudo -n pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | grep -q 'writ deny agent v4'; then
-        printf '%s OWN-ANCHOR-MISSING\n' "$(date +%H:%M:%S)" >>"$ANCHOR_INTRUSIONS"
-      fi
-      # Heartbeat AFTER the checks: a timestamp here means this poll's queries
-      # all completed, so a blocked pfctl or a descheduled watcher shows up as
-      # a gap in coverage below, not as a silently empty intrusion log that
-      # kill -0 would call healthy.
-      printf '%s\n' "$(date +%s)" >>"$ANCHOR_HEARTBEAT"
-      sleep 0.2
-    done
-  ) &
-  ANCHOR_WATCH_PID=$!
-}
-
-stop_anchor_watch() {
-  local now alive=1
-  now="$(date +%s)"
-  kill -0 "$ANCHOR_WATCH_PID" 2>/dev/null || alive=0
-  kill "$ANCHOR_WATCH_PID" >/dev/null 2>&1 || true
-  wait "$ANCHOR_WATCH_PID" 2>/dev/null || true
-  ANCHOR_WATCH_PID=""
-  [[ "$alive" -eq 1 ]] \
-    || die "the anchor watcher was not running at the end of the probe windows; the concurrency check lapsed, so nothing is graded"
-  # kill -0 only says the process exists, not that it polled. Require the
-  # heartbeats to cover the whole window with no gap over 2s (10x the 0.2s
-  # interval): a blocked pfctl or a descheduled watcher leaves a gap, and an
-  # empty log then means nothing. Checked before the intrusion greps, whose
-  # emptiness is only meaningful once coverage is proven.
-  local prev="$WATCH_START" maxgap=0 t
-  while IFS= read -r t; do
-    [[ "$t" =~ ^[0-9]+$ ]] || continue
-    (( t - prev > maxgap )) && maxgap=$(( t - prev ))
-    prev="$t"
-  done <"$ANCHOR_HEARTBEAT"
-  (( now - prev > maxgap )) && maxgap=$(( now - prev ))
-  (( maxgap <= 2 )) \
-    || die "the anchor watcher left a ${maxgap}s gap in coverage during the probe windows (a blocked pfctl or a descheduled watcher); the concurrency and translation checks lapsed, so nothing is graded"
-  if grep -q 'OWN-ANCHOR-MISSING' "$ANCHOR_INTRUSIONS"; then
-    die "this run's anchor ${PF_ANCHOR} was missing its IPv4 deny at some point during the probe windows ($(grep -c OWN-ANCHOR-MISSING "$ANCHOR_INTRUSIONS") polls); the session rules were not in place throughout, so nothing is graded"
-  fi
-  if grep -q 'POLL-FAILURE' "$ANCHOR_INTRUSIONS"; then
-    die "the anchor watcher could not list PF anchors or translation rules during the probe windows ($(grep -c POLL-FAILURE "$ANCHOR_INTRUSIONS") failed polls); the concurrency check lapsed, so nothing is graded"
-  fi
-  if grep -q 'TRANSLATION-RULE' "$ANCHOR_INTRUSIONS"; then
-    die "a PF translation rule (nat/rdr/binat) was loaded during the probe windows ($(grep -c TRANSLATION-RULE "$ANCHOR_INTRUSIONS") polls); it could rewrite the probe's source before filtering, so nothing is graded"
-  fi
-  [[ ! -s "$ANCHOR_INTRUSIONS" ]] \
-    || die "another writ session anchor was loaded during the probe windows; its rules were consulted for our datagrams, so nothing is graded. Seen: $(sort -u "$ANCHOR_INTRUSIONS" | tr '\n' ';')"
-}
-
-# The bridge the interface-scoped IPv6 deny was installed on, read from the
-# session anchor: the same interface the session's IPv4 frames traverse.
-session_bridge() {
-  sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null \
-    | grep -Eo 'on bridge[0-9]+' | head -n 1 | awk '{print $2}'
 }
 
 # The host bridge whose address is gateway $1, from ifconfig: the same lookup
@@ -645,31 +314,9 @@ bridge_for_gateway() {
   '
 }
 
-# Per-label packet counters of the session anchor, as "label count" lines.
-anchor_counters() {
-  sudo pfctl -a "$PF_ANCHOR" -vsr 2>/dev/null | python3 -c '
-import re, sys
-label = None
-for line in sys.stdin:
-    m = re.search(r"label \"([^\"]+)\"", line)
-    if m:
-        label = m.group(1)
-        continue
-    m = re.search(r"Packets: (\d+)", line)
-    if m and label is not None:
-        print(f"{label} {m.group(1)}")
-        label = None
-'
-}
-
-counter_of() {
-  # $1 = counters text, $2 = label
-  printf '%s\n' "$1" | awk -v l="$2" '$0 ~ "^"l" " {print $NF}' | head -n 1
-}
-
 # Source address of the first packet, from line $2 onward of capture $1,
-# addressed to $3:$4 whose payload carries nonce $5; empty if none. tcpdump
-# -A prints the header line, then the payload as text, so the nonce line is
+# addressed to $3:$4 whose payload carries nonce $5; empty if none. tcpdump -A
+# prints the header line, then the payload as text, so the nonce line is
 # attributed to the most recent header for our destination.
 bridge_source_for_nonce() {
   sed -n "$(($2 + 1)),\$p" "$1" | awk -v dst=" > $3.$4: " -v nonce="$5" '
@@ -680,148 +327,141 @@ bridge_source_for_nonce() {
   '
 }
 
-# Die unless every bridge capture is still running. A capture that died
-# mid-window returns empty lookups, which would grade as "not forwarded" and
-# pin a false drop. `ps` rather than `kill -0`: the captures run under sudo,
-# and kill -0 on a root process from here fails whether or not it exists. And
-# ps's *output* rather than its exit status: on recent macOS `ps -p` can exit
-# 1 with "ps: time: requires entitlement" while still listing the process.
+# `ps` rather than `kill -0`: the capture runs under sudo, and kill -0 on a
+# root process from here fails whether or not it exists; and ps's *output*, not
+# its exit status: on recent macOS `ps -p` can exit 1 with "ps: time: requires
+# entitlement" while still listing the process.
 process_alive() {
   [[ -n "$(ps -p "$1" -o pid= 2>/dev/null)" ]]
 }
 
-require_observers_alive() {
-  local moment="$1" target
-  for target in "${!TARGET_CAPTURE_PID[@]}"; do
-    process_alive "${TARGET_CAPTURE_PID[$target]}" \
-      || die "the ${target} bridge capture was not running ${moment}; its silence would have been graded, so nothing is graded"
-  done
-}
-
-# Start capturing UDP to the probe port on target $1's bridge.
+# Start capturing UDP to the probe port on the session bridge.
 start_capture() {
-  local target="$1" bridge="${TARGET_BRIDGE[$1]}"
-  local capture="${TMP_DIR}/tcpdump-${target}.log" err="${TMP_DIR}/tcpdump-${target}.err"
-  log "capturing UDP to port ${PROBE_PORT} on ${bridge} (${target})"
+  local err="${TMP_DIR}/tcpdump.err"
+  CAPTURE_FILE="${TMP_DIR}/tcpdump.log"
+  log "capturing UDP to port ${PROBE_PORT} on ${SESSION_BRIDGE}"
   # The redirects are deliberately the unprivileged shell's: the log lives in
   # the user-owned TMP_DIR, and only the capture itself needs root.
   # shellcheck disable=SC2024
-  sudo tcpdump -i "$bridge" -n -l -q -A "udp and dst port ${PROBE_PORT}" >"$capture" 2>"$err" &
-  TARGET_CAPTURE_PID[$target]=$!
-  TARGET_CAPTURE[$target]="$capture"
+  sudo tcpdump -i "$SESSION_BRIDGE" -n -l -q -A "udp and dst port ${PROBE_PORT}" >"$CAPTURE_FILE" 2>"$err" &
+  CAPTURE_PID=$!
   sleep 2
-  process_alive "${TARGET_CAPTURE_PID[$target]}" \
-    || die "tcpdump did not start on ${bridge}: $(cat "$err")"
+  process_alive "$CAPTURE_PID" \
+    || die "tcpdump did not start on ${SESSION_BRIDGE}: $(cat "$err")"
 }
 
-# Send one UDP datagram from target $1's guest with source $3 toward that
-# guest's gateway, and report what the bridge capture saw. The guest's exit
-# status is logged and ignored. Writes one line to result-<target>-<name>,
-# because every consumer is a single `read`:
-#   <name> <emitted> <forwarded> <delta> <bridge src> <rewritten>
-# where bridge src is the source the capture saw ("-" if none) and rewritten
-# is "no" or "bridge" (the capture saw a source other than the requested one).
-probe() {
-  local target="$1" name="$2" source="$3" add_address="$4"
-  local vm="${TARGET_VM[$target]}" gateway="${TARGET_GATEWAY[$target]}"
-  local bridge="${TARGET_BRIDGE[$target]}" capture="${TARGET_CAPTURE[$target]}"
-  local nonce="writ-spoof-${target}-${name}-${RANDOM}${RANDOM}"
-  log "probe ${target}/${name}: source ${source} -> ${gateway}:${PROBE_PORT} (${nonce})"
+# Decode a guest's /proc/self/status (read from file $1) HERE on the host, never
+# in the guest: whether CAP_NET_ADMIN (bit 12) and CAP_NET_RAW (bit 13) are
+# present in the effective, permitted, and bounding sets. Prints, on the last
+# line, a machine verdict: "CAPS <net_admin_bnd> <net_raw_bnd> <net_admin_eff>
+# <net_raw_eff>" with yes/no fields, and human lines before it. Fails only if
+# the status text carries no Cap* lines at all (a garbled read).
+decode_caps() {
+  python3 - "$1" <<'PY'
+import re
+import sys
 
-  if [[ "$add_address" == "yes" ]]; then
-    # Tolerate an alias that already exists (ip prints "File exists", exit 2),
-    # then insist it is there: a silently missing alias would make nc fail to
-    # bind, no frame would be sent, and the capture's silence would read as a
-    # platform verdict. Capture the add's own stderr (merged) so a real failure
-    # — no privilege, missing CAP_NET_ADMIN, an ip that lacks `addr add` — is
-    # reported rather than hidden; `|| true` keeps its non-zero exit (including
-    # the benign already-exists) from tripping errexit.
-    local add_out
-    add_out="$(guest_in "$vm" "ip addr add ${source}/32 dev eth0" 2>&1)" || true
-    guest_in "$vm" "ip -4 -o addr show dev eth0 | grep -q 'inet ${source}/32 '" \
-      || die "${vm} did not configure ${source}/32 on eth0; the ${target}/${name} probe would send nothing. ip addr add: [${add_out:-<no output>}]; guest uid: [$(guest_in "$vm" 'id -u' 2>&1 || true)]; eth0 addrs: [$(guest_in "$vm" 'ip -4 -o addr show dev eth0' 2>&1 | tr '\n' ';' || true)]"
+CAP_NET_ADMIN = 12
+CAP_NET_RAW = 13
+text = open(sys.argv[1]).read()
+sets = {}
+for name in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+    m = re.search(rf"^{name}:\s*([0-9A-Fa-f]+)", text, re.MULTILINE)
+    if m:
+        sets[name] = int(m.group(1), 16)
+if not sets:
+    print("no Cap* lines in /proc/self/status", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def has(mask, bit):
+    return "yes" if (mask >> bit) & 1 else "no"
+
+
+# Human-readable lines to stderr (shown to the operator); only the machine
+# verdict goes to stdout, so the caller captures exactly one line.
+for name in ("CapEff", "CapPrm", "CapBnd"):
+    if name in sets:
+        print(
+            f"  {name}=0x{sets[name]:016x} "
+            f"NET_ADMIN={has(sets[name], CAP_NET_ADMIN)} "
+            f"NET_RAW={has(sets[name], CAP_NET_RAW)}",
+            file=sys.stderr,
+        )
+bnd = sets.get("CapBnd", 0)
+eff = sets.get("CapEff", 0)
+# Absent from the bounding set means the process can never regain the cap, even
+# after a setuid or capset; that is the security-relevant fact.
+print(
+    "CAPS "
+    f"{has(bnd, CAP_NET_ADMIN)} {has(bnd, CAP_NET_RAW)} "
+    f"{has(eff, CAP_NET_ADMIN)} {has(eff, CAP_NET_RAW)}"
+)
+PY
+}
+
+# Emit one UDP datagram from the guest with source $2 toward the gateway, adding
+# $2 as an eth0 alias first when $3 is "yes". Reports, via the RESULT_* globals:
+#   RESULT_EMITTED    yes|no    guest-reported (TX counter rose, or nc succeeded)
+#   RESULT_BRIDGE_SRC <ip>|-    host-owned: the source the capture saw, "-" none
+#   RESULT_ADD_OUT    <text>    guest-reported `ip addr add` output ("" if $3=no)
+#   RESULT_ADD_OK     yes|no|na did the alias actually get configured?
+send_datagram() {
+  local name="$1" source="$2" add_alias="$3"
+  local nonce="writ-spoof-${name}-${RANDOM}${RANDOM}"
+  RESULT_ADD_OUT=""
+  RESULT_ADD_OK="na"
+  log "attempt ${name}: source ${source} -> ${IPV4_GATEWAY}:${PROBE_PORT} (${nonce})"
+
+  if [[ "$add_alias" == "yes" ]]; then
+    # Capture the add's merged output: a real failure (EPERM from a missing
+    # CAP_NET_ADMIN) is the whole point of the measurement, and `|| true` keeps
+    # its non-zero exit (or a benign already-exists) from tripping errexit.
+    RESULT_ADD_OUT="$(guest_in "$VM_NAME" "ip addr add ${source}/32 dev eth0" 2>&1)" || true
+    if guest_in "$VM_NAME" "ip -4 -o addr show dev eth0 | grep -q 'inet ${source}/32 '"; then
+      RESULT_ADD_OK="yes"
+      log "  alias ${source}/32 configured on eth0 (CAP_NET_ADMIN present)"
+    else
+      RESULT_ADD_OK="no"
+      log "  alias ${source}/32 NOT configured: [${RESULT_ADD_OUT:-<no output>}]"
+    fi
   fi
 
-  local before="" after="" tx_before tx_after
-  if [[ "$target" == "session" ]]; then
-    before="$(anchor_counters)"
-  fi
-  tx_before="$(guest_tx_packets "$vm")"
-  local capture_lines_before
-  capture_lines_before="$(wc -l <"$capture" | tr -d ' ')"
+  local tx_before tx_after cap_before
+  tx_before="$(guest_tx_packets "$VM_NAME")"
+  cap_before="$(wc -l <"$CAPTURE_FILE" | tr -d ' ')"
 
   # -w 1: BusyBox nc otherwise waits for a reply that never comes. Its exit
-  # status is diagnostic. Whether a frame left the guest at all is decided
-  # below from the capture, the TX counter, and nc's stderr, not this status.
-  local nc_err="${TMP_DIR}/nc-${target}-${name}.err"
+  # status is diagnostic; whether a frame left the guest is decided from the TX
+  # counter and the capture, not from nc. Sending from an unconfigured source
+  # fails to bind, which is exactly what we want to observe when the alias add
+  # was denied.
+  local nc_err="${TMP_DIR}/nc-${name}.err"
   set +e
-  guest_in "$vm" "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${gateway} ${PROBE_PORT}" 2>"$nc_err"
+  guest_in "$VM_NAME" "printf '%s' '${nonce}' | nc -u -s ${source} -w 1 ${IPV4_GATEWAY} ${PROBE_PORT}" 2>"$nc_err"
   local guest_status=$?
   set -e
   log "  guest nc exit status ${guest_status} (diagnostic only)"
   sleep 2
-  tx_after="$(guest_tx_packets "$vm")"
+  tx_after="$(guest_tx_packets "$VM_NAME")"
 
-  local guest_says_emitted="yes"
-  if [[ -s "$nc_err" ]]; then
-    guest_says_emitted="no"
-    log "  guest nc wrote to stderr: $(tr '\n' ' ' <"$nc_err")"
-  fi
-  if (( tx_after <= tx_before )); then
-    guest_says_emitted="no"
-    log "  guest eth0 TX packet counter did not rise (${tx_before} -> ${tx_after})"
-  fi
+  RESULT_BRIDGE_SRC="$(bridge_source_for_nonce "$CAPTURE_FILE" "$cap_before" "$IPV4_GATEWAY" "$PROBE_PORT" "$nonce")"
+  RESULT_BRIDGE_SRC="${RESULT_BRIDGE_SRC:--}"
 
-  # The bridge capture (BPF, which taps the interface before PF filters) is
-  # the host observer that matters: did vmnet put the frame on the host
-  # bridge? Correlate by nonce only; the source is an observation.
-  local fwd_src forwarded="no" rewritten="no"
-  fwd_src="$(bridge_source_for_nonce "$capture" "$capture_lines_before" "$gateway" "$PROBE_PORT" "$nonce")"
-  if [[ -n "$fwd_src" ]]; then
-    forwarded="yes"
+  if [[ "$RESULT_BRIDGE_SRC" != "-" ]]; then
+    RESULT_EMITTED="yes"
+  elif (( tx_after > tx_before )); then
+    RESULT_EMITTED="yes"
+  elif [[ "$guest_status" -eq 0 ]]; then
+    RESULT_EMITTED="yes"
+  else
+    RESULT_EMITTED="no"
   fi
-  # Host evidence outranks the guest's: a frame the capture saw was emitted,
-  # whatever nc printed afterwards (an ICMP port-unreachable, or PF's `block
-  # return`, can make nc report an error once the frame has left). The
-  # guest-side witness only decides when the capture saw nothing.
-  local emitted="$guest_says_emitted"
-  if [[ "$forwarded" == "yes" ]]; then
-    emitted="yes"
-    if [[ "$guest_says_emitted" == "no" ]]; then
-      log "  (the capture saw the frame, so it was emitted; the guest-side error above is diagnostic)"
-    fi
-  fi
-  if [[ -n "$fwd_src" && "$fwd_src" != "$source" ]]; then
-    rewritten="bridge"
-    log "  SOURCE REWRITTEN on the bridge: requested ${source}, bridge saw ${fwd_src}"
-  fi
-
-  local delta=0 counter_text=""
-  if [[ "$target" == "session" ]]; then
-    after="$(anchor_counters)"
-    local v4_before v4_after
-    v4_before="$(counter_of "$before" "writ deny agent v4")"
-    v4_after="$(counter_of "$after" "writ deny agent v4")"
-    # No `${x:-0}` fabrication: an absent label means the anchor is not loaded
-    # as expected, and a backwards count means it was reloaded or reset
-    # mid-probe. Either way the delta would be a lie, so abort.
-    [[ -n "$v4_before" && -n "$v4_after" ]] \
-      || die "the 'writ deny agent v4' label was absent from a counter snapshot; the anchor is not loaded as expected, so nothing is graded"
-    (( v4_after >= v4_before )) \
-      || die "the 'writ deny agent v4' counter went backwards (${v4_before} -> ${v4_after}); the anchor was reloaded or reset mid-probe, so nothing is graded"
-    delta=$(( v4_after - v4_before ))
-    counter_text="; 'writ deny agent v4' counter +${delta}"
-  fi
-
-  log "  guest emitted a frame: ${emitted}; forwarded onto ${bridge}: ${forwarded} (src ${fwd_src:--})${counter_text}"
-  RESULTS+=("${target}/${name} source=${source} emitted=${emitted} forwarded=${forwarded} bridge_src=${fwd_src:--} rewritten=${rewritten} deny_v4_delta=${delta}")
-  printf '%s %s %s %s %s %s\n' "$name" "$emitted" "$forwarded" "$delta" "${fwd_src:--}" "$rewritten" \
-    >"${TMP_DIR}/result-${target}-${name}"
+  log "  emitted (guest-reported): ${RESULT_EMITTED}; source on ${SESSION_BRIDGE} (host-owned): ${RESULT_BRIDGE_SRC}"
 }
 
 require_cmd container
 require_cmd python3
-require_cmd curl
 require_cmd uuidgen
 require_cmd tcpdump
 require_cmd ifconfig
@@ -829,48 +469,19 @@ choose_cargo
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 IPV4_GATEWAY="$(cidr_host "$IPV4_CIDR" 1)"
-# The unconfined network must be a /24 disjoint from the pool, so that neither
-# guest's own address is "foreign" or "sibling" to the other.
-[[ "$CONTROL_SUBNET" == */24 ]] || die "WRIT_PROBE_CONTROL_SUBNET=${CONTROL_SUBNET} must be a /24"
-require_disjoint "$IPV4_POOL" "$CONTROL_SUBNET" \
-  || die "WRIT_PROBE_CONTROL_SUBNET=${CONTROL_SUBNET} overlaps the pool ${IPV4_POOL}"
-# A "foreign" source inside any network here is not foreign: inside the
-# session /24 the source-scoped deny matches it legitimately, elsewhere in
-# the pool it is the sibling case, and inside the control subnet it is that
-# guest's own neighbourhood. Either way the verdict would be about the wrong
-# thing.
-require_outside "$IPV4_POOL" "$FOREIGN_SOURCE" \
-  || die "WRIT_PROBE_FOREIGN_SOURCE=${FOREIGN_SOURCE} lies inside the pool ${IPV4_POOL}; the foreign probe needs an out-of-pool source"
-require_outside "$CONTROL_SUBNET" "$FOREIGN_SOURCE" \
-  || die "WRIT_PROBE_FOREIGN_SOURCE=${FOREIGN_SOURCE} lies inside the control subnet ${CONTROL_SUBNET}"
-SIBLING_INDEX="$(sibling_subnet_index "$IPV4_POOL" "$SUBNET_INDEX")"
-if [[ -n "$SIBLING_INDEX" ]]; then
-  SIBLING_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SIBLING_INDEX")"
-  SIBLING_SOURCE="$(cidr_host "$SIBLING_CIDR" 7)"
-else
-  log "pool ${IPV4_POOL} holds a single /24: the sibling-subnet probe is unavailable and will be skipped"
-fi
+# A "foreign" source inside the session /24 would be legitimately covered by
+# the source-scoped deny, so it would not be a spoof at all.
+require_outside "$IPV4_CIDR" "$FOREIGN_SOURCE" \
+  || die "WRIT_PROBE_FOREIGN_SOURCE=${FOREIGN_SOURCE} lies inside the session /24 ${IPV4_CIDR}; it needs to be an out-of-subnet source"
 
 mkdir -p "$BROKER_DIR"
 printf 'broker-ok\n' >"${BROKER_DIR}/broker.txt"
 
-log "requesting sudo credentials for pfctl and tcpdump"
+log "requesting sudo credentials for the lifecycle runner and tcpdump"
 sudo -v
 sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' || die "PF is not enabled"
 sudo pfctl -sr 2>/dev/null | grep -q 'anchor "writ/session/\*"' \
   || die 'missing top-level PF anchor; add `anchor "writ/session/*"` to /etc/pf.conf and reload PF'
-require_no_other_anchors "before start"
-
-# PF translation (nat/rdr/binat) runs before the filter rules, so a rule that
-# rewrites the probe's source would make the source-scoped deny judge a
-# different source than the bridge capture (which taps before PF) saw, and a
-# "loose on the host" reading could be wrong. The runner preflight already
-# forbids `pass`-modifier translations; the probe additionally refuses to run
-# while any translation rule is loaded in the main ruleset (Internet Sharing,
-# a manual nat, ...). Anchor lines (`nat-anchor ...`) are declarations, not
-# rules, so they are exempt; nested-anchor translations are out of scope, like
-# the anchor-exclusivity check — do not run this alongside them.
-require_no_translations "before start"
 
 log "building PF helper and lifecycle runner"
 "${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper --bin writ-agent-vm-runner
@@ -888,33 +499,9 @@ for _ in {1..20}; do
   [[ "$BROKER_PORT_MIN" == "$BROKER_PORT_MAX" ]] && break
   PROBE_PORT="$(pick_port udp "$BROKER_PORT_MIN" "$BROKER_PORT_MAX")"
 done
-if [[ "$PROBE_PORT" == "$BROKER_PORT" ]]; then
-  log "probe UDP target port shares its number with the TCP broker port ${BROKER_PORT} (range has no free alternative); harmless, nothing binds it on the host"
-fi
 BROKER_PID="$(start_http_server "$BROKER_DIR" "$BROKER_PORT" "${TMP_DIR}/broker.log")"
 log "broker is up on ${BROKER_PORT} (TCP); probe target port is ${PROBE_PORT} (UDP, no host listener — the bridge capture is the observer)"
 
-# --- the unconfined positive control: a root guest on a network of this
-# script's own making, with no PF anchor, from the same image. Created the
-# way the runner creates session networks and guests, minus the anchor.
-log "starting unconfined control guest ${CONTROL_VM} on ${CONTROL_SUBNET} (no PF anchor)"
-CONTROL_STARTED=1
-container network create --internal --subnet "$CONTROL_SUBNET" "$CONTROL_NETWORK" >/dev/null
-container run --name "$CONTROL_VM" --network "$CONTROL_NETWORK" -d "$IMAGE" sh -c 'sleep 600' >/dev/null
-wait_for_guest_shell "$CONTROL_VM"
-require_guest_tooling "$CONTROL_VM"
-TARGET_VM[unconfined]="$CONTROL_VM"
-TARGET_GATEWAY[unconfined]="$(guest_default_gateway "$CONTROL_VM")"
-[[ -n "${TARGET_GATEWAY[unconfined]}" ]] || die "could not determine the control guest's default gateway"
-require_outside "$IPV4_POOL" "${TARGET_GATEWAY[unconfined]}" \
-  || die "the control network's gateway ${TARGET_GATEWAY[unconfined]} lies inside the pool; the network was not created on ${CONTROL_SUBNET}"
-TARGET_BRIDGE[unconfined]="$(bridge_for_gateway "${TARGET_GATEWAY[unconfined]}")"
-[[ -n "${TARGET_BRIDGE[unconfined]}" ]] || die "no host bridge carries the control gateway ${TARGET_GATEWAY[unconfined]}"
-CONTROL_GUEST_IPV4="$(guest_ipv4_addr "$CONTROL_VM")"
-[[ -n "$CONTROL_GUEST_IPV4" ]] || die "could not determine the control guest's IPv4 address"
-log "control guest is ${CONTROL_GUEST_IPV4} behind ${TARGET_GATEWAY[unconfined]} on ${TARGET_BRIDGE[unconfined]}"
-
-# --- the session under test.
 log "starting runner-managed VM ${VM_NAME} on ${IPV4_CIDR} under ${IPV6_MODE}"
 "$RUNNER" \
   --pf-helper "$HELPER" \
@@ -934,78 +521,45 @@ grep -Fxq "session_id=${SESSION_ID}" "$START_OUTPUT" || die "runner did not prin
 wait_for_released_guest_command
 require_guest_tooling "$VM_NAME"
 
-TARGET_VM[session]="$VM_NAME"
-TARGET_GATEWAY[session]="$IPV4_GATEWAY"
 GUEST_IPV4="$(guest_ipv4_addr "$VM_NAME")"
 [[ -n "$GUEST_IPV4" ]] || die "could not determine the session guest's IPv4 address"
-TARGET_BRIDGE[session]="$(session_bridge)"
-[[ -n "${TARGET_BRIDGE[session]}" ]] || die "could not find the session bridge in the PF anchor (is the IPv6 interface deny installed?)"
-[[ "${TARGET_BRIDGE[session]}" != "${TARGET_BRIDGE[unconfined]}" ]] \
-  || die "the session and control networks share ${TARGET_BRIDGE[session]}; the control would not be unconfined"
-log "session guest is ${GUEST_IPV4} behind ${IPV4_GATEWAY} on ${TARGET_BRIDGE[session]}"
+SESSION_BRIDGE="$(bridge_for_gateway "$IPV4_GATEWAY")"
+[[ -n "$SESSION_BRIDGE" ]] || die "no host bridge carries the session gateway ${IPV4_GATEWAY}"
+log "session guest is ${GUEST_IPV4} behind ${IPV4_GATEWAY} on ${SESSION_BRIDGE}"
 
-start_capture unconfined
-start_capture session
-require_no_other_anchors "after both guests started"
-require_no_translations "after both guests started"
-require_own_anchor_loaded "after both guests started"
-start_anchor_watch
+start_capture
 
-log "session anchor rules:"
-sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null | sed 's/^/    /'
+# --- capability readout: the mechanistic reason the guest cannot spoof. Read
+# the raw status from the guest (untrusted input) and decode it on the host.
+STATUS_FILE="${TMP_DIR}/guest-status.txt"
+guest_in "$VM_NAME" 'cat /proc/self/status' >"$STATUS_FILE" 2>/dev/null \
+  || die "could not read /proc/self/status in the guest"
+GUEST_UID="$(guest_in "$VM_NAME" 'id -u' 2>/dev/null | tr -d '[:space:]')"
+log "guest workload capability posture (uid ${GUEST_UID:-?}; decoded on the host):"
+# decode_caps prints the per-set human lines to stderr (shown above the verdict)
+# and exactly the "CAPS ..." machine line to stdout, which we capture and split.
+CAPS_LINE="$(decode_caps "$STATUS_FILE")" \
+  || die "could not decode the guest capability masks"
+read -r _ CAP_NET_ADMIN_BND CAP_NET_RAW_BND CAP_NET_ADMIN_EFF CAP_NET_RAW_EFF <<<"$CAPS_LINE"
 
-RESULTS=()
+# --- positive control: the guest's own-source frame MUST reach the bridge, or
+# the capture is not observing the wire and no silence below means anything.
+send_datagram control "$GUEST_IPV4" no
+CONTROL_EMITTED="$RESULT_EMITTED"
+CONTROL_BRIDGE_SRC="$RESULT_BRIDGE_SRC"
+[[ "$CONTROL_EMITTED" == "yes" ]] \
+  || die "the guest did not emit its own-address datagram (nc error and no TX, capture saw nothing); the sender is not working"
+[[ "$CONTROL_BRIDGE_SRC" != "-" ]] \
+  || die "the guest's own-address datagram was not seen on ${SESSION_BRIDGE}; the capture is not observing the wire, so no silence below would mean anything"
 
-# --- positive controls first. The unconfined guest's own address must be
-# forwarded onto its bridge, or the capture is not observing that bridge and
-# nothing else in the run can be graded. Its spoofed sends must at least be
-# emitted, or the sender cannot spoof and a session silence would be about
-# nc, not vmnet.
-probe unconfined control "$CONTROL_GUEST_IPV4" no
-read -r _ uc_emitted uc_forwarded _ _ _ <"${TMP_DIR}/result-unconfined-control"
-[[ "$uc_emitted" == "yes" ]] \
-  || die "the unconfined guest did not emit its own-address datagram (nc error and no TX, and the capture saw nothing); the sender is not working"
-[[ "$uc_forwarded" == "yes" ]] \
-  || die "the unconfined own-address datagram was not seen on ${TARGET_BRIDGE[unconfined]}; the capture is not observing that bridge, so no silence below would mean anything"
+# --- the spoof attempt: add a foreign alias (needs CAP_NET_ADMIN) and send.
+send_datagram foreign "$FOREIGN_SOURCE" yes
+FOREIGN_ADD_OK="$RESULT_ADD_OK"
+FOREIGN_ADD_OUT="$RESULT_ADD_OUT"
+FOREIGN_BRIDGE_SRC="$RESULT_BRIDGE_SRC"
 
-probe unconfined foreign "$FOREIGN_SOURCE" yes
-read -r _ uf_emitted uf_fwd _ uf_fwd_src _ <"${TMP_DIR}/result-unconfined-foreign"
-[[ "$uf_emitted" == "yes" ]] \
-  || die "the unconfined guest did not emit the foreign-source datagram; the spoofing sender does not work even without confinement"
-if [[ -n "$SIBLING_SOURCE" ]]; then
-  probe unconfined sibling "$SIBLING_SOURCE" yes
-  read -r _ us_emitted us_fwd _ us_fwd_src _ <"${TMP_DIR}/result-unconfined-sibling"
-  [[ "$us_emitted" == "yes" ]] \
-    || die "the unconfined guest did not emit the sibling-source datagram; the spoofing sender does not work even without confinement"
-fi
-
-# --- session calibration: an in-subnet frame must be forwarded onto the
-# session bridge and counted by the labelled IPv4 deny, or a blind capture,
-# a broken counter parser, or an anchor that is not denying would each let a
-# later result be misread. (Delivery to a host socket is not a signal here:
-# vmnet does not deliver guest UDP to the gateway into host sockets at all.)
-probe session control "$GUEST_IPV4" no
-read -r _ ctl_emitted ctl_forwarded ctl_delta _ _ <"${TMP_DIR}/result-session-control"
-[[ "$ctl_emitted" == "yes" ]] \
-  || die "the session guest did not emit the control datagram (nc error and no TX, and the capture saw nothing); the sender is not working"
-[[ "$ctl_forwarded" == "yes" ]] \
-  || die "the control datagram from the session guest's own address was not seen on ${TARGET_BRIDGE[session]}; the capture is not observing the session bridge"
-[[ "$ctl_delta" -gt 0 ]] \
-  || die "the control datagram did not raise the 'writ deny agent v4' counter (delta ${ctl_delta}); either the anchor did not match an in-subnet frame or the counter parser is broken"
-
-probe session foreign "$FOREIGN_SOURCE" yes
-if [[ -n "$SIBLING_SOURCE" ]]; then
-  probe session sibling "$SIBLING_SOURCE" yes
-fi
-# A session that appeared during the probe windows would have had its rules
-# consulted for our datagrams; if one is here now, or the watch saw one pass
-# through, nothing above is graded. Likewise an observer that died: every
-# empty lookup above would then be a lie.
-require_no_other_anchors "after the probes"
-require_no_translations "after the probes"
-require_own_anchor_loaded "after the probes"
-stop_anchor_watch
-require_observers_alive "after the probes"
+process_alive "$CAPTURE_PID" \
+  || die "the bridge capture was not running at the end of the attempts; its silence would have been graded, so nothing is graded"
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
@@ -1018,82 +572,38 @@ log "stopping session through lifecycle runner"
   --subnet-index "$SUBNET_INDEX" >/dev/null
 STOP_DONE=1
 
-log "results (host-observed; guest output was diagnostic only):"
-for r in "${RESULTS[@]}"; do
-  log "  ${r}"
-done
+# --- was the foreign source spoofed onto the bridge?
+FOREIGN_ON_BRIDGE="no"
+if [[ "$FOREIGN_BRIDGE_SRC" != "-" ]] && ! addr_in_cidr "$IPV4_CIDR" "$FOREIGN_BRIDGE_SRC"; then
+  FOREIGN_ON_BRIDGE="yes"
+fi
+caps_denied="no"
+if [[ "$CAP_NET_ADMIN_BND" == "no" && "$CAP_NET_RAW_BND" == "no" ]]; then
+  caps_denied="yes"
+fi
 
-# Verdict per spoofed source. The one trusted observer is the bridge capture:
-# it sits after vmnet and before PF (BPF taps the interface), so it can prove
-# a frame with a given source reached the host bridge, but it cannot say who
-# set that source (vmnet, or the untrusted guest / an nc that ignores -s),
-# nor, since the deny counter is aggregate and not nonce-correlated, whether
-# that counter moved for THIS frame. So exactly one thing is pinnable: an
-# out-of-/24 source physically on the host bridge, which the source-scoped
-# rules cannot match. Everything else is a no-gap observation or inconclusive.
-# The unconfined result is the positive control that vmnet forwards a spoofed
-# source at all. Guest facts (emission) can withhold a verdict, never award one.
-#   $1 name; $2 requested source;
-#   $3 $4 unconfined forwarded / bridge source;
-#   $5..$8 session emitted / forwarded / deny delta / bridge source.
-# Observed sources are "-" when the capture saw nothing.
-verdict() {
-  local name="$1" source="$2"
-  local u_fwd="$3" u_fwd_src="$4"
-  local emitted="$5" fwd="$6" delta="$7" fwd_src="$8"
+log "results (host-observed unless noted):"
+log "  positive control: own source ${GUEST_IPV4} seen on ${SESSION_BRIDGE} as ${CONTROL_BRIDGE_SRC}"
+log "  spoof attempt: ip addr add ${FOREIGN_SOURCE}/32 -> ${FOREIGN_ADD_OK} [${FOREIGN_ADD_OUT:-<no output>}] (guest-reported)"
+log "  spoof attempt: foreign source on ${SESSION_BRIDGE} -> ${FOREIGN_BRIDGE_SRC} (host-owned)"
+log "  CapBnd: NET_ADMIN=${CAP_NET_ADMIN_BND} NET_RAW=${CAP_NET_RAW_BND}; CapEff: NET_ADMIN=${CAP_NET_ADMIN_EFF} NET_RAW=${CAP_NET_RAW_EFF} (guest-reported, host-decoded)"
 
-  # Was the source that reached the host bridge inside the session /24?
-  # "unknown" when the capture saw nothing (the fwd==no branches never use it).
-  local src_in_session="unknown"
-  if [[ "$fwd_src" != "-" ]]; then
-    if addr_in_cidr "$IPV4_CIDR" "$fwd_src"; then src_in_session="yes"; else src_in_session="no"; fi
-  fi
-  # The deny counter is aggregate and not nonce-correlated, so it never AWARDS
-  # a reassuring verdict. It is used only to WITHHOLD the alarming LIVE GAP
-  # claim: a translation (anywhere, nested anchors included) that rewrote our
-  # out-of-/24 frame into the session /24 before filtering would trip the quick
-  # labelled deny and raise this counter, so delta==0 is a sound necessary
-  # condition for "the source-scoped rules did not cover it". A nonzero delta
-  # may be that, or merely unrelated in-subnet traffic in the window; either
-  # way it downgrades LIVE GAP to inconclusive rather than upgrading anything.
-  local counter_note=" ('writ deny agent v4' moved by ${delta} in the window; not correlated to this datagram)"
-
-  # --- platform fact: only "an out-of-/24 source reached the host bridge" is
-  # pinnable, and it is the answer to Beyond-E3 question 4.
-  if [[ "$emitted" != "yes" ]]; then
-    log "PLATFORM ${name}: the session guest did not emit its copy, and the only observer is post-vmnet, so nothing about forwarding is pinnable. See the verdict below."
-  elif [[ "$fwd" == "yes" && "$src_in_session" == "no" ]]; then
-    log "PLATFORM ${name}: a frame with an out-of-/24 source (${fwd_src}) reached the host bridge (control: forwarded=${u_fwd}, source ${u_fwd_src}). Whether that source was set by vmnet or by the guest cannot be told from a post-vmnet observer, but either way an out-of-subnet frame reached the host side. Pinned platform fact (plan 'Beyond E3' question 4): the source-scoped IPv4 rules face a real out-of-subnet frame, so C2b is a live fix."
-  else
-    log "PLATFORM ${name}: no out-of-/24 frame was observed on the host bridge for this source (bridge saw ${fwd_src}). With only a post-vmnet observer, neither 'vmnet drops spoofed sources' nor 'vmnet rewrites them' can be pinned. Not a platform fact. See the verdict below."
-  fi
-
-  # --- confinement verdict.
-  if [[ "$emitted" != "yes" ]]; then
-    log "VERDICT ${name}: INCONCLUSIVE - the session guest did not emit the datagram (nc stderr / TX counter above), and the only observer is post-vmnet, so its silence says nothing. Fix the sender and rerun."
-  elif [[ "$fwd" == "no" && "$u_fwd" == "yes" ]]; then
-    log "VERDICT ${name}: UNEXPLAINED - forwarded on the unconfined bridge but not the session bridge, yet the capture taps before PF, so the anchor cannot account for it. Inspect the captures and rerun.${counter_note}"
-  elif [[ "$fwd" == "no" ]]; then
-    log "VERDICT ${name}: INCONCLUSIVE - neither bridge saw the frame, but the only trusted observer is post-vmnet, so this cannot be told apart from a guest that never emitted the spoof (its emission rests on the aggregate, guest-reported TX counter). A forwarded result would be conclusive; a silent one is not. Do not read it as 'vmnet drops spoofed sources'; C2b stays warranted.${counter_note}"
-  elif [[ "$src_in_session" == "no" && "$delta" -eq 0 ]]; then
-    log "VERDICT ${name}: LIVE GAP - a frame with the out-of-/24 source ${fwd_src} reached the host bridge and the labelled deny did not fire (counter unmoved), so no translation rewrote it into the session /24 to be caught; the source-scoped IPv4 rules cannot match it and did not cover it. Stage C2b (interface-scoped IPv4 rules) is urgent for the legacy profile.${counter_note}"
-  elif [[ "$src_in_session" == "no" ]]; then
-    log "VERDICT ${name}: INCONCLUSIVE - an out-of-/24 source (${fwd_src}) reached the host bridge, but the labelled deny counter also moved (+${delta}) in the window, so a translation may have rewritten this frame into the session /24 where the quick deny caught it (no gap), or unrelated in-subnet traffic moved the counter (real gap). The two cannot be told apart. Rerun in a quiet window before recording anything.${counter_note}"
-  else
-    log "VERDICT ${name}: NO GAP OBSERVED - the frame that reached the host bridge carried the in-subnet source ${fwd_src}, which the source-scoped deny does cover, and no out-of-subnet frame was seen for this source. Whether the guest failed to spoof (nc/-s, guest networking) or vmnet rewrote the source into the subnet cannot be told from a post-vmnet observer, so this is not proof that vmnet anti-spoofs; C2b stays warranted.${counter_note}"
-  fi
-}
-read -r _ f_emitted f_fwd f_delta f_fwd_src _ <"${TMP_DIR}/result-session-foreign"
-verdict foreign "$FOREIGN_SOURCE" \
-  "$uf_fwd" "$uf_fwd_src" \
-  "$f_emitted" "$f_fwd" "$f_delta" "$f_fwd_src"
-if [[ -n "$SIBLING_SOURCE" ]]; then
-  read -r _ s_emitted s_fwd s_delta s_fwd_src _ <"${TMP_DIR}/result-session-sibling"
-  verdict sibling "$SIBLING_SOURCE" \
-    "$us_fwd" "$us_fwd_src" \
-    "$s_emitted" "$s_fwd" "$s_delta" "$s_fwd_src"
+# --- verdict (host-owned). The bridge is the arbiter: it sits after vmnet and
+# before PF, so a foreign source on it is a real spoofed frame regardless of
+# what the guest reports, and its absence (with the control present) means no
+# spoof escaped in this run. The capabilities explain why.
+if [[ "$FOREIGN_ON_BRIDGE" == "yes" ]]; then
+  log "VERDICT: SPOOF POSSIBLE — a frame carrying the out-of-subnet source ${FOREIGN_BRIDGE_SRC} reached the host bridge. The capability model did NOT prevent source forgery here (CapBnd NET_ADMIN=${CAP_NET_ADMIN_BND} NET_RAW=${CAP_NET_RAW_BND}, add=${FOREIGN_ADD_OK}). The source-scoped IPv4 rules face a real out-of-subnet frame: plan 'Beyond E3' question 4 is live and stage C2b (interface-scoped rules) is warranted. Investigate why the workload could spoof."
+elif [[ "$caps_denied" == "yes" && "$FOREIGN_ADD_OK" != "yes" ]]; then
+  log "VERDICT: CAPABILITY-DENIED — the guest workload lacks CAP_NET_ADMIN and CAP_NET_RAW in its bounding set (so root cannot reacquire them), \`ip addr add\` was refused, and no out-of-subnet frame reached the host bridge while the own-source control did. A compromised root agent cannot build an IPv4 frame with a spoofed source, so the source-scoped session rules never face one. This is the answer to plan 'Beyond E3' question 4 for this launch path: source spoofing is prevented below vmnet and PF, at the capability layer."
 else
-  log "VERDICT sibling: not measured — ${IPV4_POOL} holds a single /24, so there is no other session subnet to spoof from."
+  # Fail-closed catch-all: no spoofed frame was seen this run, but the guest
+  # holds or could reacquire a forging capability (CapBnd shows one, or the
+  # alias add succeeded), or the two disagree (e.g. a forged /proc claiming the
+  # caps absent while the add worked). A post-vmnet observer's silence is not
+  # reassuring here — it may be nc, timing, or vmnet, none of which it can pin —
+  # so this is never read as denied.
+  log "VERDICT: CAPABILITY PRESENT — the guest holds, or could reacquire, a capability that enables source forgery (CapBnd NET_ADMIN=${CAP_NET_ADMIN_BND} NET_RAW=${CAP_NET_RAW_BND}, add=${FOREIGN_ADD_OK}), or the capability readout and the add result disagree, yet no spoofed frame was seen on the bridge this run. Treat source spoofing as possible and re-run the forwarding measurement; do NOT read this as denied."
 fi
 
 cleanup
