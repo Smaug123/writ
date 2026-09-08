@@ -508,7 +508,16 @@ E3's proof is where the answers get recorded, as pinned facts about the
    even acquire an address to attack from.
 4. **Does vmnet forward a frame whose IPv4 source is outside the subnet?**
    Decides whether the source-scoped IPv4 rules are a live gap or a
-   theoretical one, and so how urgent C2b is for the legacy profile.
+   theoretical one, and so how urgent C2b is for the legacy profile. The
+   sender half is now answered (2026-09-08, see the design doc's source-scoped
+   delta): the legacy workload holds `CAP_NET_RAW` (Apple `container`'s default;
+   the launch passes no `--cap-*`), so it *can* build such a frame — `IP_FREEBIND`
+   is bind-only, so caps are the sender-side boundary. The open half is vmnet
+   forwarding: measure it with a raw-socket sender inside
+   `scripts/prove-agent-vm-lifecycle.sh` once C3's labelled deny counter exists,
+   grading on that counter and/or a pcap-header parse of the bridge, with a
+   positive control. Independently, the legacy launch can `--cap-drop NET_RAW`
+   now to remove the sender-side capability regardless of the vmnet answer.
 5. **What does `pfctl -sr` readback look like for a loaded session anchor on
    this platform** (rule order, label rendering, counter formatting)? C2 and
    C3 are written against the documented format; the proof confirms it.
