@@ -729,12 +729,17 @@ probe() {
   log "probe ${target}/${name}: source ${source} -> ${gateway}:${PROBE_PORT} (${nonce})"
 
   if [[ "$add_address" == "yes" ]]; then
-    # Tolerate an alias that already exists, then insist it is there: a
-    # silently missing alias would make nc fail to bind, no frame would be
-    # sent, and the capture's silence would read as a platform verdict.
-    guest_in "$vm" "ip addr add ${source}/32 dev eth0 2>/dev/null || true" || true
+    # Tolerate an alias that already exists (ip prints "File exists", exit 2),
+    # then insist it is there: a silently missing alias would make nc fail to
+    # bind, no frame would be sent, and the capture's silence would read as a
+    # platform verdict. Capture the add's own stderr (merged) so a real failure
+    # — no privilege, missing CAP_NET_ADMIN, an ip that lacks `addr add` — is
+    # reported rather than hidden; `|| true` keeps its non-zero exit (including
+    # the benign already-exists) from tripping errexit.
+    local add_out
+    add_out="$(guest_in "$vm" "ip addr add ${source}/32 dev eth0" 2>&1)" || true
     guest_in "$vm" "ip -4 -o addr show dev eth0 | grep -q 'inet ${source}/32 '" \
-      || die "${vm} did not configure ${source}/32 on eth0; the ${target}/${name} probe would send nothing"
+      || die "${vm} did not configure ${source}/32 on eth0; the ${target}/${name} probe would send nothing. ip addr add: [${add_out:-<no output>}]; guest uid: [$(guest_in "$vm" 'id -u' 2>&1 || true)]; eth0 addrs: [$(guest_in "$vm" 'ip -4 -o addr show dev eth0' 2>&1 | tr '\n' ';' || true)]"
   fi
 
   local before="" after="" tx_before tx_after
