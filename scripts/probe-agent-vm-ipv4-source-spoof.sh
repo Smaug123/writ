@@ -138,6 +138,7 @@ SESSION_BRIDGE=""
 CAPTURE_FILE=""
 CAPTURE_PID=""
 CARGO_CMD=()
+GUEST_EXEC_TIMEOUT=()
 STOP_DONE=0
 CLEANUP_STARTED=0
 
@@ -289,8 +290,23 @@ start_http_server() {
 }
 
 # Run a shell command as root inside guest $1.
+# Run a shell command as root inside guest $1, under a host-side deadline. The
+# guest binaries are untrusted (a compromised or custom image may ship a hostile
+# `sh`/`ip`/`nc`), so `nc -w 1` and friends — enforced only by the guest — are
+# not a real bound; `container exec` has none of its own. GUEST_EXEC_TIMEOUT
+# (set at startup to `timeout -k 5 <n>`) caps every call so a hung guest cannot
+# hold the attack window open or block cleanup. On timeout the command exits
+# non-zero (124), which callers already treat as failure.
 guest_in() {
-  container exec "$1" sh -lc "$2"
+  "${GUEST_EXEC_TIMEOUT[@]}" container exec "$1" sh -lc "$2"
+}
+
+# Render untrusted guest-originated text safe to log: drop control characters
+# (CSI/OSC/newline sequences could rewrite the terminal or hide later evidence
+# and verdicts) and bound the length. Used on any string that came from a guest
+# binary before it reaches a `log` call.
+sanitize() {
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-200
 }
 
 wait_for_released_guest_command() {
@@ -343,12 +359,76 @@ bridge_for_gateway() {
 # prints the header line, then the payload as text, so the nonce line is
 # attributed to the most recent header for our destination.
 bridge_source_for_nonce() {
-  sed -n "$(($2 + 1)),\$p" "$1" | awk -v dst=" > $3.$4: " -v nonce="$5" '
-    / IP [0-9.]+ > [0-9.]+: / { hdr = (index($0, dst) ? $0 : "") ; next }
-    hdr != "" && index($0, nonce) {
-      sub(/.* IP /, "", hdr); sub(/\.[0-9]+ > .*/, "", hdr); print hdr; exit
-    }
-  '
+  # Real IPv4 source of the first captured UDP packet whose destination is
+  # $2:$3 and whose payload contains nonce $4, parsed from the pcap $1 by header
+  # STRUCTURE. Unlike a `tcpdump -A` text scan, payload bytes cannot masquerade
+  # as a header line here: the source is read from the IP header, the nonce is
+  # matched only in the UDP payload. Empty if no such packet. Tolerates a
+  # truncated final record (tcpdump writes concurrently).
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import socket
+import struct
+import sys
+
+path, dst_ip, dst_port, nonce = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].encode()
+try:
+    data = open(path, "rb").read()
+except OSError:
+    sys.exit(0)
+if len(data) < 24:
+    sys.exit(0)
+magic = data[:4]
+if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):
+    end = "<"
+elif magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+    end = ">"
+else:
+    sys.exit(0)
+linktype = struct.unpack(end + "I", data[20:24])[0]
+off = 24
+while off + 16 <= len(data):
+    _ts_s, _ts_u, incl, _orig = struct.unpack(end + "IIII", data[off:off + 16])
+    off += 16
+    if incl <= 0 or off + incl > len(data):
+        break  # truncated final record
+    pkt = data[off:off + incl]
+    off += incl
+    if linktype == 1:  # Ethernet
+        if len(pkt) < 14:
+            continue
+        etype = struct.unpack(">H", pkt[12:14])[0]
+        l3 = 14
+        if etype == 0x8100:  # 802.1Q VLAN tag
+            if len(pkt) < 18:
+                continue
+            etype = struct.unpack(">H", pkt[16:18])[0]
+            l3 = 18
+        if etype != 0x0800:  # IPv4
+            continue
+    elif linktype == 0:  # BSD loopback/null: 4-byte address family
+        l3 = 4
+    else:
+        continue
+    if len(pkt) < l3 + 20:
+        continue
+    ver_ihl = pkt[l3]
+    if (ver_ihl >> 4) != 4:
+        continue
+    ihl = (ver_ihl & 0x0f) * 4
+    if ihl < 20 or pkt[l3 + 9] != 17:  # UDP
+        continue
+    src = socket.inet_ntoa(pkt[l3 + 12:l3 + 16])
+    dip = socket.inet_ntoa(pkt[l3 + 16:l3 + 20])
+    udp = l3 + ihl
+    if len(pkt) < udp + 8:
+        continue
+    dport = struct.unpack(">H", pkt[udp + 2:udp + 4])[0]
+    payload = pkt[udp + 8:]
+    if dip == dst_ip and dport == dst_port and nonce in payload:
+        print(src)
+        sys.exit(0)
+sys.exit(0)
+PY
 }
 
 # `ps` rather than `kill -0`: the capture runs under sudo, and kill -0 on a
@@ -362,12 +442,15 @@ process_alive() {
 # Start capturing UDP to the probe port on the session bridge.
 start_capture() {
   local err="${TMP_DIR}/tcpdump.err"
-  CAPTURE_FILE="${TMP_DIR}/tcpdump.log"
-  log "capturing UDP to port ${PROBE_PORT} on ${SESSION_BRIDGE}"
-  # The redirects are deliberately the unprivileged shell's: the log lives in
-  # the user-owned TMP_DIR, and only the capture itself needs root.
+  CAPTURE_FILE="${TMP_DIR}/capture.pcap"
+  log "capturing UDP to port ${PROBE_PORT} on ${SESSION_BRIDGE} (pcap)"
+  # `-w -` writes a pcap stream to stdout, redirected by the unprivileged shell
+  # into a user-owned file (so python can read it), while only tcpdump itself
+  # runs as root. pcap, not `-A` text: bridge_source_for_nonce parses packet
+  # HEADERS, so a guest-controlled payload cannot forge a source line. `-U`
+  # flushes each packet; `-s 0` keeps full frames.
   # shellcheck disable=SC2024
-  sudo tcpdump -i "$SESSION_BRIDGE" -n -l -q -A "udp and dst port ${PROBE_PORT}" >"$CAPTURE_FILE" 2>"$err" &
+  sudo tcpdump -i "$SESSION_BRIDGE" -n -p -U -s 0 -w - "udp and dst port ${PROBE_PORT}" >"$CAPTURE_FILE" 2>"$err" &
   CAPTURE_PID=$!
   sleep 2
   process_alive "$CAPTURE_PID" \
@@ -455,7 +538,8 @@ send_datagram() {
     # Capture the add's merged output: a real failure (EPERM from a missing
     # CAP_NET_ADMIN) is the whole point of the measurement, and `|| true` keeps
     # its non-zero exit (or a benign already-exists) from tripping errexit.
-    RESULT_ADD_OUT="$(guest_in "$VM_NAME" "ip addr add ${source}/32 dev eth0" 2>&1)" || true
+    # sanitize: the add's stderr is guest-controlled and gets logged.
+    RESULT_ADD_OUT="$(sanitize "$(guest_in "$VM_NAME" "ip addr add ${source}/32 dev eth0" 2>&1)")" || true
     if guest_in "$VM_NAME" "ip -4 -o addr show dev eth0 | grep -q 'inet ${source}/32 '"; then
       RESULT_ADD_OK="yes"
       log "  alias ${source}/32 configured on eth0 (CAP_NET_ADMIN present)"
@@ -465,9 +549,8 @@ send_datagram() {
     fi
   fi
 
-  local tx_before tx_after cap_before
+  local tx_before tx_after
   tx_before="$(guest_tx_packets "$VM_NAME")"
-  cap_before="$(wc -l <"$CAPTURE_FILE" | tr -d ' ')"
 
   # -w 1: BusyBox nc otherwise waits for a reply that never comes. Its exit
   # status is diagnostic; whether a frame left the guest is decided from the TX
@@ -486,7 +569,7 @@ send_datagram() {
   sleep 2
   tx_after="$(guest_tx_packets "$VM_NAME")"
 
-  RESULT_BRIDGE_SRC="$(bridge_source_for_nonce "$CAPTURE_FILE" "$cap_before" "$IPV4_GATEWAY" "$PROBE_PORT" "$nonce")"
+  RESULT_BRIDGE_SRC="$(bridge_source_for_nonce "$CAPTURE_FILE" "$IPV4_GATEWAY" "$PROBE_PORT" "$nonce")"
   RESULT_BRIDGE_SRC="${RESULT_BRIDGE_SRC:--}"
 
   if [[ "$RESULT_BRIDGE_SRC" != "-" ]]; then
@@ -507,6 +590,17 @@ require_cmd uuidgen
 require_cmd tcpdump
 require_cmd ifconfig
 choose_cargo
+
+# A host-side deadline for every guest exec (see guest_in). macOS ships no
+# `timeout`; the Nix dev shell provides GNU coreutils' `timeout`, and Homebrew
+# provides `gtimeout`. Require one rather than run guest binaries unbounded.
+if command -v timeout >/dev/null 2>&1; then
+  GUEST_EXEC_TIMEOUT=(timeout -k 5 30)
+elif command -v gtimeout >/dev/null 2>&1; then
+  GUEST_EXEC_TIMEOUT=(gtimeout -k 5 30)
+else
+  die "no 'timeout' (or 'gtimeout') found; run under \`nix develop\` (coreutils) so guest commands get a host-side deadline"
+fi
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 IPV4_GATEWAY="$(cidr_host "$IPV4_CIDR" 1)"
