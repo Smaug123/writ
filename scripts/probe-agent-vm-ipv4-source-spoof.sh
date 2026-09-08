@@ -488,6 +488,11 @@ IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 IPV4_GATEWAY="$(cidr_host "$IPV4_CIDR" 1)"
 # A "foreign" source inside the session /24 would be legitimately covered by
 # the source-scoped deny, so it would not be a spoof at all.
+# The capture BPF, the /32 alias, and the nc send are all IPv4; an IPv6
+# override would silently exercise a family the observer never watches, so the
+# spoof leg would "pass" without testing the configured source. Require IPv4.
+python3 -c 'import ipaddress, sys; ipaddress.IPv4Address(sys.argv[1])' "$FOREIGN_SOURCE" 2>/dev/null \
+  || die "WRIT_PROBE_FOREIGN_SOURCE=${FOREIGN_SOURCE} is not an IPv4 address; the probe observes IPv4 only"
 require_outside "$IPV4_CIDR" "$FOREIGN_SOURCE" \
   || die "WRIT_PROBE_FOREIGN_SOURCE=${FOREIGN_SOURCE} lies inside the session /24 ${IPV4_CIDR}; it needs to be an out-of-subnet source"
 
