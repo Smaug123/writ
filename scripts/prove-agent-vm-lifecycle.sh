@@ -12,8 +12,10 @@ Requires:
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
-    wget, nslookup, and ping/ping6 (the IPv6 backstop assertion sends a real
-    ICMPv6 probe and fails the proof if no ping tool is present)
+    wget, and nslookup (the IPv6 backstop assertion sends a real IPv6 TCP
+    probe with wget and grades it on the host's PF deny counter; the released
+    workload holds no CAP_NET_RAW, so a raw-socket tool such as busybox ping
+    cannot be the sender)
 
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
@@ -248,6 +250,76 @@ guest_ipv4_addr() {
   guest "ip -4 -o addr show scope global | awk '{print \$4}' | head -n 1 | cut -d/ -f1"
 }
 
+# Linux capability bit numbers (include/uapi/linux/capability.h).
+CAP_NET_ADMIN_BIT=12
+CAP_NET_RAW_BIT=13
+
+# rc 0 iff bit $2 is set in the hex capability mask $1 as /proc/<pid>/status
+# renders it. Decoded here in bash (64-bit arithmetic), not in the guest's
+# 32-bit busybox ash.
+cap_mask_has_bit() {
+  local mask="$1"
+  local bit="$2"
+  [[ "$mask" =~ ^[0-9a-fA-F]{1,16}$ ]] || die "malformed capability mask: '${mask}'"
+  (( (0x$mask >> bit) & 1 ))
+}
+
+# The decoder's own positive control, so the assertion below cannot pass
+# because the decoder reads every mask as empty. Apple `container`'s documented
+# default set (AUDIT_WRITE CHOWN DAC_OVERRIDE FOWNER FSETID KILL MKNOD
+# NET_BIND_SERVICE NET_RAW SETFCAP SETGID SETPCAP SETUID SYS_CHROOT) renders as
+# this mask: it holds NET_RAW and CHOWN and not NET_ADMIN.
+assert_capability_decoder_works() {
+  local default_set=00000000a80425fb
+  if ! cap_mask_has_bit "$default_set" "$CAP_NET_RAW_BIT"; then
+    die "capability decoder self-test: NET_RAW not found in ${default_set}"
+  fi
+  if ! cap_mask_has_bit "$default_set" 0; then
+    die "capability decoder self-test: CHOWN not found in ${default_set}"
+  fi
+  if cap_mask_has_bit "$default_set" "$CAP_NET_ADMIN_BIT"; then
+    die "capability decoder self-test: NET_ADMIN found in ${default_set}"
+  fi
+}
+
+# The released workload is PID 1 (the IPv4-only prelaunch gate `exec`s the
+# guest command once released), so its capability sets are /proc/1/status's.
+# Every one of the five sets is checked: a capability that is merely not
+# effective — still permitted, or still in the bounding set for a re-exec of a
+# file-capability binary to pick up — must fail too.
+assert_released_workload_lacks_net_admin_and_net_raw() {
+  log "assert: released workload holds neither NET_ADMIN nor NET_RAW in any capability set"
+  assert_capability_decoder_works
+  # Positive control on the target: PID 1 must be the released guest command,
+  # not the prelaunch gate or an init shim, or the masks describe the wrong
+  # process. The released command is a `while :; do sleep; done` loop, not a
+  # bare `sleep`, precisely so BusyBox ash does not tail-exec it away and
+  # PID 1's cmdline keeps the marker (capabilities are preserved across any
+  # exec regardless, so /proc/1/status is the workload's posture either way).
+  guest 'tr "\0" " " </proc/1/cmdline | grep -q lifecycle-released' \
+    || die "guest PID 1 is not the released guest command"
+  local status
+  status="$(guest 'cat /proc/1/status')" || die "could not read /proc/1/status in the guest"
+  local seen=0
+  local name mask
+  while read -r name mask; do
+    case "$name" in
+      CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:) ;;
+      *) continue ;;
+    esac
+    seen=$((seen + 1))
+    if cap_mask_has_bit "$mask" "$CAP_NET_ADMIN_BIT"; then
+      die "released workload holds NET_ADMIN in ${name} ${mask}"
+    fi
+    if cap_mask_has_bit "$mask" "$CAP_NET_RAW_BIT"; then
+      die "released workload holds NET_RAW in ${name} ${mask} (the IPv4-only launch must pass --cap-drop NET_RAW)"
+    fi
+    log "  ${name} ${mask}: no NET_ADMIN, no NET_RAW"
+  done <<<"$status"
+  [[ "$seen" -eq 5 ]] || die "expected 5 capability sets in /proc/1/status, decoded ${seen}"
+  log "pass: released workload holds neither NET_ADMIN nor NET_RAW in any capability set"
+}
+
 assert_guest_has_no_routable_ipv6() {
   log "assert: guest has no routable IPv6 address or default route"
   set +e
@@ -291,14 +363,41 @@ assert_pf_anchor_has_ipv6_interface_deny() {
 # reacquire a vmnet-RA ULA after release. Prove the *host* PF interface deny
 # still blocks its IPv6 egress, so the bypass is closed at a layer the guest
 # cannot touch.
+# The summed packet counter of the session anchor's interface-scoped IPv6
+# denies, read on the host from `pfctl -vsr`, which renders each rule followed
+# by an indented `[ Evaluations: N Packets: N Bytes: N States: N ]` line. The
+# firewall installs a separate `block ... inet6 all` per interface (the bridge
+# AND each vmenet member), and PF may drop the probe on any of them, so this
+# aggregates the Packets counters of ALL matching denies. Dies unless at least
+# one such rule renders with a counter, so a format drift fails the proof
+# rather than reading as zero.
+pf_ipv6_iface_deny_packets() {
+  local rules
+  rules="$(sudo pfctl -a "$PF_ANCHOR" -vsr 2>/dev/null)" \
+    || die "could not read verbose rules for ${PF_ANCHOR}"
+  local count
+  count="$(printf '%s\n' "$rules" | awk '
+    /^block .* on (bridge|vmenet)[0-9]+ inet6 all/ { rule = 1; next }
+    rule && match($0, /Packets: [0-9]+/) {
+      total += substr($0, RSTART + 9, RLENGTH - 9); matched = 1; rule = 0; next
+    }
+    /^[^ \t[]/ { rule = 0 }
+    END { if (matched) print total }
+  ')"
+  [[ "$count" =~ ^[0-9]+$ ]] \
+    || die "no IPv6 interface deny with a packet counter rendered in pfctl -vsr for ${PF_ANCHOR}"
+  printf '%s\n' "$count"
+}
+
 assert_reenabled_ipv6_egress_blocked() {
   log "assert: a root guest that re-enables IPv6 still cannot egress it"
   # A real IPv6 packet probe is mandatory: without one this assertion could pass
-  # vacuously (a missing tool returns non-zero, which looks "blocked") and so
-  # could not detect a nonfunctional PF rule. Require ping/ping6 up front and fail
-  # the proof — not pass — if the image lacks it.
-  guest 'command -v ping6 >/dev/null 2>&1 || command -v ping >/dev/null 2>&1' \
-    || die "proof image has no ping/ping6; cannot send an IPv6 probe to exercise the backstop (use WRIT_PROVE_IMAGE with ping)"
+  # vacuously (a tool that fails before sending returns non-zero, which looks
+  # "blocked") and so could not detect a nonfunctional PF rule. The sender is
+  # busybox wget (required of the image above), which needs no capability. The
+  # released workload holds no CAP_NET_RAW, and `container exec` inherits that,
+  # so busybox ping/ping6 — a raw ICMP socket with no SOCK_DGRAM fallback —
+  # would die before sending anything; it cannot be the sender.
   # Undo the in-guest disable exactly as a malicious agent would, then nudge the
   # link so a fresh RA is solicited.
   guest '
@@ -319,13 +418,36 @@ assert_reenabled_ipv6_egress_blocked() {
   gw="$(guest 'ip -6 route show default 2>/dev/null | awk "{print \$3}" | head -n1' | tr -d "[:space:]")"
   [ -n "$gw" ] \
     || die "guest reacquired no IPv6 default route after re-enabling; cannot send a routed IPv6 probe to prove the deny (investigate RA timing)"
-  log "probing IPv6 egress to reacquired gateway ${gw}"
-  # A real ICMPv6 echo to the bridge: absent the deny the host replies (rc 0);
-  # with the deny the packet is dropped/returned (rc != 0). ping6 or `ping -6`,
-  # whichever the image ships.
+  # A link-local gateway (the RA's source) needs the zone of the link it came
+  # in on; a global one does not.
+  local target="$gw"
+  if [[ "$gw" == fe80:* ]]; then
+    target="${gw}%eth0"
+  fi
+  local before
+  before="$(pf_ipv6_iface_deny_packets)"
+  log "probing IPv6 egress to reacquired gateway ${gw} (deny counter before: ${before})"
+  # A TCP connect over IPv6 to the host bridge. The guest's exit code is not the
+  # oracle: with `block return` PF answers with a reset, and with no deny the
+  # gateway has no IPv6 listener on that port either, so wget fails both ways.
+  # The oracle is the host's deny-rule packet counter: it moves iff an IPv6
+  # frame from the guest reached PF on the bridge and was blocked by exactly
+  # that rule (the connect's SYN, or the neighbour solicitation that precedes
+  # it). A probe that sends nothing leaves it unchanged and fails the proof.
+  # Residual window: the guest kernel's own solicitations after the re-enable
+  # can also hit the deny between the two readings, so a moving counter is
+  # proof that PF blocks the guest's IPv6 on this bridge rather than proof
+  # that it was wget's frame specifically.
   expect_guest_blocked \
-    "re-enabled guest IPv6 egress to the host bridge is blocked by host PF" \
-    "if command -v ping6 >/dev/null 2>&1; then ping6 -c1 -w2 '$gw'; else ping -6 -c1 -w2 '$gw'; fi"
+    "re-enabled guest IPv6 egress to the host bridge is refused" \
+    "wget -q -T 3 -O /dev/null 'http://[${target}]:${BROKER_PORT}/broker.txt'"
+  local after
+  after="$(pf_ipv6_iface_deny_packets)"
+  log "deny counter after: ${after}"
+  if (( after <= before )); then
+    die "the host IPv6 interface deny counted no packet during the guest's probe (before=${before}, after=${after}); the probe sent nothing, or PF did not see it on the bridge"
+  fi
+  log "pass: host PF blocked $((after - before)) IPv6 packet(s) from the re-enabled guest"
 }
 
 assert_pf_anchor_empty() {
@@ -433,7 +555,7 @@ log "starting runner-managed VM ${VM_NAME} on ${IPV4_CIDR}"
   --broker-port-max "$BROKER_PORT_MAX" \
   --image "$IMAGE" \
   --ipv6-mode "$IPV6_MODE" \
-  -- sh -c 'printf lifecycle-released >/tmp/writ-agent-vm-released; sleep 600' \
+  -- sh -c 'printf lifecycle-released >/tmp/writ-agent-vm-released; while :; do sleep 600; done' \
   | tee "$START_OUTPUT"
 
 grep -Fxq "session_id=${SESSION_ID}" "$START_OUTPUT" || die "runner did not print expected session ID"
@@ -443,6 +565,11 @@ grep -Fxq "broker_url=http://${IPV4_GATEWAY}:${BROKER_PORT}/" "$START_OUTPUT" ||
   die "runner did not print expected broker URL"
 
 wait_for_released_guest_command
+
+# The IPv4-only launch drops CAP_NET_RAW (the default set never holds
+# CAP_NET_ADMIN): without either, the workload cannot forge an out-of-subnet
+# IPv4 source, which the session anchor's source-scoped rules would not match.
+assert_released_workload_lacks_net_admin_and_net_raw
 
 expect_guest_success \
   "guest has required probe tools" \
@@ -500,4 +627,4 @@ assert_no_pf_state_for_guest
 
 cleanup
 trap - EXIT INT TERM
-log "runner lifecycle proof succeeded for ${IPV4_CIDR}; broker reachable, forbidden host port blocked, IPv6 posture proven, host IPv6 interface deny installed and holds against a re-enabling root guest, and runner cleanup verified"
+log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, broker reachable, forbidden host port blocked, IPv6 posture proven, host IPv6 interface deny installed and holds against a re-enabling root guest, and runner cleanup verified"

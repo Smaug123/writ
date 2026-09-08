@@ -42,6 +42,40 @@ fn start_invocations_probe_create_inspect_firewall_probe_vm_then_vm() {
     assert_eq!(&vm_args[0..2], ["run", "--name"]);
     assert!(vm_args.contains(&"writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string()));
     assert_tmpfs_mounts_present(&vm_args);
+    // The capability edit is the IPv4-only launch's; dual-stack runs with the
+    // platform default set, as before.
+    assert!(
+        !vm_args.iter().any(|arg| arg.starts_with("--cap-")),
+        "{vm_args:?}"
+    );
+}
+
+/// The IPv4-only launch's capability edit is exactly `--cap-drop NET_RAW`:
+/// present once, spelled the way `container run` accepts it, and with no
+/// `--cap-add` that could hand the sender-side forgery capability back.
+#[test]
+fn ipv4_only_launch_drops_net_raw_and_adds_nothing() {
+    let invocations =
+        plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6).start_invocations();
+    let vm_args = invocations[5].args_lossy();
+    let cap_flags = vm_args
+        .windows(2)
+        .filter(|window| window[0].starts_with("--cap-"))
+        .map(|window| (window[0].as_str(), window[1].as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(cap_flags, [("--cap-drop", "NET_RAW")]);
+    let image_position = vm_args
+        .iter()
+        .position(|arg| arg == "alpine:latest")
+        .expect("image present");
+    let drop_position = vm_args
+        .iter()
+        .position(|arg| arg == "--cap-drop")
+        .expect("--cap-drop present");
+    assert!(
+        drop_position < image_position,
+        "a flag after the image is a guest-command argument, not a launch flag: {vm_args:?}"
+    );
 }
 
 #[test]
@@ -59,21 +93,50 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     // not up yet).
     assert!(!firewall_args.contains(&"--deny-guest-ipv6".to_string()));
 
+    // The whole `run` argv, held equal to the intended list: the capability
+    // drop sits with the other launch flags, before the image, and the guest
+    // command is wrapped by the prelaunch gate.
+    assert_eq!(
+        invocations[5].args_lossy(),
+        [
+            "run",
+            "--name",
+            "writ-agent-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            "--label",
+            "writ.owner=writ-test-owner",
+            "--network",
+            "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d",
+            "--cpus",
+            "1",
+            "--memory",
+            "512m",
+            "-d",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/run",
+            "--tmpfs",
+            "/var/tmp",
+            "--tmpfs",
+            "/root",
+            "--cap-drop",
+            "NET_RAW",
+            "alpine:latest",
+            "sh",
+            "-c",
+            IPV4_ONLY_PRELAUNCH_SCRIPT,
+            "writ-agent-vm-prelaunch",
+            "sleep",
+            "600",
+        ]
+    );
     let start_vm_args = invocations[5].args_lossy();
-    assert_eq!(&start_vm_args[0..2], ["run", "--name"]);
     assert_tmpfs_mounts_present(&start_vm_args);
-    assert!(start_vm_args.contains(&"sh".to_string()));
-    assert!(start_vm_args.contains(&"-c".to_string()));
     assert!(
         start_vm_args
             .iter()
             .any(|arg| arg.contains("/run/writ-agent-vm/start") && arg.contains("exec \"$@\""))
     );
-    assert!(start_vm_args.ends_with(&[
-        "writ-agent-vm-prelaunch".into(),
-        "sleep".into(),
-        "600".into()
-    ]));
 
     // Index 6: the post-start guest-IPv6 deny — a pf-helper re-install that asks
     // the privileged helper to discover the bridge itself (`--deny-guest-ipv6`).
