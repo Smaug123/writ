@@ -447,9 +447,14 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
   today they are validated CLI arguments);
 - it syntax-checks, atomically loads, parses exact readback, and re-resolves
   after the load (not shipped);
-- it answers `protocol-version` with one bounded JSON object, and returns
-  bounded versioned JSON describing anchor, interfaces, and firewall phase (not
-  shipped; the daemon's `ipv4_only_locked_v1` admission depends on the probe).
+- it answers `protocol-version` with one bounded JSON object (shipped: the
+  helper reports version 1, and the host-side parser accepts exactly the
+  helper's rendering, refusing trailing data, a second object, or another
+  protocol name; the number moves to 2 only when the policy file, exact
+  readback, and re-resolve above have all landed, so "v2" names that whole
+  boundary), and returns bounded versioned JSON describing anchor, interfaces,
+  and firewall phase (not shipped; the daemon's `ipv4_only_locked_v1` admission
+  depends on the probe).
 
 Tests inject a fake `pfctl` path into the unprivileged Rust library, not into
 the production privileged CLI.

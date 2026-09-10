@@ -1091,6 +1091,7 @@ the session-teardown execution — run stop invocations, poll resources until
 absent, fold errors),
 `agent_vm_daemon.rs` (1295, with the `AgentVmDaemon` method impl in
 `agent_vm_daemon/daemon_impl.rs`) + `agent_vm_daemon/`, `agent_vm_firewall.rs`,
+`agent_vm_pf_helper_protocol.rs`,
 `broker_vm.rs` (966, with the `BrokerVmPlan` invocation builders in
 `broker_vm/plan.rs` and tests in `broker_vm/tests.rs`), `broker_vm_runner.rs`,
 `broker_entrypoint.rs`,
@@ -1101,7 +1102,12 @@ model itself lives in `writ-core` (`core/agent_vm.rs`).
 **Topology.** *Host:* the `writd` daemon (`AgentVmDaemon`), an unprivileged
 lifecycle runner (`writ-agent-vm-runner`, owns Apple-`container` ordering), and
 a root PF helper (`writ-agent-vm-pf-helper`, pins `/sbin/pfctl` +
-`/sbin/ifconfig`, trusts no caller-supplied path). *Guest:* the agent VM, and —
+`/sbin/ifconfig`, trusts no caller-supplied path; its `protocol-version`
+subcommand answers with the one bounded JSON line of
+`agent_vm_pf_helper_protocol::PfHelperProtocolDoc`, running neither tool, and
+the host-side parser accepts exactly the renderer's output — the helper
+reports v1 today, and v2 will mean the whole of the locked-profile boundary,
+policy file included). *Guest:* the agent VM, and —
 under `BrokerPlacement::Vm` — a dedicated broker VM running `writd broker` on a
 shared `--internal` network.
 
