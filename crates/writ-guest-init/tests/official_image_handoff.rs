@@ -30,6 +30,7 @@
 //!
 //! `WRIT_GUEST_IMAGE_TOOL` overrides the runtime's executable path.
 
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -181,7 +182,6 @@ impl Harness {
     /// pipes are drained on their own threads so a chatty child cannot block
     /// on a full pipe while the deadline loop waits for it.
     fn run_tool_within(&self, args: &[&str], deadline: Duration) -> ToolOutput {
-        use std::io::Read;
         let mut command = Command::new(&self.tool);
         command
             .args(args)
@@ -192,26 +192,26 @@ impl Harness {
         // guard requires.
         let mut child = writ_core::process_spawn::spawn(&mut command)
             .unwrap_or_else(|e| panic!("could not spawn {} {args:?}: {e}", self.tool));
-        let drain = |pipe: Option<std::process::ChildStdout>,
-                     err: Option<std::process::ChildStderr>| {
+        // Each pipe is drained on its own thread that hands the bytes back
+        // over a channel, so the deadline also bounds the *drain*: a runtime
+        // that leaves a descendant holding the pipe open after the direct
+        // child has been reaped (or killed) cannot hold the test past its
+        // budget. The abandoned thread just blocks until that descendant goes.
+        fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+            let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                match (pipe, err) {
-                    (Some(mut p), None) => {
-                        let _ = p.read_to_end(&mut buf);
-                    }
-                    (None, Some(mut e)) => {
-                        let _ = e.read_to_end(&mut buf);
-                    }
-                    _ => {}
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut buf);
                 }
-                buf
-            })
-        };
-        let stdout = drain(child.stdout.take(), None);
-        let stderr = drain(None, child.stderr.take());
+                let _ = tx.send(buf);
+            });
+            rx
+        }
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
         let start = Instant::now();
-        let (status, timed_out) = loop {
+        let (status, mut timed_out) = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break (Some(status), false),
                 Ok(None) if start.elapsed() > deadline => {
@@ -223,10 +223,20 @@ impl Harness {
                 Err(e) => panic!("waiting on {} {args:?}: {e}", self.tool),
             }
         };
-        let stdout = stdout.join().expect("stdout drain thread");
-        let stderr = stderr.join().expect("stderr drain thread");
+        let mut collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match rx.recv_timeout(remaining) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    timed_out = true;
+                    Vec::new()
+                }
+            }
+        };
+        let stdout = collect(stdout);
+        let stderr = collect(stderr);
         ToolOutput {
-            ok: status.is_some_and(|s| s.success()),
+            ok: status.is_some_and(|s| s.success()) && !timed_out,
             timed_out,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -293,7 +303,6 @@ impl Harness {
                 return logs;
             }
             if start.elapsed() > deadline {
-                self.cleanup();
                 panic!("timed out after {deadline:?} waiting for {what}\n--- logs ---\n{logs}");
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -326,16 +335,24 @@ impl Harness {
     fn release(&self) {
         self.must(&["kill", "--signal", "USR1", &self.name]);
     }
+}
 
-    fn cleanup(&self) {
-        match self.runtime {
-            Runtime::Docker => {
-                self.run_tool(&["rm", "-f", &self.name]);
-            }
-            Runtime::AppleContainer => {
-                self.run_tool(&["stop", &self.name]);
-                self.run_tool(&["rm", &self.name]);
-            }
+/// The container is released whenever the harness goes away, including by
+/// unwinding from a failed assertion: a parked initializer left behind is,
+/// on the Apple runtime, a whole VM still running after the test exits.
+/// Nothing here may panic (a panic while unwinding aborts), so every runtime
+/// call is caught and its failure ignored.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let name = self.name.clone();
+        let argvs: Vec<Vec<&str>> = match self.runtime {
+            Runtime::Docker => vec![vec!["rm", "-f", &name]],
+            Runtime::AppleContainer => vec![vec!["stop", &name], vec!["rm", &name]],
+        };
+        for argv in &argvs {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.run_tool(argv);
+            }));
         }
     }
 }
@@ -399,12 +416,9 @@ fn official_image_handoff_releases_to_the_locked_identity_and_tools_run() {
     // 2. Host-observed: PID 1 parked in the release wait is the locked
     //    identity with USR1 visibly blocked.
     let awaiting_text = harness.awaiting_status();
-    let awaiting = ProcStatus::parse(awaiting_text.trim()).unwrap_or_else(|e| {
-        harness.cleanup();
-        panic!("pre-release PID 1 status did not parse: {e}\n{awaiting_text}")
-    });
+    let awaiting = ProcStatus::parse(awaiting_text.trim())
+        .unwrap_or_else(|e| panic!("pre-release PID 1 status did not parse: {e}\n{awaiting_text}"));
     if let Err(violations) = LockedAwaitingRelease::verify(&awaiting) {
-        harness.cleanup();
         panic!(
             "parked PID 1 is not the awaiting-release locked identity (the host would refuse \
              to release it): {violations:?}\n{awaiting_text}"
@@ -416,7 +430,7 @@ fn official_image_handoff_releases_to_the_locked_identity_and_tools_run() {
     let logs = harness.wait_for_log(DONE_DEADLINE, "the workload to finish", |logs| {
         logs.contains(DONE_MARKER)
     });
-    harness.cleanup();
+    drop(harness);
 
     // The record was emitted once, not again after release.
     assert_eq!(
@@ -506,7 +520,7 @@ fn official_image_injected_failure_prevents_exec() {
     // once more and stop looking.
     std::thread::sleep(Duration::from_secs(2));
     let logs = harness.logs();
-    harness.cleanup();
+    drop(harness);
 
     let records = record_lines(&logs);
     assert_eq!(
