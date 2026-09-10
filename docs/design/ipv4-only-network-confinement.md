@@ -468,9 +468,9 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
   access control list (a macOS ACL can grant write access the mode bits do
   not show, so any ACL is refused rather than interpreted), in a directory
   with the same properties, bounded size, opened non-blocking so a FIFO is
-  refused rather than waited on — and `install`, `remove`, and `preflight`
-  all refuse without it; the v1 arguments that carried the bounds are
-  rejected as unknown, so an older daemon fails closed). The
+  refused rather than waited on — and `install`, `remove`, `preflight`, and
+  `counters` all refuse without it; the v1 arguments that carried the bounds
+  are rejected as unknown, so an older daemon fails closed). The
   admitted interface policy is deliberately *not* in the file: which host
   interfaces the IPv6 deny may scope to stays compiled into the discovery
   (`bridgeN` carrying the session gateway, with `vmenetN` members), because a
@@ -497,6 +497,13 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
   `anchor "writ/session/*"` sits, every `pass` translation rule loaded — read
   by the same function whose verdict gates the install, so the report the
   daemon reads and the check that guards the load cannot disagree (shipped);
+  it answers `counters` with one session anchor's labelled rule counters
+  from `pfctl -vsr`, keyed by (label, interface) because the attached anchor
+  stamps one label on the bridge rule and on each member's, parsed with the
+  same exact rule grammar as the readback so an anchor holding a foreign
+  rule is an error rather than a partial answer, and with a delta that is
+  defined only for two readings of the same loaded anchor — the same keys,
+  none fallen (shipped, inert until the vertical proof reads it);
   and a successful `install` returns bounded versioned JSON naming the anchor
   whose readback matched, the interfaces it was resolved to, and the last
   phase completed (shipped; the daemon's `ipv4_only_locked_v1` admission

@@ -18,9 +18,9 @@ use crate::agent_vm_lifecycle::{
 };
 use crate::core::{
     AgentFirewallNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts,
-    Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfReadbackParseError, PfRuleset, SessionId,
-    parse_pf_readback, render_pf, render_pf_readback, session_attached_pf_ruleset,
-    session_firewall_pf_ruleset,
+    Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfCounterSnapshot, PfCountersParseError, PfInterface,
+    PfReadbackParseError, PfRuleset, SessionId, parse_pf_readback, parse_pf_verbose_readback,
+    render_pf, render_pf_readback, session_attached_pf_ruleset, session_firewall_pf_ruleset,
 };
 use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome};
 
@@ -341,6 +341,14 @@ pub enum PfctlError {
         anchor: String,
         #[source]
         source: PfReadbackParseError,
+    },
+    /// The anchor's verbose readback holds something other than session
+    /// rules with counters.
+    #[error("cannot parse the counters of PF anchor {anchor}: {source}")]
+    CountersUnparseable {
+        anchor: String,
+        #[source]
+        source: PfCountersParseError,
     },
     /// The anchor read back after the load is not the intended ruleset.
     #[error(
@@ -1022,6 +1030,51 @@ pub fn verify_session_anchor_readback(
             actual: actual.into_owned(),
         })
     }
+}
+
+/// One session's anchor, named for a counter reading: the session facts are
+/// validated against the pool like a removal's, and nothing else is needed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCounterQuery {
+    anchor: PfAnchorName,
+}
+
+impl SessionCounterQuery {
+    pub fn new(
+        session_id: SessionId,
+        pool: AgentNetworkPool,
+        ipv4: Ipv4Cidr,
+        ipv6: Option<Ipv6Cidr>,
+    ) -> Result<Self, AgentVmConfigError> {
+        pool.claim_firewall(ipv4, ipv6)?;
+        Ok(Self {
+            anchor: PfAnchorName::for_session(session_id),
+        })
+    }
+
+    pub fn anchor(&self) -> &PfAnchorName {
+        &self.anchor
+    }
+
+    /// `pfctl -a <anchor> -vsr`: the loaded anchor with its counters.
+    pub fn invocation(&self) -> PfctlInvocation {
+        PfctlInvocation::new(["-a", self.anchor.as_str(), "-vsr"])
+    }
+}
+
+/// Read one session anchor's labelled rule counters. Runs only the verbose
+/// readback; an anchor `pfctl` cannot print, or one holding a rule this
+/// crate never rendered, is an error rather than an empty snapshot.
+pub fn read_session_counters(
+    pfctl: &Path,
+    query: &SessionCounterQuery,
+) -> Result<PfCounterSnapshot, PfctlError> {
+    let output = query.invocation().run(pfctl)?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_pf_verbose_readback(&text).map_err(|source| PfctlError::CountersUnparseable {
+        anchor: query.anchor.as_str().to_string(),
+        source,
+    })
 }
 
 /// Install one session's firewall, phase by phase ([`PfInstallPhase`]):
@@ -2029,6 +2082,112 @@ mod tests {
         wildcard: bool,
         stdout: String,
         exit: i32,
+    }
+
+    const VERBOSE_DUMP: &str = "pass in quick on bridge100 inet proto tcp from 192.168.252.0/24 to 192.168.252.1 port = 65000 flags S/SA keep state\n\
+                                \x20 [ Evaluations: 12        Packets: 8         Bytes: 640        States: 1     ]\n\
+                                \x20 [ Inserted: uid 0 pid 4242 ]\n\
+                                block return in quick on bridge100 inet all label \"writ deny agent v4 iface\"\n\
+                                \x20 [ Evaluations: 4         Packets: 3         Bytes: 180        States: 0     ]\n\
+                                \x20 [ Inserted: uid 0 pid 4242 ]\n\
+                                block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\"\n\
+                                \x20 [ Evaluations: 0         Packets: 0         Bytes: 0          States: 0     ]\n\
+                                \x20 [ Inserted: uid 0 pid 4242 ]\n";
+
+    fn counter_query() -> SessionCounterQuery {
+        SessionCounterQuery::new(session_id(), pool(), ipv4(), None).unwrap()
+    }
+
+    fn scripted_verbose_readback(dir: &Path, stdout: &str, exit: i32) -> PathBuf {
+        let query = counter_query();
+        write_scripted_pfctl(
+            dir,
+            &[Scripted {
+                prefix: Box::leak(format!("-a {} -vsr", query.anchor().as_str()).into_boxed_str()),
+                wildcard: false,
+                stdout: stdout.to_string(),
+                exit,
+            }],
+        )
+    }
+
+    #[test]
+    fn reading_counters_runs_only_the_verbose_readback_and_files_the_labelled_rules() {
+        use crate::core::{PfCounterKey, PfCounters};
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = scripted_verbose_readback(dir.path(), VERBOSE_DUMP, 0);
+
+        let snapshot = read_session_counters(&pfctl, &counter_query()).unwrap();
+
+        let bridge = PfInterface::new("bridge100").unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(
+            snapshot
+                .get(&PfCounterKey::new("writ deny agent v4 iface", Some(bridge.clone())).unwrap()),
+            Some(PfCounters {
+                packets: 3,
+                bytes: 180
+            })
+        );
+        assert_eq!(
+            snapshot.get(&PfCounterKey::new("writ deny agent v6 iface", Some(bridge)).unwrap()),
+            Some(PfCounters {
+                packets: 0,
+                bytes: 0
+            })
+        );
+        assert_eq!(
+            fake_pfctl_calls(dir.path()),
+            vec![format!("-a {} -vsr", counter_query().anchor().as_str())]
+        );
+    }
+
+    #[test]
+    fn counters_of_an_anchor_pfctl_cannot_print_or_that_holds_a_foreign_rule_are_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = scripted_verbose_readback(dir.path(), "", 1);
+        assert!(matches!(
+            read_session_counters(&pfctl, &counter_query()).unwrap_err(),
+            PfctlError::Failed { .. }
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = format!(
+            "{VERBOSE_DUMP}block drop out all\n  [ Evaluations: 0  Packets: 0  Bytes: 0  States: 0  ]\n"
+        );
+        let pfctl = scripted_verbose_readback(dir.path(), &foreign, 0);
+        match read_session_counters(&pfctl, &counter_query()).unwrap_err() {
+            PfctlError::CountersUnparseable { anchor, source } => {
+                assert_eq!(anchor, counter_query().anchor().as_str());
+                assert!(
+                    matches!(
+                        source,
+                        PfCountersParseError::UnrecognisedRule {
+                            line_number: 10,
+                            ..
+                        }
+                    ),
+                    "{source:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A rule without its counter line is a truncated dump, not zero.
+        let dir = tempfile::tempdir().unwrap();
+        let truncated: String = VERBOSE_DUMP
+            .lines()
+            .take(4)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let pfctl = scripted_verbose_readback(dir.path(), &truncated, 0);
+        assert!(matches!(
+            read_session_counters(&pfctl, &counter_query()).unwrap_err(),
+            PfctlError::CountersUnparseable {
+                source: PfCountersParseError::MissingCounters { line_number: 4 },
+                ..
+            }
+        ));
     }
 
     fn write_scripted_pfctl(dir: &Path, cases: &[Scripted]) -> PathBuf {

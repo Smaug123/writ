@@ -1114,7 +1114,12 @@ unwritable by others, in a directory with the same properties), never from
 the caller, so the unprivileged daemon passes only a session's own facts. Its
 `preflight` subcommand reports that policy and the host-local PF facts an
 install is conditional on as `PfHelperPreflightDoc`, read by the same
-`pf_preflight` whose `require_clean` is the install's first phase.
+`pf_preflight` whose `require_clean` is the install's first phase. Its
+`counters` subcommand reports one session anchor's labelled rule counters
+from `pfctl -vsr` as `PfHelperCountersDoc` (`PfCounterSnapshot`, keyed by
+label and interface; `delta` between two readings refuses a different key
+set or a fallen counter), the host-owned evidence a confinement proof grades
+on; nothing in the daemon reads it yet.
 `install` itself is phased — `PfInstallPhase`: precheck, resolve, syntax
 check, load, readback, re-resolve — and proves the loaded anchor is exactly
 the intent by parsing `pfctl -sr` with `writ-core`'s `pf_readback` grammar

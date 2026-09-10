@@ -115,7 +115,7 @@ impl PfReadbackRule {
         }
     }
 
-    fn parse_line(line: &str) -> Option<Self> {
+    pub(crate) fn parse_line(line: &str) -> Option<Self> {
         if let Some(rest) = line.strip_prefix("pass in quick ") {
             return Self::parse_allow(rest);
         }
