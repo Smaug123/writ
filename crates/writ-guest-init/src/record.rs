@@ -35,7 +35,46 @@ pub const RECORD_PREFIX: &str = "writ-agent-vm-guest-init";
 /// `security-ready` record. Bumped only when the host/guest contract changes;
 /// it is the same notion as the image's `org.writ.agent-vm.isolation-abi`
 /// label (Stage B3), which is held equal to this.
-pub const ISOLATION_ABI_VERSION: u32 = 1;
+pub const ISOLATION_ABI_VERSION: u32 = parse_abi_version_file(ISOLATION_ABI_VERSION_FILE);
+
+/// The one place the ABI version is written down: a text file the official
+/// image's Nix build reads for its `org.writ.agent-vm.isolation-abi` label,
+/// and this crate reads at compile time. One source, so the label the image
+/// carries and the number the initializer announces cannot disagree.
+const ISOLATION_ABI_VERSION_FILE: &str = include_str!("../isolation-abi-version");
+
+/// Parse the version file at compile time: ASCII digits, no leading zero, one
+/// trailing newline, nothing else. A malformed file is a build error, not a
+/// runtime surprise.
+const fn parse_abi_version_file(text: &str) -> u32 {
+    let bytes = text.as_bytes();
+    assert!(
+        !bytes.is_empty() && bytes[bytes.len() - 1] == b'\n',
+        "isolation-abi-version must end in exactly one newline"
+    );
+    let digits = bytes.len() - 1;
+    assert!(digits > 0, "isolation-abi-version is empty");
+    assert!(
+        digits == 1 || bytes[0] != b'0',
+        "isolation-abi-version has a leading zero"
+    );
+    let mut value: u32 = 0;
+    let mut i = 0;
+    while i < digits {
+        let b = bytes[i];
+        assert!(b.is_ascii_digit(), "isolation-abi-version is not decimal");
+        value = match value.checked_mul(10) {
+            Some(v) => v,
+            None => panic!("isolation-abi-version overflows u32"),
+        };
+        value = match value.checked_add((b - b'0') as u32) {
+            Some(v) => v,
+            None => panic!("isolation-abi-version overflows u32"),
+        };
+        i += 1;
+    }
+    value
+}
 
 /// The most bytes a [`BoundedMessage`] keeps. An error reason longer than this
 /// is truncated on construction, on a UTF-8 boundary.
@@ -265,6 +304,17 @@ mod tests {
         assert_eq!(render_bounded(&record), SECURITY_READY_LINE);
         assert_eq!(GuestInitRecord::parse(SECURITY_READY_LINE), Ok(record));
         assert_eq!(ISOLATION_ABI_VERSION, 1);
+    }
+
+    #[test]
+    fn the_version_file_is_the_canonical_spelling_of_the_constant() {
+        // The Nix image build trims this file and stamps it into the label, so
+        // the file must be exactly the decimal the constant parses to, plus a
+        // newline: any other bytes would make the label and the record differ.
+        assert_eq!(
+            ISOLATION_ABI_VERSION_FILE,
+            format!("{ISOLATION_ABI_VERSION}\n")
+        );
     }
 
     /// Render, asserting the byte bound the ABI promises, so a change that
