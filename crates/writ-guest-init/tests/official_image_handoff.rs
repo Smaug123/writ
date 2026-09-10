@@ -44,12 +44,20 @@ const IPV6_ROUTE_MARKER: &str = "===IPV6-ROUTE===";
 const SMOKE_MARKER: &str = "===SMOKE===";
 const DONE_MARKER: &str = "===DONE===";
 const SMOKE_TOOLS: [&str; 4] = ["git", "nix", "claude", "codex"];
+/// Each `ip -6` inspection prints its exit status after its output, so an
+/// inspection that *failed* (an empty section) is never mistaken for one that
+/// found nothing.
+const INSPECT_RC_PREFIX: &str = "===INSPECT-RC=";
 
 /// Booting a VM and chowning the Nix store take real time on the Apple
 /// runtime; Docker is quicker. Both are bounded here.
 const READY_DEADLINE: Duration = Duration::from_secs(180);
 const DONE_DEADLINE: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// No single runtime command (start, logs, inspect, exec, kill, cleanup) may
+/// take longer than this: a hung runtime fails the test inside its budget
+/// rather than hanging the CI job until the job-level timeout.
+const TOOL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The workload the initializer releases into: everything the host wants to
 /// see, bracketed by markers so the log can be sectioned.
@@ -68,9 +76,9 @@ fn workload_script() -> String {
         "echo {RELEASED_MARKER}\n\
          cat /proc/self/status\n\
          echo {IPV6_ADDR_MARKER}\n\
-         ip -6 addr\n\
+         ip -6 addr; echo \"{INSPECT_RC_PREFIX}$?\"\n\
          echo {IPV6_ROUTE_MARKER}\n\
-         ip -6 route\n\
+         ip -6 route; echo \"{INSPECT_RC_PREFIX}$?\"\n\
          echo {SMOKE_MARKER}\n\
          echo \"uid=$(id -u) gid=$(id -g) groups=$(id -G)\"\n\
          {smoke}\n\
@@ -136,6 +144,8 @@ struct Harness {
 
 struct ToolOutput {
     ok: bool,
+    /// The command was killed for exceeding its deadline (`ok` is false).
+    timed_out: bool,
     stdout: String,
     stderr: String,
 }
@@ -164,6 +174,14 @@ impl Harness {
     }
 
     fn run_tool(&self, args: &[&str]) -> ToolOutput {
+        self.run_tool_within(args, TOOL_DEADLINE)
+    }
+
+    /// Run one runtime command, killing it if it outlives `deadline`. Both
+    /// pipes are drained on their own threads so a chatty child cannot block
+    /// on a full pipe while the deadline loop waits for it.
+    fn run_tool_within(&self, args: &[&str], deadline: Duration) -> ToolOutput {
+        use std::io::Read;
         let mut command = Command::new(&self.tool);
         command
             .args(args)
@@ -172,12 +190,46 @@ impl Harness {
             .stderr(Stdio::piped());
         // Through the workspace's retrying primitive, as the spawn-hygiene
         // guard requires.
-        let output = writ_core::process_spawn::output(&mut command)
+        let mut child = writ_core::process_spawn::spawn(&mut command)
             .unwrap_or_else(|e| panic!("could not spawn {} {args:?}: {e}", self.tool));
+        let drain = |pipe: Option<std::process::ChildStdout>,
+                     err: Option<std::process::ChildStderr>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                match (pipe, err) {
+                    (Some(mut p), None) => {
+                        let _ = p.read_to_end(&mut buf);
+                    }
+                    (None, Some(mut e)) => {
+                        let _ = e.read_to_end(&mut buf);
+                    }
+                    _ => {}
+                }
+                buf
+            })
+        };
+        let stdout = drain(child.stdout.take(), None);
+        let stderr = drain(None, child.stderr.take());
+        let start = Instant::now();
+        let (status, timed_out) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (Some(status), false),
+                Ok(None) if start.elapsed() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (None, true);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("waiting on {} {args:?}: {e}", self.tool),
+            }
+        };
+        let stdout = stdout.join().expect("stdout drain thread");
+        let stderr = stderr.join().expect("stderr drain thread");
         ToolOutput {
-            ok: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            ok: status.is_some_and(|s| s.success()),
+            timed_out,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
     }
 
@@ -185,8 +237,15 @@ impl Harness {
         let out = self.run_tool(args);
         assert!(
             out.ok,
-            "{} {args:?} failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            self.tool, out.stdout, out.stderr
+            "{} {args:?} {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.tool,
+            if out.timed_out {
+                format!("did not finish within {TOOL_DEADLINE:?}")
+            } else {
+                "failed".to_string()
+            },
+            out.stdout,
+            out.stderr
         );
         out
     }
@@ -207,17 +266,29 @@ impl Harness {
     }
 
     fn logs(&self) -> String {
-        let out = self.run_tool(&["logs", &self.name]);
+        self.logs_within(TOOL_DEADLINE)
+    }
+
+    fn logs_within(&self, deadline: Duration) -> String {
+        let out = self.run_tool_within(&["logs", &self.name], deadline);
+        assert!(
+            !out.timed_out,
+            "{} logs did not finish within {deadline:?}",
+            self.tool
+        );
         // Both runtimes interleave the container's stderr into the log
         // channel; a failed `logs` (container gone) yields what it printed.
         format!("{}{}", out.stdout, out.stderr)
     }
 
-    /// Poll the log channel until `pred` holds, or the deadline passes.
+    /// Poll the log channel until `pred` holds, or the deadline passes. Each
+    /// read gets at most the remaining budget, so a hung `logs` cannot carry
+    /// the wait past its deadline.
     fn wait_for_log(&self, deadline: Duration, what: &str, pred: impl Fn(&str) -> bool) -> String {
         let start = Instant::now();
         loop {
-            let logs = self.logs();
+            let remaining = deadline.saturating_sub(start.elapsed());
+            let logs = self.logs_within(remaining.max(POLL_INTERVAL).min(TOOL_DEADLINE));
             if pred(&logs) {
                 return logs;
             }
@@ -273,6 +344,20 @@ fn record_lines(logs: &str) -> Vec<&str> {
     logs.lines()
         .filter(|l| l.starts_with("writ-agent-vm-guest-init"))
         .collect()
+}
+
+/// An inspection section is evidence only if the command it came from exited
+/// 0: an `ip` that failed prints nothing, and nothing looks like "no IPv6".
+fn assert_inspection_succeeded(what: &str, section: &str) {
+    let rc = section
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(INSPECT_RC_PREFIX))
+        .unwrap_or_else(|| panic!("{what} recorded no exit status\n{section}"));
+    assert_eq!(
+        rc.trim(),
+        "0",
+        "{what} failed in the released guest\n{section}"
+    );
 }
 
 fn section<'a>(logs: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -354,6 +439,7 @@ fn official_image_handoff_releases_to_the_locked_identity_and_tools_run() {
     //    not take its word for it).
     let addrs = section(&logs, IPV6_ADDR_MARKER, IPV6_ROUTE_MARKER)
         .unwrap_or_else(|| panic!("no ip -6 addr section\n--- logs ---\n{logs}"));
+    assert_inspection_succeeded("ip -6 addr", addrs);
     let stray_addrs: Vec<&str> = addrs
         .lines()
         .filter(|l| l.contains("inet6") && !l.contains("::1/128"))
@@ -364,10 +450,11 @@ fn official_image_handoff_releases_to_the_locked_identity_and_tools_run() {
     );
     let routes = section(&logs, IPV6_ROUTE_MARKER, SMOKE_MARKER)
         .unwrap_or_else(|| panic!("no ip -6 route section\n--- logs ---\n{logs}"));
+    assert_inspection_succeeded("ip -6 route", routes);
     let live_routes: Vec<&str> = routes
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.starts_with(INSPECT_RC_PREFIX))
         .filter(|l| {
             !(l.starts_with("::1 ")
                 || l.starts_with("unreachable ")
