@@ -12,6 +12,7 @@ use writ::agent_vm_firewall::{
     SessionFirewallInstall, SessionFirewallRemoval, discover_session_bridge_interfaces,
     install_session_firewall, remove_session_firewall,
 };
+use writ::agent_vm_pf_helper_protocol::PfHelperProtocolDoc;
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
@@ -33,6 +34,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Report this helper's protocol name and version as one bounded JSON
+    /// object, without running `pfctl` or `ifconfig` at all. The daemon reads
+    /// it as admission evidence for `ipv4_only_locked_v1`.
+    ProtocolVersion,
     /// Validate and install PF rules for one agent VM session.
     Install(InstallArgs),
     /// Remove PF rules and matching live states for one agent VM session.
@@ -109,10 +114,34 @@ fn main() {
     }
 }
 
+/// The executables the helper may run. Production pins the system paths
+/// ([`SYSTEM_PFCTL`], [`SYSTEM_IFCONFIG`]); tests inject recorders here, at the
+/// unprivileged dispatch, never through the CLI.
+struct HelperTools<'a> {
+    pfctl: &'a Path,
+    ifconfig: &'a Path,
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let cli = Cli::parse();
-    match cli.cmd {
+    let tools = HelperTools {
+        pfctl: Path::new(SYSTEM_PFCTL),
+        ifconfig: Path::new(SYSTEM_IFCONFIG),
+    };
+    if let Some(line) = execute(cli.cmd, &tools)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Interpret one command. Returns the single line to print on success, if any.
+fn execute(
+    cmd: Cmd,
+    tools: &HelperTools<'_>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match cmd {
+        Cmd::ProtocolVersion => Ok(Some(PfHelperProtocolDoc::current().render())),
         Cmd::Install(args) => {
             let parsed = parse_session_network(&args.session)?;
             let broker_ports = BrokerPorts::new(
@@ -144,12 +173,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .claim_firewall(parsed.ipv4, parsed.ipv6)?
                     .ipv4_gateway();
                 let min_members = if broker_host.is_some() { 2 } else { 1 };
-                discover_session_bridge_interfaces(
-                    Path::new(SYSTEM_IFCONFIG),
-                    gateway,
-                    min_members,
-                )?
-                .deny_interfaces()
+                discover_session_bridge_interfaces(tools.ifconfig, gateway, min_members)?
+                    .deny_interfaces()
             } else {
                 Vec::new()
             };
@@ -163,8 +188,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 broker_host,
                 ipv6_deny_interfaces,
             )?;
-            install_session_firewall(Path::new(SYSTEM_PFCTL), &install)?;
-            println!("{}", install.ruleset().anchor().as_str());
+            install_session_firewall(tools.pfctl, &install)?;
+            Ok(Some(install.ruleset().anchor().as_str().to_string()))
         }
         Cmd::Remove(args) => {
             let parsed = parse_session_network(&args.session)?;
@@ -174,10 +199,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 parsed.ipv4,
                 parsed.ipv6,
             )?;
-            remove_session_firewall(Path::new(SYSTEM_PFCTL), &removal)?;
+            remove_session_firewall(tools.pfctl, &removal)?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 struct ParsedSessionNetwork {
@@ -225,4 +250,98 @@ fn parse_ipv6_cidr(raw: &str) -> Result<Ipv6Cidr, Box<dyn std::error::Error>> {
 fn split_cidr(raw: &str) -> Result<(&str, &str), Box<dyn std::error::Error>> {
     raw.split_once('/')
         .ok_or_else(|| format!("CIDR value must contain '/', got {raw:?}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// A stand-in for `pfctl`/`ifconfig` that appends every argument vector it
+    /// is invoked with to a log beside itself and otherwise succeeds silently.
+    fn write_recorder(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let path = dir.join(name);
+        let log = dir.join(format!("{name}.calls"));
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        (path, log)
+    }
+
+    fn recorded_calls(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn session_args() -> SessionNetworkArgs {
+        SessionNetworkArgs {
+            session_id: "0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b".to_string(),
+            ipv4_pool: "10.200.0.0/16".to_string(),
+            ipv6_pool: "fd00:7772:6974::/48".to_string(),
+            ipv4_cidr: "10.200.7.0/24".to_string(),
+            ipv6_cidr: None,
+        }
+    }
+
+    #[test]
+    fn protocol_version_is_a_standalone_subcommand() {
+        let cli = Cli::try_parse_from(["writ-agent-vm-pf-helper", "protocol-version"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::ProtocolVersion));
+        // It takes no session facts: any argument is a usage error, so a caller
+        // cannot smuggle an install through the probe's spelling.
+        assert!(
+            Cli::try_parse_from([
+                "writ-agent-vm-pf-helper",
+                "protocol-version",
+                "--session-id",
+                "x"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn protocol_version_invokes_no_tool_and_prints_the_current_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pfctl, pfctl_log) = write_recorder(dir.path(), "pfctl");
+        let (ifconfig, ifconfig_log) = write_recorder(dir.path(), "ifconfig");
+        let tools = HelperTools {
+            pfctl: &pfctl,
+            ifconfig: &ifconfig,
+        };
+
+        let line = execute(Cmd::ProtocolVersion, &tools).unwrap().unwrap();
+
+        assert_eq!(
+            PfHelperProtocolDoc::parse(&line),
+            Ok(PfHelperProtocolDoc::current())
+        );
+        assert_eq!(recorded_calls(&pfctl_log), Vec::<String>::new());
+        assert_eq!(recorded_calls(&ifconfig_log), Vec::<String>::new());
+
+        // The recorders are live: a command that does touch PF shows up in the
+        // same log, so the empty log above is evidence and not a broken probe.
+        execute(
+            Cmd::Remove(RemoveArgs {
+                session: session_args(),
+            }),
+            &tools,
+        )
+        .unwrap();
+        assert!(!recorded_calls(&pfctl_log).is_empty());
+        assert_eq!(recorded_calls(&ifconfig_log), Vec::<String>::new());
+    }
 }
