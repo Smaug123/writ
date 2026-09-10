@@ -252,6 +252,16 @@ two placements will share one renderer applies here first.
   the root guest and asserts the labelled IPv4 deny counter rose, with the
   unconfined-control clause from E3 applied once E3 exists.
 
+**Landed, with one deviation on the third oracle.** The root guest cannot
+send a spoofed-source probe: #402 dropped `CAP_NET_RAW` from the released
+workload, and `container exec` inherits that. The lifecycle proof instead
+asserts every rule of the loaded anchor carries `on <iface>` and grades an
+in-subnet probe to a forbidden host port on the labelled IPv4 interface
+deny's counter, which shows the rule the readback names is the rule deciding
+the guest's frames. The spoofed sender is the separate probe container of
+question 4 under "Beyond E3", where it also answers whether vmnet forwards
+such a frame.
+
 ---
 
 ## Stage C3: Labelled counters as a host observer

@@ -89,8 +89,8 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     let firewall_args = invocations[3].args_lossy();
     assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
     assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
-    // The pre-start install does not request the guest-IPv6 deny (the bridge is
-    // not up yet).
+    // The pre-start install does not request the attached anchor (the bridge is
+    // not up yet), so it loads the subnet-scoped bootstrap one.
     assert!(!firewall_args.contains(&"--deny-guest-ipv6".to_string()));
     // The helper's bounds come from its root-owned policy file, never from this
     // unprivileged caller: no pool or port-range argument on any helper call.
@@ -157,11 +157,12 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
             .any(|arg| arg.contains("/run/writ-agent-vm/start") && arg.contains("exec \"$@\""))
     );
 
-    // Index 6: the post-start guest-IPv6 deny — a pf-helper re-install that asks
-    // the privileged helper to discover the bridge itself (`--deny-guest-ipv6`).
-    // It runs between StartVm and the guest IPv6 probe, so the host IPv6 deny is
-    // installed before the guest command is ever released. The runner passes no
-    // interface names or tool paths — the helper owns discovery.
+    // Index 6: the post-start attached anchor — a pf-helper re-install that asks
+    // the privileged helper to discover the bridge itself (`--deny-guest-ipv6`)
+    // and scope every rule to it. It runs between StartVm and the guest IPv6
+    // probe, so the interface-scoped rules are installed before the guest
+    // command is ever released. The runner passes no interface names or tool
+    // paths — the helper owns discovery.
     let deny_args = invocations[6].args_lossy();
     assert_eq!(&deny_args[0..2], ["writ-agent-vm-pf-helper", "install"]);
     assert!(

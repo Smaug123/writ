@@ -171,13 +171,16 @@ impl AgentVmSessionPlan {
         ));
         steps.push(AgentVmStartStep::StartVm(self.start_vm_invocation()));
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
-            // Host-side backstop first: the VM's bridge now exists, so re-load the
-            // session PF anchor with an interface-scoped IPv6 deny on it — a
-            // guest-tamper-proof block that a root agent cannot undo by re-enabling
-            // IPv6 and re-acquiring a vmnet-RA ULA. The pf-helper discovers the
-            // interfaces itself from the session gateway. This runs before the
-            // in-guest enforce/probe (a defence-in-depth belt) and the release, so
-            // IPv6 egress is blocked at the host the whole time.
+            // Host-side backstop first: the VM's bridge now exists, so replace
+            // the bootstrap anchor with the attached one, every rule scoped to
+            // the bridge and its members: the IPv4 allow for the broker tuple,
+            // an IPv4 deny of everything else (whatever source the guest
+            // forges), and an IPv6 deny — a guest-tamper-proof block that a
+            // root agent cannot undo by re-enabling IPv6 and re-acquiring a
+            // vmnet-RA ULA. The pf-helper discovers the interfaces itself from
+            // the session gateway. This runs before the in-guest enforce/probe
+            // (a defence-in-depth belt) and the release, so IPv6 egress is
+            // blocked at the host the whole time.
             steps.push(AgentVmStartStep::InstallGuestIpv6Deny(
                 self.firewall_install_invocation(true),
             ));
@@ -354,11 +357,12 @@ impl AgentVmSessionPlan {
     /// The pf-helper install invocation. `deny_guest_ipv6` selects the post-start
     /// re-install (`Ipv4OnlyNoGuestIpv6`) that adds `--deny-guest-ipv6`: the
     /// pf-helper then discovers the agent's bridge itself (from a fixed root-owned
-    /// `ifconfig`) and installs an interface-scoped IPv6 deny. The runner passes no
-    /// interface names and no tool path — the privileged boundary owns discovery.
-    /// The pre-start install passes `false` (the bridge does not exist yet).
-    /// Re-loading the same anchor replaces its rules atomically, so the second
-    /// install renders v4 rules + the v6 deny.
+    /// `ifconfig`) and loads the attached anchor, every rule scoped to the bridge
+    /// and its members: the IPv4 allow, an IPv4 deny, and the IPv6 deny. The
+    /// runner passes no interface names and no tool path — the privileged
+    /// boundary owns discovery. The pre-start install passes `false` (the bridge
+    /// does not exist yet) and loads the subnet-scoped bootstrap anchor.
+    /// Re-loading the same anchor replaces its rules atomically.
     ///
     /// The pools and the broker-port range are *not* passed: the helper takes
     /// those bounds from its root-owned policy file (protocol v2), so this

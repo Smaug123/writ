@@ -71,13 +71,17 @@ More concretely:
 9. The irreversible guest privilege handoff applies to every agent-VM profile,
    so changing profiles cannot restore network-management authority.
 
-Today, `HostFirewallFinal` holds for host placement (layer 1) for IPv6, and
-for IPv4 traffic whose source is inside the session subnet; an out-of-subnet
-IPv4 source is not covered by the shipped rules (see the known deltas below).
-The legacy workload could construct such a frame while it held `CAP_NET_RAW`
-(measured); the IPv4-only launch now drops it (#402), so the sender-side
-capability is gone and the remaining question — whether vmnet would forward
-such a frame at all — is defence in depth for C2b rather than a live gap.
+Today, `HostFirewallFinal` holds for host placement (layer 1) for both
+families: once the VM's bridge and members exist, the session anchor is
+replaced by one whose every rule is scoped to them, so an IPv4 frame from the
+guest is passed only if it is the broker tuple and blocked otherwise, whatever
+source the guest gave it, and every IPv6 frame is blocked. The subnet-scoped
+anchor loaded before the VM exists is a bootstrap: no agent code has run
+while it is the anchor, because the workload is released only after the
+attached anchor has been read back. Independently, the IPv4-only launch drops
+`CAP_NET_RAW` (#402), so the workload cannot forge a source in the first
+place; whether vmnet would forward such a frame is a defence-in-depth
+measurement, not a gap.
 `GuestNetworkAuthorityRemoved` does not hold anywhere (layer 2 is unbuilt), and
 `BrokerInternalFirewallFinal` does not hold anywhere (layer 3 is unbuilt), which
 is why vm placement refuses new sessions (#396). `GuestIpv6Absent` is
@@ -116,10 +120,13 @@ ProbeNetworkAbsent -> CreateNetwork -> InspectAndValidate -> InstallFirewall
   -> ProbeAndValidateGuestIpv6 -> ReleaseGuestCommand
 ```
 
-`InstallFirewall` loads the IPv4 session anchor: allow the agent subnet to the
-broker endpoint on the broker ports, then `block return` everything else from
-the agent subnet. `StartVm` starts the VM under a guarded prelaunch command that
-sets `disable_ipv6=1` and waits; the agent command has not run yet.
+`InstallFirewall` loads the bootstrap session anchor: allow the agent subnet to
+the broker endpoint on the broker ports, then `block return` everything else
+from the agent subnet. Both rules match on the session subnet as source,
+because there is no interface to match on yet; that is why this anchor is
+replaced rather than extended once there is. `StartVm` starts the VM under a
+guarded prelaunch command that sets `disable_ipv6=1` and waits; the agent
+command has not run yet.
 
 `InstallGuestIpv6Deny` invokes the privileged helper with `--deny-guest-ipv6`.
 The helper, not the daemon, resolves the interface: it runs the fixed
@@ -130,19 +137,28 @@ the agent's), retries while they attach, and fails closed if no single such
 bridge exists. An unrelated interface that happens to share the gateway (an
 `en0` or `utun` on an overlapping LAN) is rejected as a candidate rather than
 matched, so it can neither be selected nor block the real bridge. It then
-re-loads the session anchor with, on the bridge and each member:
+replaces the session anchor with the attached one: on the bridge and each
+member, in this order,
 
 ```pf
+pass in quick on <iface> inet proto tcp from <agent /24> to <broker> port $broker_ports keep state
+block return in quick on <iface> inet all label "writ deny agent v4 iface"
 block return in quick on <iface> inet6 all label "writ deny agent v6 iface"
 ```
 
-The daemon never passes an interface name to the helper; a direct malicious
-invocation of the helper cannot make it deny IPv6 on `en0`. Only after the deny
+Every rule carries `on <iface>`: the anchor decides every frame that arrives
+on the agent's interfaces, however the guest addressed it, and no frame that
+arrives anywhere else. The helper reads the anchor back after the load and
+requires exactly these rules (`pf_readback`, `writ-core`), so a bootstrap rule
+surviving the replacement is a failed install. The daemon never passes an
+interface name to the helper; a direct malicious invocation of the helper
+cannot make it scope rules to `en0`. Only after the attached anchor
 is loaded does `ProbeAndValidateGuestIpv6` confirm the guest holds no routable
 IPv6 (a precondition, see below) and `ReleaseGuestCommand` start the workload.
 
-The live proof `scripts/prove-agent-vm-lifecycle.sh` asserts the anchor carries
-the interface deny, then has a root guest write `disable_ipv6=0`, re-enable
+The live proof `scripts/prove-agent-vm-lifecycle.sh` asserts every rule of the
+anchor is interface-scoped and that the IPv4 deny counts a probe to a
+forbidden host port, then has a root guest write `disable_ipv6=0`, re-enable
 RAs, bounce the link, wait for a routed IPv6 default to come back, and send a
 real ICMPv6 echo to the reacquired gateway. The proof fails, not passes, if
 the guest lacks `ping`, or if no route came back, so it cannot pass vacuously.
@@ -168,22 +184,24 @@ not rediscovered. None reopens the bypass #288 closed.
   were required before `ipv4_only_locked_v1` admits, because vm placement's
   quarantine-then-replace sequence (below) has no meaning without an exact
   readback.
-- **The IPv4 rules are source-scoped, not interface-scoped.** The shipped
-  anchor is `pass in quick inet proto tcp from <agent /24> to <broker> port
-  $broker_ports` and `block return in quick inet from <agent /24> to any`. A
-  packet whose IPv4 source is outside the session subnet matches neither, and
-  falls through to whatever the host's default PF policy is. Forging an outbound
-  IPv4 source on Linux needs a capability — `CAP_NET_RAW` (raw / AF_PACKET
-  socket) or `CAP_NET_ADMIN` (`IP_TRANSPARENT`, or an address alias). It is NOT
-  achievable unprivileged: `IP_FREEBIND` (and the `ip_nonlocal_bind` sysctl)
-  relaxes `bind(2)` only, and the output route lookup then rejects a nonlocal
-  source with `ENETUNREACH` (verified on Linux 6.18) unless `FLOWI_FLAG_ANYSRC`
-  is set, which only `IP_TRANSPARENT` or a raw socket do. The target rules match
-  the IPv4 allow and a default deny on the resolved interfaces, exactly as the
-  IPv6 deny already does. This is the one delta that is a possible live gap
-  under the legacy profile today rather than hardening; it is listed here
-  because the fix is the same interface-scoped renderer the locked profile
-  needs, and it is not blocked on any of layers 2 or 3.
+- **The IPv4 rules are interface-scoped: closed.** Until C2b the attached
+  anchor kept the bootstrap's IPv4 pair, `pass in quick inet proto tcp from
+  <agent /24> to <broker> port $broker_ports` and `block return in quick inet
+  from <agent /24> to any`, and added only the IPv6 interface deny. A packet
+  whose IPv4 source was outside the session subnet matched neither, and fell
+  through to whatever the host's default PF policy was. The attached anchor
+  now scopes the IPv4 allow and an IPv4 deny of everything else to the
+  resolved interfaces, exactly as the IPv6 deny always did (see the rules
+  above); a source-scoped rule survives only in the bootstrap anchor, which no
+  agent code runs under. Forging an outbound IPv4 source on Linux needs a
+  capability — `CAP_NET_RAW` (raw / AF_PACKET socket) or `CAP_NET_ADMIN`
+  (`IP_TRANSPARENT`, or an address alias). It is NOT achievable unprivileged:
+  `IP_FREEBIND` (and the `ip_nonlocal_bind` sysctl) relaxes `bind(2)` only,
+  and the output route lookup then rejects a nonlocal source with
+  `ENETUNREACH` (verified on Linux 6.18) unless `FLOWI_FLAG_ANYSRC` is set,
+  which only `IP_TRANSPARENT` or a raw socket do. The two mitigations are
+  independent and both ship: the capability drop below is the sender-side
+  boundary, the interface scope is the host-side one.
 
   Measured 2026-09-08 (macOS 26.6 build 25G72, Apple `container` 1.0.0,
   `alpine:latest` digest
@@ -197,8 +215,8 @@ not rediscovered. None reopens the bypass #288 closed.
   whether vmnet then forwards such a frame onto the host bridge is still
   unmeasured. Either mitigation closes it, and the locked profile carries both:
   `--cap-drop NET_RAW` on the launch (`capability_argv.rs` never grants it), or
-  the interface-scoped renderer (C2b) which drops the frame at the host however
-  it was produced. The legacy launch now carries the first (#402):
+  the interface-scoped renderer (C2b, now shipped) which drops the frame at the
+  host however it was produced. The legacy launch carries the first (#402):
   `IPV4_ONLY_CAPABILITY_ARGV` in `src/agent_vm_lifecycle.rs` adds `--cap-drop
   NET_RAW` to the `Ipv4OnlyNoGuestIpv6` `container run`, and
   `scripts/prove-agent-vm-lifecycle.sh` asserts the released workload's
@@ -587,7 +605,13 @@ diagnostics. The obligations, in the order the plan delivers them:
    the interface-scoped IPv4 deny counter to rise and the listener to stay
    silent; the unconfined control sends the same probe and must reach its
    listener, or the platform does not forward such frames and the case is
-   recorded as not applicable there, which is itself a pinned fact.
+   recorded as not applicable there, which is itself a pinned fact. The
+   spoofed sender is a separately launched probe container, not the session's
+   workload, which holds no `CAP_NET_RAW`. Until then the lifecycle proof
+   grades an in-subnet probe to a forbidden host port on the labelled IPv4
+   interface deny's counter, which shows the rule the readback names is the
+   rule deciding the guest's frames, though not yet that vmnet forwards a
+   forged source to it.
 2. **Host placement under the locked profile**: before release, the host reads
    the initializer's `security-ready` record and the released process's
    `/proc/<pid>/status` via bounded `container exec` and sees the locked
