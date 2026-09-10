@@ -348,17 +348,59 @@ pub(super) fn nix_cache_config_for_test() -> VmHttpNixCacheConfig {
 
 /// Bind a free TCP port and release it, returning the port number — so a
 /// test of the *fixed*-port binder has a port that is (momentarily) free.
+///
+/// "Momentarily" is load-bearing: between the probe releasing the port and the
+/// caller re-binding it, any other test in this binary (hundreds bind
+/// `127.0.0.1:0`) can be handed the same number. Linux picks ephemeral ports
+/// from a random offset, so this is a real (if rare) CI failure, not a
+/// theoretical one. Callers must therefore tolerate `AddrInUse` and retry;
+/// see [`bind_fixed_port_that_was_free`].
 async fn free_port() -> u16 {
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
     probe.local_addr().unwrap().port()
 }
 
+/// Drive the fixed-port binder on a port that was free a moment ago, retrying
+/// (bounded) when another test claimed the port in the probe→bind window.
+///
+/// Returns the port that was requested alongside the bound listener, so the
+/// caller can assert the binder honoured the request. Any bind failure other
+/// than `AddrInUse` is a real error and panics immediately.
+async fn bind_fixed_port_that_was_free() -> (u16, BoundVmHttpListener) {
+    const ATTEMPTS: usize = 16;
+    for _ in 0..ATTEMPTS {
+        let port = free_port().await;
+        match bind_vm_http_listener(Ipv4Addr::LOCALHOST, BrokerPort::new(port).unwrap()).await {
+            Ok(bound) => return (port, bound),
+            Err(VmHttpBindError::Io(err)) if err.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(err) => panic!("bind_vm_http_listener failed on port {port}: {err}"),
+        }
+    }
+    panic!(
+        "lost the free-port race {ATTEMPTS} times in a row; something other than contention is wrong"
+    );
+}
+
+/// Pins the error shape [`bind_fixed_port_that_was_free`] retries on: a port
+/// someone else holds must surface as `Io` with kind `AddrInUse`, not as some
+/// other variant the retry would mistake for a real failure.
+#[tokio::test]
+async fn bind_vm_http_listener_reports_addr_in_use_for_a_held_port() {
+    let holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let err = bind_vm_http_listener(Ipv4Addr::LOCALHOST, BrokerPort::new(port).unwrap())
+        .await
+        .unwrap_err();
+    match err {
+        VmHttpBindError::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::AddrInUse),
+        other => panic!("expected AddrInUse, got {other}"),
+    }
+    drop(holder);
+}
+
 #[tokio::test]
 async fn bind_vm_http_listener_binds_the_requested_port() {
-    let port = free_port().await;
-    let bound = bind_vm_http_listener(Ipv4Addr::LOCALHOST, BrokerPort::new(port).unwrap())
-        .await
-        .unwrap();
+    let (port, bound) = bind_fixed_port_that_was_free().await;
     assert_eq!(bound.broker_port().get(), port);
     assert_eq!(bound.local_addr().unwrap().port(), port);
 }
@@ -381,10 +423,14 @@ async fn prepare_on_listener_uses_the_provided_bearer_and_bound_port() {
         )
         .unwrap(),
     );
-    let port = free_port().await;
-    let listener = bind_vm_http_listener(Ipv4Addr::LOCALHOST, BrokerPort::new(port).unwrap())
+    // This test is about `prepare_vm_http_session_on_listener` honouring the
+    // listener it is handed, not about how that listener was bound — so bind
+    // it race-free (the kernel picks the port and we keep it) rather than via
+    // probe-release-rebind, which loses to concurrent tests' `:0` binds.
+    let listener = bind_ephemeral_vm_http_listener(Ipv4Addr::LOCALHOST, config.broker_port_range())
         .await
         .unwrap();
+    let port = listener.broker_port().get();
     let bearer = VmHttpBearerToken::generate();
     let bearer_str = bearer.as_str().to_string();
 
