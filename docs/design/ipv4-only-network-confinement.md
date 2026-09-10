@@ -446,10 +446,13 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
 - pools and allowed ports come from a fixed, root-owned, non-symlink,
   non-group/world-writable policy file, `/etc/writ/agent-vm-pf-policy.json`
   (shipped: `agent_vm_pf_helper_policy` loads it through the opened
-  descriptor — regular file, required owner, no group/world write bit, in a
-  directory with the same properties, bounded size — and `install`, `remove`,
-  and `preflight` all refuse without it; the v1 arguments that carried the
-  bounds are rejected as unknown, so an older daemon fails closed). The
+  descriptor — regular file, required owner, no group/world write bit, no
+  access control list (a macOS ACL can grant write access the mode bits do
+  not show, so any ACL is refused rather than interpreted), in a directory
+  with the same properties, bounded size, opened non-blocking so a FIFO is
+  refused rather than waited on — and `install`, `remove`, and `preflight`
+  all refuse without it; the v1 arguments that carried the bounds are
+  rejected as unknown, so an older daemon fails closed). The
   admitted interface policy is deliberately *not* in the file: which host
   interfaces the IPv6 deny may scope to stays compiled into the discovery
   (`bridgeN` carrying the session gateway, with `vmenetN` members), because a

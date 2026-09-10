@@ -116,6 +116,25 @@ pub enum PfHelperPolicyError {
          be writable by group or world"
     )]
     DirectoryWritable { path: PathBuf, mode: u32 },
+    /// The file or its directory carries an access control list. On macOS
+    /// an ACL can grant write access the mode bits do not show, so any ACL
+    /// is refused rather than interpreted.
+    #[error(
+        "PF helper policy file {path} carries an access control list; remove it (`chmod -N`) so \
+         the mode bits are the whole story"
+    )]
+    AclPresent { path: PathBuf },
+    #[error(
+        "the directory {path} holding the PF helper policy file carries an access control list; \
+         remove it (`chmod -N`) so the mode bits are the whole story"
+    )]
+    DirectoryAclPresent { path: PathBuf },
+    #[error("cannot read the access control list of {path}: {source}")]
+    Acl {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("PF helper policy file {path} is larger than {cap} bytes")]
     TooLarge { path: PathBuf, cap: u64 },
     #[error("cannot read PF helper policy file {path}: {source}")]
@@ -250,15 +269,85 @@ fn split_cidr(raw: &str) -> Result<(&str, &str), String> {
 /// Mode bits that let anyone but the owner write: group or world.
 const WRITABLE_BY_OTHERS: u32 = 0o022;
 
+#[cfg(target_os = "macos")]
+mod acl_sys {
+    use std::os::raw::{c_int, c_uint, c_void};
+
+    /// `ACL_TYPE_EXTENDED` from `<sys/acl.h>`: the one ACL type macOS
+    /// supports.
+    pub const ACL_TYPE_EXTENDED: c_uint = 0x0000_0100;
+
+    unsafe extern "C" {
+        /// Returns the file's ACL, or NULL with `errno == ENOENT` when it has
+        /// none. The caller frees a non-NULL result with `acl_free`.
+        pub fn acl_get_fd_np(fd: c_int, ty: c_uint) -> *mut c_void;
+        pub fn acl_free(obj: *mut c_void) -> c_int;
+    }
+}
+
+/// Whether the open file carries an access control list beyond its mode
+/// bits. An ACL can grant write access the mode bits do not show, so the
+/// loader refuses any ACL rather than interpreting one.
+#[cfg(target_os = "macos")]
+fn has_acl(file: &File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` keeps the descriptor open for the call; a non-NULL
+    // result is freed exactly once, below, and never used otherwise.
+    let acl = unsafe { acl_sys::acl_get_fd_np(file.as_raw_fd(), acl_sys::ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let err = std::io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(err)
+        };
+    }
+    // SAFETY: `acl` came from `acl_get_fd_np` and has not been freed.
+    unsafe { acl_sys::acl_free(acl) };
+    Ok(true)
+}
+
+/// Linux stores a POSIX access ACL in the `system.posix_acl_access` extended
+/// attribute, present iff an ACL is set; `ENODATA` means none, `ENOTSUP`
+/// means the filesystem cannot hold one.
+#[cfg(target_os = "linux")]
+fn has_acl(file: &File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let name = c"system.posix_acl_access";
+    // SAFETY: the name is a valid NUL-terminated C string, the descriptor is
+    // open, and a NULL buffer with size 0 asks only for the attribute's size.
+    let len = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if len >= 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENODATA | libc::ENOTSUP) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+/// No way to ask on this platform, so fail closed: the helper only ships for
+/// macOS, and Linux is where the tests build.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn has_acl(_file: &File) -> std::io::Result<bool> {
+    Err(std::io::Error::other(
+        "access control lists cannot be inspected on this platform",
+    ))
+}
+
 /// Load the policy at `path`, refusing anything but a regular file owned by
-/// `required_owner` (uid), writable by nobody else, reached without following
-/// a symlink at the final component, in a directory owned by `required_owner`
-/// and writable by nobody else. Production passes
+/// `required_owner` (uid), writable by nobody else, carrying no access
+/// control list, reached without following a symlink at the final component,
+/// in a directory owned by `required_owner`, writable by nobody else, and
+/// likewise without an ACL. Production passes
 /// [`PF_HELPER_POLICY_REQUIRED_OWNER`]; tests in a temporary directory pass
 /// their own uid, which is the only reason the owner is a parameter.
 ///
-/// The checks run on the opened file's descriptor (`fstat`), not on the path,
-/// so the file inspected is the file read.
+/// Every check runs on an opened descriptor (`fstat`, `acl_get_fd_np`), not
+/// on the path, so the file inspected is the file read. The open is
+/// non-blocking so that a FIFO in the file's place is refused as not a
+/// regular file instead of parking the helper until someone writes to it.
 pub fn load_pf_helper_policy(
     path: &Path,
     required_owner: u32,
@@ -266,7 +355,7 @@ pub fn load_pf_helper_policy(
     let owned = || path.to_path_buf();
     let mut file = match File::options()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,
@@ -306,18 +395,41 @@ pub fn load_pf_helper_policy(
             mode: meta.mode() & 0o7777,
         });
     }
+    if has_acl(&file).map_err(|source| PfHelperPolicyError::Acl {
+        path: owned(),
+        source,
+    })? {
+        return Err(PfHelperPolicyError::AclPresent { path: owned() });
+    }
     // The directory: a writable one would let another user replace the file
     // (a rename does not need write access to the file itself). Its own
     // symlink-ness is not a concern — `/etc` is a symlink on macOS — since
-    // what matters is who can write into the directory the name resolves to.
+    // what matters is who can write into the directory the name resolves to;
+    // `O_DIRECTORY` makes sure that is a directory, and the checks run on
+    // its descriptor like the file's.
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let dir_meta = std::fs::metadata(&dir).map_err(|source| PfHelperPolicyError::Directory {
-        path: dir.clone(),
-        source,
-    })?;
+    let dir_file = match File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&dir)
+    {
+        Ok(dir_file) => dir_file,
+        Err(source) if source.raw_os_error() == Some(libc::ENOTDIR) => {
+            return Err(PfHelperPolicyError::DirectoryNotDirectory { path: dir });
+        }
+        Err(source) => {
+            return Err(PfHelperPolicyError::Directory { path: dir, source });
+        }
+    };
+    let dir_meta = dir_file
+        .metadata()
+        .map_err(|source| PfHelperPolicyError::Directory {
+            path: dir.clone(),
+            source,
+        })?;
     if !dir_meta.file_type().is_dir() {
         return Err(PfHelperPolicyError::DirectoryNotDirectory { path: dir });
     }
@@ -333,6 +445,12 @@ pub fn load_pf_helper_policy(
             path: dir,
             mode: dir_meta.mode() & 0o7777,
         });
+    }
+    if has_acl(&dir_file).map_err(|source| PfHelperPolicyError::Acl {
+        path: dir.clone(),
+        source,
+    })? {
+        return Err(PfHelperPolicyError::DirectoryAclPresent { path: dir });
     }
     if meta.len() > PF_HELPER_POLICY_MAX_BYTES {
         return Err(PfHelperPolicyError::TooLarge {
@@ -599,6 +717,77 @@ mod tests {
             // owner check by making the file pass: it cannot, since both are
             // ours. The wrong-owner refusal is the file's.
             Err(PfHelperPolicyError::WrongOwner { .. })
+        ));
+    }
+
+    /// A FIFO in the file's place must be refused as not a regular file, and
+    /// promptly: a blocking open would park the helper until a writer
+    /// appeared. Run the load on a thread so a regression shows up as a
+    /// failure rather than a hung suite.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = private_dir();
+        let path = dir.path().join("agent-vm-pf-policy.json");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let required = me();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(matches!(
+                load_pf_helper_policy(&path, required),
+                Err(PfHelperPolicyError::NotRegular { .. })
+            ));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(refused) => assert!(refused, "a FIFO must be refused as not a regular file"),
+            Err(_) => panic!("loading a FIFO blocked instead of refusing it"),
+        }
+    }
+
+    /// Give `path` an ACL entry through the platform's own tool, so the
+    /// refusal is tested against a real ACL and not a model of one.
+    #[cfg(target_os = "macos")]
+    fn grant_acl(path: &Path) {
+        let mut command = std::process::Command::new("/bin/chmod");
+        command
+            .arg("+a")
+            .arg("everyone allow write")
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = crate::process_spawn::output(&mut command).expect("run chmod +a");
+        assert!(
+            output.status.success(),
+            "chmod +a failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A root-owned, mode-0644 file can still be writable by others through
+    /// an ACL; the loader must see the ACL, not just the mode.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_with_an_acl_is_refused_whatever_its_mode() {
+        let dir = private_dir();
+        let path = write_policy(dir.path(), &policy().render(), 0o444);
+        grant_acl(&path);
+        assert!(matches!(
+            load_pf_helper_policy(&path, me()),
+            Err(PfHelperPolicyError::AclPresent { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_with_an_acl_is_refused() {
+        let dir = private_dir();
+        let path = write_policy(dir.path(), &policy().render(), 0o644);
+        grant_acl(dir.path());
+        assert!(matches!(
+            load_pf_helper_policy(&path, me()),
+            Err(PfHelperPolicyError::DirectoryAclPresent { .. })
         ));
     }
 

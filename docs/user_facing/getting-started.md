@@ -267,8 +267,8 @@ Before that block does anything useful you need four things on disk:
    `broker_port_min`/`broker_port_max` as the `vm_http` block, or the
    helper refuses every subnet and port the daemon asks for:
    ```sh
-   sudo install -d -o root -g wheel -m 0755 /etc/writ
-   cat <<'EOF' | sudo install -o root -g wheel -m 0644 /dev/stdin /etc/writ/agent-vm-pf-policy.json
+   policy="$(mktemp)"
+   cat > "$policy" <<'EOF'
    {
      "version": 1,
      "ipv4_pool": "192.168.0.0/16",
@@ -277,12 +277,18 @@ Before that block does anything useful you need four things on disk:
      "broker_port_max": 65535
    }
    EOF
+   sudo install -d -o root -g wheel -m 0755 /etc/writ
+   sudo install -o root -g wheel -m 0644 "$policy" /etc/writ/agent-vm-pf-policy.json
+   rm "$policy"
    ```
-   `preflight` reports the loaded policy alongside the PF facts, and
-   refuses (exit 1, naming the reason) if the file does not load. The
-   helper and `writd` must be upgraded together: a `writd` from before
-   protocol v2 still passes the bounds as arguments, which this helper
-   rejects outright rather than ignoring.
+   The helper also refuses a file or directory carrying an access
+   control list (`ls -le` shows one as `0:` lines under the entry; `chmod
+   -N` removes it), because on macOS an ACL can grant write access the
+   mode bits do not show. `preflight` reports the loaded policy alongside
+   the PF facts, and refuses (exit 1, naming the reason) if the file does
+   not load. The helper and `writd` must be upgraded together: a `writd`
+   from before protocol v2 still passes the bounds as arguments, which
+   this helper rejects outright rather than ignoring.
 2. **`image`** — `writ-agent-vm-guest:latest` is just a tag. Apple's
    `container` won't find it until you build the guest image (e.g.
    `nix build .#agent-vm-guest-image-aarch64-linux`) and load the

@@ -392,16 +392,6 @@ log "building PF helper from the Rust core model"
 "${CARGO_CMD[@]}" build --quiet --bin writ-agent-vm-pf-helper
 HELPER="${ROOT_DIR}/target/debug/writ-agent-vm-pf-helper"
 
-# Protocol v2: the helper validates every session against the pools and
-# broker-port range in its root-owned policy file, not against arguments. The
-# file must name this proof's pools, or the install below is refused.
-log "checking the PF helper's policy file matches this proof's pools and port range"
-PREFLIGHT="$(sudo "$HELPER" preflight)" \
-  || die "PF helper preflight failed; install /etc/writ/agent-vm-pf-policy.json (see docs/user_facing/getting-started.md) with ipv4_pool=${IPV4_POOL} ipv6_pool=${IPV6_POOL} broker_port_min=${BROKER_PORT_MIN} broker_port_max=${BROKER_PORT_MAX}"
-EXPECTED_POLICY="\"policy\":{\"ipv4_pool\":\"${IPV4_POOL}\",\"ipv6_pool\":\"${IPV6_POOL}\",\"broker_port_min\":${BROKER_PORT_MIN},\"broker_port_max\":${BROKER_PORT_MAX}}"
-printf '%s' "$PREFLIGHT" | grep -Fq "$EXPECTED_POLICY" \
-  || die "PF helper policy file does not match this proof: expected ${EXPECTED_POLICY} in ${PREFLIGHT}"
-
 BROKER_PORT="$(pick_port)"
 FORBIDDEN_PORT="$(pick_port)"
 while [[ "$FORBIDDEN_PORT" == "$BROKER_PORT" ]]; do
@@ -461,6 +451,17 @@ if [[ -n "$INSPECT_IPV6_CIDR" && -n "$IPV6_GATEWAY" ]]; then
 else
   log "network inspect did not report both an IPv6 subnet and gateway; IPv6 probes will be skipped"
 fi
+
+# Protocol v2: the helper validates every session against the pools and
+# broker-port range in its root-owned policy file, not against arguments. The
+# file must name this proof's pools (finalized above, from the network the
+# harness created), or the install below is refused.
+log "checking the PF helper's policy file matches this proof's pools and port range"
+PREFLIGHT="$(sudo "$HELPER" preflight)" \
+  || die "PF helper preflight failed; install /etc/writ/agent-vm-pf-policy.json (see docs/user_facing/getting-started.md) with ipv4_pool=${IPV4_POOL} ipv6_pool=${IPV6_POOL} broker_port_min=${BROKER_PORT_MIN} broker_port_max=${BROKER_PORT_MAX}"
+EXPECTED_POLICY="\"policy\":{\"ipv4_pool\":\"${IPV4_POOL}\",\"ipv6_pool\":\"${IPV6_POOL}\",\"broker_port_min\":${BROKER_PORT_MIN},\"broker_port_max\":${BROKER_PORT_MAX}}"
+printf '%s' "$PREFLIGHT" | grep -Fq "$EXPECTED_POLICY" \
+  || die "PF helper policy file does not match this proof: expected ${EXPECTED_POLICY} in ${PREFLIGHT}"
 
 log "validating and loading PF anchor through helper"
 PF_ANCHOR="writ/session/${SESSION_ID}"

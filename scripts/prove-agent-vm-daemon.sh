@@ -190,8 +190,6 @@ cleanup() {
   if [[ -n "$HELPER" && -x "$HELPER" && -n "$SESSION_ID" && -n "$IPV4_CIDR" ]]; then
     sudo "$HELPER" remove \
       --session-id "$SESSION_ID" \
-      --ipv4-pool "$IPV4_POOL" \
-      --ipv6-pool "$IPV6_POOL" \
       --ipv4-cidr "$IPV4_CIDR" >/dev/null 2>&1 || true
   fi
 
