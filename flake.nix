@@ -144,6 +144,13 @@
           };
         in
         guestInit.overrideAttrs (old: {
+          # Fully static: the handoff chowns the whole of `/nix` to the
+          # workload, so an initializer that loaded musl's dynamic loader or
+          # libc from the store would depend on files the released workload can
+          # replace, and a restarted container would run them with the initial
+          # capabilities. With crt-static there is no interpreter and no store
+          # reference; the image build asserts both.
+          RUSTFLAGS = "-C target-feature=+crt-static";
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
@@ -286,7 +293,6 @@
             "rg"
             "sed"
             "sh"
-            "writ-agent-vm-guest-init"
             "writ-vm"
           ];
           guestRequiredBinCheck = lib.concatMapStringsSep "\n"
@@ -313,17 +319,29 @@
               exit 1
             fi
           '';
+          # The initializer is installed as a regular file at
+          # /sbin/writ-agent-vm-guest-init, *outside* /nix and outside /bin's
+          # store symlinks, because the handoff chowns /nix to the workload:
+          # a copy under the store would be the workload's to replace. It is
+          # the only copy; the locked start path names this path as the
+          # container command.
+          guestInitInstall = buildPkgs.runCommand "writ-agent-vm-guest-init-install" {} ''
+            install -D -m 0555 ${guestInit}/bin/writ-agent-vm-guest-init \
+              $out/sbin/writ-agent-vm-guest-init
+          '';
           # The locked profile's rootfs invariants (plan stage B3), checked over
           # the closure the image is assembled from, i.e. the rootfs as it will
-          # be presented: no setuid or setgid file anywhere, and the
-          # initializer's own binary and its directory carry no write bit. File
+          # be presented: no setuid or setgid file anywhere; the initializer's
+          # own binary and its directory carry no write bit; and the initializer
+          # references nothing under /nix/store (no dynamic loader, no shared
+          # libc), so nothing the workload comes to own is on its path. File
           # capabilities cannot occur: every path is a Nix store path, and the
           # store strips extended attributes and canonicalises modes to
           # 0444/0555 on registration, so the `perms` overrides below are the
           # only way a mode could differ, and they are asserted against setuid
           # and setgid in Nix.
           guestRootfsClosure = buildPkgs.closureInfo {
-            rootPaths = [ guestRuntimeDirs guestRoot ];
+            rootPaths = [ guestRuntimeDirs guestRoot guestInitInstall ];
           };
           guestRootfsScan = ''
             offenders=$(while read -r p; do
@@ -334,8 +352,16 @@
               echo "$offenders" >&2
               exit 1
             fi
-            init_bin=$(readlink -f "${guestRoot}/bin/writ-agent-vm-guest-init")
+            init_bin="${guestInitInstall}/sbin/writ-agent-vm-guest-init"
             init_dir=$(dirname "$init_bin")
+            if [ -L "$init_bin" ]; then
+              echo "guest image initializer must be a regular file, not a symlink" >&2
+              exit 1
+            fi
+            if grep -q /nix/store "$init_bin"; then
+              echo "guest image initializer references the Nix store (not static?): $init_bin" >&2
+              exit 1
+            fi
             for path in "$init_bin" "$init_dir"; do
               case "$(stat -c '%A' "$path")" in
                 *w*)
@@ -418,7 +444,6 @@
             name = "writ-agent-vm-guest-root";
             paths = [
               writVm
-              guestInit
               claudeCode
               guestEtcFiles
               guestPkgs.bash
@@ -476,7 +501,7 @@
           nix2containerPkgs.nix2container.buildImage {
             name = imageName;
             tag = "latest";
-            copyToRoot = [ guestRuntimeDirs guestRoot ];
+            copyToRoot = [ guestRuntimeDirs guestRoot guestInitInstall ];
             arch = guestArchitecture guestSystem;
             perms = guestImagePerms;
             config = {

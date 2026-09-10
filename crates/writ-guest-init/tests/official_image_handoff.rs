@@ -34,11 +34,11 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use writ_guest_init::INITIALIZER_PATH;
 use writ_guest_init::capability_argv::LOCKED_CAPABILITY_ARGV_PROFILE;
 use writ_guest_init::proc_status::{LockedAwaitingRelease, LockedReleased, ProcStatus};
 use writ_guest_init::record::{GuestInitRecord, ISOLATION_ABI_VERSION};
 
-const INITIALIZER: &str = "/bin/writ-agent-vm-guest-init";
 const RELEASED_MARKER: &str = "===RELEASED-WORKLOAD-RAN===";
 const IPV6_ADDR_MARKER: &str = "===IPV6-ADDR===";
 const IPV6_ROUTE_MARKER: &str = "===IPV6-ROUTE===";
@@ -82,6 +82,9 @@ fn workload_script() -> String {
          ip -6 route; echo \"{INSPECT_RC_PREFIX}$?\"\n\
          echo {SMOKE_MARKER}\n\
          echo \"uid=$(id -u) gid=$(id -g) groups=$(id -G)\"\n\
+         echo \"init-writable=$([ -w {INITIALIZER_PATH} ] && echo yes || echo no) \
+         init-dir-writable=$([ -w $(dirname {INITIALIZER_PATH}) ] && echo yes || echo no) \
+         init-owner=$(stat -c %u:%g {INITIALIZER_PATH})\"\n\
          {smoke}\n\
          echo {DONE_MARKER}\n"
     )
@@ -271,7 +274,7 @@ impl Harness {
         for e in &env_args {
             args.extend(["--env", e.as_str()]);
         }
-        args.extend([self.image.as_str(), INITIALIZER, "sh", "-c", workload]);
+        args.extend([self.image.as_str(), INITIALIZER_PATH, "sh", "-c", workload]);
         self.must(&args);
     }
 
@@ -454,9 +457,14 @@ fn official_image_handoff_releases_to_the_locked_identity_and_tools_run() {
     let addrs = section(&logs, IPV6_ADDR_MARKER, IPV6_ROUTE_MARKER)
         .unwrap_or_else(|| panic!("no ip -6 addr section\n--- logs ---\n{logs}"));
     assert_inspection_succeeded("ip -6 addr", addrs);
+    // The address is the token after `inet6`, compared whole: `fe80::1/128`
+    // also *contains* `::1/128`.
     let stray_addrs: Vec<&str> = addrs
         .lines()
-        .filter(|l| l.contains("inet6") && !l.contains("::1/128"))
+        .filter(|l| {
+            let mut fields = l.split_whitespace();
+            fields.next() == Some("inet6") && fields.next() != Some("::1/128")
+        })
         .collect();
     assert!(
         stray_addrs.is_empty(),
@@ -490,6 +498,15 @@ fn official_image_handoff_releases_to_the_locked_identity_and_tools_run() {
             .lines()
             .any(|l| l.trim() == "uid=1000 gid=1000 groups=1000"),
         "workload identity is not 1000:1000 with no supplementary groups\n{smoke}"
+    );
+    // The initializer stays out of the released workload's reach: root-owned,
+    // and neither it nor its directory is writable as the locked identity,
+    // even though the handoff chowned the whole Nix store to that identity.
+    assert!(
+        smoke
+            .lines()
+            .any(|l| l.trim() == "init-writable=no init-dir-writable=no init-owner=0:0"),
+        "the released workload can reach the initializer\n{smoke}"
     );
     for tool in SMOKE_TOOLS {
         assert!(

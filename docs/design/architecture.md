@@ -1167,14 +1167,19 @@ an unprivileged user namespace against both acceptance types, `#[ignore]`d
 because a GitHub runner's locked mounts block the namespace, so it runs on
 demand and the runtime evidence comes from the official-image test below and
 E3's proof. The official guest image (`flake.nix`, `mkAgentVmGuestImage`)
-ships the initializer at `/bin/writ-agent-vm-guest-init` (cross-compiled by
-`mkCrossGuestInit`), the locked identity `writ` 1000:1000 in `/etc/passwd`
+ships the initializer at `/sbin/writ-agent-vm-guest-init`
+(`INITIALIZER_PATH`; cross-compiled fully static by `mkCrossGuestInit` and
+installed as a regular file outside `/nix`, because the handoff chowns the
+whole store to the workload and an initializer, loader, or libc the workload
+owns would be its to replace for a restarted container), the locked identity
+`writ` 1000:1000 in `/etc/passwd`
 with an empty root-owned `/home/writ` and `/workspace` for the initializer to
 chown, and the `org.writ.agent-vm.isolation-abi` label, whose value is read
 from `crates/writ-guest-init/isolation-abi-version` — the same file the crate
 compiles `ISOLATION_ABI_VERSION` from, so the label and the ready record
 cannot disagree. The image build scans its closure for setuid/setgid files and
-asserts the initializer's binary and directory carry no write bit. The image's
+asserts the initializer is a regular file with no `/nix/store` reference
+whose binary and directory carry no write bit. The image's
 entrypoint is deliberately unchanged: the legacy profile still launches it as
 today, and the locked start path (E2) names the initializer as the container
 command, which makes it PID 1. `tests/official_image_handoff.rs` runs that
@@ -1182,8 +1187,9 @@ launch against the built image under exactly the locked capability profile —
 Docker on the Linux CI runner (`guest-image` job), Apple `container` on a Mac —
 reads the ready record and PID 1's pre-release status from the host side,
 releases with `USR1`, and checks the released status, the absence of IPv6
-addresses and live routes, and that `git`, `nix`, `claude`, and `codex` start
-as UID 1000. See `ipv4-only-network-confinement.md`, layer 2.
+addresses and live routes, that `git`, `nix`, `claude`, and `codex` start
+as UID 1000, and that the released identity cannot write the initializer or
+its directory. See `ipv4-only-network-confinement.md`, layer 2.
 `AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`
 (`agent_vm_lifecycle/state_store.rs`); the start-step state machine
