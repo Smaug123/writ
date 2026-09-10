@@ -72,9 +72,50 @@ jobs:
       run: |
         nix build .#packages.x86_64-linux.default --print-build-logs
 
+  # The official agent-VM guest image, built for this runner's architecture,
+  # then driven for real: the locked-profile initializer is started from the
+  # image under exactly the locked capability profile, released with USR1 from
+  # the host, and the released identity and tools are checked. The rootfs
+  # invariants (no setuid/setgid, unwritable initializer) are asserted inside
+  # the image derivation itself, so `nix build` succeeding is part of the
+  # evidence. See docs/plans/2026-09-01-ipv4-only-locked-v1.md, stage B3.
+  guest-image:
+    name: Guest image handoff
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ab0a9732c6464e5bb81efb82a2103c7d98f0946f
+    - name: Enable Nix cache
+      uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
+
+    - name: Use Cachix
+      uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+      with:
+        name: ${{ env.CACHIX_CACHE }}
+
+    - name: Build the guest image
+      run: |
+        nix build .#agent-vm-guest-image-x86_64-linux --print-build-logs --out-link guest-image.oci.tar
+
+    - name: Load the image into Docker
+      run: |
+        nix run nixpkgs#skopeo -- copy oci-archive:guest-image.oci.tar docker-daemon:writ-agent-vm-guest:latest
+        docker image inspect writ-agent-vm-guest:latest --format '{{json .Config.Labels}}'
+
+    - name: Run the handoff against the image
+      env:
+        WRIT_GUEST_IMAGE_RUNTIME: docker
+        WRIT_GUEST_IMAGE_REF: writ-agent-vm-guest:latest
+      run: |
+        nix develop --command cargo test -p writ-guest-init --test official_image_handoff -- --ignored --test-threads=1
+
   all-required-checks-complete:
     if: ${{ always() }}
-    needs: [nix-build, rust]
+    needs: [nix-build, rust, guest-image]
     runs-on: ubuntu-latest
     steps:
       - uses: G-Research/common-actions/check-required-lite@2b7dc49cb14f3344fbe6019c14a31165e258c059
