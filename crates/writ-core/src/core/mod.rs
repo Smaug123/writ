@@ -7,6 +7,7 @@ mod decision;
 mod grant;
 mod network_health;
 mod notes_ref;
+mod pf_counters;
 #[cfg(test)]
 mod pf_packet_model;
 mod pf_readback;
@@ -30,6 +31,10 @@ pub use decision::{
 pub use grant::CredentialGrant;
 pub use network_health::NetworkHealth;
 pub use notes_ref::{NotesRef, NotesRefError};
+pub use pf_counters::{
+    PfCounterDelta, PfCounterDeltaError, PfCounterKey, PfCounterSnapshot, PfCounters,
+    PfCountersParseError, parse_pf_verbose_readback,
+};
 pub use pf_readback::{
     PfReadbackParseError, PfReadbackRule, is_valid_label, parse_pf_readback, render_pf_readback,
 };

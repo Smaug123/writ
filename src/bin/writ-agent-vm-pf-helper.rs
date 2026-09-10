@@ -10,15 +10,16 @@ use std::path::Path;
 
 use clap::{Args, Parser, Subcommand};
 use writ::agent_vm_firewall::{
-    DenyGuestIpv6, SessionFirewallRemoval, SessionFirewallSpec, SessionFirewallTools,
-    install_session_firewall, pf_preflight, remove_session_firewall,
+    DenyGuestIpv6, SessionCounterQuery, SessionFirewallRemoval, SessionFirewallSpec,
+    SessionFirewallTools, install_session_firewall, pf_preflight, read_session_counters,
+    remove_session_firewall,
 };
 use writ::agent_vm_pf_helper_policy::{
     PF_HELPER_POLICY_PATH, PF_HELPER_POLICY_REQUIRED_OWNER, PfHelperPolicy, load_pf_helper_policy,
     parse_ipv4_cidr, parse_ipv6_cidr,
 };
 use writ::agent_vm_pf_helper_protocol::{
-    PfHelperInstallReportDoc, PfHelperPreflightDoc, PfHelperProtocolDoc,
+    PfHelperCountersDoc, PfHelperInstallReportDoc, PfHelperPreflightDoc, PfHelperProtocolDoc,
 };
 use writ::core::{BrokerPort, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId};
 
@@ -61,6 +62,11 @@ enum Cmd {
     Install(InstallArgs),
     /// Remove PF rules and matching live states for one agent VM session.
     Remove(RemoveArgs),
+    /// Read one session anchor's labelled rule counters (`pfctl -vsr`) as one
+    /// bounded JSON object, keyed by label and interface. Validates the
+    /// session against the policy file first; loads, flushes, and kills
+    /// nothing. The host-owned evidence a confinement proof grades on.
+    Counters(CountersArgs),
 }
 
 #[derive(Args)]
@@ -96,6 +102,12 @@ struct InstallArgs {
 
 #[derive(Args)]
 struct RemoveArgs {
+    #[command(flatten)]
+    session: SessionNetworkArgs,
+}
+
+#[derive(Args)]
+struct CountersArgs {
     #[command(flatten)]
     session: SessionNetworkArgs,
 }
@@ -217,6 +229,20 @@ fn execute(cmd: Cmd, helper: Helper<'_>) -> Result<Option<String>, Box<dyn std::
             )?;
             remove_session_firewall(helper.tools.pfctl, &removal)?;
             Ok(None)
+        }
+        Cmd::Counters(args) => {
+            let policy = helper.policy()?;
+            let parsed = parse_session_network(&args.session)?;
+            let query = SessionCounterQuery::new(
+                parsed.session_id,
+                policy.pool(),
+                parsed.ipv4,
+                parsed.ipv6,
+            )?;
+            let snapshot = read_session_counters(helper.tools.pfctl, &query)?;
+            Ok(Some(
+                PfHelperCountersDoc::new(parsed.session_id, snapshot).render(),
+            ))
         }
     }
 }
@@ -439,6 +465,9 @@ mod tests {
             Cmd::Remove(RemoveArgs {
                 session: session_args(),
             }),
+            Cmd::Counters(CountersArgs {
+                session: session_args(),
+            }),
         ];
         for cmd in commands {
             let err = execute(cmd, helper).unwrap_err().to_string();
@@ -496,6 +525,18 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("not inside configured pool"), "{err}");
+        let err = execute(
+            Cmd::Counters(CountersArgs {
+                session: SessionNetworkArgs {
+                    ipv4_cidr: "192.168.7.0/24".to_string(),
+                    ..session_args()
+                },
+            }),
+            fixture.helper(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not inside configured pool"), "{err}");
         // A port outside the policy's range likewise.
         let err = execute(
             Cmd::Install(InstallArgs {
@@ -510,6 +551,97 @@ mod tests {
         .to_string();
         assert!(err.contains("outside configured range"), "{err}");
         assert_eq!(recorded_calls(&fixture.pfctl_log), Vec::<String>::new());
+    }
+
+    /// A recorder that also answers one exact argument string with `stdout`.
+    fn write_answering_recorder(
+        dir: &Path,
+        name: &str,
+        answer_args: &str,
+        stdout: &str,
+    ) -> (PathBuf, PathBuf) {
+        let path = dir.join(name);
+        let log = dir.join(format!("{name}.calls"));
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 [ \"$*\" = '{}' ] && printf '%s' '{}'\n\
+                 exit 0\n",
+                log.display(),
+                answer_args.replace('\'', r"'\''"),
+                stdout.replace('\'', r"'\''"),
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        (path, log)
+    }
+
+    #[test]
+    fn counters_runs_only_the_verbose_readback_and_prints_a_parseable_document() {
+        use writ::core::{PfCounterKey, PfCounters, PfInterface};
+        let fixture = Fixture::new(Some(policy()));
+        let anchor = "writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b";
+        let dump = "pass in quick on bridge100 inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49152 flags S/SA keep state\n\
+                    \x20 [ Evaluations: 12        Packets: 8         Bytes: 640        States: 1     ]\n\
+                    \x20 [ Inserted: uid 0 pid 4242 ]\n\
+                    block return in quick on bridge100 inet all label \"writ deny agent v4 iface\"\n\
+                    \x20 [ Evaluations: 4         Packets: 3         Bytes: 180        States: 0     ]\n\
+                    \x20 [ Inserted: uid 0 pid 4242 ]\n\
+                    block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\"\n\
+                    \x20 [ Evaluations: 0         Packets: 0         Bytes: 0          States: 0     ]\n\
+                    \x20 [ Inserted: uid 0 pid 4242 ]\n";
+        let (pfctl, pfctl_log) = write_answering_recorder(
+            fixture.dir.path(),
+            "answering-pfctl",
+            &format!("-a {anchor} -vsr"),
+            dump,
+        );
+        let helper = Helper {
+            tools: SessionFirewallTools {
+                pfctl: &pfctl,
+                ifconfig: &fixture.ifconfig,
+            },
+            ..fixture.helper()
+        };
+
+        let line = execute(
+            Cmd::Counters(CountersArgs {
+                session: session_args(),
+            }),
+            helper,
+        )
+        .unwrap()
+        .unwrap();
+
+        let doc = PfHelperCountersDoc::parse(&line).unwrap();
+        assert_eq!(doc.anchor().as_str(), anchor);
+        let bridge = PfInterface::new("bridge100").unwrap();
+        assert_eq!(doc.snapshot().len(), 2);
+        assert_eq!(
+            doc.snapshot()
+                .get(&PfCounterKey::new("writ deny agent v4 iface", Some(bridge.clone())).unwrap()),
+            Some(PfCounters {
+                packets: 3,
+                bytes: 180
+            })
+        );
+        assert_eq!(
+            doc.snapshot()
+                .get(&PfCounterKey::new("writ deny agent v6 iface", Some(bridge)).unwrap()),
+            Some(PfCounters {
+                packets: 0,
+                bytes: 0
+            })
+        );
+        assert_eq!(
+            recorded_calls(&pfctl_log),
+            vec![format!("-a {anchor} -vsr")]
+        );
+        assert_eq!(recorded_calls(&fixture.ifconfig_log), Vec::<String>::new());
     }
 
     #[test]

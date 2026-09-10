@@ -10,13 +10,16 @@
 //! trailing data, no second object, no unknown protocol name, no non-canonical
 //! spelling of the same object.
 //!
-//! Three documents:
+//! Four documents:
 //! - [`PfHelperProtocolDoc`], the answer to `protocol-version`;
 //! - [`PfHelperPreflightDoc`], the answer to `preflight`: the host-local PF
 //!   facts an install is conditional on, read without loading anything;
 //! - [`PfHelperInstallReportDoc`], what a successful `install` prints: the
 //!   anchor whose readback matched, the interfaces it was resolved to, and the
-//!   last phase completed.
+//!   last phase completed;
+//! - [`PfHelperCountersDoc`], the answer to `counters`: one session anchor's
+//!   labelled rule counters, the host-owned evidence the vertical proof
+//!   grades on.
 //!
 //! Version 2 is what the shipped helper speaks, and it *means* the whole of
 //! Stage C2's boundary: the pools and broker-port range come from the
@@ -33,7 +36,10 @@ use crate::agent_vm_firewall::{
     SessionFirewallReport,
 };
 use crate::agent_vm_pf_helper_policy::{PfHelperPolicy, parse_ipv4_cidr, parse_ipv6_cidr};
-use crate::core::{AgentNetworkPool, BrokerPortRange, PfAnchorName, PfInterface, SessionId};
+use crate::core::{
+    AgentNetworkPool, BrokerPortRange, PfAnchorName, PfCounterKey, PfCounterSnapshot, PfCounters,
+    PfInterface, SessionId,
+};
 
 /// The protocol name every helper document carries.
 pub const PF_HELPER_PROTOCOL_NAME: &str = "writ-agent-vm-pf-helper";
@@ -54,6 +60,11 @@ pub const PF_HELPER_PREFLIGHT_MAX_BYTES: usize = 16 * 1024;
 /// Maximum `install` report the host reads: one anchor path and a handful of
 /// interface names.
 pub const PF_HELPER_INSTALL_REPORT_MAX_BYTES: usize = 4096;
+
+/// Maximum `counters` response the host reads: one anchor path and, per
+/// labelled rule, a label, an interface, and two counters. A session anchor
+/// has two labelled rules per interface and a few interfaces.
+pub const PF_HELPER_COUNTERS_MAX_BYTES: usize = 16 * 1024;
 
 /// Why a helper response was refused.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -454,10 +465,250 @@ impl PfHelperInstallReportDoc {
     }
 }
 
+// --- counters ---------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CountersWire<'a> {
+    protocol: &'a str,
+    version: u16,
+    anchor: String,
+    counters: Vec<CounterWire>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterWire {
+    label: String,
+    interface: Option<String>,
+    packets: u64,
+    bytes: u64,
+}
+
+impl WireHeader for CountersWire<'_> {
+    fn protocol(&self) -> &str {
+        self.protocol
+    }
+    fn version(&self) -> u16 {
+        self.version
+    }
+}
+
+/// A parsed `counters` answer: one session anchor's labelled rule counters
+/// at one reading, in key order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PfHelperCountersDoc {
+    session_id: SessionId,
+    snapshot: PfCounterSnapshot,
+}
+
+impl PfHelperCountersDoc {
+    pub fn new(session_id: SessionId, snapshot: PfCounterSnapshot) -> Self {
+        Self {
+            session_id,
+            snapshot,
+        }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn anchor(&self) -> PfAnchorName {
+        PfAnchorName::for_session(self.session_id)
+    }
+
+    pub fn snapshot(&self) -> &PfCounterSnapshot {
+        &self.snapshot
+    }
+
+    /// Render as one line without a trailing newline.
+    pub fn render(&self) -> String {
+        render_wire(&CountersWire {
+            protocol: PF_HELPER_PROTOCOL_NAME,
+            version: PF_HELPER_PROTOCOL_VERSION,
+            anchor: self.anchor().as_str().to_string(),
+            counters: self
+                .snapshot
+                .iter()
+                .map(|(key, counters)| CounterWire {
+                    label: key.label().to_string(),
+                    interface: key.interface().map(|iface| iface.as_str().to_string()),
+                    packets: counters.packets,
+                    bytes: counters.bytes,
+                })
+                .collect(),
+        })
+    }
+
+    /// Parse a captured response. Accepts exactly [`Self::render`]'s output
+    /// for the current protocol version, optionally followed by one `\n`:
+    /// in particular the counters must be in key order with no key twice.
+    pub fn parse(response: &str) -> Result<Self, PfHelperProtocolParseError> {
+        use PfHelperProtocolParseError::Malformed;
+        parse_exact(
+            response,
+            PF_HELPER_COUNTERS_MAX_BYTES,
+            |version| version == PF_HELPER_PROTOCOL_VERSION,
+            |wire: CountersWire<'_>| {
+                let session_id = wire
+                    .anchor
+                    .strip_prefix("writ/session/")
+                    .and_then(|id| id.parse::<SessionId>().ok())
+                    .ok_or(Malformed)?;
+                let entries = wire
+                    .counters
+                    .into_iter()
+                    .map(|counter| {
+                        let interface = counter
+                            .interface
+                            .map(|name| PfInterface::new(name).map_err(|_| Malformed))
+                            .transpose()?;
+                        let key = PfCounterKey::new(counter.label, interface).ok_or(Malformed)?;
+                        Ok((
+                            key,
+                            PfCounters {
+                                packets: counter.packets,
+                                bytes: counter.bytes,
+                            },
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, PfHelperProtocolParseError>>()?;
+                let snapshot = PfCounterSnapshot::new(entries).map_err(|_| Malformed)?;
+                Ok(Self {
+                    session_id,
+                    snapshot,
+                })
+            },
+            |doc| doc.render(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    mod counters {
+        use super::*;
+
+        fn arb_key() -> impl Strategy<Value = PfCounterKey> {
+            (
+                "[ -!#-~]{0,24}",
+                prop::option::of(
+                    "[a-zA-Z][a-zA-Z0-9]{0,14}".prop_map(|name| PfInterface::new(name).unwrap()),
+                ),
+            )
+                .prop_map(|(label, interface)| PfCounterKey::new(label, interface).unwrap())
+        }
+
+        fn arb_counters() -> impl Strategy<Value = PfCounters> {
+            (any::<u64>(), any::<u64>()).prop_map(|(packets, bytes)| PfCounters { packets, bytes })
+        }
+
+        fn arb_doc() -> impl Strategy<Value = PfHelperCountersDoc> {
+            (
+                any::<u128>(),
+                prop::collection::btree_map(arb_key(), arb_counters(), 0..12),
+            )
+                .prop_map(|(session, counters)| {
+                    PfHelperCountersDoc::new(
+                        SessionId::from_uuid(uuid::Uuid::from_u128(session)),
+                        PfCounterSnapshot::new(counters).unwrap(),
+                    )
+                })
+        }
+
+        #[test]
+        fn the_documented_answer_is_one_line_in_key_order() {
+            let session_id: SessionId = "0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b".parse().unwrap();
+            let bridge = PfInterface::new("bridge100").unwrap();
+            let vmenet = PfInterface::new("vmenet0").unwrap();
+            let snapshot = PfCounterSnapshot::new([
+                (
+                    PfCounterKey::new("writ deny agent v6 iface", Some(vmenet.clone())).unwrap(),
+                    PfCounters {
+                        packets: 1,
+                        bytes: 60,
+                    },
+                ),
+                (
+                    PfCounterKey::new("writ deny agent v4 iface", Some(bridge.clone())).unwrap(),
+                    PfCounters {
+                        packets: 3,
+                        bytes: 180,
+                    },
+                ),
+            ])
+            .unwrap();
+            let doc = PfHelperCountersDoc::new(session_id, snapshot);
+            assert_eq!(
+                doc.render(),
+                r#"{"protocol":"writ-agent-vm-pf-helper","version":2,"anchor":"writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b","counters":[{"label":"writ deny agent v4 iface","interface":"bridge100","packets":3,"bytes":180},{"label":"writ deny agent v6 iface","interface":"vmenet0","packets":1,"bytes":60}]}"#
+            );
+            assert_eq!(PfHelperCountersDoc::parse(&doc.render()), Ok(doc));
+        }
+
+        #[test]
+        fn the_same_counters_spelled_differently_are_refused() {
+            let rendered = r#"{"protocol":"writ-agent-vm-pf-helper","version":2,"anchor":"writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b","counters":[{"label":"writ deny agent v4 iface","interface":"bridge100","packets":3,"bytes":180},{"label":"writ deny agent v6 iface","interface":"vmenet0","packets":1,"bytes":60}]}"#;
+            assert!(PfHelperCountersDoc::parse(rendered).is_ok());
+            // Out of key order.
+            let reordered = r#"{"protocol":"writ-agent-vm-pf-helper","version":2,"anchor":"writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b","counters":[{"label":"writ deny agent v6 iface","interface":"vmenet0","packets":1,"bytes":60},{"label":"writ deny agent v4 iface","interface":"bridge100","packets":3,"bytes":180}]}"#;
+            assert_eq!(
+                PfHelperCountersDoc::parse(reordered),
+                Err(PfHelperProtocolParseError::Malformed)
+            );
+            // A key twice.
+            let twice = r#"{"protocol":"writ-agent-vm-pf-helper","version":2,"anchor":"writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b","counters":[{"label":"writ deny agent v4 iface","interface":"bridge100","packets":3,"bytes":180},{"label":"writ deny agent v4 iface","interface":"bridge100","packets":3,"bytes":180}]}"#;
+            assert_eq!(
+                PfHelperCountersDoc::parse(twice),
+                Err(PfHelperProtocolParseError::Malformed)
+            );
+            // An interface name that is not one.
+            let bad_interface = rendered.replace("bridge100", "en0; rm");
+            assert_eq!(
+                PfHelperCountersDoc::parse(&bad_interface),
+                Err(PfHelperProtocolParseError::Malformed)
+            );
+            // Version 1 never spoke this document.
+            let v1 = rendered.replace(r#""version":2"#, r#""version":1"#);
+            assert_eq!(
+                PfHelperCountersDoc::parse(&v1),
+                Err(PfHelperProtocolParseError::UnsupportedVersion(1))
+            );
+            assert_eq!(
+                PfHelperCountersDoc::parse(&format!("{rendered}\n{{}}")),
+                Err(PfHelperProtocolParseError::TrailingData)
+            );
+        }
+
+        proptest! {
+            #[test]
+            fn parse_inverts_render_with_or_without_the_println_newline(doc in arb_doc()) {
+                let rendered = doc.render();
+                prop_assert!(!rendered.contains(['\n', '\r']));
+                prop_assert!(rendered.len() <= PF_HELPER_COUNTERS_MAX_BYTES, "{}", rendered.len());
+                prop_assert_eq!(PfHelperCountersDoc::parse(&rendered), Ok(doc.clone()));
+                prop_assert_eq!(PfHelperCountersDoc::parse(&format!("{rendered}\n")), Ok(doc));
+            }
+
+            #[test]
+            fn an_oversized_answer_is_refused_before_parsing(padding in 0usize..64) {
+                let doc = PfHelperCountersDoc::new(
+                    SessionId::from_uuid(uuid::Uuid::from_u128(7)),
+                    PfCounterSnapshot::default(),
+                );
+                let rendered = doc.render();
+                let filler = " ".repeat(PF_HELPER_COUNTERS_MAX_BYTES + 1 + padding - rendered.len());
+                prop_assert_eq!(
+                    PfHelperCountersDoc::parse(&format!("{rendered}{filler}")),
+                    Err(PfHelperProtocolParseError::TooLarge(PF_HELPER_COUNTERS_MAX_BYTES))
+                );
+            }
+        }
+    }
 
     /// Independent oracle for "is `s` exactly a rendered protocol document":
     /// the grammar `{"protocol":"writ-agent-vm-pf-helper","version":<u16
