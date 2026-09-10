@@ -293,7 +293,14 @@ Before announcing readiness, PID 1:
 The agent image has a fixed identity and initializer ABI, advertised by an OCI
 label (`org.writ.agent-vm.isolation-abi`); UID, GID, and the capability set are
 not configuration knobs. An image without the label, or with a version the
-daemon does not know, does not admit `ipv4_only_locked_v1`.
+daemon does not know, does not admit `ipv4_only_locked_v1`. (The image side is
+shipped: the official image carries the initializer, the 1000:1000 identity,
+and the label, stamped from the same version file the initializer compiles its
+ready record from; the label is a compatibility signal only, and identity is
+the image's resolved digest, which the daemon's evidence gathering will read.
+The image's entrypoint is not the initializer: the locked start path names it
+as the container command, so the legacy profile's launch of the same image is
+untouched until that profile closes.)
 
 The host observes the pre-release record through bounded `container logs` and
 releases PID 1 with `container kill --signal USR1`. This preserves the no-host-

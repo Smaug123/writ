@@ -36,3 +36,10 @@ pub mod record;
 pub const LOCKED_UID: u32 = 1000;
 /// See [`LOCKED_UID`].
 pub const LOCKED_GID: u32 = 1000;
+
+/// Where the official image installs the initializer: a regular file outside
+/// `/nix` (which the handoff chowns to the workload) and outside `/bin`'s
+/// store symlinks, root-owned and unwritable by the released identity. The
+/// locked start path names this path as the container command, which makes
+/// it PID 1.
+pub const INITIALIZER_PATH: &str = "/sbin/writ-agent-vm-guest-init";

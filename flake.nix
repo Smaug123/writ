@@ -126,6 +126,53 @@
           };
         });
 
+      # The locked profile's guest initializer (`crates/writ-guest-init`), the
+      # PID 1 of an `ipv4_only_locked_v1` agent VM. Pure-Rust, Linux-only body
+      # behind a stub on other targets; cross-compiled to musl like writ-vm. It
+      # is shipped as a plain binary: the image's entrypoint is unchanged, the
+      # locked start path names it as the container command explicitly, and the
+      # legacy profile keeps launching the same image the way it does today.
+      mkCrossGuestInit = buildPkgs: guestSystem:
+        let
+          cross = guestCross guestSystem;
+          pkgs = buildPkgs.pkgsCross.${cross.pkgsCross};
+          guestInit = mkWrit pkgs {
+            pname = "writ-agent-vm-guest-init";
+            cargoBuildFlags = [ "-p" "writ-guest-init" "--bin" "writ-agent-vm-guest-init" ];
+            # Target binaries are not executable on the Darwin builder.
+            doCheck = false;
+          };
+        in
+        guestInit.overrideAttrs (old: {
+          # Fully static: the handoff chowns the whole of `/nix` to the
+          # workload, so an initializer that loaded musl's dynamic loader or
+          # libc from the store would depend on files the released workload can
+          # replace, and a restarted container would run them with the initial
+          # capabilities. With crt-static there is no interpreter and no store
+          # reference; the image build asserts both.
+          RUSTFLAGS = "-C target-feature=+crt-static";
+          passthru = (old.passthru or {}) // {
+            inherit guestSystem;
+            rustTarget = cross.rustTarget;
+          };
+          meta = (old.meta or {}) // {
+            description = "Cross-compiled writ-agent-vm-guest-init (locked-profile PID 1) for ${guestSystem}";
+          };
+        });
+
+      # The guest isolation ABI the official image advertises, read from the
+      # same file `crates/writ-guest-init` compiles its `ISOLATION_ABI_VERSION`
+      # from, so the label and the initializer's ready record cannot disagree.
+      isolationAbiLabel = "org.writ.agent-vm.isolation-abi";
+      isolationAbiVersion =
+        let
+          raw = builtins.readFile ./crates/writ-guest-init/isolation-abi-version;
+          trimmed = lib.removeSuffix "\n" raw;
+        in
+        if builtins.match "[1-9][0-9]*|0" trimmed == null || trimmed + "\n" != raw
+        then throw "crates/writ-guest-init/isolation-abi-version must be one decimal and a newline, got ${builtins.toJSON raw}"
+        else trimmed;
+
       # The broker VM (broker_placement = vm) runs `writd broker`, so its image
       # ships writd built with the `host` feature (the default) rather than the
       # agent's `vm-client`. Cross-compiled to musl for the Linux guest, like
@@ -219,6 +266,7 @@
         let
           guestPkgs = mkPkgs guestSystem;
           writVm = mkCrossWritVm buildPkgs guestSystem;
+          guestInit = mkCrossGuestInit buildPkgs guestSystem;
           claudeCode = mkGuestClaudeCode buildPkgs guestSystem;
           imageName =
             if includeProofTools
@@ -266,6 +314,62 @@
               echo "guest image /etc/passwd has no uid-0 entry" >&2
               exit 1
             fi
+            if ! grep -qE '^writ:[^:]*:1000:1000:' "${guestRoot}/etc/passwd"; then
+              echo "guest image /etc/passwd has no uid-1000 entry for the locked identity" >&2
+              exit 1
+            fi
+          '';
+          # The initializer is installed as a regular file at
+          # /sbin/writ-agent-vm-guest-init, *outside* /nix and outside /bin's
+          # store symlinks, because the handoff chowns /nix to the workload:
+          # a copy under the store would be the workload's to replace. It is
+          # the only copy; the locked start path names this path as the
+          # container command.
+          guestInitInstall = buildPkgs.runCommand "writ-agent-vm-guest-init-install" {} ''
+            install -D -m 0555 ${guestInit}/bin/writ-agent-vm-guest-init \
+              $out/sbin/writ-agent-vm-guest-init
+          '';
+          # The locked profile's rootfs invariants (plan stage B3), checked over
+          # the closure the image is assembled from, i.e. the rootfs as it will
+          # be presented: no setuid or setgid file anywhere; the initializer's
+          # own binary and its directory carry no write bit; and the initializer
+          # references nothing under /nix/store (no dynamic loader, no shared
+          # libc), so nothing the workload comes to own is on its path. File
+          # capabilities cannot occur: every path is a Nix store path, and the
+          # store strips extended attributes and canonicalises modes to
+          # 0444/0555 on registration, so the `perms` overrides below are the
+          # only way a mode could differ, and they are asserted against setuid
+          # and setgid in Nix.
+          guestRootfsClosure = buildPkgs.closureInfo {
+            rootPaths = [ guestRuntimeDirs guestRoot guestInitInstall ];
+          };
+          guestRootfsScan = ''
+            offenders=$(while read -r p; do
+              find "$p" -type f \( -perm -4000 -o -perm -2000 \) -print
+            done < "${guestRootfsClosure}/store-paths")
+            if [ -n "$offenders" ]; then
+              echo "guest image rootfs contains setuid/setgid files:" >&2
+              echo "$offenders" >&2
+              exit 1
+            fi
+            init_bin="${guestInitInstall}/sbin/writ-agent-vm-guest-init"
+            init_dir=$(dirname "$init_bin")
+            if [ -L "$init_bin" ]; then
+              echo "guest image initializer must be a regular file, not a symlink" >&2
+              exit 1
+            fi
+            if grep -q /nix/store "$init_bin"; then
+              echo "guest image initializer references the Nix store (not static?): $init_bin" >&2
+              exit 1
+            fi
+            for path in "$init_bin" "$init_dir"; do
+              case "$(stat -c '%A' "$path")" in
+                *w*)
+                  echo "guest image initializer path is writable: $path" >&2
+                  exit 1
+                  ;;
+              esac
+            done
           '';
           # grep/sed/awk/find and curl now ship in production (see the guest
           # dev toolset in guestRoot below), so they are no longer forbidden.
@@ -313,6 +417,13 @@
             install -d -m 1777 $out/var/tmp
             install -d -m 0755 $out/run
             install -d -m 0700 $out/root
+            # The locked identity's home and workspace. Root-owned and empty in
+            # the image; the initializer chowns them to 1000:1000 before the
+            # handoff (its runtime directory lives on the /run tmpfs and is
+            # created at boot). The legacy profile, which runs as root, never
+            # touches them.
+            install -d -m 0755 $out/home/writ
+            install -d -m 0755 $out/workspace
           '';
           # Without an /etc/passwd entry for the running uid, any getpwuid_r
           # caller wedges the guest. Concretely: `dotnet restore` (e.g. the
@@ -325,7 +436,9 @@
           guestEtcFiles = buildPkgs.runCommand "writ-agent-vm-guest-etc-files" {} ''
             install -d $out/etc
             printf 'root:x:0:0:root:/root:/bin/sh\n' > $out/etc/passwd
+            printf 'writ:x:1000:1000:writ:/home/writ:/bin/sh\n' >> $out/etc/passwd
             printf 'root:x:0:\n' > $out/etc/group
+            printf 'writ:x:1000:\n' >> $out/etc/group
           '';
           guestRoot = buildPkgs.buildEnv {
             name = "writ-agent-vm-guest-root";
@@ -362,29 +475,43 @@
               "/etc"
             ];
           };
-          image = nix2containerPkgs.nix2container.buildImage {
+          # Mode overrides for the image rootfs. Asserted free of setuid and
+          # setgid (a leading 4 or 2 in a four-digit mode) because they are the
+          # only place a mode can differ from what the Nix store canonicalises.
+          guestImagePerms = [
+            {
+              path = guestRuntimeDirs;
+              regex = ".*/tmp$|.*/var/tmp$";
+              mode = "1777";
+            }
+            {
+              path = guestRuntimeDirs;
+              regex = ".*/var$|.*/run$|.*/home$|.*/home/writ$|.*/workspace$";
+              mode = "0755";
+            }
+            {
+              path = guestRuntimeDirs;
+              regex = ".*/root$";
+              mode = "0700";
+            }
+          ];
+          image = assert lib.all
+            (p: builtins.match "[01]?[0-7]{3}" p.mode != null)
+            guestImagePerms;
+          nix2containerPkgs.nix2container.buildImage {
             name = imageName;
             tag = "latest";
-            copyToRoot = [ guestRuntimeDirs guestRoot ];
+            copyToRoot = [ guestRuntimeDirs guestRoot guestInitInstall ];
             arch = guestArchitecture guestSystem;
-            perms = [
-              {
-                path = guestRuntimeDirs;
-                regex = ".*/tmp$|.*/var/tmp$";
-                mode = "1777";
-              }
-              {
-                path = guestRuntimeDirs;
-                regex = ".*/var$|.*/run$";
-                mode = "0755";
-              }
-              {
-                path = guestRuntimeDirs;
-                regex = ".*/root$";
-                mode = "0700";
-              }
-            ];
+            perms = guestImagePerms;
             config = {
+              # Self-asserted compatibility signal for the locked profile: an
+              # image without it (or with a version the daemon does not know) is
+              # refused for the right reason. Identity is the resolved digest,
+              # never this label.
+              Labels = {
+                "${isolationAbiLabel}" = isolationAbiVersion;
+              };
               Cmd = [ "/bin/sh" ];
               Env = [
                 "PATH=/bin"
@@ -417,14 +544,22 @@
             passthru.imageName = imageName;
             passthru.imageTag = "latest";
             passthru.image = image;
+            passthru.isolationAbiVersion = isolationAbiVersion;
             meta.description = imageDescription;
           }
           ''
             ${guestRequiredBinCheck}
             ${guestRequiredEtcCheck}
+            ${guestRootfsScan}
             ${lib.optionalString includeProofTools proofToolCheck}
             ${lib.optionalString (!includeProofTools) productionForbiddenBinCheck}
-            ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
+            # skopeo directly, not the image's `copy-to` wrapper: its
+            # `oci-archive:` destination stages layers under `/var/tmp` (it does
+            # not consult `TMPDIR`), which exists on a Darwin builder but not in
+            # the Linux Nix sandbox, so it is pointed at the sandbox's scratch
+            # directory explicitly. The broker image below does the same.
+            ${nix2containerPkgs.skopeo-nix2container}/bin/skopeo --insecure-policy --tmpdir "$TMPDIR" \
+              copy nix:${image} oci-archive:$out:${imageName}:latest
           '';
 
       # The broker VM image (broker_placement = vm). It runs `writd broker`
@@ -558,7 +693,8 @@
           ''
             ${brokerRequiredBinCheck}
             ${brokerRequiredEtcCheck}
-            ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
+            ${nix2containerPkgs.skopeo-nix2container}/bin/skopeo --insecure-policy --tmpdir "$TMPDIR" \
+              copy nix:${image} oci-archive:$out:${imageName}:latest
           '';
     in
     flake-utils.lib.eachDefaultSystem (system:
@@ -595,6 +731,11 @@
             name = "agent-vm-writ-vm-${guestSystem}-musl";
             value = mkCrossWritVm pkgs guestSystem;
           })
+          guestSystems) // lib.listToAttrs (map
+          (guestSystem: {
+            name = "agent-vm-guest-init-${guestSystem}-musl";
+            value = mkCrossGuestInit pkgs guestSystem;
+          })
           guestSystems);
         brokerImagePackages = lib.listToAttrs (map
           (guestSystem: {
@@ -622,6 +763,7 @@
             includeProofTools = true;
           };
           agent-vm-writ-vm-musl = mkCrossWritVm pkgs defaultGuestSystem;
+          agent-vm-guest-init-musl = mkCrossGuestInit pkgs defaultGuestSystem;
           broker-vm-image = mkBrokerVmImage pkgs nix2containerPkgs {
             guestSystem = defaultGuestSystem;
           };
