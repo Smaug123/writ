@@ -112,42 +112,70 @@ pub struct PfAnchorName(String);
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PfInterface(String);
 
+/// The allow: `pass in quick [on <iface>] <af> proto tcp from <source> to
+/// <destination> port $broker_ports keep state`.
+///
+/// `interface` is `None` for the bootstrap anchor, loaded before the VM (and
+/// so its host interfaces) exists, and `Some` for the attached anchor that
+/// replaces it, where every rule is scoped to the interface the guest's
+/// frames arrive on (see [`session_attached_pf_ruleset`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfAllowRule {
+    interface: Option<PfInterface>,
     source: PfCidr,
     destination: PfHost,
 }
 
+/// A source-scoped deny: `block return in quick <af> from <source> to any`.
+///
+/// Only the bootstrap anchor carries one: it matches on the session subnet as
+/// source wherever the frame arrives, which is all a rule can do before the
+/// VM's interfaces exist, and is also why the bootstrap anchor is replaced as
+/// soon as they do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfDenyRule {
     source: PfCidr,
     label: String,
 }
 
-/// An interface-scoped IPv6 deny: `block return in quick on <iface> inet6 all`.
+/// An interface-scoped deny: `block return in quick on <iface> <af> all`.
 ///
 /// Unlike [`PfDenyRule`], which scopes by source CIDR, this scopes by the host
-/// interface and matches *all* IPv6, regardless of source address. It is the
-/// only backstop that survives a root guest reassigning its own IPv6 source
-/// (see the `Ipv4OnlyNoGuestIpv6` lifecycle mode): a source-CIDR rule keyed on
-/// the RA-acquired ULA is bypassable, an interface rule is not.
+/// interface and matches *all* traffic of its family, regardless of source
+/// address. It is the only rule that survives a root guest choosing its own
+/// source (see the `Ipv4OnlyNoGuestIpv6` lifecycle mode): a source-CIDR rule
+/// keyed on the RA-acquired ULA, or on the session's IPv4 subnet, is
+/// bypassable by a guest that can forge a source; an interface rule is not.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfInterfaceDenyRule {
     interface: PfInterface,
+    family: IpFamily,
     label: String,
+}
+
+/// One rule of a session anchor. A [`PfRuleset`] is an ordered list of these;
+/// every rule is `quick`, so the first match decides and order is meaning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PfRule {
+    Allow(PfAllowRule),
+    Deny(PfDenyRule),
+    InterfaceDeny(PfInterfaceDenyRule),
 }
 
 /// Inert PF ruleset description for one agent session.
 ///
 /// `anchor` names the PF anchor the helper should load this ruleset into. It
 /// is not rendered inside the rules body; the helper supplies it to `pfctl`.
+///
+/// Only the constructors in this module build one, so the two shapes they
+/// build are the only two that exist: the bootstrap anchor (subnet-scoped,
+/// [`session_firewall_pf_ruleset`]) and the attached anchor (every rule
+/// interface-scoped, [`session_attached_pf_ruleset`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfRuleset {
     anchor: PfAnchorName,
     broker_ports: BrokerPorts,
-    allow: Vec<PfAllowRule>,
-    deny: Vec<PfDenyRule>,
-    iface_deny: Vec<PfInterfaceDenyRule>,
+    rules: Vec<PfRule>,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -198,6 +226,8 @@ pub enum AgentVmConfigError {
         "invalid PF interface name {0:?}: expected a short ASCII-alphanumeric token led by a letter"
     )]
     InvalidPfInterface(String),
+    #[error("an interface-scoped session anchor needs at least one interface")]
+    NoSessionInterfaces,
     #[error(
         "an interface-scoped IPv6 deny is only valid without an IPv6 firewall scope, \
          but the session has an IPv6 scope whose allow it would contradict"
@@ -576,15 +606,20 @@ impl std::fmt::Display for PfInterface {
 }
 
 impl PfInterfaceDenyRule {
-    fn new(interface: PfInterface, label: impl Into<String>) -> Self {
+    fn new(interface: PfInterface, family: IpFamily, label: impl Into<String>) -> Self {
         Self {
             interface,
+            family,
             label: label.into(),
         }
     }
 
     pub fn interface(&self) -> &PfInterface {
         &self.interface
+    }
+
+    pub fn family(&self) -> IpFamily {
+        self.family
     }
 
     pub fn label(&self) -> &str {
@@ -611,16 +646,22 @@ impl PfAnchorName {
 }
 
 impl PfAllowRule {
-    fn new(source: PfCidr, destination: PfHost) -> Self {
+    fn new(interface: Option<PfInterface>, source: PfCidr, destination: PfHost) -> Self {
         debug_assert_eq!(
             source.family(),
             destination.family(),
             "allow rule source and destination must share an IP family",
         );
         Self {
+            interface,
             source,
             destination,
         }
+    }
+
+    /// The interface the rule is scoped to; `None` matches a frame on any.
+    pub fn interface(&self) -> Option<&PfInterface> {
+        self.interface.as_ref()
     }
 
     pub fn family(&self) -> IpFamily {
@@ -658,19 +699,11 @@ impl PfDenyRule {
 }
 
 impl PfRuleset {
-    fn new(
-        anchor: PfAnchorName,
-        broker_ports: BrokerPorts,
-        allow: Vec<PfAllowRule>,
-        deny: Vec<PfDenyRule>,
-        iface_deny: Vec<PfInterfaceDenyRule>,
-    ) -> Self {
+    fn new(anchor: PfAnchorName, broker_ports: BrokerPorts, rules: Vec<PfRule>) -> Self {
         Self {
             anchor,
             broker_ports,
-            allow,
-            deny,
-            iface_deny,
+            rules,
         }
     }
 
@@ -682,60 +715,60 @@ impl PfRuleset {
         &self.broker_ports
     }
 
-    pub fn allow(&self) -> &[PfAllowRule] {
-        &self.allow
-    }
-
-    pub fn deny(&self) -> &[PfDenyRule] {
-        &self.deny
-    }
-
-    pub fn iface_deny(&self) -> &[PfInterfaceDenyRule] {
-        &self.iface_deny
+    /// The rules in load order.
+    pub fn rules(&self) -> &[PfRule] {
+        &self.rules
     }
 }
 
-/// Label on the interface-scoped IPv6 deny rules (see [`PfInterfaceDenyRule`]).
-const IPV6_IFACE_DENY_LABEL: &str = "writ deny agent v6 iface";
+/// Label on the interface-scoped IPv4 deny of the attached anchor.
+pub const IPV4_IFACE_DENY_LABEL: &str = "writ deny agent v4 iface";
+/// Label on the interface-scoped IPv6 deny of the attached anchor.
+pub const IPV6_IFACE_DENY_LABEL: &str = "writ deny agent v6 iface";
 
 pub fn session_pf_ruleset(
     session_id: SessionId,
     network: AgentNetwork,
     broker_ports: &BrokerPorts,
 ) -> PfRuleset {
-    session_firewall_pf_ruleset(session_id, network.into(), broker_ports, None, &[])
+    session_firewall_pf_ruleset(session_id, network.into(), broker_ports, None)
 }
 
-/// Build the per-session PF ruleset: allow the agent subnet to reach the broker
-/// on `broker_ports`, deny it everything else.
+/// The IPv4 allow's endpoints: the session subnet as source, and as
+/// destination the broker's IPv4 endpoint. `None` defaults to the subnet
+/// gateway — the host-broker case, where the broker is the macOS host on the
+/// gateway address. For `broker_placement = vm` the broker is a VM on the
+/// agent subnet, so the caller passes its discovered IP; the `pass quick`
+/// allow then takes precedence over the deny, so the agent reaches its broker
+/// VM while every other host (including the gateway) stays blocked.
+fn ipv4_allow_endpoints(
+    network: AgentFirewallNetwork,
+    broker_ipv4_host: Option<Ipv4Addr>,
+) -> (PfCidr, PfHost) {
+    let allow_host = broker_ipv4_host.unwrap_or_else(|| network.ipv4_gateway());
+    (PfCidr::Inet(network.ipv4()), PfHost::Inet(allow_host))
+}
+
+/// The bootstrap anchor: what `InstallFirewall` loads before the VM exists.
+/// Allow the agent subnet to reach the broker on `broker_ports`, then deny the
+/// agent subnet everything else; for a dual-stack scope, the same pair for
+/// IPv6 with the subnet's `::1` as the broker.
 ///
-/// `broker_ipv4_host` is the broker's IPv4 endpoint the allow rule targets.
-/// `None` defaults to the subnet gateway — the host-broker case, where the
-/// broker is the macOS host on the gateway address. For `broker_placement = vm`
-/// the broker is a VM on the agent subnet, so the caller passes its discovered IP
-/// here; the `pass quick` allow then takes precedence over the subnet deny, so
-/// the agent reaches its broker VM while every other host (including the gateway)
-/// stays blocked.
-///
-/// `ipv6_deny_interfaces` adds one interface-scoped IPv6 deny per interface
-/// (`block ... on <iface> inet6 all`). This is the `Ipv4OnlyNoGuestIpv6`
-/// backstop: the guest's IPv6 comes from a host vmnet RA on a ULA prefix Apple
-/// chooses (not one we can predict), so a source-CIDR rule cannot pin it and a
-/// root guest could reassign its source anyway — only the interface scope holds.
-/// The interfaces are discovered post-VM-start and passed by the shell; the core
-/// only records the (already validated) names.
+/// Both rules match on the session subnet as *source*, because before the VM
+/// starts there is no interface to match on. That is a bootstrap property, not
+/// the boundary: a guest that can forge a source is not covered by either
+/// rule, and a frame with that source arriving on an unrelated interface
+/// would be. The `Ipv4OnlyNoGuestIpv6` mode therefore replaces this anchor
+/// with [`session_attached_pf_ruleset`] once the VM's interfaces exist; the
+/// dual-stack mode, which has no post-attach step, keeps it.
 pub fn session_firewall_pf_ruleset(
     session_id: SessionId,
     network: AgentFirewallNetwork,
     broker_ports: &BrokerPorts,
     broker_ipv4_host: Option<Ipv4Addr>,
-    ipv6_deny_interfaces: &[PfInterface],
 ) -> PfRuleset {
-    let allow_host = broker_ipv4_host.unwrap_or_else(|| network.ipv4_gateway());
-    let mut allow = vec![PfAllowRule::new(
-        PfCidr::Inet(network.ipv4()),
-        PfHost::Inet(allow_host),
-    )];
+    let (source, destination) = ipv4_allow_endpoints(network, broker_ipv4_host);
+    let mut allow = vec![PfAllowRule::new(None, source, destination)];
     let mut deny = vec![PfDenyRule::new(
         PfCidr::Inet(network.ipv4()),
         "writ deny agent v4",
@@ -743,57 +776,119 @@ pub fn session_firewall_pf_ruleset(
     if let Some(ipv6) = network.ipv6() {
         let ipv6_gateway = Ipv6Addr::from(u128::from(ipv6.network()) + 1);
         allow.push(PfAllowRule::new(
+            None,
             PfCidr::Inet6(ipv6),
             PfHost::Inet6(ipv6_gateway),
         ));
         deny.push(PfDenyRule::new(PfCidr::Inet6(ipv6), "writ deny agent v6"));
     }
-    let iface_deny = ipv6_deny_interfaces
-        .iter()
-        .cloned()
-        .map(|interface| PfInterfaceDenyRule::new(interface, IPV6_IFACE_DENY_LABEL))
+    let rules = allow
+        .into_iter()
+        .map(PfRule::Allow)
+        .chain(deny.into_iter().map(PfRule::Deny))
         .collect();
     PfRuleset::new(
         PfAnchorName::for_session(session_id),
         broker_ports.clone(),
-        allow,
-        deny,
-        iface_deny,
+        rules,
     )
 }
 
+/// The attached anchor: what replaces the bootstrap anchor once the VM's host
+/// interfaces (its `bridgeN` and `vmenetN` members) exist. Per interface, in
+/// order: the IPv4 allow for the broker tuple, an IPv4 deny of everything
+/// else, and an IPv6 deny of everything. Every rule carries `on <iface>`:
+/// the anchor decides every frame that arrives on one of `interfaces`,
+/// however the guest addressed it, and no frame that arrives anywhere else.
+///
+/// The IPv6 deny is the `Ipv4OnlyNoGuestIpv6` backstop: the guest's IPv6
+/// comes from a host vmnet RA on a ULA prefix Apple chooses, so a source-CIDR
+/// rule cannot pin it and a root guest could reassign its source anyway. The
+/// IPv4 deny closes the same gap for a forged IPv4 source. An IPv6 scope is
+/// refused because that deny would contradict its allow, and an empty
+/// interface set is refused because the anchor would then decide nothing.
+/// The interfaces are discovered after the VM starts and passed by the shell;
+/// the core only records the (already validated) names.
+pub fn session_attached_pf_ruleset(
+    session_id: SessionId,
+    network: AgentFirewallNetwork,
+    broker_ports: &BrokerPorts,
+    broker_ipv4_host: Option<Ipv4Addr>,
+    interfaces: &[PfInterface],
+) -> Result<PfRuleset, AgentVmConfigError> {
+    if network.ipv6().is_some() {
+        return Err(AgentVmConfigError::Ipv6DenyInterfaceWithIpv6Scope);
+    }
+    if interfaces.is_empty() {
+        return Err(AgentVmConfigError::NoSessionInterfaces);
+    }
+    let (source, destination) = ipv4_allow_endpoints(network, broker_ipv4_host);
+    let rules = interfaces
+        .iter()
+        .flat_map(|interface| {
+            [
+                PfRule::Allow(PfAllowRule::new(
+                    Some(interface.clone()),
+                    source,
+                    destination,
+                )),
+                PfRule::InterfaceDeny(PfInterfaceDenyRule::new(
+                    interface.clone(),
+                    IpFamily::Inet,
+                    IPV4_IFACE_DENY_LABEL,
+                )),
+                PfRule::InterfaceDeny(PfInterfaceDenyRule::new(
+                    interface.clone(),
+                    IpFamily::Inet6,
+                    IPV6_IFACE_DENY_LABEL,
+                )),
+            ]
+        })
+        .collect();
+    Ok(PfRuleset::new(
+        PfAnchorName::for_session(session_id),
+        broker_ports.clone(),
+        rules,
+    ))
+}
+
+/// `on <iface> ` when the rule is interface-scoped, nothing otherwise.
+fn render_pf_scope(interface: Option<&PfInterface>) -> String {
+    interface
+        .map(|interface| format!("on {interface} "))
+        .unwrap_or_default()
+}
+
+/// The `pf.conf` text the helper loads: the port macro, then one line per
+/// rule in load order.
 pub fn render_pf(ruleset: &PfRuleset) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "broker_ports = \"{{ {} }}\"\n\n",
         ruleset.broker_ports().render_pf_set()
     ));
-    for rule in ruleset.allow() {
-        out.push_str(&format!(
-            "pass in quick {} proto tcp from {} to {} port $broker_ports keep state\n",
-            rule.family().pf_name(),
-            rule.source(),
-            rule.destination(),
-        ));
-    }
-    out.push('\n');
-    for rule in ruleset.deny() {
-        out.push_str(&format!(
-            "block return in quick {} from {} to any label \"{}\"\n",
-            rule.family().pf_name(),
-            rule.source(),
-            rule.label(),
-        ));
-    }
-    // Interface-scoped IPv6 denies come last: no source CIDR (matches `all`),
-    // scoped to the agent VM's bridge/member so a root guest cannot escape it by
-    // reassigning its IPv6 source address.
-    for rule in ruleset.iface_deny() {
-        out.push_str(&format!(
-            "block return in quick on {} inet6 all label \"{}\"\n",
-            rule.interface(),
-            rule.label(),
-        ));
+    for rule in ruleset.rules() {
+        match rule {
+            PfRule::Allow(rule) => out.push_str(&format!(
+                "pass in quick {}{} proto tcp from {} to {} port $broker_ports keep state\n",
+                render_pf_scope(rule.interface()),
+                rule.family().pf_name(),
+                rule.source(),
+                rule.destination(),
+            )),
+            PfRule::Deny(rule) => out.push_str(&format!(
+                "block return in quick {} from {} to any label \"{}\"\n",
+                rule.family().pf_name(),
+                rule.source(),
+                rule.label(),
+            )),
+            PfRule::InterfaceDeny(rule) => out.push_str(&format!(
+                "block return in quick on {} {} all label \"{}\"\n",
+                rule.interface(),
+                rule.family().pf_name(),
+                rule.label(),
+            )),
+        }
     }
     out
 }
@@ -1219,20 +1314,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![18080, 18081],
         );
-        assert_eq!(ruleset.allow().len(), 2);
-        assert_eq!(ruleset.deny().len(), 2);
-        assert_eq!(ruleset.allow()[0].source(), PfCidr::Inet(network.ipv4()));
+        let [
+            PfRule::Allow(allow_v4),
+            PfRule::Allow(allow_v6),
+            PfRule::Deny(deny_v4),
+            PfRule::Deny(deny_v6),
+        ] = ruleset.rules()
+        else {
+            panic!("unexpected rules: {:?}", ruleset.rules());
+        };
+        assert_eq!(allow_v4.interface(), None);
+        assert_eq!(allow_v4.source(), PfCidr::Inet(network.ipv4()));
+        assert_eq!(allow_v4.destination(), PfHost::Inet(network.ipv4_gateway()),);
+        assert_eq!(allow_v6.interface(), None);
+        assert_eq!(allow_v6.source(), PfCidr::Inet6(network.ipv6()));
         assert_eq!(
-            ruleset.allow()[0].destination(),
-            PfHost::Inet(network.ipv4_gateway()),
-        );
-        assert_eq!(ruleset.allow()[1].source(), PfCidr::Inet6(network.ipv6()));
-        assert_eq!(
-            ruleset.allow()[1].destination(),
+            allow_v6.destination(),
             PfHost::Inet6(Ipv6Addr::from(u128::from(network.ipv6().network()) + 1)),
         );
-        assert_eq!(ruleset.deny()[0].label(), "writ deny agent v4");
-        assert_eq!(ruleset.deny()[1].label(), "writ deny agent v6");
+        assert_eq!(deny_v4.label(), "writ deny agent v4");
+        assert_eq!(deny_v6.label(), "writ deny agent v6");
     }
 
     #[test]
@@ -1246,7 +1347,6 @@ mod tests {
                 "\n",
                 "pass in quick inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
                 "pass in quick inet6 proto tcp from fd83:b6f2:e57:f536::/64 to fd83:b6f2:e57:f536::1 port $broker_ports keep state\n",
-                "\n",
                 "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
                 "block return in quick inet6 from fd83:b6f2:e57:f536::/64 to any label \"writ deny agent v6\"\n",
             ),
@@ -1258,49 +1358,72 @@ mod tests {
         let network = sample_pool().allocate(0).unwrap();
         let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
         let ruleset =
-            session_firewall_pf_ruleset(session_id(), firewall_scope, &sample_ports(), None, &[]);
-        assert_eq!(ruleset.allow().len(), 1);
-        assert_eq!(ruleset.deny().len(), 1);
-        assert!(ruleset.iface_deny().is_empty());
+            session_firewall_pf_ruleset(session_id(), firewall_scope, &sample_ports(), None);
+        assert_eq!(ruleset.rules().len(), 2);
         assert_eq!(
             render_pf(&ruleset),
             concat!(
                 "broker_ports = \"{ 18080, 18081 }\"\n",
                 "\n",
                 "pass in quick inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
-                "\n",
                 "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
             ),
         );
     }
 
     #[test]
-    fn render_pf_appends_interface_scoped_ipv6_deny_for_each_interface() {
+    fn render_pf_renders_the_attached_anchor_per_interface() {
         let network = sample_pool().allocate(0).unwrap();
         let firewall_scope = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
         let interfaces = [
             PfInterface::new("bridge100").unwrap(),
             PfInterface::new("vmenet0").unwrap(),
         ];
-        let ruleset = session_firewall_pf_ruleset(
+        let ruleset = session_attached_pf_ruleset(
             session_id(),
             firewall_scope,
             &sample_ports(),
             None,
             &interfaces,
-        );
-        assert_eq!(ruleset.iface_deny().len(), 2);
+        )
+        .unwrap();
+        assert_eq!(ruleset.rules().len(), 6);
         assert_eq!(
             render_pf(&ruleset),
             concat!(
                 "broker_ports = \"{ 18080, 18081 }\"\n",
                 "\n",
-                "pass in quick inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
-                "\n",
-                "block return in quick inet from 192.168.126.0/24 to any label \"writ deny agent v4\"\n",
+                "pass in quick on bridge100 inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
+                "block return in quick on bridge100 inet all label \"writ deny agent v4 iface\"\n",
                 "block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\"\n",
+                "pass in quick on vmenet0 inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state\n",
+                "block return in quick on vmenet0 inet all label \"writ deny agent v4 iface\"\n",
                 "block return in quick on vmenet0 inet6 all label \"writ deny agent v6 iface\"\n",
             ),
+        );
+    }
+
+    #[test]
+    fn the_attached_anchor_refuses_an_ipv6_scope_and_no_interfaces() {
+        let network = sample_pool().allocate(0).unwrap();
+        let interface = PfInterface::new("bridge100").unwrap();
+        let dual_stack = AgentFirewallNetwork::new(network.ipv4(), Some(network.ipv6())).unwrap();
+        assert_eq!(
+            session_attached_pf_ruleset(
+                session_id(),
+                dual_stack,
+                &sample_ports(),
+                None,
+                std::slice::from_ref(&interface),
+            )
+            .unwrap_err(),
+            AgentVmConfigError::Ipv6DenyInterfaceWithIpv6Scope,
+        );
+        let ipv4_only = AgentFirewallNetwork::new(network.ipv4(), None).unwrap();
+        assert_eq!(
+            session_attached_pf_ruleset(session_id(), ipv4_only, &sample_ports(), None, &[])
+                .unwrap_err(),
+            AgentVmConfigError::NoSessionInterfaces,
         );
     }
 
@@ -1344,7 +1467,6 @@ mod tests {
             firewall_scope,
             &sample_ports(),
             Some(broker_vm_ip),
-            &[],
         ));
         // The `pass quick` allow targets the broker VM IP (and precedes the
         // subnet deny), so the agent reaches its broker VM...
@@ -1395,21 +1517,29 @@ mod tests {
                 prop_assert!(!name.is_empty() && name.len() <= PfInterface::MAX_LEN);
                 prop_assert!(name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
                 prop_assert!(name.chars().all(|c| c.is_ascii_alphanumeric()));
-                // The rendered rule stays a single, well-formed line.
-                let rendered = render_pf(&session_firewall_pf_ruleset(
+                // The rendered rules stay single, well-formed lines.
+                let rendered = render_pf(&session_attached_pf_ruleset(
                     session_id(),
                     AgentFirewallNetwork::new(sample_pool().allocate(0).unwrap().ipv4(), None).unwrap(),
                     &sample_ports(),
                     None,
                     std::slice::from_ref(&iface),
-                ));
-                let iface_lines: Vec<_> = rendered
+                ).unwrap());
+                let rule_lines: Vec<_> = rendered
                     .lines()
-                    .filter(|l| l.contains("inet6 all"))
+                    .filter(|l| l.contains(" on "))
                     .collect();
-                prop_assert_eq!(iface_lines.len(), 1);
+                prop_assert_eq!(rule_lines.len(), 3);
                 prop_assert_eq!(
-                    iface_lines[0],
+                    rule_lines[0],
+                    format!("pass in quick on {name} inet proto tcp from 192.168.126.0/24 to 192.168.126.1 port $broker_ports keep state")
+                );
+                prop_assert_eq!(
+                    rule_lines[1],
+                    format!("block return in quick on {name} inet all label \"writ deny agent v4 iface\"")
+                );
+                prop_assert_eq!(
+                    rule_lines[2],
                     format!("block return in quick on {name} inet6 all label \"writ deny agent v6 iface\"")
                 );
             }

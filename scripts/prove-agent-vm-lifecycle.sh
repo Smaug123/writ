@@ -345,37 +345,56 @@ assert_guest_has_no_routable_ipv6() {
   log "pass: guest has no routable IPv6 address or default route"
 }
 
-assert_pf_anchor_has_ipv6_interface_deny() {
-  log "assert: PF session anchor carries an interface-scoped IPv6 deny"
+# The attached anchor: once the VM's bridge and members exist, every rule of
+# the session anchor is scoped to one of them, so the anchor decides every
+# frame the guest emits however the guest addressed it, and no frame that
+# arrives on any other host interface. A rule without `on <iface>` here is the
+# bootstrap anchor surviving past the attach, which is a failed replacement.
+assert_pf_anchor_is_interface_scoped() {
+  log "assert: every rule of the PF session anchor is scoped to the agent's bridge or a member"
   local rules
   rules="$(sudo pfctl -a "$PF_ANCHOR" -sr 2>/dev/null || true)"
   printf '%s\n' "$rules"
+  local unscoped
+  unscoped="$(printf '%s\n' "$rules" | grep -Ev '^$|^(pass|block)[^"]* on (bridge|vmenet)[0-9]+ ' || true)"
+  if [[ -n "$unscoped" ]]; then
+    die "PF anchor holds a rule not scoped to the agent's bridge or a member: ${unscoped}"
+  fi
+  # e.g. pass in quick on bridge100 inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49152 flags S/SA keep state
+  if ! printf '%s\n' "$rules" | grep -Eq '^pass in quick on (bridge|vmenet)[0-9]+ inet proto tcp from '; then
+    die "PF anchor lacks an interface-scoped IPv4 allow for the broker: ${PF_ANCHOR}"
+  fi
+  # e.g. block return in quick on bridge100 inet all label "writ deny agent v4 iface"
+  if ! printf '%s\n' "$rules" | grep -Eq '^block return in quick on (bridge|vmenet)[0-9]+ inet all label '; then
+    die "PF anchor lacks an interface-scoped IPv4 deny: ${PF_ANCHOR}"
+  fi
   # e.g. block return in quick on bridge100 inet6 all label "writ deny agent v6 iface"
-  if ! printf '%s\n' "$rules" | grep -Eq 'block .* on (bridge|vmenet)[0-9]+ inet6 all'; then
+  if ! printf '%s\n' "$rules" | grep -Eq '^block return in quick on (bridge|vmenet)[0-9]+ inet6 all label '; then
     die "PF anchor lacks an interface-scoped IPv6 deny (the IPv4-only backstop): ${PF_ANCHOR}"
   fi
-  log "pass: PF session anchor carries an interface-scoped IPv6 deny"
+  log "pass: PF session anchor is interface-scoped, with the IPv4 allow, the IPv4 deny, and the IPv6 deny"
 }
 
 # The core of the P1: a root guest can undo the in-guest IPv6 disable and
 # reacquire a vmnet-RA ULA after release. Prove the *host* PF interface deny
 # still blocks its IPv6 egress, so the bypass is closed at a layer the guest
 # cannot touch.
-# The summed packet counter of the session anchor's interface-scoped IPv6
-# denies, read on the host from `pfctl -vsr`, which renders each rule followed
-# by an indented `[ Evaluations: N Packets: N Bytes: N States: N ]` line. The
-# firewall installs a separate `block ... inet6 all` per interface (the bridge
-# AND each vmenet member), and PF may drop the probe on any of them, so this
-# aggregates the Packets counters of ALL matching denies. Dies unless at least
-# one such rule renders with a counter, so a format drift fails the proof
-# rather than reading as zero.
-pf_ipv6_iface_deny_packets() {
+# The summed packet counter of the session anchor's interface-scoped denies of
+# one family (`inet` or `inet6`), read on the host from `pfctl -vsr`, which
+# renders each rule followed by an indented `[ Evaluations: N Packets: N Bytes:
+# N States: N ]` line. The firewall installs a separate `block ... <af> all`
+# per interface (the bridge AND each vmenet member), and PF may drop the probe
+# on any of them, so this aggregates the Packets counters of ALL matching
+# denies. Dies unless at least one such rule renders with a counter, so a
+# format drift fails the proof rather than reading as zero.
+pf_iface_deny_packets() {
+  local family="$1"
   local rules
   rules="$(sudo pfctl -a "$PF_ANCHOR" -vsr 2>/dev/null)" \
     || die "could not read verbose rules for ${PF_ANCHOR}"
   local count
-  count="$(printf '%s\n' "$rules" | awk '
-    /^block .* on (bridge|vmenet)[0-9]+ inet6 all/ { rule = 1; next }
+  count="$(printf '%s\n' "$rules" | awk -v family="$family" '
+    $0 ~ ("^block .* on (bridge|vmenet)[0-9]+ " family " all") { rule = 1; next }
     rule && match($0, /Packets: [0-9]+/) {
       total += substr($0, RSTART + 9, RLENGTH - 9); matched = 1; rule = 0; next
     }
@@ -383,8 +402,34 @@ pf_ipv6_iface_deny_packets() {
     END { if (matched) print total }
   ')"
   [[ "$count" =~ ^[0-9]+$ ]] \
-    || die "no IPv6 interface deny with a packet counter rendered in pfctl -vsr for ${PF_ANCHOR}"
+    || die "no ${family} interface deny with a packet counter rendered in pfctl -vsr for ${PF_ANCHOR}"
   printf '%s\n' "$count"
+}
+
+# The interface-scoped IPv4 deny is live on the guest's actual path: a TCP
+# connect from the guest to a host port that is not the broker's must be
+# blocked by that rule and counted by it. The guest's exit code is not the
+# oracle (see assert_reenabled_ipv6_egress_blocked); the host's deny-rule
+# packet counter is. This exercises the same rule a forged-source frame would
+# hit, but with an in-subnet source: the released workload holds neither
+# NET_RAW nor NET_ADMIN (asserted above), so it cannot forge a source at all,
+# and the forged-source measurement is a separate probe container's job (the
+# plan's "Beyond E3", question 4). What this proves is that the rule counted
+# in the readback is the rule deciding the guest's frames.
+assert_forbidden_ipv4_egress_counted() {
+  local before
+  before="$(pf_iface_deny_packets inet)"
+  log "probing a forbidden host port (IPv4 deny counter before: ${before})"
+  expect_guest_blocked \
+    "VM cannot reach forbidden host port" \
+    "wget -q -T 3 -O - '$FORBIDDEN_URL'"
+  local after
+  after="$(pf_iface_deny_packets inet)"
+  log "IPv4 deny counter after: ${after}"
+  if (( after <= before )); then
+    die "the host IPv4 interface deny counted no packet during the guest's probe (before=${before}, after=${after}); the probe sent nothing, or PF did not see it on the bridge"
+  fi
+  log "pass: host PF blocked $((after - before)) IPv4 packet(s) to the forbidden host port"
 }
 
 assert_reenabled_ipv6_egress_blocked() {
@@ -423,7 +468,7 @@ assert_reenabled_ipv6_egress_blocked() {
     target="${gw}%eth0"
   fi
   local before
-  before="$(pf_ipv6_iface_deny_packets)"
+  before="$(pf_iface_deny_packets inet6)"
   log "probing IPv6 egress to reacquired gateway ${gw} (deny counter before: ${before})"
   # A TCP connect over IPv6 to the host bridge. The guest's exit code is not the
   # oracle: with `block return` PF answers with a reset, and with no deny the
@@ -440,7 +485,7 @@ assert_reenabled_ipv6_egress_blocked() {
     "re-enabled guest IPv6 egress to the host bridge is refused" \
     "wget -q -T 3 -O /dev/null 'http://[${target}]:${BROKER_PORT}/broker.txt'"
   local after
-  after="$(pf_ipv6_iface_deny_packets)"
+  after="$(pf_iface_deny_packets inet6)"
   log "deny counter after: ${after}"
   if (( after <= before )); then
     die "the host IPv6 interface deny counted no packet during the guest's probe (before=${before}, after=${after}); the probe sent nothing, or PF did not see it on the bridge"
@@ -577,7 +622,9 @@ wait_for_released_guest_command
 
 # The IPv4-only launch drops CAP_NET_RAW (the default set never holds
 # CAP_NET_ADMIN): without either, the workload cannot forge an out-of-subnet
-# IPv4 source, which the session anchor's source-scoped rules would not match.
+# IPv4 source. The attached anchor below would block such a frame anyway (its
+# rules are interface-scoped, not source-scoped); the capability drop is the
+# sender-side half of the same boundary.
 assert_released_workload_lacks_net_admin_and_net_raw
 
 expect_guest_success \
@@ -586,9 +633,9 @@ expect_guest_success \
 
 assert_guest_has_no_routable_ipv6
 
-# The host-side backstop must be installed on the agent VM's bridge before the
+# The attached anchor must be on the agent VM's bridge and members before the
 # guest command was ever released.
-assert_pf_anchor_has_ipv6_interface_deny
+assert_pf_anchor_is_interface_scoped
 
 GUEST_IPV4="$(guest_ipv4_addr)"
 if [[ -z "$GUEST_IPV4" ]]; then
@@ -603,9 +650,7 @@ expect_guest_success \
   "VM can reach broker port through host-only gateway" \
   "wget -q -T 3 -O - '$BROKER_URL' | grep -q '^broker-ok$'"
 
-expect_guest_blocked \
-  "VM cannot reach forbidden host port" \
-  "wget -q -T 3 -O - '$FORBIDDEN_URL'"
+assert_forbidden_ipv4_egress_counted
 
 expect_guest_blocked \
   "VM cannot reach direct IPv4 internet" \
@@ -636,4 +681,4 @@ assert_no_pf_state_for_guest
 
 cleanup
 trap - EXIT INT TERM
-log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, broker reachable, forbidden host port blocked, IPv6 posture proven, host IPv6 interface deny installed and holds against a re-enabling root guest, and runner cleanup verified"
+log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, host IPv6 interface deny holds against a re-enabling root guest, and runner cleanup verified"

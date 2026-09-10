@@ -254,7 +254,7 @@ fn managed_start_then_managed_stop_success_removes_state_record() {
 fn ipv4_only_start_reinstalls_firewall_with_guest_ipv6_deny_after_vm_start() {
     // Drives the *real* post-start path: after StartVm, the runner re-invokes the
     // pf-helper with `--deny-guest-ipv6` so the privileged helper discovers the
-    // bridge itself and installs the interface-scoped IPv6 deny. (The fake helper
+    // bridge itself and installs the interface-scoped attached anchor. (The fake helper
     // here only records that it was asked; the discovery logic is covered by the
     // pf-helper's own tests and the real-hardware prove script.)
     let dir = tempfile::tempdir().unwrap();

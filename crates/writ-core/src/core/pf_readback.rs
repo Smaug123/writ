@@ -19,23 +19,25 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::agent_vm::{
-    BrokerPort, IpFamily, Ipv4Cidr, Ipv6Cidr, PfCidr, PfHost, PfInterface, PfRuleset,
+    BrokerPort, IpFamily, Ipv4Cidr, Ipv6Cidr, PfCidr, PfHost, PfInterface, PfRule, PfRuleset,
 };
 
 /// One rule of a session anchor, as `pfctl -sr` prints it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PfReadbackRule {
-    /// `pass in quick <af> proto tcp from <source> to <destination> port = <port> flags S/SA keep state`
+    /// `pass in quick [on <interface>] <af> proto tcp from <source> to <destination> port = <port> flags S/SA keep state`
     Allow {
+        interface: Option<PfInterface>,
         source: PfCidr,
         destination: PfHost,
         port: BrokerPort,
     },
     /// `block return in quick <af> from <source> to any label "<label>"`
     Deny { source: PfCidr, label: String },
-    /// `block return in quick on <interface> inet6 all label "<label>"`
+    /// `block return in quick on <interface> <af> all label "<label>"`
     InterfaceDeny {
         interface: PfInterface,
+        family: IpFamily,
         label: String,
     },
 }
@@ -50,31 +52,32 @@ pub enum PfReadbackParseError {
 }
 
 impl PfRuleset {
-    /// The rules `pfctl -sr` prints once this ruleset is loaded, in order:
-    /// one allow per (allow rule, broker port), then the source-scoped denies,
-    /// then the interface-scoped IPv6 denies.
+    /// The rules `pfctl -sr` prints once this ruleset is loaded, in load
+    /// order, with each allow expanded into one rule per broker port.
     pub fn readback_rules(&self) -> Vec<PfReadbackRule> {
         let mut rules = Vec::new();
-        for allow in self.allow() {
-            for port in self.broker_ports().as_slice() {
-                rules.push(PfReadbackRule::Allow {
-                    source: allow.source(),
-                    destination: allow.destination(),
-                    port: *port,
-                });
+        for rule in self.rules() {
+            match rule {
+                PfRule::Allow(allow) => {
+                    for port in self.broker_ports().as_slice() {
+                        rules.push(PfReadbackRule::Allow {
+                            interface: allow.interface().cloned(),
+                            source: allow.source(),
+                            destination: allow.destination(),
+                            port: *port,
+                        });
+                    }
+                }
+                PfRule::Deny(deny) => rules.push(PfReadbackRule::Deny {
+                    source: deny.source(),
+                    label: deny.label().to_string(),
+                }),
+                PfRule::InterfaceDeny(deny) => rules.push(PfReadbackRule::InterfaceDeny {
+                    interface: deny.interface().clone(),
+                    family: deny.family(),
+                    label: deny.label().to_string(),
+                }),
             }
-        }
-        for deny in self.deny() {
-            rules.push(PfReadbackRule::Deny {
-                source: deny.source(),
-                label: deny.label().to_string(),
-            });
-        }
-        for deny in self.iface_deny() {
-            rules.push(PfReadbackRule::InterfaceDeny {
-                interface: deny.interface().clone(),
-                label: deny.label().to_string(),
-            });
         }
         rules
     }
@@ -84,11 +87,16 @@ impl PfReadbackRule {
     fn render_line(&self) -> String {
         match self {
             Self::Allow {
+                interface,
                 source,
                 destination,
                 port,
             } => format!(
-                "pass in quick {} proto tcp from {source} to {destination} port = {} flags S/SA keep state",
+                "pass in quick {}{} proto tcp from {source} to {destination} port = {} flags S/SA keep state",
+                interface
+                    .as_ref()
+                    .map(|interface| format!("on {interface} "))
+                    .unwrap_or_default(),
                 source.family().pf_name(),
                 port.get(),
             ),
@@ -96,9 +104,14 @@ impl PfReadbackRule {
                 "block return in quick {} from {source} to any label \"{label}\"",
                 source.family().pf_name(),
             ),
-            Self::InterfaceDeny { interface, label } => {
-                format!("block return in quick on {interface} inet6 all label \"{label}\"")
-            }
+            Self::InterfaceDeny {
+                interface,
+                family,
+                label,
+            } => format!(
+                "block return in quick on {interface} {} all label \"{label}\"",
+                family.pf_name(),
+            ),
         }
     }
 
@@ -115,8 +128,15 @@ impl PfReadbackRule {
         None
     }
 
-    /// `<af> proto tcp from <source> to <destination> port = <port> flags S/SA keep state`
+    /// `[on <interface> ]<af> proto tcp from <source> to <destination> port = <port> flags S/SA keep state`
     fn parse_allow(rest: &str) -> Option<Self> {
+        let (interface, rest) = match rest.strip_prefix("on ") {
+            Some(rest) => {
+                let (interface, rest) = rest.split_once(' ')?;
+                (Some(PfInterface::new(interface).ok()?), rest)
+            }
+            None => (None, rest),
+        };
         let (family, rest) = parse_family(rest)?;
         let rest = rest.strip_prefix("proto tcp from ")?;
         let (source, rest) = rest.split_once(" to ")?;
@@ -126,6 +146,7 @@ impl PfReadbackRule {
         let port = rest.strip_suffix(" flags S/SA keep state")?;
         let port = parse_port(port)?;
         Some(Self::Allow {
+            interface,
             source,
             destination,
             port,
@@ -142,12 +163,18 @@ impl PfReadbackRule {
         Some(Self::Deny { source, label })
     }
 
-    /// `<interface> inet6 all label "<label>"`
+    /// `<interface> <af> all label "<label>"`
     fn parse_interface_deny(rest: &str) -> Option<Self> {
-        let (interface, rest) = rest.split_once(" inet6 all label ")?;
+        let (interface, rest) = rest.split_once(' ')?;
         let interface = PfInterface::new(interface).ok()?;
+        let (family, rest) = parse_family(rest)?;
+        let rest = rest.strip_prefix("all label ")?;
         let label = parse_label(rest)?;
-        Some(Self::InterfaceDeny { interface, label })
+        Some(Self::InterfaceDeny {
+            interface,
+            family,
+            label,
+        })
     }
 }
 
@@ -281,7 +308,8 @@ mod tests {
 
     use super::super::SessionId;
     use super::super::agent_vm::{
-        AgentNetworkPool, BrokerPorts, session_firewall_pf_ruleset, session_pf_ruleset,
+        AgentNetworkPool, BrokerPorts, session_attached_pf_ruleset, session_firewall_pf_ruleset,
+        session_pf_ruleset,
     };
     use super::*;
 
@@ -331,22 +359,36 @@ mod tests {
         "[a-zA-Z][a-zA-Z0-9]{0,14}".prop_map(|name| PfInterface::new(name).unwrap())
     }
 
+    fn arb_family() -> impl Strategy<Value = IpFamily> {
+        prop_oneof![Just(IpFamily::Inet), Just(IpFamily::Inet6)]
+    }
+
     fn arb_rule() -> impl Strategy<Value = PfReadbackRule> {
         prop_oneof![
-            (arb_ipv4_cidr(), any::<u32>(), arb_port()).prop_map(|(source, dst, port)| {
-                PfReadbackRule::Allow {
+            (
+                prop::option::of(arb_interface()),
+                arb_ipv4_cidr(),
+                any::<u32>(),
+                arb_port()
+            )
+                .prop_map(|(interface, source, dst, port)| PfReadbackRule::Allow {
+                    interface,
                     source: PfCidr::Inet(source),
                     destination: PfHost::Inet(Ipv4Addr::from(dst)),
                     port,
-                }
-            }),
-            (arb_ipv6_cidr(), arb_ipv6_addr(), arb_port()).prop_map(|(source, dst, port)| {
-                PfReadbackRule::Allow {
+                }),
+            (
+                prop::option::of(arb_interface()),
+                arb_ipv6_cidr(),
+                arb_ipv6_addr(),
+                arb_port()
+            )
+                .prop_map(|(interface, source, dst, port)| PfReadbackRule::Allow {
+                    interface,
                     source: PfCidr::Inet6(source),
                     destination: PfHost::Inet6(dst),
                     port,
-                }
-            }),
+                }),
             (arb_ipv4_cidr(), arb_label()).prop_map(|(source, label)| PfReadbackRule::Deny {
                 source: PfCidr::Inet(source),
                 label,
@@ -355,8 +397,13 @@ mod tests {
                 source: PfCidr::Inet6(source),
                 label,
             }),
-            (arb_interface(), arb_label())
-                .prop_map(|(interface, label)| PfReadbackRule::InterfaceDeny { interface, label }),
+            (arb_interface(), arb_family(), arb_label()).prop_map(|(interface, family, label)| {
+                PfReadbackRule::InterfaceDeny {
+                    interface,
+                    family,
+                    label,
+                }
+            }),
         ]
     }
 
@@ -365,8 +412,9 @@ mod tests {
     }
 
     /// A real session ruleset, as the shipped renderer builds it: any pool,
-    /// any subnet in it, an IPv4-only or dual-stack scope, an optional broker
-    /// host override, and any number of deny interfaces.
+    /// any subnet in it, an IPv4-only or dual-stack bootstrap anchor with an
+    /// optional broker host override, or the attached anchor on any number
+    /// of interfaces.
     fn arb_session_ruleset() -> impl Strategy<Value = PfRuleset> {
         (
             any::<u128>(),
@@ -406,13 +454,18 @@ mod tests {
                         let network = pool.claim_firewall(ipv4, None).unwrap();
                         let broker_host =
                             broker_host.map(|host| Ipv4Addr::new(10, 200, v4_slot, host));
-                        session_firewall_pf_ruleset(
-                            session_id,
-                            network,
-                            &ports,
-                            broker_host,
-                            &interfaces,
-                        )
+                        if interfaces.is_empty() {
+                            session_firewall_pf_ruleset(session_id, network, &ports, broker_host)
+                        } else {
+                            session_attached_pf_ruleset(
+                                session_id,
+                                network,
+                                &ports,
+                                broker_host,
+                                &interfaces,
+                            )
+                            .unwrap()
+                        }
                     }
                 },
             )
@@ -443,17 +496,30 @@ mod tests {
             PfInterface::new("bridge100").unwrap(),
             PfInterface::new("vmenet0").unwrap(),
         ];
-        let ruleset = session_firewall_pf_ruleset(session_id, network, &ports, None, &interfaces);
+        let bootstrap = session_firewall_pf_ruleset(session_id, network, &ports, None);
         // What `pfctl -nvf` printed for the rendered file on macOS 15: the
         // macro expanded per port in ascending order, `port = N`, and the
         // `flags S/SA` default made explicit.
         let expected = "pass in quick inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49152 flags S/SA keep state\n\
                         pass in quick inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49153 flags S/SA keep state\n\
-                        block return in quick inet from 10.200.7.0/24 to any label \"writ deny agent v4\"\n\
+                        block return in quick inet from 10.200.7.0/24 to any label \"writ deny agent v4\"\n";
+        assert_eq!(render_pf_readback(&bootstrap.readback_rules()), expected);
+        assert_eq!(parse_pf_readback(expected), Ok(bootstrap.readback_rules()));
+
+        let attached =
+            session_attached_pf_ruleset(session_id, network, &ports, None, &interfaces).unwrap();
+        // What `pfctl -nvf` printed on macOS 26 for the attached anchor: the
+        // interface scope precedes the family, and `all` stays `all`.
+        let expected = "pass in quick on bridge100 inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49152 flags S/SA keep state\n\
+                        pass in quick on bridge100 inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49153 flags S/SA keep state\n\
+                        block return in quick on bridge100 inet all label \"writ deny agent v4 iface\"\n\
                         block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\"\n\
+                        pass in quick on vmenet0 inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49152 flags S/SA keep state\n\
+                        pass in quick on vmenet0 inet proto tcp from 10.200.7.0/24 to 10.200.7.1 port = 49153 flags S/SA keep state\n\
+                        block return in quick on vmenet0 inet all label \"writ deny agent v4 iface\"\n\
                         block return in quick on vmenet0 inet6 all label \"writ deny agent v6 iface\"\n";
-        assert_eq!(render_pf_readback(&ruleset.readback_rules()), expected);
-        assert_eq!(parse_pf_readback(expected), Ok(ruleset.readback_rules()));
+        assert_eq!(render_pf_readback(&attached.readback_rules()), expected);
+        assert_eq!(parse_pf_readback(expected), Ok(attached.readback_rules()));
     }
 
     #[test]
@@ -474,14 +540,37 @@ mod tests {
             let rules = ruleset.readback_rules();
             let text = render_pf_readback(&rules);
             prop_assert_eq!(parse_pf_readback(&text), Ok(rules.clone()));
-            // One allow per (rule, port), then every deny, then every
-            // interface deny: the readback carries the whole ruleset.
-            let allows = rules.iter().filter(|r| matches!(r, PfReadbackRule::Allow { .. })).count();
-            prop_assert_eq!(allows, ruleset.allow().len() * ruleset.broker_ports().as_slice().len());
-            let denies = rules.iter().filter(|r| matches!(r, PfReadbackRule::Deny { .. })).count();
-            prop_assert_eq!(denies, ruleset.deny().len());
-            let iface = rules.iter().filter(|r| matches!(r, PfReadbackRule::InterfaceDeny { .. })).count();
-            prop_assert_eq!(iface, ruleset.iface_deny().len());
+            // Each allow becomes one rule per port and each deny one rule, in
+            // load order: the readback carries the whole ruleset.
+            let ports = ruleset.broker_ports().as_slice().len();
+            let expected: Vec<usize> = ruleset
+                .rules()
+                .iter()
+                .map(|rule| match rule {
+                    PfRule::Allow(_) => ports,
+                    PfRule::Deny(_) | PfRule::InterfaceDeny(_) => 1,
+                })
+                .collect();
+            let mut actual = Vec::new();
+            let mut rest = rules.as_slice();
+            for rule in ruleset.rules() {
+                let n = match rule {
+                    PfRule::Allow(_) => ports,
+                    PfRule::Deny(_) | PfRule::InterfaceDeny(_) => 1,
+                };
+                let (head, tail) = rest.split_at(n.min(rest.len()));
+                let same_kind = head.iter().all(|read| matches!(
+                    (rule, read),
+                    (PfRule::Allow(_), PfReadbackRule::Allow { .. })
+                        | (PfRule::Deny(_), PfReadbackRule::Deny { .. })
+                        | (PfRule::InterfaceDeny(_), PfReadbackRule::InterfaceDeny { .. })
+                ));
+                prop_assert!(same_kind, "readback rules out of order: {:?}", rules);
+                actual.push(head.len());
+                rest = tail;
+            }
+            prop_assert_eq!(actual, expected);
+            prop_assert!(rest.is_empty(), "readback has extra rules: {:?}", rest);
         }
 
         /// Exactness: whatever the parser accepts, it accepts as exactly one

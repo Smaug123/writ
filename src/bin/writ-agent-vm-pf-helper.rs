@@ -80,14 +80,16 @@ struct InstallArgs {
     #[arg(long)]
     broker_host: Option<String>,
 
-    /// Install the `Ipv4OnlyNoGuestIpv6` backstop: block *all* IPv6 on the agent
-    /// VM's host bridge (and its `vmenet` members) so a root guest cannot
-    /// re-acquire IPv6 via a host vmnet router advertisement. The interfaces are
-    /// discovered *here*, at the privileged boundary, by matching the session
-    /// gateway in `ifconfig` output — never trusted from the caller — and
-    /// discovered again after the load, which must find the same names. Requires
-    /// the agent VM (hence its bridge) to be running, and is rejected with
-    /// `--ipv6-cidr`.
+    /// Load the attached anchor in place of the bootstrap one: on the agent
+    /// VM's host bridge and each of its `vmenet` members, allow only the broker
+    /// tuple over IPv4, block every other IPv4 frame whatever source the guest
+    /// gives it, and block *all* IPv6 (the `Ipv4OnlyNoGuestIpv6` backstop, so a
+    /// root guest cannot re-acquire IPv6 via a host vmnet router advertisement).
+    /// The interfaces are discovered *here*, at the privileged boundary, by
+    /// matching the session gateway in `ifconfig` output — never trusted from
+    /// the caller — and discovered again after the load, which must find the
+    /// same names. Requires the agent VM (hence its bridge) to be running, and
+    /// is rejected with `--ipv6-cidr`.
     #[arg(long)]
     deny_guest_ipv6: bool,
 }

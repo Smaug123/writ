@@ -19,7 +19,8 @@ use crate::agent_vm_lifecycle::{
 use crate::core::{
     AgentFirewallNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts,
     Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfReadbackParseError, PfRuleset, SessionId,
-    parse_pf_readback, render_pf, render_pf_readback, session_firewall_pf_ruleset,
+    parse_pf_readback, render_pf, render_pf_readback, session_attached_pf_ruleset,
+    session_firewall_pf_ruleset,
 };
 use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome};
 
@@ -52,7 +53,8 @@ pub enum BridgeDiscoveryError {
 
 /// Discover the agent VM's host bridge and `vmenet` members by running
 /// `ifconfig` and matching the session gateway — the privileged boundary's
-/// *independent* source of truth for which interfaces the IPv6 deny may target.
+/// *independent* source of truth for which interfaces the attached anchor may
+/// scope its rules to.
 ///
 /// The helper never trusts caller-supplied interface names: it derives them here
 /// from the (pool-validated) session gateway, so a direct malicious invocation
@@ -115,10 +117,13 @@ pub struct SessionFirewallTools<'a> {
 }
 
 /// Ask the helper to discover the agent VM's bridge and members from the
-/// session gateway and deny all IPv6 on them (the `Ipv4OnlyNoGuestIpv6`
-/// backstop). `min_members` is how many `vmenet` members the bridge must have
-/// attached before discovery counts as complete: one for host placement (the
-/// agent's), two for vm placement (the broker's and the agent's).
+/// session gateway and replace the bootstrap anchor with the attached one:
+/// every rule scoped to those interfaces, with the IPv4 allow for the broker
+/// tuple, an IPv4 deny of everything else, and the IPv6 deny of everything
+/// (the `Ipv4OnlyNoGuestIpv6` backstop) on each. `min_members` is how many
+/// `vmenet` members the bridge must have attached before discovery counts as
+/// complete: one for host placement (the agent's), two for vm placement (the
+/// broker's and the agent's).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct DenyGuestIpv6 {
     pub min_members: usize,
@@ -144,8 +149,9 @@ pub struct SessionFirewallInstall {
 }
 
 /// What a successful install proved: the anchor whose readback matched the
-/// intended ruleset exactly, and the interfaces the IPv6 deny was resolved to
-/// (empty for the pre-attach install) and re-resolved to after the load.
+/// intended ruleset exactly, and the interfaces the attached anchor was
+/// resolved to (empty for the pre-attach install) and re-resolved to after
+/// the load.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionFirewallReport {
     session_id: SessionId,
@@ -400,9 +406,10 @@ impl SessionFirewallSpec {
             broker_port_range,
             broker_ipv4_host,
         )?;
-        // The interface deny blocks *all* IPv6 on the agent's bridge, which
-        // would contradict a dual-stack scope's IPv6 allow (see
-        // `SessionFirewallInstall::new`); refuse before anything is resolved.
+        // The attached anchor's interface deny blocks *all* IPv6 on the
+        // agent's bridge, which would contradict a dual-stack scope's IPv6
+        // allow (see `session_attached_pf_ruleset`); refuse before anything
+        // is resolved.
         if deny_guest_ipv6.is_some() && network.ipv6().is_some() {
             return Err(AgentVmConfigError::Ipv6DenyInterfaceWithIpv6Scope);
         }
@@ -427,23 +434,35 @@ impl SessionFirewallSpec {
         self.deny_guest_ipv6
     }
 
-    /// The install this spec becomes once its interfaces are known: empty
-    /// when no deny was asked for, the discovered set otherwise.
-    fn resolved(&self, ipv6_deny_interfaces: &[PfInterface]) -> SessionFirewallInstall {
+    /// The install this spec becomes once its interfaces are known: the
+    /// bootstrap anchor when no deny was asked for (and nothing was
+    /// resolved), the attached anchor on the discovered set otherwise.
+    fn resolved(&self, interfaces: &[PfInterface]) -> SessionFirewallInstall {
         debug_assert_eq!(
             self.deny_guest_ipv6.is_some(),
-            !ipv6_deny_interfaces.is_empty(),
+            !interfaces.is_empty(),
             "interfaces are resolved exactly when the deny was asked for",
         );
-        SessionFirewallInstall {
-            network: self.network,
-            ruleset: session_firewall_pf_ruleset(
+        let ruleset = if interfaces.is_empty() {
+            session_firewall_pf_ruleset(
                 self.session_id,
                 self.network,
                 &self.broker_ports,
                 self.broker_ipv4_host,
-                ipv6_deny_interfaces,
-            ),
+            )
+        } else {
+            session_attached_pf_ruleset(
+                self.session_id,
+                self.network,
+                &self.broker_ports,
+                self.broker_ipv4_host,
+                interfaces,
+            )
+            .expect("`SessionFirewallSpec::new` refused an IPv6 scope with a deny, and the interfaces are non-empty")
+        };
+        SessionFirewallInstall {
+            network: self.network,
+            ruleset,
         }
     }
 }
@@ -458,7 +477,7 @@ impl SessionFirewallInstall {
         broker_ports: BrokerPorts,
         broker_port_range: BrokerPortRange,
         broker_ipv4_host: Option<Ipv4Addr>,
-        ipv6_deny_interfaces: Vec<PfInterface>,
+        interfaces: Vec<PfInterface>,
     ) -> Result<Self, AgentVmConfigError> {
         let network = claim_session_network(
             pool,
@@ -468,24 +487,24 @@ impl SessionFirewallInstall {
             broker_port_range,
             broker_ipv4_host,
         )?;
-        // An interface-scoped IPv6 deny is the `Ipv4OnlyNoGuestIpv6` backstop; it
-        // blocks *all* IPv6 on the agent VM's bridge. Pairing it with an IPv6
-        // firewall scope (dual-stack) would contradict that scope's IPv6 allow, so
-        // make the "backstop only when there is no legitimate guest IPv6" invariant
-        // a construction error rather than a silently self-cancelling ruleset.
-        if !ipv6_deny_interfaces.is_empty() && network.ipv6().is_some() {
-            return Err(AgentVmConfigError::Ipv6DenyInterfaceWithIpv6Scope);
-        }
-        Ok(Self {
-            network,
-            ruleset: session_firewall_pf_ruleset(
+        // With interfaces this is the attached anchor, whose IPv6 deny is the
+        // `Ipv4OnlyNoGuestIpv6` backstop: it blocks *all* IPv6 on the agent
+        // VM's bridge, so pairing it with an IPv6 firewall scope (dual-stack)
+        // would contradict that scope's IPv6 allow. The core makes the
+        // "backstop only when there is no legitimate guest IPv6" invariant a
+        // construction error rather than a silently self-cancelling ruleset.
+        let ruleset = if interfaces.is_empty() {
+            session_firewall_pf_ruleset(session_id, network, &broker_ports, broker_ipv4_host)
+        } else {
+            session_attached_pf_ruleset(
                 session_id,
                 network,
                 &broker_ports,
                 broker_ipv4_host,
-                &ipv6_deny_interfaces,
-            ),
-        })
+                &interfaces,
+            )?
+        };
+        Ok(Self { network, ruleset })
     }
 
     pub fn network(&self) -> AgentFirewallNetwork {
@@ -1006,7 +1025,7 @@ pub fn verify_session_anchor_readback(
 }
 
 /// Install one session's firewall, phase by phase ([`PfInstallPhase`]):
-/// precheck the host's PF state, resolve the deny interfaces if asked,
+/// precheck the host's PF state, resolve the VM's interfaces if asked,
 /// syntax-check the rendered rules, load them into the session anchor, read
 /// the anchor back and require it to equal the intent exactly, and resolve
 /// the interfaces again and require the same names. The rules are held in a
@@ -1273,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn install_renders_interface_scoped_ipv6_deny_for_an_ipv4_only_scope() {
+    fn install_with_interfaces_renders_the_attached_anchor_for_an_ipv4_only_scope() {
         let install = SessionFirewallInstall::new(
             session_id(),
             pool(),
@@ -1288,18 +1307,18 @@ mod tests {
             ],
         )
         .unwrap();
-        let rendered = install.rendered_rules();
-        assert!(
-            rendered.contains(
-                "block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\""
+        assert_eq!(
+            install.rendered_rules(),
+            concat!(
+                "broker_ports = \"{ 65000 }\"\n",
+                "\n",
+                "pass in quick on bridge100 inet proto tcp from 192.168.252.0/24 to 192.168.252.1 port $broker_ports keep state\n",
+                "block return in quick on bridge100 inet all label \"writ deny agent v4 iface\"\n",
+                "block return in quick on bridge100 inet6 all label \"writ deny agent v6 iface\"\n",
+                "pass in quick on vmenet0 inet proto tcp from 192.168.252.0/24 to 192.168.252.1 port $broker_ports keep state\n",
+                "block return in quick on vmenet0 inet all label \"writ deny agent v4 iface\"\n",
+                "block return in quick on vmenet0 inet6 all label \"writ deny agent v6 iface\"\n",
             ),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains(
-                "block return in quick on vmenet0 inet6 all label \"writ deny agent v6 iface\""
-            ),
-            "{rendered}"
         );
     }
 

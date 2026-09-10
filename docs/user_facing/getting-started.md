@@ -195,9 +195,12 @@ start.
 `ipv6_mode` selects the IPv6 profile, and `ipv4_only_no_guest_ipv6` is the value
 to use: it is the only one that starts a session on current Apple `container`.
 IPv6 is disabled inside the guest and — because a root workload can undo that —
-blocked on the agent's own bridge by an interface-scoped host PF rule the guest
-cannot reach. The interface scope is what makes the containment real: a rule
-matched on the guest's source address would not survive the guest reassigning it.
+blocked on the agent's own bridge by a host PF rule the guest cannot reach. Once
+the VM is up, every rule of its session anchor is scoped to the agent's bridge
+and members: IPv4 passes only to the broker, every other IPv4 frame is blocked
+whatever source the guest gives it, and all IPv6 is blocked. The interface scope
+is what makes the containment real: a rule matched on the guest's source address
+would not survive the guest reassigning it.
 
 `dual_stack_required` is accepted but does not currently start a session. It
 requires the session network to report the IPv6 `/64` writ planned, and writ

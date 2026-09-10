@@ -360,10 +360,11 @@ pub enum AgentVmStartStep {
     ProbeVmAbsent(ResourcePresenceProbe),
     StartVm(AgentVmStartInvocation),
     /// `Ipv4OnlyNoGuestIpv6` only: after the VM (and thus its host bridge) is up,
-    /// re-load the session PF anchor with an interface-scoped IPv6 deny on the
-    /// agent's bridge and members. The privileged pf-helper discovers those
-    /// interfaces itself (`--deny-guest-ipv6`), from the session gateway, so this
-    /// is a static invocation — the runner passes no interface names.
+    /// replace the session PF anchor with the attached one — the IPv4 allow, an
+    /// IPv4 deny, and an IPv6 deny, each scoped to the agent's bridge and
+    /// members. The privileged pf-helper discovers those interfaces itself
+    /// (`--deny-guest-ipv6`), from the session gateway, so this is a static
+    /// invocation — the runner passes no interface names.
     InstallGuestIpv6Deny(ProcessInvocation),
     ProbeAndValidateGuestIpv6 {
         probe_invocation: ProcessInvocation,

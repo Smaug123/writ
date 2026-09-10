@@ -370,8 +370,8 @@ impl WireHeader for InstallReportWire<'_> {
 }
 
 /// A parsed `install` report: the session anchor whose readback matched the
-/// intended ruleset, the interfaces the IPv6 deny was resolved to (empty for
-/// the pre-attach install), and the last install phase that completed.
+/// intended ruleset, the interfaces the attached anchor was resolved to (empty
+/// for the pre-attach install), and the last install phase that completed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfHelperInstallReportDoc {
     session_id: SessionId,

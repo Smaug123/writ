@@ -7,6 +7,8 @@ mod decision;
 mod grant;
 mod network_health;
 mod notes_ref;
+#[cfg(test)]
+mod pf_packet_model;
 mod pf_readback;
 mod request;
 mod session;
@@ -15,8 +17,9 @@ mod signing;
 
 pub use agent_vm::{
     AgentFirewallNetwork, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort,
-    BrokerPortRange, BrokerPorts, IpFamily, Ipv4Cidr, Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr,
-    PfDenyRule, PfHost, PfInterface, PfInterfaceDenyRule, PfRuleset, render_pf,
+    BrokerPortRange, BrokerPorts, IPV4_IFACE_DENY_LABEL, IPV6_IFACE_DENY_LABEL, IpFamily, Ipv4Cidr,
+    Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr, PfDenyRule, PfHost, PfInterface,
+    PfInterfaceDenyRule, PfRule, PfRuleset, render_pf, session_attached_pf_ruleset,
     session_firewall_pf_ruleset, session_pf_ruleset,
 };
 pub use capability_set::CapabilitySet;

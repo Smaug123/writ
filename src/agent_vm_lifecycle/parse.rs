@@ -80,7 +80,7 @@ pub enum GuestBridgeDiscoveryError {
 /// that holds the session's IPv4 gateway, plus the bridge's member interface(s)
 /// (the `vmenet*` the guest is attached to).
 ///
-/// This is what the `Ipv4OnlyNoGuestIpv6` backstop scopes its IPv6 deny to.
+/// This is what the `Ipv4OnlyNoGuestIpv6` attached anchor scopes its rules to.
 /// Scoping to *both* the bridge and its member removes any dependence on which
 /// interface macOS PF happens to filter bridged IPv6 on; neither carries any
 /// legitimate IPv6 in this mode, so denying all IPv6 on them is safe and cannot
@@ -100,8 +100,8 @@ impl GuestBridgeDiscovery {
         &self.members
     }
 
-    /// The full set of interfaces to install the IPv6 deny on: the bridge first,
-    /// then each member, de-duplicated while preserving order.
+    /// The full set of interfaces to scope the attached anchor to: the bridge
+    /// first, then each member, de-duplicated while preserving order.
     pub fn deny_interfaces(&self) -> Vec<PfInterface> {
         let mut out = Vec::with_capacity(self.members.len() + 1);
         for iface in std::iter::once(&self.bridge).chain(self.members.iter()) {

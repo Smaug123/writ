@@ -20,7 +20,8 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config, TestRunner};
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPorts, Ipv4Cidr, Ipv6Cidr, PfInterface, PfRuleset,
-    SessionId, render_pf, render_pf_readback, session_firewall_pf_ruleset, session_pf_ruleset,
+    SessionId, render_pf, render_pf_readback, session_attached_pf_ruleset,
+    session_firewall_pf_ruleset, session_pf_ruleset,
 };
 
 const PFCTL: &str = "/sbin/pfctl";
@@ -29,9 +30,9 @@ fn arb_interface() -> impl Strategy<Value = PfInterface> {
     "[a-zA-Z][a-zA-Z0-9]{0,14}".prop_map(|name| PfInterface::new(name).unwrap())
 }
 
-/// Any session ruleset the shipped renderer can build: IPv4-only or
-/// dual-stack scope, optional broker-host override, any deny interfaces,
-/// several ports.
+/// Any session ruleset the shipped renderer can build: an IPv4-only or
+/// dual-stack bootstrap anchor with an optional broker-host override, or the
+/// attached anchor on any interfaces; several ports.
 fn arb_session_ruleset() -> impl Strategy<Value = PfRuleset> {
     (
         any::<u128>(),
@@ -66,13 +67,18 @@ fn arb_session_ruleset() -> impl Strategy<Value = PfRuleset> {
                 } else {
                     let network = pool.claim_firewall(ipv4, None).unwrap();
                     let broker_host = broker_host.map(|host| Ipv4Addr::new(10, 200, v4_slot, host));
-                    session_firewall_pf_ruleset(
-                        session_id,
-                        network,
-                        &ports,
-                        broker_host,
-                        &interfaces,
-                    )
+                    if interfaces.is_empty() {
+                        session_firewall_pf_ruleset(session_id, network, &ports, broker_host)
+                    } else {
+                        session_attached_pf_ruleset(
+                            session_id,
+                            network,
+                            &ports,
+                            broker_host,
+                            &interfaces,
+                        )
+                        .unwrap()
+                    }
                 }
             },
         )
