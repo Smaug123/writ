@@ -102,8 +102,6 @@ cleanup() {
     helper_remove=(
       sudo "$HELPER" remove
       --session-id "$SESSION_ID"
-      --ipv4-pool "$IPV4_POOL"
-      --ipv6-pool "$IPV6_POOL"
       --ipv4-cidr "$IPV4_CIDR"
     )
     if [[ "$IPV6_MODE" == "dual-stack-required" && -n "$IPV6_CIDR" ]]; then
@@ -528,6 +526,17 @@ log "building PF helper and lifecycle runner"
   --bin writ-agent-vm-pf-helper \
   --bin writ-agent-vm-runner
 HELPER="${ROOT_DIR}/target/debug/writ-agent-vm-pf-helper"
+
+# Protocol v2: the helper validates every session against the pools and
+# broker-port range in its root-owned policy file, not against arguments. The
+# file must name this proof's pools, or every install the runner asks for is
+# refused.
+log "checking the PF helper's policy file matches this proof's pools and port range"
+PREFLIGHT="$(sudo "$HELPER" preflight)" \
+  || die "PF helper preflight failed; install /etc/writ/agent-vm-pf-policy.json (see docs/user_facing/getting-started.md) with ipv4_pool=${IPV4_POOL} ipv6_pool=${IPV6_POOL} broker_port_min=${BROKER_PORT_MIN} broker_port_max=${BROKER_PORT_MAX}"
+EXPECTED_POLICY="\"policy\":{\"ipv4_pool\":\"${IPV4_POOL}\",\"ipv6_pool\":\"${IPV6_POOL}\",\"broker_port_min\":${BROKER_PORT_MIN},\"broker_port_max\":${BROKER_PORT_MAX}}"
+printf '%s' "$PREFLIGHT" | grep -Fq "$EXPECTED_POLICY" \
+  || die "PF helper policy file does not match this proof: expected ${EXPECTED_POLICY} in ${PREFLIGHT}"
 RUNNER="${ROOT_DIR}/target/debug/writ-agent-vm-runner"
 
 BROKER_PORT="$(pick_port)"

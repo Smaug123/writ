@@ -92,6 +92,25 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     // The pre-start install does not request the guest-IPv6 deny (the bridge is
     // not up yet).
     assert!(!firewall_args.contains(&"--deny-guest-ipv6".to_string()));
+    // The helper's bounds come from its root-owned policy file, never from this
+    // unprivileged caller: no pool or port-range argument on any helper call.
+    for invocation in &invocations {
+        let args = invocation.args_lossy();
+        if args.first().map(String::as_str) != Some("writ-agent-vm-pf-helper") {
+            continue;
+        }
+        for bound in [
+            "--ipv4-pool",
+            "--ipv6-pool",
+            "--broker-port-min",
+            "--broker-port-max",
+        ] {
+            assert!(
+                !args.contains(&bound.to_string()),
+                "helper call carries a caller-supplied bound {bound}: {args:?}"
+            );
+        }
+    }
 
     // The whole `run` argv, held equal to the intended list: the capability
     // drop sits with the other launch flags, before the image, and the guest
@@ -230,6 +249,14 @@ fn ipv4_only_stop_invocations_omit_ipv6_firewall_scope() {
     let firewall_args = invocations[4].args_lossy();
     assert_eq!(&firewall_args[0..2], ["writ-agent-vm-pf-helper", "remove"]);
     assert!(!firewall_args.contains(&"--ipv6-cidr".to_string()));
+    // The removal, like the install, names only the session's facts; the
+    // pools it is validated against are the helper's policy file's.
+    assert!(
+        !firewall_args
+            .iter()
+            .any(|arg| arg == "--ipv4-pool" || arg == "--ipv6-pool"),
+        "{firewall_args:?}"
+    );
 }
 
 #[test]

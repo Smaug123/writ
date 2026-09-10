@@ -18,9 +18,13 @@
 //!   anchor whose readback matched, the interfaces it was resolved to, and the
 //!   last phase completed.
 //!
-//! Version 1 is what the shipped helper speaks. Version 2 *means* the whole of
-//! Stage C2's boundary (policy file, exact readback, re-resolve), so the number
-//! only moves once all of that has landed.
+//! Version 2 is what the shipped helper speaks, and it *means* the whole of
+//! Stage C2's boundary: the pools and broker-port range come from the
+//! root-owned policy file rather than the caller, every load is read back and
+//! compared exactly with the intent, and the interfaces are resolved again
+//! after the load. Version 1 is the helper before any of that, which still
+//! took its bounds from the unprivileged caller; the daemon's
+//! `ipv4_only_locked_v1` admission requires 2.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,13 +32,14 @@ use crate::agent_vm_firewall::{
     PassTranslationRule, PfInstallPhase, PfPreflightReport, SessionAnchorPlacement,
     SessionFirewallReport,
 };
-use crate::core::{PfAnchorName, PfInterface, SessionId};
+use crate::agent_vm_pf_helper_policy::{PfHelperPolicy, parse_ipv4_cidr, parse_ipv6_cidr};
+use crate::core::{AgentNetworkPool, BrokerPortRange, PfAnchorName, PfInterface, SessionId};
 
 /// The protocol name every helper document carries.
 pub const PF_HELPER_PROTOCOL_NAME: &str = "writ-agent-vm-pf-helper";
 
 /// The protocol version the helper built from this tree reports.
-pub const PF_HELPER_PROTOCOL_VERSION: u16 = 1;
+pub const PF_HELPER_PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum `protocol-version` response the host reads: the trust boundary's
 /// fixed byte cap, applied before any parsing.
@@ -204,9 +209,21 @@ impl PfHelperProtocolDoc {
 struct PreflightWire<'a> {
     protocol: &'a str,
     version: u16,
+    policy: PolicyWire,
     pf_enabled: bool,
     session_anchor: AnchorPlacementWire,
     pass_translation_rules: Vec<TranslationRuleWire>,
+}
+
+/// The bounds the helper loaded from its policy file, so the daemon can check
+/// they are the pools and range it allocates from.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyWire {
+    ipv4_pool: String,
+    ipv6_pool: String,
+    broker_port_min: u16,
+    broker_port_max: u16,
 }
 
 impl WireHeader for PreflightWire<'_> {
@@ -233,19 +250,25 @@ struct TranslationRuleWire {
     rule: String,
 }
 
-/// A parsed `preflight` answer: the [`PfPreflightReport`] the helper read.
+/// A parsed `preflight` answer: the [`PfPreflightReport`] the helper read,
+/// and the [`PfHelperPolicy`] it loaded to read it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PfHelperPreflightDoc {
     report: PfPreflightReport,
+    policy: PfHelperPolicy,
 }
 
 impl PfHelperPreflightDoc {
-    pub fn new(report: PfPreflightReport) -> Self {
-        Self { report }
+    pub fn new(report: PfPreflightReport, policy: PfHelperPolicy) -> Self {
+        Self { report, policy }
     }
 
     pub fn report(&self) -> &PfPreflightReport {
         &self.report
+    }
+
+    pub fn policy(&self) -> PfHelperPolicy {
+        self.policy
     }
 
     /// Render as one line without a trailing newline.
@@ -260,6 +283,12 @@ impl PfHelperPreflightDoc {
         render_wire(&PreflightWire {
             protocol: PF_HELPER_PROTOCOL_NAME,
             version: PF_HELPER_PROTOCOL_VERSION,
+            policy: PolicyWire {
+                ipv4_pool: self.policy.pool().ipv4_base().to_string(),
+                ipv6_pool: self.policy.pool().ipv6_base().to_string(),
+                broker_port_min: self.policy.broker_port_range().min().get(),
+                broker_port_max: self.policy.broker_port_range().max().get(),
+            },
             pf_enabled: self.report.pf_enabled,
             session_anchor,
             pass_translation_rules: self
@@ -289,7 +318,17 @@ impl PfHelperPreflightDoc {
                     }
                     AnchorPlacementWire::Absent => SessionAnchorPlacement::Absent,
                 };
+                use PfHelperProtocolParseError::Malformed;
+                let pool = AgentNetworkPool::new(
+                    parse_ipv4_cidr(&wire.policy.ipv4_pool).map_err(|_| Malformed)?,
+                    parse_ipv6_cidr(&wire.policy.ipv6_pool).map_err(|_| Malformed)?,
+                )
+                .map_err(|_| Malformed)?;
+                let broker_port_range =
+                    BrokerPortRange::new(wire.policy.broker_port_min, wire.policy.broker_port_max)
+                        .map_err(|_| Malformed)?;
                 Ok(Self {
+                    policy: PfHelperPolicy::new(pool, broker_port_range),
                     report: PfPreflightReport {
                         pf_enabled: wire.pf_enabled,
                         session_anchor,
@@ -436,12 +475,12 @@ mod tests {
     }
 
     #[test]
-    fn current_document_is_the_pinned_v1_line() {
+    fn current_document_is_the_pinned_v2_line() {
         assert_eq!(
             PfHelperProtocolDoc::current().render(),
-            r#"{"protocol":"writ-agent-vm-pf-helper","version":1}"#
+            r#"{"protocol":"writ-agent-vm-pf-helper","version":2}"#
         );
-        assert_eq!(PfHelperProtocolDoc::current().version(), 1);
+        assert_eq!(PfHelperProtocolDoc::current().version(), 2);
     }
 
     proptest! {
@@ -544,7 +583,7 @@ mod tests {
 
         #[test]
         fn preflight_parse_inverts_render(report in arb_preflight_report()) {
-            let doc = PfHelperPreflightDoc::new(report);
+            let doc = PfHelperPreflightDoc::new(report, test_policy());
             let rendered = doc.render();
             prop_assert!(!rendered.contains(['\n', '\r']));
             prop_assert_eq!(PfHelperPreflightDoc::parse(&rendered), Ok(doc.clone()));
@@ -566,7 +605,7 @@ mod tests {
             report in arb_preflight_report(),
             version in any::<u16>().prop_filter("must differ", |v| *v != PF_HELPER_PROTOCOL_VERSION),
         ) {
-            let rendered = PfHelperPreflightDoc::new(report).render();
+            let rendered = PfHelperPreflightDoc::new(report, test_policy()).render();
             let current = format!(r#""version":{PF_HELPER_PROTOCOL_VERSION},"#);
             prop_assert!(rendered.contains(&current));
             let other = rendered.replacen(&current, &format!(r#""version":{version},"#), 1);
@@ -586,7 +625,7 @@ mod tests {
                 session_anchor: SessionAnchorPlacement::Preceded(vec![line; lines]),
                 pass_translation_rules: Vec::new(),
             };
-            let rendered = PfHelperPreflightDoc::new(report).render();
+            let rendered = PfHelperPreflightDoc::new(report, test_policy()).render();
             prop_assert!(rendered.len() > PF_HELPER_PREFLIGHT_MAX_BYTES);
             prop_assert_eq!(
                 PfHelperPreflightDoc::parse(&rendered),
@@ -627,7 +666,7 @@ mod tests {
         let doc = PfHelperInstallReportDoc::verified(&report);
         assert_eq!(
             doc.render(),
-            r#"{"protocol":"writ-agent-vm-pf-helper","version":1,"anchor":"writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b","interfaces":["bridge100","vmenet0"],"phase":"reresolve"}"#
+            r#"{"protocol":"writ-agent-vm-pf-helper","version":2,"anchor":"writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b","interfaces":["bridge100","vmenet0"],"phase":"reresolve"}"#
         );
         assert_eq!(doc.phase(), PfInstallPhase::Reresolve);
         assert_eq!(doc.anchor(), report.anchor());
@@ -635,14 +674,17 @@ mod tests {
 
     #[test]
     fn the_preflight_of_a_clean_host_is_the_pinned_line() {
-        let doc = PfHelperPreflightDoc::new(PfPreflightReport {
-            pf_enabled: true,
-            session_anchor: SessionAnchorPlacement::First,
-            pass_translation_rules: Vec::new(),
-        });
+        let doc = PfHelperPreflightDoc::new(
+            PfPreflightReport {
+                pf_enabled: true,
+                session_anchor: SessionAnchorPlacement::First,
+                pass_translation_rules: Vec::new(),
+            },
+            test_policy(),
+        );
         assert_eq!(
             doc.render(),
-            r#"{"protocol":"writ-agent-vm-pf-helper","version":1,"pf_enabled":true,"session_anchor":{"placement":"first"},"pass_translation_rules":[]}"#
+            r#"{"protocol":"writ-agent-vm-pf-helper","version":2,"policy":{"ipv4_pool":"10.200.0.0/16","ipv6_pool":"fd00:7772:6974::/48","broker_port_min":49152,"broker_port_max":65535},"pf_enabled":true,"session_anchor":{"placement":"first"},"pass_translation_rules":[]}"#
         );
         assert_eq!(doc.report().require_clean().ok(), Some(()));
     }
@@ -683,6 +725,17 @@ mod tests {
             "install report accepted {accepted} of 1000"
         );
         assert!(refused >= 100, "install report refused {refused} of 1000");
+    }
+
+    fn test_policy() -> PfHelperPolicy {
+        PfHelperPolicy::new(
+            AgentNetworkPool::new(
+                parse_ipv4_cidr("10.200.0.0/16").unwrap(),
+                parse_ipv6_cidr("fd00:7772:6974::/48").unwrap(),
+            )
+            .unwrap(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+        )
     }
 
     fn arb_line() -> impl Strategy<Value = String> {
@@ -754,8 +807,9 @@ mod tests {
     }
 
     fn arb_edited_preflight() -> impl Strategy<Value = (String, bool)> {
-        (arb_preflight_report(), arb_edit())
-            .prop_map(|(report, e)| edit(PfHelperPreflightDoc::new(report).render(), e))
+        (arb_preflight_report(), arb_edit()).prop_map(|(report, e)| {
+            edit(PfHelperPreflightDoc::new(report, test_policy()).render(), e)
+        })
     }
 
     fn arb_edited_install_report() -> impl Strategy<Value = (String, bool)> {

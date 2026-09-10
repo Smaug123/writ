@@ -85,8 +85,6 @@ cleanup() {
   if [[ -n "$PF_ANCHOR" ]]; then
     sudo "$HELPER" remove \
       --session-id "$SESSION_ID" \
-      --ipv4-pool "$IPV4_POOL" \
-      --ipv6-pool "$IPV6_POOL" \
       --ipv4-cidr "$IPV4_CIDR" \
       --ipv6-cidr "$IPV6_CIDR" >/dev/null 2>&1 || true
   fi
@@ -454,20 +452,29 @@ else
   log "network inspect did not report both an IPv6 subnet and gateway; IPv6 probes will be skipped"
 fi
 
+# Protocol v2: the helper validates every session against the pools and
+# broker-port range in its root-owned policy file, not against arguments. The
+# file must name this proof's pools (finalized above, from the network the
+# harness created), or the install below is refused.
+log "checking the PF helper's policy file matches this proof's pools and port range"
+PREFLIGHT="$(sudo "$HELPER" preflight)" \
+  || die "PF helper preflight failed; install /etc/writ/agent-vm-pf-policy.json (see docs/user_facing/getting-started.md) with ipv4_pool=${IPV4_POOL} ipv6_pool=${IPV6_POOL} broker_port_min=${BROKER_PORT_MIN} broker_port_max=${BROKER_PORT_MAX}"
+EXPECTED_POLICY="\"policy\":{\"ipv4_pool\":\"${IPV4_POOL}\",\"ipv6_pool\":\"${IPV6_POOL}\",\"broker_port_min\":${BROKER_PORT_MIN},\"broker_port_max\":${BROKER_PORT_MAX}}"
+printf '%s' "$PREFLIGHT" | grep -Fq "$EXPECTED_POLICY" \
+  || die "PF helper policy file does not match this proof: expected ${EXPECTED_POLICY} in ${PREFLIGHT}"
+
 log "validating and loading PF anchor through helper"
 PF_ANCHOR="writ/session/${SESSION_ID}"
 # The helper prints one JSON install report naming the anchor whose readback
 # matched the intended ruleset, the interfaces the IPv6 deny resolved to, and
 # the last phase completed; require the anchor field to be this session's.
+# The pools and the broker-port range are the helper's policy file's, not
+# arguments (protocol v2); the preflight check above proved they match ours.
 INSTALL_REPORT="$(sudo "$HELPER" install \
   --session-id "$SESSION_ID" \
-  --ipv4-pool "$IPV4_POOL" \
-  --ipv6-pool "$IPV6_POOL" \
   --ipv4-cidr "$IPV4_CIDR" \
   --ipv6-cidr "$IPV6_CIDR" \
-  --broker-port "$BROKER_PORT" \
-  --broker-port-min "$BROKER_PORT_MIN" \
-  --broker-port-max "$BROKER_PORT_MAX")"
+  --broker-port "$BROKER_PORT")"
 if ! printf '%s' "$INSTALL_REPORT" | grep -Fq "\"anchor\":\"${PF_ANCHOR}\""; then
   die "helper install report does not name PF anchor ${PF_ANCHOR}: ${INSTALL_REPORT}"
 fi

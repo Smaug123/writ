@@ -101,8 +101,6 @@ cleanup_session() {
     helper_remove=(
       sudo "$HELPER" remove
       --session-id "$session_id"
-      --ipv4-pool "$IPV4_POOL"
-      --ipv6-pool "$IPV6_POOL"
       --ipv4-cidr "$ipv4_cidr"
     )
     if [[ "$IPV6_MODE" == "dual-stack-required" && -n "$ipv6_cidr" ]]; then

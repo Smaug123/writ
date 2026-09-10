@@ -907,16 +907,14 @@ impl AgentVmSessionStopPlan {
         )
     }
 
+    /// The pf-helper removal. As for install, the pools are not passed: the
+    /// helper validates the subnet against its root-owned policy file.
     fn remove_firewall_invocation(&self) -> ProcessInvocation {
         let mut args = vec![
             self.tools.pf_helper.as_os_str().to_os_string(),
             OsString::from("remove"),
             OsString::from("--session-id"),
             OsString::from(self.session_id.to_string()),
-            OsString::from("--ipv4-pool"),
-            OsString::from(self.pool.ipv4_base().to_string()),
-            OsString::from("--ipv6-pool"),
-            OsString::from(self.pool.ipv6_base().to_string()),
             OsString::from("--ipv4-cidr"),
             OsString::from(self.network.ipv4().to_string()),
         ];
