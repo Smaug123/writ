@@ -9,10 +9,12 @@ use std::path::Path;
 
 use clap::{Args, Parser, Subcommand};
 use writ::agent_vm_firewall::{
-    SessionFirewallInstall, SessionFirewallRemoval, discover_session_bridge_interfaces,
-    install_session_firewall, remove_session_firewall,
+    DenyGuestIpv6, SessionFirewallRemoval, SessionFirewallSpec, SessionFirewallTools,
+    install_session_firewall, pf_preflight, remove_session_firewall,
 };
-use writ::agent_vm_pf_helper_protocol::PfHelperProtocolDoc;
+use writ::agent_vm_pf_helper_protocol::{
+    PfHelperInstallReportDoc, PfHelperPreflightDoc, PfHelperProtocolDoc,
+};
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
@@ -38,7 +40,17 @@ enum Cmd {
     /// object, without running `pfctl` or `ifconfig` at all. The daemon reads
     /// it as admission evidence for `ipv4_only_locked_v1`.
     ProtocolVersion,
-    /// Validate and install PF rules for one agent VM session.
+    /// Report the host-local PF facts every session install is conditional on
+    /// (PF enabled, where `anchor "writ/session/*"` sits in the main ruleset,
+    /// any `pass` translation rules loaded) as one bounded JSON object. Runs
+    /// only `pfctl` status queries; loads, flushes, and kills nothing. The
+    /// daemon reads it as admission evidence for `ipv4_only_locked_v1`.
+    Preflight,
+    /// Validate and install PF rules for one agent VM session, then read the
+    /// anchor back and require it to be exactly the intended ruleset. Prints
+    /// one bounded JSON object naming the anchor, the interfaces the IPv6 deny
+    /// resolved to, and the last phase completed; a failure names its phase on
+    /// stderr and exits non-zero.
     Install(InstallArgs),
     /// Remove PF rules and matching live states for one agent VM session.
     Remove(RemoveArgs),
@@ -72,8 +84,10 @@ struct InstallArgs {
     /// VM's host bridge (and its `vmenet` members) so a root guest cannot
     /// re-acquire IPv6 via a host vmnet router advertisement. The interfaces are
     /// discovered *here*, at the privileged boundary, by matching the session
-    /// gateway in `ifconfig` output — never trusted from the caller. Requires the
-    /// agent VM (hence its bridge) to be running, and is rejected with `--ipv6-cidr`.
+    /// gateway in `ifconfig` output — never trusted from the caller — and
+    /// discovered again after the load, which must find the same names. Requires
+    /// the agent VM (hence its bridge) to be running, and is rejected with
+    /// `--ipv6-cidr`.
     #[arg(long)]
     deny_guest_ipv6: bool,
 }
@@ -114,22 +128,14 @@ fn main() {
     }
 }
 
-/// The executables the helper may run. Production pins the system paths
-/// ([`SYSTEM_PFCTL`], [`SYSTEM_IFCONFIG`]); tests inject recorders here, at the
-/// unprivileged dispatch, never through the CLI.
-struct HelperTools<'a> {
-    pfctl: &'a Path,
-    ifconfig: &'a Path,
-}
-
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let cli = Cli::parse();
-    let tools = HelperTools {
+    let tools = SessionFirewallTools {
         pfctl: Path::new(SYSTEM_PFCTL),
         ifconfig: Path::new(SYSTEM_IFCONFIG),
     };
-    if let Some(line) = execute(cli.cmd, &tools)? {
+    if let Some(line) = execute(cli.cmd, tools)? {
         println!("{line}");
     }
     Ok(())
@@ -138,10 +144,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// Interpret one command. Returns the single line to print on success, if any.
 fn execute(
     cmd: Cmd,
-    tools: &HelperTools<'_>,
+    tools: SessionFirewallTools<'_>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     match cmd {
         Cmd::ProtocolVersion => Ok(Some(PfHelperProtocolDoc::current().render())),
+        Cmd::Preflight => {
+            let report = pf_preflight(tools.pfctl)?;
+            Ok(Some(PfHelperPreflightDoc::new(report).render()))
+        }
         Cmd::Install(args) => {
             let parsed = parse_session_network(&args.session)?;
             let broker_ports = BrokerPorts::new(
@@ -158,27 +168,18 @@ fn execute(
                 .map(|raw| raw.parse::<Ipv4Addr>())
                 .transpose()
                 .map_err(|e| format!("invalid --broker-host: {e}"))?;
-            // Discover the deny interfaces here, from the pool-validated session
-            // gateway — the privileged boundary never trusts caller-supplied
-            // interface names. The discovery tool is a fixed, root-owned system
-            // path (never a caller-supplied executable, which would be arbitrary
-            // root code execution). The agent's own vmenet must have attached, so
-            // require its member: host placement has one (the agent's), vm
-            // placement shares the bridge with the broker VM, so require two (the
-            // broker's plus the agent's). `--broker-host` is set exactly for vm
-            // placement, so it distinguishes the two.
-            let ipv6_deny_interfaces = if args.deny_guest_ipv6 {
-                let gateway = parsed
-                    .pool
-                    .claim_firewall(parsed.ipv4, parsed.ipv6)?
-                    .ipv4_gateway();
-                let min_members = if broker_host.is_some() { 2 } else { 1 };
-                discover_session_bridge_interfaces(tools.ifconfig, gateway, min_members)?
-                    .deny_interfaces()
-            } else {
-                Vec::new()
-            };
-            let install = SessionFirewallInstall::new(
+            // The deny interfaces are discovered by the library, from the
+            // pool-validated session gateway — the privileged boundary never
+            // trusts caller-supplied interface names, and the discovery tool is
+            // a fixed, root-owned system path. The agent's own vmenet must have
+            // attached, so require its member: host placement has one (the
+            // agent's), vm placement shares the bridge with the broker VM, so
+            // require two (the broker's plus the agent's). `--broker-host` is
+            // set exactly for vm placement, so it distinguishes the two.
+            let deny_guest_ipv6 = args.deny_guest_ipv6.then_some(DenyGuestIpv6 {
+                min_members: if broker_host.is_some() { 2 } else { 1 },
+            });
+            let spec = SessionFirewallSpec::new(
                 parsed.session_id,
                 parsed.pool,
                 parsed.ipv4,
@@ -186,10 +187,10 @@ fn execute(
                 broker_ports,
                 broker_port_range,
                 broker_host,
-                ipv6_deny_interfaces,
+                deny_guest_ipv6,
             )?;
-            install_session_firewall(tools.pfctl, &install)?;
-            Ok(Some(install.ruleset().anchor().as_str().to_string()))
+            let report = install_session_firewall(tools, &spec)?;
+            Ok(Some(PfHelperInstallReportDoc::verified(&report).render()))
         }
         Cmd::Remove(args) => {
             let parsed = parse_session_network(&args.session)?;
@@ -257,17 +258,22 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    use writ::agent_vm_firewall::SessionAnchorPlacement;
+
     use super::*;
 
     /// A stand-in for `pfctl`/`ifconfig` that appends every argument vector it
-    /// is invoked with to a log beside itself and otherwise succeeds silently.
+    /// is invoked with to a log beside itself, answers `-s info` as an enabled
+    /// PF, and otherwise succeeds silently.
     fn write_recorder(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
         let path = dir.join(name);
         let log = dir.join(format!("{name}.calls"));
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 [ \"$*\" = '-s info' ] && printf 'Status: Enabled for 0 days 00:00:01\\n'\n\
+                 exit 0\n",
                 log.display()
             ),
         )
@@ -297,20 +303,19 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_a_standalone_subcommand() {
+    fn protocol_version_and_preflight_are_standalone_subcommands() {
         let cli = Cli::try_parse_from(["writ-agent-vm-pf-helper", "protocol-version"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::ProtocolVersion));
-        // It takes no session facts: any argument is a usage error, so a caller
-        // cannot smuggle an install through the probe's spelling.
-        assert!(
-            Cli::try_parse_from([
-                "writ-agent-vm-pf-helper",
-                "protocol-version",
-                "--session-id",
-                "x"
-            ])
-            .is_err()
-        );
+        let cli = Cli::try_parse_from(["writ-agent-vm-pf-helper", "preflight"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Preflight));
+        // They take no session facts: any argument is a usage error, so a
+        // caller cannot smuggle an install through the probe's spelling.
+        for probe in ["protocol-version", "preflight"] {
+            assert!(
+                Cli::try_parse_from(["writ-agent-vm-pf-helper", probe, "--session-id", "x"])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -318,12 +323,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (pfctl, pfctl_log) = write_recorder(dir.path(), "pfctl");
         let (ifconfig, ifconfig_log) = write_recorder(dir.path(), "ifconfig");
-        let tools = HelperTools {
+        let tools = SessionFirewallTools {
             pfctl: &pfctl,
             ifconfig: &ifconfig,
         };
 
-        let line = execute(Cmd::ProtocolVersion, &tools).unwrap().unwrap();
+        let line = execute(Cmd::ProtocolVersion, tools).unwrap().unwrap();
 
         assert_eq!(
             PfHelperProtocolDoc::parse(&line),
@@ -338,10 +343,44 @@ mod tests {
             Cmd::Remove(RemoveArgs {
                 session: session_args(),
             }),
-            &tools,
+            tools,
         )
         .unwrap();
         assert!(!recorded_calls(&pfctl_log).is_empty());
+        assert_eq!(recorded_calls(&ifconfig_log), Vec::<String>::new());
+    }
+
+    #[test]
+    fn preflight_runs_only_status_queries_and_prints_a_parseable_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pfctl, pfctl_log) = write_recorder(dir.path(), "pfctl");
+        let (ifconfig, ifconfig_log) = write_recorder(dir.path(), "ifconfig");
+        let tools = SessionFirewallTools {
+            pfctl: &pfctl,
+            ifconfig: &ifconfig,
+        };
+
+        let line = execute(Cmd::Preflight, tools).unwrap().unwrap();
+
+        let doc = PfHelperPreflightDoc::parse(&line).unwrap();
+        // The recorder answers only `-s info`; every other query reads as
+        // empty, so the report says: enabled, anchor absent, nothing loaded.
+        assert!(doc.report().pf_enabled);
+        assert_eq!(doc.report().session_anchor, SessionAnchorPlacement::Absent);
+        assert_eq!(doc.report().pass_translation_rules, Vec::new());
+
+        let calls = recorded_calls(&pfctl_log);
+        assert_eq!(calls, vec!["-s info", "-sr", "-sn", "-v -sA"]);
+        // Nothing that changes PF: no load (`-f`), flush (`-F`), or state kill
+        // (`-k`).
+        for call in &calls {
+            for mutating in ["-f", "-F", "-k"] {
+                assert!(
+                    !call.split(' ').any(|arg| arg == mutating),
+                    "preflight ran a mutating pfctl call: {call}"
+                );
+            }
+        }
         assert_eq!(recorded_calls(&ifconfig_log), Vec::<String>::new());
     }
 }

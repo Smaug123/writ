@@ -1,18 +1,34 @@
-//! The PF helper's `protocol-version` document: the one bounded JSON object the
-//! privileged helper answers with, and the host-side parser that reads it.
+//! The PF helper's documents: the bounded JSON lines the privileged helper
+//! answers with, and the host-side parsers that read them.
 //!
-//! The helper renders it; the daemon (from Stage D of the `ipv4_only_locked_v1`
-//! plan) parses it as admission evidence. Both directions live here so the two
-//! binaries cannot drift: the parser accepts *exactly* the strings the renderer
-//! produces (optionally followed by the single newline `println!` adds), and
-//! nothing else — no trailing data, no second object, no unknown protocol name,
-//! no non-canonical spelling of the same object.
+//! The helper renders them; the daemon (from Stage D of the
+//! `ipv4_only_locked_v1` plan) parses the probe and the preflight report as
+//! admission evidence, and the locked start path (Stage E2) parses the install
+//! report. Both directions live here so the two binaries cannot drift: each
+//! parser accepts *exactly* the strings its renderer produces (optionally
+//! followed by the single newline `println!` adds), and nothing else — no
+//! trailing data, no second object, no unknown protocol name, no non-canonical
+//! spelling of the same object.
+//!
+//! Three documents:
+//! - [`PfHelperProtocolDoc`], the answer to `protocol-version`;
+//! - [`PfHelperPreflightDoc`], the answer to `preflight`: the host-local PF
+//!   facts an install is conditional on, read without loading anything;
+//! - [`PfHelperInstallReportDoc`], what a successful `install` prints: the
+//!   anchor whose readback matched, the interfaces it was resolved to, and the
+//!   last phase completed.
 //!
 //! Version 1 is what the shipped helper speaks. Version 2 *means* the whole of
 //! Stage C2's boundary (policy file, exact readback, re-resolve), so the number
 //! only moves once all of that has landed.
 
 use serde::{Deserialize, Serialize};
+
+use crate::agent_vm_firewall::{
+    PassTranslationRule, PfInstallPhase, PfPreflightReport, SessionAnchorPlacement,
+    SessionFirewallReport,
+};
+use crate::core::{PfAnchorName, PfInterface, SessionId};
 
 /// The protocol name every helper document carries.
 pub const PF_HELPER_PROTOCOL_NAME: &str = "writ-agent-vm-pf-helper";
@@ -24,34 +40,117 @@ pub const PF_HELPER_PROTOCOL_VERSION: u16 = 1;
 /// fixed byte cap, applied before any parsing.
 pub const PF_HELPER_PROTOCOL_MAX_BYTES: usize = 256;
 
+/// Maximum `preflight` response the host reads. The report quotes the main
+/// ruleset lines ahead of the session anchor and every `pass` translation rule
+/// loaded, so it grows with the host's PF configuration; a host whose report
+/// does not fit is one whose PF state the daemon cannot vouch for.
+pub const PF_HELPER_PREFLIGHT_MAX_BYTES: usize = 16 * 1024;
+
+/// Maximum `install` report the host reads: one anchor path and a handful of
+/// interface names.
+pub const PF_HELPER_INSTALL_REPORT_MAX_BYTES: usize = 4096;
+
+/// Why a helper response was refused.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PfHelperProtocolParseError {
+    /// The response exceeds the document's byte cap.
+    #[error("PF helper response exceeds {0} bytes")]
+    TooLarge(usize),
+    /// The response is not the canonical single-object document.
+    #[error("PF helper response is malformed")]
+    Malformed,
+    /// The document names a protocol other than [`PF_HELPER_PROTOCOL_NAME`].
+    #[error("PF helper response names an unknown protocol")]
+    UnsupportedProtocol,
+    /// The document claims a protocol version this parser does not read.
+    #[error("PF helper response claims unsupported protocol version {0}")]
+    UnsupportedVersion(u16),
+    /// Something follows the one object (a second object, or any other bytes).
+    #[error("PF helper response has trailing data after the object")]
+    TrailingData,
+}
+
+/// The `protocol` and `version` fields every wire object starts with.
+trait WireHeader {
+    fn protocol(&self) -> &str;
+    fn version(&self) -> u16;
+}
+
+/// Read one bounded, canonical, single-object document.
+///
+/// `cap` is checked before anything is parsed; the object must start at byte
+/// 0; exactly one value is read with a streaming deserializer so "a second
+/// object follows" and "the first object is broken" are told apart; the
+/// protocol name and version are checked; and finally the parsed document is
+/// re-rendered and required to equal the input byte for byte, so the same
+/// JSON value spelled differently is refused: it is not something the helper
+/// emits, so it is not something the host accepts.
+fn parse_exact<'a, W, D>(
+    response: &'a str,
+    cap: usize,
+    accept_version: impl FnOnce(u16) -> bool,
+    from_wire: impl FnOnce(W) -> Result<D, PfHelperProtocolParseError>,
+    render: impl FnOnce(&D) -> String,
+) -> Result<D, PfHelperProtocolParseError>
+where
+    W: Deserialize<'a> + WireHeader,
+{
+    use PfHelperProtocolParseError::*;
+    if response.len() > cap {
+        return Err(TooLarge(cap));
+    }
+    let body = response.strip_suffix('\n').unwrap_or(response);
+    if !body.starts_with('{') {
+        return Err(Malformed);
+    }
+    let mut stream = serde_json::Deserializer::from_str(body).into_iter::<W>();
+    let wire = match stream.next() {
+        Some(Ok(wire)) => wire,
+        Some(Err(_)) | None => return Err(Malformed),
+    };
+    if wire.protocol() != PF_HELPER_PROTOCOL_NAME {
+        return Err(UnsupportedProtocol);
+    }
+    if !accept_version(wire.version()) {
+        return Err(UnsupportedVersion(wire.version()));
+    }
+    if stream.byte_offset() != body.len() {
+        return Err(TrailingData);
+    }
+    let doc = from_wire(wire)?;
+    if render(&doc) != body {
+        return Err(Malformed);
+    }
+    Ok(doc)
+}
+
+fn render_wire<W: Serialize>(wire: &W) -> String {
+    serde_json::to_string(wire)
+        .expect("wire structs of strings, numbers, and lists always serialise")
+}
+
+// --- protocol-version ------------------------------------------------------
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Wire<'a> {
+struct ProtocolWire<'a> {
     protocol: &'a str,
     version: u16,
+}
+
+impl WireHeader for ProtocolWire<'_> {
+    fn protocol(&self) -> &str {
+        self.protocol
+    }
+    fn version(&self) -> u16 {
+        self.version
+    }
 }
 
 /// A parsed `protocol-version` answer from the PF helper.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct PfHelperProtocolDoc {
     version: u16,
-}
-
-/// Why a `protocol-version` response was refused.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum PfHelperProtocolParseError {
-    /// The response exceeds [`PF_HELPER_PROTOCOL_MAX_BYTES`].
-    #[error("PF helper protocol response exceeds {PF_HELPER_PROTOCOL_MAX_BYTES} bytes")]
-    TooLarge,
-    /// The response is not the canonical single-object document.
-    #[error("PF helper protocol response is malformed")]
-    Malformed,
-    /// The document names a protocol other than [`PF_HELPER_PROTOCOL_NAME`].
-    #[error("PF helper protocol response names an unknown protocol")]
-    UnsupportedProtocol,
-    /// Something follows the one object (a second object, or any other bytes).
-    #[error("PF helper protocol response has trailing data after the object")]
-    TrailingData,
 }
 
 impl PfHelperProtocolDoc {
@@ -74,50 +173,245 @@ impl PfHelperProtocolDoc {
 
     /// Render as one line without a trailing newline.
     pub fn render(self) -> String {
-        let wire = Wire {
+        render_wire(&ProtocolWire {
             protocol: PF_HELPER_PROTOCOL_NAME,
             version: self.version,
-        };
-        serde_json::to_string(&wire).expect("a two-field struct of str and u16 always serialises")
+        })
     }
 
     /// Parse a captured response. Accepts exactly [`Self::render`]'s output,
-    /// optionally followed by one `\n`.
+    /// optionally followed by one `\n`. Any version is accepted: this is the
+    /// document the host reads *to learn* the version.
     pub fn parse(response: &str) -> Result<Self, PfHelperProtocolParseError> {
-        use PfHelperProtocolParseError::*;
-        if response.len() > PF_HELPER_PROTOCOL_MAX_BYTES {
-            return Err(TooLarge);
-        }
-        let body = response.strip_suffix('\n').unwrap_or(response);
-        // The object must start at byte 0: `serde_json` would skip leading
-        // whitespace, and the canonical check below would catch it, but a
-        // response that does not begin with the object is malformed rather
-        // than a non-canonical spelling.
-        if !body.starts_with('{') {
-            return Err(Malformed);
-        }
-        // Read one value with a streaming deserializer so that "a second object
-        // follows" and "the first object is broken" are told apart.
-        let mut stream = serde_json::Deserializer::from_str(body).into_iter::<Wire<'_>>();
-        let wire = match stream.next() {
-            Some(Ok(wire)) => wire,
-            Some(Err(_)) | None => return Err(Malformed),
+        parse_exact(
+            response,
+            PF_HELPER_PROTOCOL_MAX_BYTES,
+            |_| true,
+            |wire: ProtocolWire<'_>| {
+                Ok(Self {
+                    version: wire.version,
+                })
+            },
+            |doc| doc.render(),
+        )
+    }
+}
+
+// --- preflight --------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreflightWire<'a> {
+    protocol: &'a str,
+    version: u16,
+    pf_enabled: bool,
+    session_anchor: AnchorPlacementWire,
+    pass_translation_rules: Vec<TranslationRuleWire>,
+}
+
+impl WireHeader for PreflightWire<'_> {
+    fn protocol(&self) -> &str {
+        self.protocol
+    }
+    fn version(&self) -> u16 {
+        self.version
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "placement", rename_all = "snake_case", deny_unknown_fields)]
+enum AnchorPlacementWire {
+    First,
+    Preceded { lines: Vec<String> },
+    Absent,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranslationRuleWire {
+    anchor: Option<String>,
+    rule: String,
+}
+
+/// A parsed `preflight` answer: the [`PfPreflightReport`] the helper read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PfHelperPreflightDoc {
+    report: PfPreflightReport,
+}
+
+impl PfHelperPreflightDoc {
+    pub fn new(report: PfPreflightReport) -> Self {
+        Self { report }
+    }
+
+    pub fn report(&self) -> &PfPreflightReport {
+        &self.report
+    }
+
+    /// Render as one line without a trailing newline.
+    pub fn render(&self) -> String {
+        let session_anchor = match &self.report.session_anchor {
+            SessionAnchorPlacement::First => AnchorPlacementWire::First,
+            SessionAnchorPlacement::Preceded(lines) => AnchorPlacementWire::Preceded {
+                lines: lines.clone(),
+            },
+            SessionAnchorPlacement::Absent => AnchorPlacementWire::Absent,
         };
-        if wire.protocol != PF_HELPER_PROTOCOL_NAME {
-            return Err(UnsupportedProtocol);
+        render_wire(&PreflightWire {
+            protocol: PF_HELPER_PROTOCOL_NAME,
+            version: PF_HELPER_PROTOCOL_VERSION,
+            pf_enabled: self.report.pf_enabled,
+            session_anchor,
+            pass_translation_rules: self
+                .report
+                .pass_translation_rules
+                .iter()
+                .map(|rule| TranslationRuleWire {
+                    anchor: rule.anchor.clone(),
+                    rule: rule.rule.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Parse a captured response. Accepts exactly [`Self::render`]'s output
+    /// for the current protocol version, optionally followed by one `\n`.
+    pub fn parse(response: &str) -> Result<Self, PfHelperProtocolParseError> {
+        parse_exact(
+            response,
+            PF_HELPER_PREFLIGHT_MAX_BYTES,
+            |version| version == PF_HELPER_PROTOCOL_VERSION,
+            |wire: PreflightWire<'_>| {
+                let session_anchor = match wire.session_anchor {
+                    AnchorPlacementWire::First => SessionAnchorPlacement::First,
+                    AnchorPlacementWire::Preceded { lines } => {
+                        SessionAnchorPlacement::Preceded(lines)
+                    }
+                    AnchorPlacementWire::Absent => SessionAnchorPlacement::Absent,
+                };
+                Ok(Self {
+                    report: PfPreflightReport {
+                        pf_enabled: wire.pf_enabled,
+                        session_anchor,
+                        pass_translation_rules: wire
+                            .pass_translation_rules
+                            .into_iter()
+                            .map(|rule| PassTranslationRule {
+                                anchor: rule.anchor,
+                                rule: rule.rule,
+                            })
+                            .collect(),
+                    },
+                })
+            },
+            |doc| doc.render(),
+        )
+    }
+}
+
+// --- install report ---------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallReportWire<'a> {
+    protocol: &'a str,
+    version: u16,
+    anchor: String,
+    interfaces: Vec<String>,
+    phase: &'a str,
+}
+
+impl WireHeader for InstallReportWire<'_> {
+    fn protocol(&self) -> &str {
+        self.protocol
+    }
+    fn version(&self) -> u16 {
+        self.version
+    }
+}
+
+/// A parsed `install` report: the session anchor whose readback matched the
+/// intended ruleset, the interfaces the IPv6 deny was resolved to (empty for
+/// the pre-attach install), and the last install phase that completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PfHelperInstallReportDoc {
+    session_id: SessionId,
+    interfaces: Vec<PfInterface>,
+    phase: PfInstallPhase,
+}
+
+impl PfHelperInstallReportDoc {
+    /// The document a successful install prints: every phase completed.
+    pub fn verified(report: &SessionFirewallReport) -> Self {
+        Self {
+            session_id: report.session_id(),
+            interfaces: report.interfaces().to_vec(),
+            phase: PfInstallPhase::Reresolve,
         }
-        if stream.byte_offset() != body.len() {
-            return Err(TrailingData);
-        }
-        let doc = Self {
-            version: wire.version,
-        };
-        // Exact, not semantic: the same JSON value spelled differently is not
-        // something the helper emits, so it is not something the host accepts.
-        if doc.render() != body {
-            return Err(Malformed);
-        }
-        Ok(doc)
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn anchor(&self) -> PfAnchorName {
+        PfAnchorName::for_session(self.session_id)
+    }
+
+    pub fn interfaces(&self) -> &[PfInterface] {
+        &self.interfaces
+    }
+
+    pub fn phase(&self) -> PfInstallPhase {
+        self.phase
+    }
+
+    /// Render as one line without a trailing newline.
+    pub fn render(&self) -> String {
+        render_wire(&InstallReportWire {
+            protocol: PF_HELPER_PROTOCOL_NAME,
+            version: PF_HELPER_PROTOCOL_VERSION,
+            anchor: self.anchor().as_str().to_string(),
+            interfaces: self
+                .interfaces
+                .iter()
+                .map(|iface| iface.as_str().to_string())
+                .collect(),
+            phase: self.phase.as_str(),
+        })
+    }
+
+    /// Parse a captured response. Accepts exactly [`Self::render`]'s output
+    /// for the current protocol version, optionally followed by one `\n`.
+    pub fn parse(response: &str) -> Result<Self, PfHelperProtocolParseError> {
+        use PfHelperProtocolParseError::Malformed;
+        parse_exact(
+            response,
+            PF_HELPER_INSTALL_REPORT_MAX_BYTES,
+            |version| version == PF_HELPER_PROTOCOL_VERSION,
+            |wire: InstallReportWire<'_>| {
+                let session_id = wire
+                    .anchor
+                    .strip_prefix("writ/session/")
+                    .and_then(|id| id.parse::<SessionId>().ok())
+                    .ok_or(Malformed)?;
+                let interfaces = wire
+                    .interfaces
+                    .into_iter()
+                    .map(|name| PfInterface::new(name).map_err(|_| Malformed))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let phase = PfInstallPhase::ALL
+                    .into_iter()
+                    .find(|phase| phase.as_str() == wire.phase)
+                    .ok_or(Malformed)?;
+                Ok(Self {
+                    session_id,
+                    interfaces,
+                    phase,
+                })
+            },
+            |doc| doc.render(),
+        )
     }
 }
 
@@ -126,9 +420,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Independent oracle for "is `s` exactly a rendered document": the grammar
-    /// `{"protocol":"writ-agent-vm-pf-helper","version":<u16 decimal>}` with no
-    /// leading zeros and nothing else.
+    /// Independent oracle for "is `s` exactly a rendered protocol document":
+    /// the grammar `{"protocol":"writ-agent-vm-pf-helper","version":<u16
+    /// decimal>}` with no leading zeros and nothing else.
     fn canonical_version(s: &str) -> Option<u16> {
         let body = s.strip_prefix(r#"{"protocol":"writ-agent-vm-pf-helper","version":"#)?;
         let digits = body.strip_suffix('}')?;
@@ -195,7 +489,7 @@ mod tests {
             prop_assert!(oversized.len() > PF_HELPER_PROTOCOL_MAX_BYTES);
             prop_assert_eq!(
                 PfHelperProtocolDoc::parse(&oversized),
-                Err(PfHelperProtocolParseError::TooLarge)
+                Err(PfHelperProtocolParseError::TooLarge(PF_HELPER_PROTOCOL_MAX_BYTES))
             );
         }
 
@@ -245,6 +539,227 @@ mod tests {
                 "input {:?}", input
             );
         }
+
+        // --- preflight ---
+
+        #[test]
+        fn preflight_parse_inverts_render(report in arb_preflight_report()) {
+            let doc = PfHelperPreflightDoc::new(report);
+            let rendered = doc.render();
+            prop_assert!(!rendered.contains(['\n', '\r']));
+            prop_assert_eq!(PfHelperPreflightDoc::parse(&rendered), Ok(doc.clone()));
+            prop_assert_eq!(PfHelperPreflightDoc::parse(&format!("{rendered}\n")), Ok(doc));
+        }
+
+        /// Whatever the preflight parser accepts, it accepts as exactly one
+        /// rendering: inputs are rendered documents with random byte edits.
+        #[test]
+        fn preflight_accepts_only_its_own_renderings((text, edited) in arb_edited_preflight()) {
+            match PfHelperPreflightDoc::parse(&text) {
+                Ok(doc) => prop_assert_eq!(doc.render(), text.clone()),
+                Err(err) => prop_assert!(edited, "an unedited document was refused: {err}"),
+            }
+        }
+
+        #[test]
+        fn preflight_refuses_any_other_version(
+            report in arb_preflight_report(),
+            version in any::<u16>().prop_filter("must differ", |v| *v != PF_HELPER_PROTOCOL_VERSION),
+        ) {
+            let rendered = PfHelperPreflightDoc::new(report).render();
+            let current = format!(r#""version":{PF_HELPER_PROTOCOL_VERSION},"#);
+            prop_assert!(rendered.contains(&current));
+            let other = rendered.replacen(&current, &format!(r#""version":{version},"#), 1);
+            prop_assert_eq!(
+                PfHelperPreflightDoc::parse(&other),
+                Err(PfHelperProtocolParseError::UnsupportedVersion(version))
+            );
+        }
+
+        #[test]
+        fn preflight_over_the_cap_is_too_large(lines in 1usize..4, width in 0usize..256) {
+            // Enough anchor lines to cross the cap, each well-formed: size is
+            // refused before content is looked at.
+            let line = "a".repeat(PF_HELPER_PREFLIGHT_MAX_BYTES / lines + width);
+            let report = PfPreflightReport {
+                pf_enabled: true,
+                session_anchor: SessionAnchorPlacement::Preceded(vec![line; lines]),
+                pass_translation_rules: Vec::new(),
+            };
+            let rendered = PfHelperPreflightDoc::new(report).render();
+            prop_assert!(rendered.len() > PF_HELPER_PREFLIGHT_MAX_BYTES);
+            prop_assert_eq!(
+                PfHelperPreflightDoc::parse(&rendered),
+                Err(PfHelperProtocolParseError::TooLarge(PF_HELPER_PREFLIGHT_MAX_BYTES))
+            );
+        }
+
+        // --- install report ---
+
+        #[test]
+        fn install_report_parse_inverts_render(doc in arb_install_report()) {
+            let rendered = doc.render();
+            prop_assert!(rendered.len() <= PF_HELPER_INSTALL_REPORT_MAX_BYTES);
+            prop_assert!(!rendered.contains(['\n', '\r']));
+            prop_assert_eq!(PfHelperInstallReportDoc::parse(&rendered), Ok(doc.clone()));
+            prop_assert_eq!(PfHelperInstallReportDoc::parse(&format!("{rendered}\n")), Ok(doc));
+        }
+
+        #[test]
+        fn install_report_accepts_only_its_own_renderings((text, edited) in arb_edited_install_report()) {
+            match PfHelperInstallReportDoc::parse(&text) {
+                Ok(doc) => prop_assert_eq!(doc.render(), text.clone()),
+                Err(err) => prop_assert!(edited, "an unedited document was refused: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_verified_report_names_the_anchor_interfaces_and_final_phase() {
+        let session_id: SessionId = "0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b".parse().unwrap();
+        let report = SessionFirewallReport::new(
+            session_id,
+            vec![
+                PfInterface::new("bridge100").unwrap(),
+                PfInterface::new("vmenet0").unwrap(),
+            ],
+        );
+        let doc = PfHelperInstallReportDoc::verified(&report);
+        assert_eq!(
+            doc.render(),
+            r#"{"protocol":"writ-agent-vm-pf-helper","version":1,"anchor":"writ/session/0e3a2b52-0a2d-4f7c-9b9e-1d9c3e4f5a6b","interfaces":["bridge100","vmenet0"],"phase":"reresolve"}"#
+        );
+        assert_eq!(doc.phase(), PfInstallPhase::Reresolve);
+        assert_eq!(doc.anchor(), report.anchor());
+    }
+
+    #[test]
+    fn the_preflight_of_a_clean_host_is_the_pinned_line() {
+        let doc = PfHelperPreflightDoc::new(PfPreflightReport {
+            pf_enabled: true,
+            session_anchor: SessionAnchorPlacement::First,
+            pass_translation_rules: Vec::new(),
+        });
+        assert_eq!(
+            doc.render(),
+            r#"{"protocol":"writ-agent-vm-pf-helper","version":1,"pf_enabled":true,"session_anchor":{"placement":"first"},"pass_translation_rules":[]}"#
+        );
+        assert_eq!(doc.report().require_clean().ok(), Some(()));
+    }
+
+    /// Both verdicts must be reachable for the edit properties to mean
+    /// anything; check the generators actually land on both sides.
+    #[test]
+    fn the_edited_generators_reach_both_verdicts() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+        let mut runner = TestRunner::deterministic();
+        let (mut accepted, mut refused) = (0usize, 0usize);
+        for _ in 0..1000 {
+            let (text, _) = arb_edited_preflight()
+                .new_tree(&mut runner)
+                .unwrap()
+                .current();
+            match PfHelperPreflightDoc::parse(&text) {
+                Ok(_) => accepted += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        assert!(accepted >= 100, "preflight accepted {accepted} of 1000");
+        assert!(refused >= 100, "preflight refused {refused} of 1000");
+        let (mut accepted, mut refused) = (0usize, 0usize);
+        for _ in 0..1000 {
+            let (text, _) = arb_edited_install_report()
+                .new_tree(&mut runner)
+                .unwrap()
+                .current();
+            match PfHelperInstallReportDoc::parse(&text) {
+                Ok(_) => accepted += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        assert!(
+            accepted >= 100,
+            "install report accepted {accepted} of 1000"
+        );
+        assert!(refused >= 100, "install report refused {refused} of 1000");
+    }
+
+    fn arb_line() -> impl Strategy<Value = String> {
+        // pf.conf rule text as pfctl prints it: printable ASCII, and the odd
+        // quote or backslash that JSON has to escape.
+        "[ -~]{0,60}"
+    }
+
+    fn arb_preflight_report() -> impl Strategy<Value = PfPreflightReport> {
+        (
+            any::<bool>(),
+            prop_oneof![
+                Just(SessionAnchorPlacement::First),
+                prop::collection::vec(arb_line(), 1..4).prop_map(SessionAnchorPlacement::Preceded),
+                Just(SessionAnchorPlacement::Absent),
+            ],
+            prop::collection::vec(
+                (prop::option::of("[a-z./]{1,20}"), arb_line())
+                    .prop_map(|(anchor, rule)| PassTranslationRule { anchor, rule }),
+                0..3,
+            ),
+        )
+            .prop_map(|(pf_enabled, session_anchor, pass_translation_rules)| {
+                PfPreflightReport {
+                    pf_enabled,
+                    session_anchor,
+                    pass_translation_rules,
+                }
+            })
+    }
+
+    fn arb_install_report() -> impl Strategy<Value = PfHelperInstallReportDoc> {
+        (
+            any::<u128>(),
+            prop::collection::vec("[a-zA-Z][a-zA-Z0-9]{0,14}", 0..4),
+            prop::sample::select(PfInstallPhase::ALL.to_vec()),
+        )
+            .prop_map(|(session, interfaces, phase)| PfHelperInstallReportDoc {
+                session_id: SessionId::from_uuid(uuid::Uuid::from_u128(session)),
+                interfaces: interfaces
+                    .into_iter()
+                    .map(|name| PfInterface::new(name).unwrap())
+                    .collect(),
+                phase,
+            })
+    }
+
+    /// One byte-level edit: an inserted space, a deleted byte, a case flip,
+    /// or a replaced printable byte.
+    fn edit(text: String, edit: Option<(prop::sample::Index, u8, u8)>) -> (String, bool) {
+        let Some((index, kind, byte)) = edit else {
+            return (text, false);
+        };
+        let mut bytes = text.into_bytes();
+        let at = index.index(bytes.len());
+        match kind {
+            0 => bytes.insert(at, b' '),
+            1 => {
+                bytes.remove(at);
+            }
+            2 => bytes[at] = bytes[at].to_ascii_uppercase(),
+            _ => bytes[at] = 0x20 + byte % 0x5f,
+        }
+        (String::from_utf8_lossy(&bytes).into_owned(), true)
+    }
+
+    fn arb_edit() -> impl Strategy<Value = Option<(prop::sample::Index, u8, u8)>> {
+        prop::option::of((any::<prop::sample::Index>(), 0u8..4, any::<u8>()))
+    }
+
+    fn arb_edited_preflight() -> impl Strategy<Value = (String, bool)> {
+        (arb_preflight_report(), arb_edit())
+            .prop_map(|(report, e)| edit(PfHelperPreflightDoc::new(report).render(), e))
+    }
+
+    fn arb_edited_install_report() -> impl Strategy<Value = (String, bool)> {
+        (arb_install_report(), arb_edit()).prop_map(|(doc, e)| edit(doc.render(), e))
     }
 
     fn trailing_suffix() -> impl Strategy<Value = String> {

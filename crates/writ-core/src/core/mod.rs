@@ -7,6 +7,7 @@ mod decision;
 mod grant;
 mod network_health;
 mod notes_ref;
+mod pf_readback;
 mod request;
 mod session;
 mod sha256_hex;
@@ -26,6 +27,9 @@ pub use decision::{
 pub use grant::CredentialGrant;
 pub use network_health::NetworkHealth;
 pub use notes_ref::{NotesRef, NotesRefError};
+pub use pf_readback::{
+    PfReadbackParseError, PfReadbackRule, is_valid_label, parse_pf_readback, render_pf_readback,
+};
 pub use request::{CapabilityRequest, GitHubRequest};
 pub use session::{AgentKind, SessionRecord};
 pub use sha256_hex::{Sha256Hex, Sha256HexError};

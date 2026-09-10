@@ -1107,7 +1107,16 @@ subcommand answers with the one bounded JSON line of
 `agent_vm_pf_helper_protocol::PfHelperProtocolDoc`, running neither tool, and
 the host-side parser accepts exactly the renderer's output — the helper
 reports v1 today, and v2 will mean the whole of the locked-profile boundary,
-policy file included). *Guest:* the agent VM, and —
+policy file included. Its `preflight` subcommand reports the host-local PF
+facts an install is conditional on as `PfHelperPreflightDoc`, read by the
+same `pf_preflight` whose `require_clean` is the install's first phase.
+`install` itself is phased — `PfInstallPhase`: precheck, resolve, syntax
+check, load, readback, re-resolve — and proves the loaded anchor is exactly
+the intent by parsing `pfctl -sr` with `writ-core`'s `pf_readback` grammar
+(rendered per port as pfctl normalises it; pinned to the real pfctl by an
+ignored macOS-only test) and resolving the interfaces again after the load;
+a failure names its phase and whether the anchor may be loaded, and success
+prints `PfHelperInstallReportDoc`). *Guest:* the agent VM, and —
 under `BrokerPlacement::Vm` — a dedicated broker VM running `writd broker` on a
 shared `--internal` network.
 

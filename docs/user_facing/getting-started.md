@@ -245,7 +245,15 @@ Before that block does anything useful you need four things on disk:
    and `pass` there sends matching packets past every filter rule,
    including the session anchor. Such rules are common in local
    port-forwarding recipes; drop the `pass` and add an ordinary filter
-   `pass` rule instead, then reload.
+   `pass` rule instead, then reload. You can ask for these three facts
+   without starting anything: `sudo writ-agent-vm-pf-helper preflight`
+   prints them as one JSON line and runs only `pfctl` status queries.
+   Every install also reads the session anchor back after loading it
+   and refuses the session unless the readback is exactly the intended
+   ruleset (and, for the post-start IPv6 deny, unless the agent's bridge
+   and members resolve to the same names after the load as before); the
+   error names the phase that failed and whether the anchor may have
+   been loaded.
 2. **`image`** — `writ-agent-vm-guest:latest` is just a tag. Apple's
    `container` won't find it until you build the guest image (e.g.
    `nix build .#agent-vm-guest-image-aarch64-linux`) and load the

@@ -498,7 +498,7 @@ impl AgentNetworkPool {
 }
 
 impl IpFamily {
-    fn pf_name(self) -> &'static str {
+    pub(crate) fn pf_name(self) -> &'static str {
         match self {
             Self::Inet => "inet",
             Self::Inet6 => "inet6",
