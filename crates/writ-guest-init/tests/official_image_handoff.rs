@@ -103,12 +103,15 @@ impl Runtime {
     }
 
     /// Runtime-specific `run` flags. Docker masks `/proc/sys` read-only by
-    /// default, which would fail the IPv6 sysctl steps for a reason unrelated
-    /// to the image, so it is asked for unconfined system paths (the test's
-    /// container is not the thing being confined); it also gets no network,
-    /// which leaves `lo` and the sysctl tree as the handoff needs them. The
-    /// Apple runtime is left on its default network so the handoff runs
-    /// against real vmnet router advertisements.
+    /// default, and its default AppArmor profile separately denies writes
+    /// under `/proc/sys/net` (`deny @{PROC}/sys/[^k]** w`), either of which
+    /// would fail the IPv6 sysctl steps for a reason unrelated to the image;
+    /// so it is asked for unconfined system paths and no AppArmor profile (the
+    /// test's container is not the thing being confined, and the capability
+    /// set stays exactly the locked profile). It also gets no network, which
+    /// leaves `lo` and the sysctl tree as the handoff needs them. The Apple
+    /// runtime is left on its default network so the handoff runs against
+    /// real vmnet router advertisements.
     fn run_flags(self) -> Vec<&'static str> {
         match self {
             Self::Docker => vec![
@@ -116,6 +119,8 @@ impl Runtime {
                 "none",
                 "--security-opt",
                 "systempaths=unconfined",
+                "--security-opt",
+                "apparmor=unconfined",
             ],
             Self::AppleContainer => vec![],
         }
