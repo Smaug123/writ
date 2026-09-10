@@ -1106,10 +1106,15 @@ a root PF helper (`writ-agent-vm-pf-helper`, pins `/sbin/pfctl` +
 subcommand answers with the one bounded JSON line of
 `agent_vm_pf_helper_protocol::PfHelperProtocolDoc`, running neither tool, and
 the host-side parser accepts exactly the renderer's output — the helper
-reports v1 today, and v2 will mean the whole of the locked-profile boundary,
-policy file included. Its `preflight` subcommand reports the host-local PF
-facts an install is conditional on as `PfHelperPreflightDoc`, read by the
-same `pf_preflight` whose `require_clean` is the install's first phase.
+reports v2, which names the whole of the locked-profile boundary. Its pools
+and broker-port range come from the root-owned policy file
+`/etc/writ/agent-vm-pf-policy.json` (`agent_vm_pf_helper_policy`: loaded
+through the opened descriptor, refused unless a regular file owned by root,
+unwritable by others, in a directory with the same properties), never from
+the caller, so the unprivileged daemon passes only a session's own facts. Its
+`preflight` subcommand reports that policy and the host-local PF facts an
+install is conditional on as `PfHelperPreflightDoc`, read by the same
+`pf_preflight` whose `require_clean` is the install's first phase.
 `install` itself is phased — `PfInstallPhase`: precheck, resolve, syntax
 check, load, readback, re-resolve — and proves the loaded anchor is exactly
 the intent by parsing `pfctl -sr` with `writ-core`'s `pf_readback` grammar

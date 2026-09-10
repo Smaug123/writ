@@ -443,9 +443,18 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
   caller-controlled executable path (shipped);
 - the helper accepts structured session facts, never PF text (shipped);
 - it derives the interfaces itself from the pool-validated gateway (shipped);
-- pools, allowed ports, and admitted interface policy come from a fixed,
-  root-owned, non-symlink, non-group/world-writable policy file (not shipped;
-  today they are validated CLI arguments);
+- pools and allowed ports come from a fixed, root-owned, non-symlink,
+  non-group/world-writable policy file, `/etc/writ/agent-vm-pf-policy.json`
+  (shipped: `agent_vm_pf_helper_policy` loads it through the opened
+  descriptor — regular file, required owner, no group/world write bit, in a
+  directory with the same properties, bounded size — and `install`, `remove`,
+  and `preflight` all refuse without it; the v1 arguments that carried the
+  bounds are rejected as unknown, so an older daemon fails closed). The
+  admitted interface policy is deliberately *not* in the file: which host
+  interfaces the IPv6 deny may scope to stays compiled into the discovery
+  (`bridgeN` carrying the session gateway, with `vmenetN` members), because a
+  fixed rule is stronger than a configurable one and there is no second
+  interface shape to admit;
 - it syntax-checks, atomically loads, parses exact readback, and re-resolves
   after the load (shipped: `install_session_firewall` runs precheck, resolve,
   `pfctl -n`, load, `pfctl -sr` readback, re-resolve, in that order and never
@@ -458,13 +467,14 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
   the two resolutions fail in `reresolve`; every failure names its phase and
   whether the anchor may be loaded);
 - it answers `protocol-version` with one bounded JSON object (shipped: the
-  helper reports version 1, and the host-side parser accepts exactly the
+  helper reports version 2, which names this whole boundary — policy file,
+  exact readback, re-resolve — and the host-side parser accepts exactly the
   helper's rendering, refusing trailing data, a second object, or another
-  protocol name; the number moves to 2 only when the policy file above has
-  landed as well, so "v2" names that whole boundary); it answers `preflight`
-  with the host-local facts every install is conditional on — PF enabled,
-  where `anchor "writ/session/*"` sits, every `pass` translation rule loaded —
-  read by the same function whose verdict gates the install, so the report the
+  protocol name; a helper reporting 1 is one that still took its bounds from
+  the caller); it answers `preflight` with the policy it loaded and the
+  host-local facts every install is conditional on — PF enabled, where
+  `anchor "writ/session/*"` sits, every `pass` translation rule loaded — read
+  by the same function whose verdict gates the install, so the report the
   daemon reads and the check that guards the load cannot disagree (shipped);
   and a successful `install` returns bounded versioned JSON naming the anchor
   whose readback matched, the interfaces it was resolved to, and the last

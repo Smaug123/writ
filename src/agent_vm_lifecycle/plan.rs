@@ -359,16 +359,17 @@ impl AgentVmSessionPlan {
     /// The pre-start install passes `false` (the bridge does not exist yet).
     /// Re-loading the same anchor replaces its rules atomically, so the second
     /// install renders v4 rules + the v6 deny.
+    ///
+    /// The pools and the broker-port range are *not* passed: the helper takes
+    /// those bounds from its root-owned policy file (protocol v2), so this
+    /// unprivileged caller cannot widen them. It passes only the session's own
+    /// facts, which the helper validates against that file.
     fn firewall_install_invocation(&self, deny_guest_ipv6: bool) -> ProcessInvocation {
         let mut args = vec![
             self.tools.pf_helper.as_os_str().to_os_string(),
             OsString::from("install"),
             OsString::from("--session-id"),
             OsString::from(self.session_id.to_string()),
-            OsString::from("--ipv4-pool"),
-            OsString::from(self.pool.ipv4_base().to_string()),
-            OsString::from("--ipv6-pool"),
-            OsString::from(self.pool.ipv6_base().to_string()),
             OsString::from("--ipv4-cidr"),
             OsString::from(self.network.ipv4().to_string()),
         ];
@@ -386,12 +387,6 @@ impl AgentVmSessionPlan {
             args.push(OsString::from("--broker-port"));
             args.push(OsString::from(port.get().to_string()));
         }
-        args.extend([
-            OsString::from("--broker-port-min"),
-            OsString::from(self.broker_port_range.min().get().to_string()),
-            OsString::from("--broker-port-max"),
-            OsString::from(self.broker_port_range.max().get().to_string()),
-        ]);
         if deny_guest_ipv6 {
             args.push(OsString::from("--deny-guest-ipv6"));
         }
