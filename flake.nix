@@ -528,7 +528,13 @@
             ${guestRootfsScan}
             ${lib.optionalString includeProofTools proofToolCheck}
             ${lib.optionalString (!includeProofTools) productionForbiddenBinCheck}
-            ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
+            # skopeo directly, not the image's `copy-to` wrapper: its
+            # `oci-archive:` destination stages layers under `/var/tmp` (it does
+            # not consult `TMPDIR`), which exists on a Darwin builder but not in
+            # the Linux Nix sandbox, so it is pointed at the sandbox's scratch
+            # directory explicitly. The broker image below does the same.
+            ${nix2containerPkgs.skopeo-nix2container}/bin/skopeo --insecure-policy --tmpdir "$TMPDIR" \
+              copy nix:${image} oci-archive:$out:${imageName}:latest
           '';
 
       # The broker VM image (broker_placement = vm). It runs `writd broker`
@@ -662,7 +668,8 @@
           ''
             ${brokerRequiredBinCheck}
             ${brokerRequiredEtcCheck}
-            ${image.copyTo}/bin/copy-to oci-archive:$out:${imageName}:latest
+            ${nix2containerPkgs.skopeo-nix2container}/bin/skopeo --insecure-policy --tmpdir "$TMPDIR" \
+              copy nix:${image} oci-archive:$out:${imageName}:latest
           '';
     in
     flake-utils.lib.eachDefaultSystem (system:
