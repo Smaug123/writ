@@ -33,7 +33,32 @@ log() {
 
 die() {
   printf '[prove-lifecycle] error: %s\n' "$*" >&2
+  dump_pf_diagnostics
   exit 1
+}
+
+# On failure, before anything is torn down: what PF did with the session's
+# frames. The per-rule counters say which rule of the anchor decided each
+# packet and on which interface; the states say what `keep state` created.
+# Best effort, so a failure before the anchor or VM exists prints nothing.
+dump_pf_diagnostics() {
+  if [[ -z "${PF_ANCHOR:-}" ]]; then
+    return
+  fi
+  printf '[prove-lifecycle] diagnostics: pfctl -a %s -vvsr\n' "$PF_ANCHOR" >&2
+  sudo pfctl -a "$PF_ANCHOR" -vvsr >&2 2>/dev/null || true
+  printf '[prove-lifecycle] diagnostics: pfctl -vss (session subnet only)\n' >&2
+  sudo pfctl -vss 2>/dev/null | grep -B1 -A3 -F "${IPV4_CIDR%.0/24}." >&2 || true
+  printf '[prove-lifecycle] diagnostics: pfctl -s info\n' >&2
+  sudo pfctl -s info >&2 2>/dev/null || true
+  printf '[prove-lifecycle] diagnostics: pfctl -s Interfaces -v (bridge and vmenet)\n' >&2
+  sudo pfctl -s Interfaces -v 2>/dev/null | grep -A8 -E '^(bridge|vmenet)' >&2 || true
+  printf '[prove-lifecycle] diagnostics: ifconfig (bridge and vmenet)\n' >&2
+  ifconfig 2>/dev/null | grep -A12 -E '^(bridge|vmenet)[0-9]+:' >&2 || true
+  if [[ -n "${VM_NAME:-}" ]]; then
+    printf '[prove-lifecycle] diagnostics: guest ip addr / route / neigh\n' >&2
+    container exec "$VM_NAME" sh -lc 'ip -4 addr; ip -4 route; ip neigh' >&2 2>/dev/null || true
+  fi
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
