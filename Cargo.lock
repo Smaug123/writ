@@ -3024,8 +3024,10 @@ dependencies = [
 name = "writ-guest-init"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "proptest",
  "thiserror",
+ "writ-core",
 ]
 
 [[package]]

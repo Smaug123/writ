@@ -3,14 +3,30 @@ name = "writ-guest-init"
 version = "0.1.0"
 edition = "2024"
 
-# The guest-side one-way handoff, as data: what the initializer that will run
-# as PID 1 inside the agent VM must do before it releases the workload, and
-# what the host is entitled to expect afterwards. This crate is pure. It has no
-# host dependency and performs no effect; the binary that interprets these
-# plans (Linux-only) lands separately. See
+# The guest-side one-way handoff. The library is pure: it describes what the
+# initializer that will run as PID 1 inside the agent VM must do before it
+# releases the workload, and what the host is entitled to expect afterwards. It
+# has no host dependency and performs no effect. The interpreter that carries
+# the plan out — the `writ-agent-vm-guest-init` binary below — is Linux-only
+# and is the one effectful edge; it depends on `libc` only on Linux, and on
+# every other target it is a stub that refuses to run. See
 # docs/design/ipv4-only-network-confinement.md, "Enforcement layer 2".
 [dependencies]
 thiserror = "2"
 
+# The interpreter's syscalls. Linux-only: the binary's real body is
+# `#[cfg(target_os = "linux")]`, and no other target references libc, so a
+# macOS host build neither pulls it nor compiles the effectful code.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 proptest = "1"
+# Test-only: the integration test spawns `unshare` through the workspace's
+# retrying spawn primitive, as the spawn-hygiene guard requires of every
+# spawn. A dev-dependency, so the pure library never gains it.
+writ-core = { path = "../writ-core" }
+
+[[bin]]
+name = "writ-agent-vm-guest-init"
+path = "src/bin/writ-agent-vm-guest-init.rs"

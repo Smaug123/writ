@@ -1147,12 +1147,26 @@ crate, `crates/writ-guest-init` (no host deps): the `container run`
 capability profile and its exact parser (`capability_argv`), the ordered
 `HandoffStep` plan with `simulate`, a reference model of the Linux privilege
 rules that accepts a plan iff every step could succeed and it ends, once, in
-a verification that finds the locked state (`handoff`), and the
+a verification that finds the locked state (`handoff`), the
 `/proc/<pid>/status` acceptance types (`proc_status`): `LockedAwaitingRelease`,
-which the host checks before release while PID 1 is parked in `sigwait` with
-`SIGUSR1` blocked, and `LockedReleased`, which the Linux CI oracle checks of
-the `exec`ed workload, where `SIGUSR1` must be unblocked. The Linux-only interpreter that performs the
-plan is not yet built; see `ipv4-only-network-confinement.md`, layer 2.
+which the host checks before release while PID 1 is parked in the release wait
+with `SIGUSR1` blocked, and `LockedReleased`, checked of the `exec`ed workload,
+where `SIGUSR1` must be unblocked, and the versioned, single-line, byte-bounded
+record PID 1 writes to stdout — `SecurityReady` (gates release) or
+`HandoffFailed` — as the `record` module's `GuestInitRecord` ABI. The Linux-only
+interpreter that performs the plan is the `writ-agent-vm-guest-init` binary
+(`src/bin/`, with a macOS stub so the library stays pure): it blocks `SIGUSR1`
+first (arming the wait for the whole handoff), enumerates interfaces from
+`/proc/net/dev`, walks the plan as real syscalls, verifies no IPv6 address *or
+live route* survives, emits the ready record, waits for `SIGUSR1` via a
+`signalfd` (which — unlike `sigwait` — leaves the signal visibly blocked in
+`/proc/self/status`, the state the host's release gate requires), unblocks
+`SIGUSR1`, and `exec`s the workload; any step's failure emits one `HandoffFailed`
+record and never starts the workload. `tests/interpreter_handoff.rs` runs it in
+an unprivileged user namespace against both acceptance types, `#[ignore]`d
+because a GitHub runner's locked mounts block the namespace, so it runs on
+demand and the runtime evidence comes from B3's image test and E3's proof. See
+`ipv4-only-network-confinement.md`, layer 2.
 `AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`
 (`agent_vm_lifecycle/state_store.rs`); the start-step state machine
@@ -2055,7 +2069,7 @@ rationale in a dated `docs/plans/` slice and update §5 here.
 |---|---|---|
 | [`broker.md`](./broker.md) | The original "why this shape": capability model, why-a-DU, the audit rationale, XDG path conventions. | §1, §4, §5.1–5.4 (its file layout and 4-table schema are stale). |
 | [`apple-container-agent-vm.md`](./apple-container-agent-vm.md) | Empirical VM-isolation findings, PF strategy, the no-egress proof spikes, the Nix-in-VM reasoning. | §5.5, §5.6. |
-| [`ipv4-only-network-confinement.md`](./ipv4-only-network-confinement.md) | The IPv6-confinement security argument: why the deny is interface-scoped, the unbuilt guest handoff and broker-ingress layers behind `ipv4_only_locked_v1`, and the evidence protocol for proving any of it. Not a journal: it is the target state, with layer 1 described as shipped. | §5.5 for what exists; the plan is `docs/plans/2026-09-01-ipv4-only-locked-v1.md`. |
+| [`ipv4-only-network-confinement.md`](./ipv4-only-network-confinement.md) | The IPv6-confinement security argument: why the deny is interface-scoped, the guest handoff (its guest-side interpreter is now built; the host release path is not) and broker-ingress layers behind `ipv4_only_locked_v1`, and the evidence protocol for proving any of it. Not a journal: it is the target state, with layer 1 described as shipped. | §5.5 for what exists; the plan is `docs/plans/2026-09-01-ipv4-only-locked-v1.md`. |
 | [`vm-mediated-push.md`](./vm-mediated-push.md) | The trust-boundary argument and ancestry-validation reasoning behind the push pipeline. | §5.7. |
 | [`approve_state_machine.md`](./approve_state_machine.md) | The approve/reject state model and boot-reconcile design (schema "v5" is a snapshot). | §5.4, §5.7. |
 | [`approve-crash-injection-harness.md`](./approve-crash-injection-harness.md) | The deterministic crash-injection test design (fake GitHub, fake origin, crash points). | Still current as a *test* design; not superseded. |
