@@ -161,12 +161,13 @@ not rediscovered. None reopens the bypass #288 closed.
 - **`return` versus `drop`.** `return` answers the guest with a reset or
   unreachable, which is a covert channel of one bit per probe and a faster
   failure for legitimate misconfiguration. Not a containment difference.
-- **No readback, no post-load re-resolve.** The helper resolves the interface
-  once, before loading. The target boundary resolves again immediately after
-  the load and parses `pfctl -sr` back to prove the loaded anchor is exactly
-  the intended one. Both are required before `ipv4_only_locked_v1` admits,
-  because vm placement's quarantine-then-replace sequence (below) has no
-  meaning without an exact readback.
+- **Readback and post-load re-resolve: closed.** The helper now parses
+  `pfctl -sr` back after every load and requires it to equal the intended
+  ruleset exactly, and resolves the interfaces again after the load and
+  requires the same names (see the privileged-helper boundary below). Both
+  were required before `ipv4_only_locked_v1` admits, because vm placement's
+  quarantine-then-replace sequence (below) has no meaning without an exact
+  readback.
 - **The IPv4 rules are source-scoped, not interface-scoped.** The shipped
   anchor is `pass in quick inet proto tcp from <agent /24> to <broker> port
   $broker_ports` and `block return in quick inet from <agent /24> to any`. A
@@ -446,15 +447,30 @@ of service. The helper's boundary is therefore narrow, and partly shipped:
   root-owned, non-symlink, non-group/world-writable policy file (not shipped;
   today they are validated CLI arguments);
 - it syntax-checks, atomically loads, parses exact readback, and re-resolves
-  after the load (not shipped);
+  after the load (shipped: `install_session_firewall` runs precheck, resolve,
+  `pfctl -n`, load, `pfctl -sr` readback, re-resolve, in that order and never
+  a flush; the readback is parsed by the grammar in `writ-core`'s
+  `pf_readback`, which renders a ruleset exactly as pfctl prints it back —
+  macro expanded per port, `flags S/SA` made explicit — and is pinned to the
+  real pfctl by an ignored macOS-only test over generated rulesets; any
+  missing, extra, reordered, or differently-scoped rule, or an unparseable
+  dump, fails in the `readback` phase, and interface names that differ between
+  the two resolutions fail in `reresolve`; every failure names its phase and
+  whether the anchor may be loaded);
 - it answers `protocol-version` with one bounded JSON object (shipped: the
   helper reports version 1, and the host-side parser accepts exactly the
   helper's rendering, refusing trailing data, a second object, or another
-  protocol name; the number moves to 2 only when the policy file, exact
-  readback, and re-resolve above have all landed, so "v2" names that whole
-  boundary), and returns bounded versioned JSON describing anchor, interfaces,
-  and firewall phase (not shipped; the daemon's `ipv4_only_locked_v1` admission
-  depends on the probe).
+  protocol name; the number moves to 2 only when the policy file above has
+  landed as well, so "v2" names that whole boundary); it answers `preflight`
+  with the host-local facts every install is conditional on — PF enabled,
+  where `anchor "writ/session/*"` sits, every `pass` translation rule loaded —
+  read by the same function whose verdict gates the install, so the report the
+  daemon reads and the check that guards the load cannot disagree (shipped);
+  and a successful `install` returns bounded versioned JSON naming the anchor
+  whose readback matched, the interfaces it was resolved to, and the last
+  phase completed (shipped; the daemon's `ipv4_only_locked_v1` admission
+  depends on the probe and the preflight report, and its locked start path on
+  the install report).
 
 Tests inject a fake `pfctl` path into the unprivileged Rust library, not into
 the production privileged CLI.

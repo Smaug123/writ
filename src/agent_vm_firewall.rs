@@ -18,8 +18,8 @@ use crate::agent_vm_lifecycle::{
 };
 use crate::core::{
     AgentFirewallNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts,
-    Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfRuleset, SessionId, render_pf,
-    session_firewall_pf_ruleset,
+    Ipv4Cidr, Ipv6Cidr, PfAnchorName, PfInterface, PfReadbackParseError, PfRuleset, SessionId,
+    parse_pf_readback, render_pf, render_pf_readback, session_firewall_pf_ruleset,
 };
 use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome};
 
@@ -105,10 +105,164 @@ pub fn discover_session_bridge_interfaces(
 
 pub const SESSION_BOOTSTRAP_ANCHOR: &str = r#"anchor "writ/session/*""#;
 
+/// The executables the helper runs. Production pins `/sbin/pfctl` and
+/// `/sbin/ifconfig` in the privileged binary; tests inject recorders here, at
+/// the unprivileged library, never through the CLI.
+#[derive(Copy, Clone, Debug)]
+pub struct SessionFirewallTools<'a> {
+    pub pfctl: &'a Path,
+    pub ifconfig: &'a Path,
+}
+
+/// Ask the helper to discover the agent VM's bridge and members from the
+/// session gateway and deny all IPv6 on them (the `Ipv4OnlyNoGuestIpv6`
+/// backstop). `min_members` is how many `vmenet` members the bridge must have
+/// attached before discovery counts as complete: one for host placement (the
+/// agent's), two for vm placement (the broker's and the agent's).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct DenyGuestIpv6 {
+    pub min_members: usize,
+}
+
+/// A session firewall request validated against the broker's bounds but not
+/// yet resolved to interfaces: what the helper knows before it has run
+/// anything. [`install_session_firewall`] resolves it (when
+/// `deny_guest_ipv6` asks for that) and loads the result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionFirewallSpec {
+    session_id: SessionId,
+    network: AgentFirewallNetwork,
+    broker_ports: BrokerPorts,
+    broker_ipv4_host: Option<Ipv4Addr>,
+    deny_guest_ipv6: Option<DenyGuestIpv6>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionFirewallInstall {
     network: AgentFirewallNetwork,
     ruleset: PfRuleset,
+}
+
+/// What a successful install proved: the anchor whose readback matched the
+/// intended ruleset exactly, and the interfaces the IPv6 deny was resolved to
+/// (empty for the pre-attach install) and re-resolved to after the load.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionFirewallReport {
+    session_id: SessionId,
+    interfaces: Vec<PfInterface>,
+}
+
+impl SessionFirewallReport {
+    pub fn new(session_id: SessionId, interfaces: Vec<PfInterface>) -> Self {
+        Self {
+            session_id,
+            interfaces,
+        }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn anchor(&self) -> PfAnchorName {
+        PfAnchorName::for_session(self.session_id)
+    }
+
+    pub fn interfaces(&self) -> &[PfInterface] {
+        &self.interfaces
+    }
+}
+
+/// The phases of [`install_session_firewall`], in order. An error names the
+/// phase it happened in, because the phases after `Load` fail with the anchor
+/// already loaded: the daemon must then treat the session as unreleasable
+/// (it is fail-closed on any helper error) and tear the anchor down.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PfInstallPhase {
+    /// PF enabled, session anchor first, no `pass` translation rules.
+    Precheck,
+    /// The bridge and members resolved from the session gateway.
+    Resolve,
+    /// `pfctl -n -f` over the rendered rules.
+    SyntaxCheck,
+    /// `pfctl -a <anchor> -f`.
+    Load,
+    /// `pfctl -a <anchor> -sr`, parsed and compared with the intent.
+    Readback,
+    /// The interfaces resolved again and compared with `Resolve`'s.
+    Reresolve,
+}
+
+impl PfInstallPhase {
+    /// Every phase, in execution order.
+    pub const ALL: [Self; 6] = [
+        Self::Precheck,
+        Self::Resolve,
+        Self::SyntaxCheck,
+        Self::Load,
+        Self::Readback,
+        Self::Reresolve,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Precheck => "precheck",
+            Self::Resolve => "resolve",
+            Self::SyntaxCheck => "syntax_check",
+            Self::Load => "load",
+            Self::Readback => "readback",
+            Self::Reresolve => "reresolve",
+        }
+    }
+
+    /// Whether a failure in this phase leaves the session anchor possibly
+    /// loaded. `Load` itself counts: a load that reports failure may still
+    /// have replaced the anchor's rules.
+    pub fn anchor_may_be_loaded(self) -> bool {
+        match self {
+            Self::Precheck | Self::Resolve | Self::SyntaxCheck => false,
+            Self::Load | Self::Readback | Self::Reresolve => true,
+        }
+    }
+}
+
+impl std::fmt::Display for PfInstallPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PfInstallFailure {
+    #[error(transparent)]
+    Pfctl(#[from] PfctlError),
+    #[error(transparent)]
+    Discovery(#[from] BridgeDiscoveryError),
+    /// The session's interfaces resolved to different names after the load
+    /// than before it, so the loaded interface rules may name the wrong ones.
+    #[error(
+        "session interfaces changed between resolution and re-resolution after the load: \
+         before {before:?}, after {after:?}"
+    )]
+    InterfacesChanged {
+        before: Vec<String>,
+        after: Vec<String>,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "session firewall install failed in phase {phase} ({}): {source}",
+    if phase.anchor_may_be_loaded() {
+        "the session anchor may be loaded"
+    } else {
+        "nothing was loaded"
+    }
+)]
+pub struct SessionFirewallInstallError {
+    pub phase: PfInstallPhase,
+    #[source]
+    pub source: PfInstallFailure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +328,124 @@ pub enum PfctlError {
     PfDisabled,
     #[error("PF session anchor {anchor} still contains rules after removal: {rules}")]
     SessionAnchorNotEmpty { anchor: String, rules: String },
+    /// The anchor read back after the load contains something the readback
+    /// grammar does not know, so what PF loaded cannot be proven.
+    #[error("PF session anchor {anchor} read back unparseably after the load: {source}")]
+    ReadbackUnparseable {
+        anchor: String,
+        #[source]
+        source: PfReadbackParseError,
+    },
+    /// The anchor read back after the load is not the intended ruleset.
+    #[error(
+        "PF session anchor {anchor} read back differently from the intended ruleset after \
+         the load; expected:\n{expected}actual:\n{actual}"
+    )]
+    ReadbackMismatch {
+        anchor: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+/// Validate the session facts every install shares against the broker's
+/// bounds: ports inside the range, subnets inside the pool, and any broker
+/// host override inside the IPv4 subnet of an IPv4-only scope.
+fn claim_session_network(
+    pool: AgentNetworkPool,
+    ipv4: Ipv4Cidr,
+    ipv6: Option<Ipv6Cidr>,
+    broker_ports: &BrokerPorts,
+    broker_port_range: BrokerPortRange,
+    broker_ipv4_host: Option<Ipv4Addr>,
+) -> Result<AgentFirewallNetwork, AgentVmConfigError> {
+    broker_port_range.require_contains(broker_ports)?;
+    let network = pool.claim_firewall(ipv4, ipv6)?;
+    if let Some(broker_host) = broker_ipv4_host {
+        // The override whitelists this address on the broker ports before the
+        // blanket deny, so it must be inside the session subnet — otherwise a
+        // bad inspect result or manual invocation could open a non-broker
+        // host. And it must be an IPv4-only scope: a dual-stack scope would
+        // still allow the agent to the host IPv6 gateway.
+        if !network.ipv4().contains_addr(broker_host) {
+            return Err(AgentVmConfigError::BrokerHostOutsideSubnet {
+                broker_host,
+                subnet: network.ipv4(),
+            });
+        }
+        if network.ipv6().is_some() {
+            return Err(AgentVmConfigError::BrokerHostWithIpv6FirewallScope);
+        }
+    }
+    Ok(network)
+}
+
+impl SessionFirewallSpec {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: SessionId,
+        pool: AgentNetworkPool,
+        ipv4: Ipv4Cidr,
+        ipv6: Option<Ipv6Cidr>,
+        broker_ports: BrokerPorts,
+        broker_port_range: BrokerPortRange,
+        broker_ipv4_host: Option<Ipv4Addr>,
+        deny_guest_ipv6: Option<DenyGuestIpv6>,
+    ) -> Result<Self, AgentVmConfigError> {
+        let network = claim_session_network(
+            pool,
+            ipv4,
+            ipv6,
+            &broker_ports,
+            broker_port_range,
+            broker_ipv4_host,
+        )?;
+        // The interface deny blocks *all* IPv6 on the agent's bridge, which
+        // would contradict a dual-stack scope's IPv6 allow (see
+        // `SessionFirewallInstall::new`); refuse before anything is resolved.
+        if deny_guest_ipv6.is_some() && network.ipv6().is_some() {
+            return Err(AgentVmConfigError::Ipv6DenyInterfaceWithIpv6Scope);
+        }
+        Ok(Self {
+            session_id,
+            network,
+            broker_ports,
+            broker_ipv4_host,
+            deny_guest_ipv6,
+        })
+    }
+
+    pub fn network(&self) -> AgentFirewallNetwork {
+        self.network
+    }
+
+    pub fn anchor(&self) -> PfAnchorName {
+        PfAnchorName::for_session(self.session_id)
+    }
+
+    pub fn deny_guest_ipv6(&self) -> Option<DenyGuestIpv6> {
+        self.deny_guest_ipv6
+    }
+
+    /// The install this spec becomes once its interfaces are known: empty
+    /// when no deny was asked for, the discovered set otherwise.
+    fn resolved(&self, ipv6_deny_interfaces: &[PfInterface]) -> SessionFirewallInstall {
+        debug_assert_eq!(
+            self.deny_guest_ipv6.is_some(),
+            !ipv6_deny_interfaces.is_empty(),
+            "interfaces are resolved exactly when the deny was asked for",
+        );
+        SessionFirewallInstall {
+            network: self.network,
+            ruleset: session_firewall_pf_ruleset(
+                self.session_id,
+                self.network,
+                &self.broker_ports,
+                self.broker_ipv4_host,
+                ipv6_deny_interfaces,
+            ),
+        }
+    }
 }
 
 impl SessionFirewallInstall {
@@ -188,24 +460,14 @@ impl SessionFirewallInstall {
         broker_ipv4_host: Option<Ipv4Addr>,
         ipv6_deny_interfaces: Vec<PfInterface>,
     ) -> Result<Self, AgentVmConfigError> {
-        broker_port_range.require_contains(&broker_ports)?;
-        let network = pool.claim_firewall(ipv4, ipv6)?;
-        if let Some(broker_host) = broker_ipv4_host {
-            // The override whitelists this address on the broker ports before the
-            // blanket deny, so it must be inside the session subnet — otherwise a
-            // bad inspect result or manual invocation could open a non-broker
-            // host. And it must be an IPv4-only scope: a dual-stack scope would
-            // still allow the agent to the host IPv6 gateway.
-            if !network.ipv4().contains_addr(broker_host) {
-                return Err(AgentVmConfigError::BrokerHostOutsideSubnet {
-                    broker_host,
-                    subnet: network.ipv4(),
-                });
-            }
-            if network.ipv6().is_some() {
-                return Err(AgentVmConfigError::BrokerHostWithIpv6FirewallScope);
-            }
-        }
+        let network = claim_session_network(
+            pool,
+            ipv4,
+            ipv6,
+            &broker_ports,
+            broker_port_range,
+            broker_ipv4_host,
+        )?;
         // An interface-scoped IPv6 deny is the `Ipv4OnlyNoGuestIpv6` backstop; it
         // blocks *all* IPv6 on the agent VM's bridge. Pairing it with an IPv6
         // firewall scope (dual-stack) would contradict that scope's IPv6 allow, so
@@ -236,6 +498,11 @@ impl SessionFirewallInstall {
 
     pub fn rendered_rules(&self) -> String {
         render_pf(&self.ruleset)
+    }
+
+    /// `pfctl -a <anchor> -sr`: the loaded anchor as PF prints it.
+    pub fn readback_invocation(&self) -> PfctlInvocation {
+        PfctlInvocation::new(["-a", self.ruleset.anchor().as_str(), "-sr"])
     }
 
     pub fn validate_invocation(&self, rules_file: &Path) -> PfctlInvocation {
@@ -555,20 +822,32 @@ pub fn pf_anchor_has_rules(rules: &str) -> bool {
     rules.chars().any(|c| !c.is_whitespace())
 }
 
-pub fn ensure_pf_enabled(pfctl: &Path) -> Result<(), PfctlError> {
+/// Whether PF reports itself enabled (`pfctl -s info`).
+pub fn pf_enabled(pfctl: &Path) -> Result<bool, PfctlError> {
     let output = PfctlInvocation::new(["-s", "info"]).run(pfctl)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if pf_info_says_enabled(&stdout) {
+    Ok(pf_info_says_enabled(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+pub fn ensure_pf_enabled(pfctl: &Path) -> Result<(), PfctlError> {
+    if pf_enabled(pfctl)? {
         Ok(())
     } else {
         Err(PfctlError::PfDisabled)
     }
 }
 
-pub fn ensure_session_bootstrap_anchor(pfctl: &Path) -> Result<(), PfctlError> {
+/// Where the bootstrap anchor sits in the loaded main ruleset (`pfctl -sr`).
+pub fn loaded_session_anchor_placement(pfctl: &Path) -> Result<SessionAnchorPlacement, PfctlError> {
     let output = PfctlInvocation::new(["-sr"]).run(pfctl)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    match session_anchor_placement(&stdout) {
+    Ok(session_anchor_placement(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+pub fn ensure_session_bootstrap_anchor(pfctl: &Path) -> Result<(), PfctlError> {
+    match loaded_session_anchor_placement(pfctl)? {
         SessionAnchorPlacement::First => Ok(()),
         SessionAnchorPlacement::Preceded(lines) => Err(PfctlError::BootstrapAnchorNotFirst(lines)),
         SessionAnchorPlacement::Absent => {
@@ -577,7 +856,7 @@ pub fn ensure_session_bootstrap_anchor(pfctl: &Path) -> Result<(), PfctlError> {
     }
 }
 
-/// Refuse if any loaded translation rule carries the `pass` modifier.
+/// Every loaded translation rule carrying the `pass` modifier, in order.
 ///
 /// PF runs translation before filtering, and `pass` on a `nat`/`rdr`/`binat`
 /// rule passes matching packets without consulting the filter rules at all,
@@ -585,9 +864,9 @@ pub fn ensure_session_bootstrap_anchor(pfctl: &Path) -> Result<(), PfctlError> {
 /// main ruleset readback shows only the translation *anchor* calls, not what
 /// the anchors hold, so this reads the main translation ruleset and then every
 /// anchor `pfctl -v -sA` lists. Whether a given rule could match an agent VM's
-/// packets is not reasoned about: any `pass` translation rule is refused,
+/// packets is not reasoned about: any `pass` translation rule is reported,
 /// because the operator can always drop the modifier and keep the translation.
-pub fn ensure_no_pass_translation_rules(pfctl: &Path) -> Result<(), PfctlError> {
+pub fn loaded_pass_translation_rules(pfctl: &Path) -> Result<Vec<PassTranslationRule>, PfctlError> {
     let mut found = Vec::new();
     let main = PfctlInvocation::new(["-sn"]).run(pfctl)?;
     found.extend(
@@ -610,11 +889,67 @@ pub fn ensure_no_pass_translation_rules(pfctl: &Path) -> Result<(), PfctlError> 
                 }),
         );
     }
+    Ok(found)
+}
+
+/// Refuse if any loaded translation rule carries the `pass` modifier; see
+/// [`loaded_pass_translation_rules`].
+pub fn ensure_no_pass_translation_rules(pfctl: &Path) -> Result<(), PfctlError> {
+    let found = loaded_pass_translation_rules(pfctl)?;
     if found.is_empty() {
         Ok(())
     } else {
         Err(PfctlError::PassTranslationRules(found))
     }
+}
+
+/// The host-local PF facts every session install is conditional on, read
+/// without loading anything. The helper's `preflight` command reports this
+/// document, and [`install_session_firewall`]'s first phase refuses on
+/// exactly the same facts ([`PfPreflightReport::require_clean`]), so the
+/// report the daemon reads as admission evidence and the check that guards
+/// the load cannot disagree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PfPreflightReport {
+    pub pf_enabled: bool,
+    pub session_anchor: SessionAnchorPlacement,
+    pub pass_translation_rules: Vec<PassTranslationRule>,
+}
+
+impl PfPreflightReport {
+    /// `Ok` iff an install's precheck would pass: PF enabled, the session
+    /// anchor present and first, and no `pass` translation rule loaded.
+    pub fn require_clean(&self) -> Result<(), PfctlError> {
+        if !self.pf_enabled {
+            return Err(PfctlError::PfDisabled);
+        }
+        match &self.session_anchor {
+            SessionAnchorPlacement::First => {}
+            SessionAnchorPlacement::Preceded(lines) => {
+                return Err(PfctlError::BootstrapAnchorNotFirst(lines.clone()));
+            }
+            SessionAnchorPlacement::Absent => {
+                return Err(PfctlError::MissingBootstrapAnchor(SESSION_BOOTSTRAP_ANCHOR));
+            }
+        }
+        if !self.pass_translation_rules.is_empty() {
+            return Err(PfctlError::PassTranslationRules(
+                self.pass_translation_rules.clone(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read the [`PfPreflightReport`]. Only status queries are run (`-s info`,
+/// `-sr`, `-sn`, `-v -sA`, and `-a <anchor> -sn` per listed anchor); nothing
+/// is loaded, flushed, or killed.
+pub fn pf_preflight(pfctl: &Path) -> Result<PfPreflightReport, PfctlError> {
+    Ok(PfPreflightReport {
+        pf_enabled: pf_enabled(pfctl)?,
+        session_anchor: loaded_session_anchor_placement(pfctl)?,
+        pass_translation_rules: loaded_pass_translation_rules(pfctl)?,
+    })
 }
 
 /// Read back the session anchor and fail if it still lists rules. A flush that
@@ -643,18 +978,97 @@ pub fn ensure_session_anchor_empty(pfctl: &Path, anchor: &PfAnchorName) -> Resul
     }
 }
 
-pub fn install_session_firewall(
+/// Read the session anchor back and require it to be exactly the intended
+/// ruleset: every rule present, none extra, none on another interface, in
+/// order. A dump the readback grammar cannot parse is a failure too, because
+/// then what PF loaded is unknown.
+pub fn verify_session_anchor_readback(
     pfctl: &Path,
     install: &SessionFirewallInstall,
 ) -> Result<(), PfctlError> {
-    ensure_pf_enabled(pfctl)?;
-    ensure_session_bootstrap_anchor(pfctl)?;
-    ensure_no_pass_translation_rules(pfctl)?;
-    let rendered_rules = install.rendered_rules();
-    let rules_file = TempRulesFile::create(&rendered_rules)?;
-    install.validate_invocation(rules_file.path()).run(pfctl)?;
-    install.load_invocation(rules_file.path()).run(pfctl)?;
-    Ok(())
+    let anchor = install.ruleset().anchor().as_str().to_string();
+    let output = install.readback_invocation().run(pfctl)?;
+    let actual = String::from_utf8_lossy(&output.stdout);
+    let expected = install.ruleset().readback_rules();
+    let parsed = parse_pf_readback(&actual).map_err(|source| PfctlError::ReadbackUnparseable {
+        anchor: anchor.clone(),
+        source,
+    })?;
+    if parsed == expected {
+        Ok(())
+    } else {
+        Err(PfctlError::ReadbackMismatch {
+            anchor,
+            expected: render_pf_readback(&expected),
+            actual: actual.into_owned(),
+        })
+    }
+}
+
+/// Install one session's firewall, phase by phase ([`PfInstallPhase`]):
+/// precheck the host's PF state, resolve the deny interfaces if asked,
+/// syntax-check the rendered rules, load them into the session anchor, read
+/// the anchor back and require it to equal the intent exactly, and resolve
+/// the interfaces again and require the same names. The rules are held in a
+/// private temporary file for the two `pfctl -f` calls only.
+pub fn install_session_firewall(
+    tools: SessionFirewallTools<'_>,
+    spec: &SessionFirewallSpec,
+) -> Result<SessionFirewallReport, SessionFirewallInstallError> {
+    fn fail<E: Into<PfInstallFailure>>(
+        phase: PfInstallPhase,
+    ) -> impl Fn(E) -> SessionFirewallInstallError {
+        move |source| SessionFirewallInstallError {
+            phase,
+            source: source.into(),
+        }
+    }
+    use PfInstallPhase::*;
+
+    pf_preflight(tools.pfctl)
+        .and_then(|report| report.require_clean())
+        .map_err(fail(Precheck))?;
+
+    let resolve = |phase: PfInstallPhase| -> Result<Vec<PfInterface>, SessionFirewallInstallError> {
+        match spec.deny_guest_ipv6 {
+            Some(deny) => discover_session_bridge_interfaces(
+                tools.ifconfig,
+                spec.network.ipv4_gateway(),
+                deny.min_members,
+            )
+            .map(|discovery| discovery.deny_interfaces())
+            .map_err(fail(phase)),
+            None => Ok(Vec::new()),
+        }
+    };
+    let interfaces = resolve(Resolve)?;
+    let install = spec.resolved(&interfaces);
+
+    let rules_file = TempRulesFile::create(&install.rendered_rules()).map_err(fail(SyntaxCheck))?;
+    install
+        .validate_invocation(rules_file.path())
+        .run(tools.pfctl)
+        .map_err(fail(SyntaxCheck))?;
+    install
+        .load_invocation(rules_file.path())
+        .run(tools.pfctl)
+        .map_err(fail(Load))?;
+    drop(rules_file);
+
+    verify_session_anchor_readback(tools.pfctl, &install).map_err(fail(Readback))?;
+
+    let again = resolve(Reresolve)?;
+    if again != interfaces {
+        return Err(SessionFirewallInstallError {
+            phase: Reresolve,
+            source: PfInstallFailure::InterfacesChanged {
+                before: interfaces.iter().map(ToString::to_string).collect(),
+                after: again.iter().map(ToString::to_string).collect(),
+            },
+        });
+    }
+
+    Ok(SessionFirewallReport::new(spec.session_id, interfaces))
 }
 
 pub fn remove_session_firewall(
@@ -1551,7 +1965,8 @@ mod tests {
                 ("-v -sA", ""),
             ],
         );
-        let install = SessionFirewallInstall::new(
+        let ifconfig = write_fake_ifconfig(dir.path(), "");
+        let spec = SessionFirewallSpec::new(
             session_id(),
             pool(),
             ipv4(),
@@ -1559,12 +1974,23 @@ mod tests {
             ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             None,
-            Vec::new(),
+            None,
         )
         .unwrap();
-        let err = install_session_firewall(&pfctl, &install).unwrap_err();
+        let err = install_session_firewall(
+            SessionFirewallTools {
+                pfctl: &pfctl,
+                ifconfig: &ifconfig,
+            },
+            &spec,
+        )
+        .unwrap_err();
+        assert_eq!(err.phase, PfInstallPhase::Precheck);
         assert!(
-            matches!(err, PfctlError::PassTranslationRules(_)),
+            matches!(
+                err.source,
+                PfInstallFailure::Pfctl(PfctlError::PassTranslationRules(_))
+            ),
             "expected PassTranslationRules, got {err:?}"
         );
         let calls = fake_pfctl_calls(dir.path());
@@ -1572,6 +1998,463 @@ mod tests {
             !calls.iter().any(|c| c.contains("-f ")),
             "session rules must not be loaded after a refused precheck; calls: {calls:?}"
         );
+    }
+
+    /// A fake `pfctl` scripted per invocation, with wildcard patterns: each
+    /// case matches an argument vector that equals `prefix` (or, with
+    /// `wildcard`, starts with it), prints its stdout, and exits with its
+    /// status. Unmatched invocations print nothing and exit 0. Every call is
+    /// logged to `calls.log` beside the script.
+    struct Scripted {
+        prefix: &'static str,
+        wildcard: bool,
+        stdout: String,
+        exit: i32,
+    }
+
+    fn write_scripted_pfctl(dir: &Path, cases: &[Scripted]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("scripted-pfctl");
+        let log = dir.join("calls.log");
+        let mut script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n",
+            log.display()
+        );
+        for case in cases {
+            let pattern = format!(
+                "'{}'{}",
+                case.prefix.replace('\'', r"'\''"),
+                if case.wildcard { "*" } else { "" }
+            );
+            script.push_str(&format!(
+                "  {pattern}) printf '%s' '{}'; exit {};;\n",
+                case.stdout.replace('\'', r"'\''"),
+                case.exit,
+            ));
+        }
+        script.push_str("esac\nexit 0\n");
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// A fake `ifconfig` that answers `first` on its first invocation and
+    /// `later` on every one after, so the two resolutions can disagree.
+    fn write_stateful_ifconfig(dir: &Path, first: &str, later: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("stateful-ifconfig");
+        let counter = dir.join("ifconfig.calls");
+        let script = format!(
+            "#!/bin/sh\nprintf 'x' >> '{counter}'\n\
+             if [ \"$(wc -c < '{counter}' | tr -d ' ')\" = 1 ]; then printf '%s' '{first}'; \
+             else printf '%s' '{later}'; fi\n",
+            counter = counter.display(),
+            first = first.replace('\'', r"'\''"),
+            later = later.replace('\'', r"'\''"),
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    const BRIDGE_100: &str = "bridge100: flags=8863<UP> mtu 1500\n\
+         \tinet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255\n\
+         \tmember: vmenet0 flags=20003<VIRTIO>\n";
+    const BRIDGE_101: &str = "bridge101: flags=8863<UP> mtu 1500\n\
+         \tinet 192.168.252.1 netmask 0xffffff00 broadcast 192.168.252.255\n\
+         \tmember: vmenet1 flags=20003<VIRTIO>\n";
+
+    fn spec(deny_guest_ipv6: Option<DenyGuestIpv6>) -> SessionFirewallSpec {
+        SessionFirewallSpec::new(
+            session_id(),
+            pool(),
+            ipv4(),
+            None,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            None,
+            deny_guest_ipv6,
+        )
+        .unwrap()
+    }
+
+    fn interfaces(names: &[&str]) -> Vec<PfInterface> {
+        names
+            .iter()
+            .map(|name| PfInterface::new(*name).unwrap())
+            .collect()
+    }
+
+    /// What `pfctl -a <anchor> -sr` prints for `spec` resolved to `ifaces`.
+    fn expected_readback(spec: &SessionFirewallSpec, ifaces: &[PfInterface]) -> String {
+        render_pf_readback(&spec.resolved(ifaces).ruleset().readback_rules())
+    }
+
+    /// The precheck answers of a clean host, plus the scripted `-f`/`-sr`
+    /// answers for the session anchor.
+    fn clean_host_with(anchor: &str, readback: &str, extra: Vec<Scripted>) -> Vec<Scripted> {
+        let mut cases = vec![
+            Scripted {
+                prefix: "-s info",
+                wildcard: false,
+                stdout: "Status: Enabled for 0 days 00:00:01\n".into(),
+                exit: 0,
+            },
+            Scripted {
+                prefix: "-sr",
+                wildcard: false,
+                stdout: "anchor \"writ/session/*\" all\nanchor \"com.apple/*\" all\n".into(),
+                exit: 0,
+            },
+            Scripted {
+                prefix: "-sn",
+                wildcard: false,
+                stdout: CLEAN_MAIN_NAT.into(),
+                exit: 0,
+            },
+        ];
+        cases.extend(extra);
+        cases.push(Scripted {
+            prefix: Box::leak(format!("-a {anchor} -sr").into_boxed_str()),
+            wildcard: false,
+            stdout: readback.into(),
+            exit: 0,
+        });
+        cases
+    }
+
+    #[test]
+    fn install_runs_the_phases_in_order_reads_back_and_never_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(Some(DenyGuestIpv6 { min_members: 1 }));
+        let anchor = spec.anchor().as_str().to_string();
+        let ifaces = interfaces(&["bridge100", "vmenet0"]);
+        let pfctl = write_scripted_pfctl(
+            dir.path(),
+            &clean_host_with(&anchor, &expected_readback(&spec, &ifaces), Vec::new()),
+        );
+        let ifconfig = write_stateful_ifconfig(dir.path(), BRIDGE_100, BRIDGE_100);
+
+        let report = install_session_firewall(
+            SessionFirewallTools {
+                pfctl: &pfctl,
+                ifconfig: &ifconfig,
+            },
+            &spec,
+        )
+        .unwrap();
+
+        assert_eq!(report.anchor().as_str(), anchor);
+        assert_eq!(report.interfaces(), ifaces.as_slice());
+        let calls = fake_pfctl_calls(dir.path());
+        // Exactly: the four precheck reads, the syntax check, the load, the
+        // readback. The two `-f` calls name the same private rules file.
+        assert_eq!(calls.len(), 7, "calls: {calls:?}");
+        assert_eq!(&calls[..4], &["-s info", "-sr", "-sn", "-v -sA"]);
+        let syntax_file = calls[4].strip_prefix("-n -f ").expect("syntax check");
+        let load_file = calls[5]
+            .strip_prefix(&format!("-a {anchor} -f "))
+            .expect("load");
+        assert_eq!(syntax_file, load_file);
+        assert_eq!(calls[6], format!("-a {anchor} -sr"));
+        assert!(
+            !calls.iter().any(|c| c.split(' ').any(|arg| arg == "-F")),
+            "install must never flush: {calls:?}"
+        );
+        // The rules file is private to the two `-f` calls and gone afterwards.
+        assert!(!Path::new(load_file).exists());
+        // Resolved before the load and again after it.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ifconfig.calls")).unwrap(),
+            "xx"
+        );
+    }
+
+    #[test]
+    fn the_pre_attach_install_resolves_nothing_and_reads_back_the_ipv4_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(None);
+        let anchor = spec.anchor().as_str().to_string();
+        let pfctl = write_scripted_pfctl(
+            dir.path(),
+            &clean_host_with(&anchor, &expected_readback(&spec, &[]), Vec::new()),
+        );
+        let ifconfig = write_stateful_ifconfig(dir.path(), BRIDGE_100, BRIDGE_100);
+
+        let report = install_session_firewall(
+            SessionFirewallTools {
+                pfctl: &pfctl,
+                ifconfig: &ifconfig,
+            },
+            &spec,
+        )
+        .unwrap();
+
+        assert_eq!(report.interfaces(), &[]);
+        assert!(!dir.path().join("ifconfig.calls").exists());
+    }
+
+    #[test]
+    fn a_readback_that_is_not_the_intent_fails_in_the_readback_phase() {
+        let spec = spec(Some(DenyGuestIpv6 { min_members: 1 }));
+        let anchor = spec.anchor().as_str().to_string();
+        let ifaces = interfaces(&["bridge100", "vmenet0"]);
+        let intended = expected_readback(&spec, &ifaces);
+        let lines: Vec<&str> = intended.lines().collect();
+        let missing_a_rule = format!("{}\n", lines[1..].join("\n"));
+        let extra_rule = format!("{intended}{}\n", lines[0]);
+        let other_interface = intended.replace("bridge100", "bridge101");
+        let reordered = format!("{}\n{}\n", lines[1..].join("\n"), lines[0]);
+        type Verdict = fn(&PfctlError) -> bool;
+        let cases: [(&str, String, Verdict); 6] = [
+            ("missing a rule", missing_a_rule, |e| {
+                matches!(e, PfctlError::ReadbackMismatch { .. })
+            }),
+            ("an extra rule", extra_rule, |e| {
+                matches!(e, PfctlError::ReadbackMismatch { .. })
+            }),
+            ("a rule on another interface", other_interface, |e| {
+                matches!(e, PfctlError::ReadbackMismatch { .. })
+            }),
+            ("rules out of order", reordered, |e| {
+                matches!(e, PfctlError::ReadbackMismatch { .. })
+            }),
+            ("empty", String::new(), |e| {
+                matches!(e, PfctlError::ReadbackMismatch { .. })
+            }),
+            ("unparseable", "block drop out all\n".into(), |e| {
+                matches!(e, PfctlError::ReadbackUnparseable { .. })
+            }),
+        ];
+        for (name, readback, is_expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let pfctl =
+                write_scripted_pfctl(dir.path(), &clean_host_with(&anchor, &readback, Vec::new()));
+            let ifconfig = write_stateful_ifconfig(dir.path(), BRIDGE_100, BRIDGE_100);
+
+            let err = install_session_firewall(
+                SessionFirewallTools {
+                    pfctl: &pfctl,
+                    ifconfig: &ifconfig,
+                },
+                &spec,
+            )
+            .unwrap_err();
+
+            assert_eq!(err.phase, PfInstallPhase::Readback, "{name}: {err}");
+            assert!(err.phase.anchor_may_be_loaded());
+            match &err.source {
+                PfInstallFailure::Pfctl(source) => {
+                    assert!(is_expected(source), "{name}: {source:?}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+            // The re-resolve never ran: the failure is the readback's.
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("ifconfig.calls")).unwrap(),
+                "x",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_interface_that_changes_name_after_the_load_fails_in_the_reresolve_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(Some(DenyGuestIpv6 { min_members: 1 }));
+        let anchor = spec.anchor().as_str().to_string();
+        let ifaces = interfaces(&["bridge100", "vmenet0"]);
+        let pfctl = write_scripted_pfctl(
+            dir.path(),
+            &clean_host_with(&anchor, &expected_readback(&spec, &ifaces), Vec::new()),
+        );
+        let ifconfig = write_stateful_ifconfig(dir.path(), BRIDGE_100, BRIDGE_101);
+
+        let err = install_session_firewall(
+            SessionFirewallTools {
+                pfctl: &pfctl,
+                ifconfig: &ifconfig,
+            },
+            &spec,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.phase, PfInstallPhase::Reresolve, "{err}");
+        match err.source {
+            PfInstallFailure::InterfacesChanged { before, after } => {
+                assert_eq!(before, vec!["bridge100", "vmenet0"]);
+                assert_eq!(after, vec!["bridge101", "vmenet1"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_load_names_the_load_phase_and_skips_the_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(None);
+        let anchor = spec.anchor().as_str().to_string();
+        let pfctl = write_scripted_pfctl(
+            dir.path(),
+            &clean_host_with(
+                &anchor,
+                &expected_readback(&spec, &[]),
+                vec![Scripted {
+                    prefix: Box::leak(format!("-a {anchor} -f ").into_boxed_str()),
+                    wildcard: true,
+                    stdout: String::new(),
+                    exit: 1,
+                }],
+            ),
+        );
+        let ifconfig = write_stateful_ifconfig(dir.path(), BRIDGE_100, BRIDGE_100);
+
+        let err = install_session_firewall(
+            SessionFirewallTools {
+                pfctl: &pfctl,
+                ifconfig: &ifconfig,
+            },
+            &spec,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.phase, PfInstallPhase::Load, "{err}");
+        assert!(err.phase.anchor_may_be_loaded());
+        let calls = fake_pfctl_calls(dir.path());
+        assert!(!calls.iter().any(|c| c == &format!("-a {anchor} -sr")));
+    }
+
+    #[test]
+    fn a_failed_syntax_check_names_its_phase_and_loads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(None);
+        let anchor = spec.anchor().as_str().to_string();
+        let pfctl = write_scripted_pfctl(
+            dir.path(),
+            &clean_host_with(
+                &anchor,
+                &expected_readback(&spec, &[]),
+                vec![Scripted {
+                    prefix: "-n -f ",
+                    wildcard: true,
+                    stdout: String::new(),
+                    exit: 1,
+                }],
+            ),
+        );
+        let ifconfig = write_stateful_ifconfig(dir.path(), BRIDGE_100, BRIDGE_100);
+
+        let err = install_session_firewall(
+            SessionFirewallTools {
+                pfctl: &pfctl,
+                ifconfig: &ifconfig,
+            },
+            &spec,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.phase, PfInstallPhase::SyntaxCheck, "{err}");
+        assert!(!err.phase.anchor_may_be_loaded());
+        let calls = fake_pfctl_calls(dir.path());
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with(&format!("-a {anchor} -f "))),
+            "calls: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_reads_the_facts_install_refuses_on() {
+        // A disabled PF with the anchor appended and a pass translation rule
+        // loaded: every fact reported, and `require_clean` refuses on the
+        // first of them, exactly as the install precheck would.
+        let dir = tempfile::tempdir().unwrap();
+        let pfctl = write_fake_pfctl_responses(
+            dir.path(),
+            &[
+                ("-s info", "Status: Disabled for 0 days 00:00:01\n"),
+                (
+                    "-sr",
+                    "anchor \"com.apple/*\" all\nanchor \"writ/session/*\" all\n",
+                ),
+                (
+                    "-sn",
+                    "rdr pass on lo0 inet proto tcp from any to any port = 80 -> 127.0.0.1 port 8080\n",
+                ),
+                ("-v -sA", ""),
+            ],
+        );
+        let report = pf_preflight(&pfctl).unwrap();
+        assert_eq!(
+            report,
+            PfPreflightReport {
+                pf_enabled: false,
+                session_anchor: SessionAnchorPlacement::Preceded(vec![
+                    "anchor \"com.apple/*\" all".into()
+                ]),
+                pass_translation_rules: vec![PassTranslationRule {
+                    anchor: None,
+                    rule: "rdr pass on lo0 inet proto tcp from any to any port = 80 -> 127.0.0.1 port 8080".into(),
+                }],
+            }
+        );
+        assert!(matches!(
+            report.require_clean(),
+            Err(PfctlError::PfDisabled)
+        ));
+        assert_eq!(
+            fake_pfctl_calls(dir.path()),
+            vec!["-s info", "-sr", "-sn", "-v -sA"]
+        );
+    }
+
+    proptest! {
+        /// `require_clean` is `Ok` iff every fact is clean, and otherwise
+        /// names the first unclean fact in precheck order.
+        #[test]
+        fn require_clean_refuses_exactly_the_unclean_reports(
+            pf_enabled in any::<bool>(),
+            placement in prop_oneof![
+                Just(SessionAnchorPlacement::First),
+                prop::collection::vec("[ -~]{1,30}", 1..3).prop_map(SessionAnchorPlacement::Preceded),
+                Just(SessionAnchorPlacement::Absent),
+            ],
+            rules in prop::collection::vec("[ -~]{1,30}", 0..3),
+        ) {
+            let report = PfPreflightReport {
+                pf_enabled,
+                session_anchor: placement.clone(),
+                pass_translation_rules: rules
+                    .iter()
+                    .map(|rule| PassTranslationRule { anchor: None, rule: rule.clone() })
+                    .collect(),
+            };
+            let verdict = report.require_clean();
+            match (pf_enabled, &placement, rules.is_empty()) {
+                (false, _, _) => prop_assert!(matches!(verdict, Err(PfctlError::PfDisabled))),
+                (true, SessionAnchorPlacement::Absent, _) => {
+                    prop_assert!(matches!(verdict, Err(PfctlError::MissingBootstrapAnchor(_))))
+                }
+                (true, SessionAnchorPlacement::Preceded(lines), _) => match verdict {
+                    Err(PfctlError::BootstrapAnchorNotFirst(reported)) => {
+                        prop_assert_eq!(&reported, lines)
+                    }
+                    other => prop_assert!(false, "{:?}", other),
+                },
+                (true, SessionAnchorPlacement::First, false) => match verdict {
+                    Err(PfctlError::PassTranslationRules(reported)) => {
+                        prop_assert_eq!(reported.len(), rules.len())
+                    }
+                    other => prop_assert!(false, "{:?}", other),
+                },
+                (true, SessionAnchorPlacement::First, true) => prop_assert!(verdict.is_ok()),
+            }
+        }
     }
 
     fn write_fake_ifconfig(dir: &Path, output: &str) -> PathBuf {

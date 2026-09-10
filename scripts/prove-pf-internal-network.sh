@@ -456,7 +456,10 @@ fi
 
 log "validating and loading PF anchor through helper"
 PF_ANCHOR="writ/session/${SESSION_ID}"
-LOADED_PF_ANCHOR="$(sudo "$HELPER" install \
+# The helper prints one JSON install report naming the anchor whose readback
+# matched the intended ruleset, the interfaces the IPv6 deny resolved to, and
+# the last phase completed; require the anchor field to be this session's.
+INSTALL_REPORT="$(sudo "$HELPER" install \
   --session-id "$SESSION_ID" \
   --ipv4-pool "$IPV4_POOL" \
   --ipv6-pool "$IPV6_POOL" \
@@ -465,10 +468,10 @@ LOADED_PF_ANCHOR="$(sudo "$HELPER" install \
   --broker-port "$BROKER_PORT" \
   --broker-port-min "$BROKER_PORT_MIN" \
   --broker-port-max "$BROKER_PORT_MAX")"
-if [[ "$LOADED_PF_ANCHOR" != "$PF_ANCHOR" ]]; then
-  die "helper loaded unexpected PF anchor ${LOADED_PF_ANCHOR}; expected ${PF_ANCHOR}"
+if ! printf '%s' "$INSTALL_REPORT" | grep -Fq "\"anchor\":\"${PF_ANCHOR}\""; then
+  die "helper install report does not name PF anchor ${PF_ANCHOR}: ${INSTALL_REPORT}"
 fi
-log "loaded PF anchor ${PF_ANCHOR}"
+log "loaded and read back PF anchor ${PF_ANCHOR}: ${INSTALL_REPORT}"
 
 log "starting VM ${VM_NAME} on ${NETWORK_NAME}"
 container run --name "$VM_NAME" \
