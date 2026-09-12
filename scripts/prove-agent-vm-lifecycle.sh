@@ -24,6 +24,11 @@ Environment overrides:
   WRIT_PROVE_SUBNET_INDEX  session subnet index, default 252
   WRIT_PROVE_BROKER_PORT_MIN  minimum allowed broker port, default 49152
   WRIT_PROVE_BROKER_PORT_MAX  maximum allowed broker port, default 65535
+  WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1
+                         carry on past a broker-reach failure whose evidence
+                         exactly matches the known macOS vmnet accept() defect
+                         (docs/vmnet-accept-bug-and-broker-vm-plan.md), so the
+                         firewall legs still run; the proof then exits 2
 EOF
 }
 
@@ -431,6 +436,97 @@ pf_iface_deny_packets() {
   printf '%s\n' "$count"
 }
 
+# The packet and state counters of the session anchor's interface-scoped
+# broker `pass` rules, summed over every interface the firewall installed
+# one on, read the same way as pf_iface_deny_packets. Prints "PACKETS STATES".
+# Dies on format drift rather than reading as zero, for the same reason.
+pf_broker_pass_counters() {
+  local rules
+  rules="$(sudo pfctl -a "$PF_ANCHOR" -vsr 2>/dev/null)" \
+    || die "could not read verbose rules for ${PF_ANCHOR}"
+  local counters
+  counters="$(printf '%s\n' "$rules" | awk '
+    /^pass in quick on (bridge|vmenet)[0-9]+ inet proto tcp from / { rule = 1; next }
+    rule && match($0, /Packets: [0-9]+/) {
+      packets += substr($0, RSTART + 9, RLENGTH - 9)
+      if (match($0, /States: [0-9]+/)) { states += substr($0, RSTART + 8, RLENGTH - 8) }
+      matched = 1; rule = 0; next
+    }
+    /^[^ \t[]/ { rule = 0 }
+    END { if (matched) print packets, states }
+  ')"
+  [[ "$counters" =~ ^[0-9]+\ [0-9]+$ ]] \
+    || die "no interface-scoped broker pass rule with counters rendered in pfctl -vsr for ${PF_ANCHOR}"
+  printf '%s\n' "$counters"
+}
+
+# Broker reachability is the proof's positive control: the one connection the
+# anchor must pass. When it fails, the question is whether PF dropped it or
+# whether the bytes cleared PF and were lost above it. This proof's broker is
+# a host process with a blocking accept(), and on some macOS builds a host
+# accept() of a connection that originates from a container over vmnet hands
+# back a socket the kernel considers not connected (recv -> ENOTCONN), so the
+# request is ACKed by the kernel and never seen by the process. That defect is
+# root-caused, reduced to a pure-C repro, and documented in
+# docs/vmnet-accept-bug-and-broker-vm-plan.md; the product sidesteps it with
+# `broker_placement = vm`. It has been rediscovered from this leg's bare
+# timeout more than once, so on failure this assertion checks for its exact
+# signature, all four parts read on the host:
+#   1. the anchor's broker pass rule counted the guest's packets and created a
+#      state (PF passed the connection);
+#   2. no interface-scoped IPv4 deny counted a packet during the probe (PF did
+#      not drop it);
+#   3. the host still holds a PF state for gateway:port <- guest (the
+#      handshake completed on the host);
+#   4. the broker logged the loopback control request but never one from the
+#      guest (the bytes reached the host kernel, not the listening process).
+# All four together name the vmnet accept() defect and exonerate the anchor;
+# anything else is reported as an ordinary failure for a human to read.
+# WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 lets the proof carry on past that
+# exact signature (and only that one), so the firewall legs that follow can
+# still be exercised on an affected host; the final summary then says the
+# positive control was waived, and the proof exits non-zero.
+BROKER_REACH_WAIVED=0
+assert_broker_reachable() {
+  local label="VM can reach broker port through host-only gateway"
+  local deny_before pass_before
+  deny_before="$(pf_iface_deny_packets inet)"
+  pass_before="$(pf_broker_pass_counters)"
+  log "assert: ${label}"
+  if guest "wget -q -T 3 -O - '$BROKER_URL' | grep -q '^broker-ok$'"; then
+    log "pass: ${label}"
+    return
+  fi
+  local deny_after pass_after
+  deny_after="$(pf_iface_deny_packets inet)"
+  pass_after="$(pf_broker_pass_counters)"
+  local pass_packets=$(( ${pass_after% *} - ${pass_before% *} ))
+  local pass_states="${pass_after#* }"
+  local deny_packets=$(( deny_after - deny_before ))
+  local host_state
+  host_state="$(sudo pfctl -ss 2>/dev/null \
+    | grep -F "tcp ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}:" || true)"
+  local guest_logged=0 loopback_logged=0
+  grep -Fq "${GUEST_IPV4} - -" "${TMP_DIR}/broker.log" 2>/dev/null && guest_logged=1
+  grep -Fq "127.0.0.1 - -" "${TMP_DIR}/broker.log" 2>/dev/null && loopback_logged=1
+  log "broker-reach failure evidence:"
+  log "  anchor broker pass rule: +${pass_packets} packet(s) during the probe, ${pass_states} live state(s)"
+  log "  anchor IPv4 interface deny: +${deny_packets} packet(s) during the probe"
+  log "  host PF state for ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}: ${host_state:-none}"
+  log "  broker log: loopback request logged=${loopback_logged}, guest request logged=${guest_logged}"
+  if (( pass_packets > 0 && pass_states > 0 && deny_packets == 0 && loopback_logged == 1 && guest_logged == 0 )) \
+    && [[ -n "$host_state" ]]; then
+    log "diagnosis: PF passed the guest's connection and dropped nothing; the host completed the handshake; the broker process never saw the request. This is the known macOS vmnet accept() defect (a host accept() of a vmnet-originated connection returns a not-connected socket), not a firewall drop. See docs/vmnet-accept-bug-and-broker-vm-plan.md. The session anchor is not implicated, and this host-placement leg cannot pass on an affected host; the product sidesteps it with broker_placement = vm."
+    if [[ "${WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG:-0}" == "1" ]]; then
+      BROKER_REACH_WAIVED=1
+      log "WAIVED: continuing past the positive control because WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1; the proof will exit non-zero"
+      return
+    fi
+    die "expected success: ${label} (known vmnet accept() defect, see diagnosis above; set WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 to exercise the remaining legs anyway)"
+  fi
+  die "expected success: ${label}"
+}
+
 # The interface-scoped IPv4 deny is live on the guest's actual path: a TCP
 # connect from the guest to a host port that is not the broker's must be
 # blocked by that rule and counted by it. The guest's exit code is not the
@@ -671,9 +767,7 @@ log "guest IPv4 address is ${GUEST_IPV4}"
 BROKER_URL="http://${IPV4_GATEWAY}:${BROKER_PORT}/broker.txt"
 FORBIDDEN_URL="http://${IPV4_GATEWAY}:${FORBIDDEN_PORT}/forbidden.txt"
 
-expect_guest_success \
-  "VM can reach broker port through host-only gateway" \
-  "wget -q -T 3 -O - '$BROKER_URL' | grep -q '^broker-ok$'"
+assert_broker_reachable
 
 assert_forbidden_ipv4_egress_counted
 
@@ -706,4 +800,8 @@ assert_no_pf_state_for_guest
 
 cleanup
 trap - EXIT INT TERM
+if (( BROKER_REACH_WAIVED == 1 )); then
+  log "runner lifecycle proof INCOMPLETE for ${IPV4_CIDR}: the positive control (broker reachable) was waived under WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 because this host shows the known vmnet accept() defect (docs/vmnet-accept-bug-and-broker-vm-plan.md); every other leg passed: workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, host IPv6 interface deny holds against a re-enabling root guest, and runner cleanup verified"
+  exit 2
+fi
 log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, host IPv6 interface deny holds against a re-enabling root guest, and runner cleanup verified"
