@@ -431,6 +431,7 @@ impl AgentVmSessionPlan {
         }
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             args.extend(IPV4_ONLY_CAPABILITY_ARGV.map(str::to_string));
+            args.extend(IPV4_ONLY_KERNEL_ARGV.map(str::to_string));
         }
         if let Some(env_file) = env_file {
             args.extend(["--env-file".to_string(), env_file.display().to_string()]);

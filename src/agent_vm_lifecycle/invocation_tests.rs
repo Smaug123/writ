@@ -78,6 +78,45 @@ fn ipv4_only_launch_drops_net_raw_and_adds_nothing() {
     );
 }
 
+/// The `Ipv4OnlyNoGuestIpv6` launch disables IPv6 at the guest kernel boot
+/// line (`--kernel-arg ipv6.disable=1`), so the guest is born with no IPv6
+/// stack at all — irreversible from guest userland and independent of a
+/// writable `/proc/sys` (which Apple `container`'s vminit now mounts
+/// read-only). The flag sits with the other launch flags, before the image,
+/// and `DualStackRequired` never carries it.
+#[test]
+fn ipv4_only_launch_disables_ipv6_at_the_kernel_boot_line() {
+    let vm_args = plan_with_ipv6_mode(252, Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6)
+        .start_invocations()[5]
+        .args_lossy();
+    let kernel_arg_flags = vm_args
+        .windows(2)
+        .filter(|window| window[0] == "--kernel-arg")
+        .map(|window| window[1].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(kernel_arg_flags, ["ipv6.disable=1"]);
+    let image_position = vm_args
+        .iter()
+        .position(|arg| arg == "alpine:latest")
+        .expect("image present");
+    let kernel_arg_position = vm_args
+        .iter()
+        .position(|arg| arg == "--kernel-arg")
+        .expect("--kernel-arg present");
+    assert!(
+        kernel_arg_position < image_position,
+        "a flag after the image is a guest-command argument, not a launch flag: {vm_args:?}"
+    );
+
+    let dual_stack_args = plan_with_ipv6_mode(252, Ipv6IsolationMode::DualStackRequired)
+        .start_invocations()[5]
+        .args_lossy();
+    assert!(
+        !dual_stack_args.iter().any(|arg| arg == "--kernel-arg"),
+        "dual-stack keeps IPv6: {dual_stack_args:?}"
+    );
+}
+
 #[test]
 fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
     let invocations =
@@ -140,6 +179,8 @@ fn ipv4_only_start_invocations_probe_before_releasing_guest_command() {
             "/root",
             "--cap-drop",
             "NET_RAW",
+            "--kernel-arg",
+            "ipv6.disable=1",
             "alpine:latest",
             "sh",
             "-c",
