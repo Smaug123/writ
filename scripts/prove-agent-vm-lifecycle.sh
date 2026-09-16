@@ -476,8 +476,10 @@ pf_broker_pass_counters() {
 #      state (PF passed the connection);
 #   2. no interface-scoped IPv4 deny counted a packet during the probe (PF did
 #      not drop it);
-#   3. the host still holds a PF state for gateway:port <- guest (the
-#      handshake completed on the host);
+#   3. the host holds a PF state for gateway:port <- guest whose TCP phase shows
+#      the handshake COMPLETED (ESTABLISHED or a later closing state, not a
+#      SYN_SENT/SYN_RCVD half-open — a broker that never SYN-ACKed is a
+#      different failure and is not waived);
 #   4. the broker logged the loopback control request but never one from the
 #      guest (the bytes reached the host kernel, not the listening process).
 # All four together name the vmnet accept() defect and exonerate the anchor;
@@ -503,19 +505,32 @@ assert_broker_reachable() {
   local pass_packets=$(( ${pass_after% *} - ${pass_before% *} ))
   local pass_states="${pass_after#* }"
   local deny_packets=$(( deny_after - deny_before ))
-  local host_state
+  local host_state handshake_complete=0
   host_state="$(sudo pfctl -ss 2>/dev/null \
     | grep -F "tcp ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}:" || true)"
+  # The defect's signature is that the handshake COMPLETED (the host ACKed the
+  # request) yet the process never read it — the original capture showed the
+  # state as ESTABLISHED:FIN_WAIT_2. A state that exists but is still mid-
+  # handshake (SYN_SENT / SYN_RCVD, i.e. the broker never SYN-ACKed) is a
+  # different failure and must NOT be waived. pfctl prints the TCP state pair on
+  # the same line as the tuple, so require a post-handshake phase there.
+  if [[ "$host_state" == *ESTABLISHED* ]] \
+    || [[ "$host_state" == *FIN_WAIT* ]] \
+    || [[ "$host_state" == *CLOSE_WAIT* ]] \
+    || [[ "$host_state" == *CLOSING* ]] \
+    || [[ "$host_state" == *LAST_ACK* ]] \
+    || [[ "$host_state" == *TIME_WAIT* ]]; then
+    handshake_complete=1
+  fi
   local guest_logged=0 loopback_logged=0
   grep -Fq "${GUEST_IPV4} - -" "${TMP_DIR}/broker.log" 2>/dev/null && guest_logged=1
   grep -Fq "127.0.0.1 - -" "${TMP_DIR}/broker.log" 2>/dev/null && loopback_logged=1
   log "broker-reach failure evidence:"
   log "  anchor broker pass rule: +${pass_packets} packet(s) during the probe, ${pass_states} live state(s)"
   log "  anchor IPv4 interface deny: +${deny_packets} packet(s) during the probe"
-  log "  host PF state for ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}: ${host_state:-none}"
+  log "  host PF state for ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}: ${host_state:-none} (handshake complete=${handshake_complete})"
   log "  broker log: loopback request logged=${loopback_logged}, guest request logged=${guest_logged}"
-  if (( pass_packets > 0 && pass_states > 0 && deny_packets == 0 && loopback_logged == 1 && guest_logged == 0 )) \
-    && [[ -n "$host_state" ]]; then
+  if (( pass_packets > 0 && pass_states > 0 && deny_packets == 0 && loopback_logged == 1 && guest_logged == 0 && handshake_complete == 1 )); then
     log "diagnosis: PF passed the guest's connection and dropped nothing; the host completed the handshake; the broker process never saw the request. This is the known macOS vmnet accept() defect (a host accept() of a vmnet-originated connection returns a not-connected socket), not a firewall drop. See docs/vmnet-accept-bug-and-broker-vm-plan.md. The session anchor is not implicated, and this host-placement leg cannot pass on an affected host; the product sidesteps it with broker_placement = vm."
     if [[ "${WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG:-0}" == "1" ]]; then
       BROKER_REACH_WAIVED=1
