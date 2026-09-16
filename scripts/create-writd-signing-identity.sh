@@ -19,13 +19,13 @@ This adds ONE code-signing certificate + private key to a keychain. It needs no
 sudo. It does NOT get the firewall's auto-allow (that needs an Apple-anchored
 Developer ID; see the plan's Tier A) — it makes the manual allow durable.
 
+The first time codesign uses the key (scripts/install-macos.sh) macOS asks you
+to authorise it; click "Always Allow" and it will not ask again. Signing does
+not need the key to be trusted, so no trust dialog is involved.
+
 Environment overrides:
-  WRIT_SIGN_IDENTITY_CN        certificate common name (default: "org.writ.writd signing")
-  WRIT_SIGN_KEYCHAIN           keychain to import into (default: the login keychain)
-  WRIT_SIGN_KEYCHAIN_PASSWORD  if set, authorises codesign to use the key without
-                               an interactive Keychain prompt (via
-                               `security set-key-partition-list`); otherwise the
-                               first codesign run may prompt once ("Always Allow")
+  WRIT_SIGN_IDENTITY_CN  certificate common name (default: "org.writ.writd signing")
+  WRIT_SIGN_KEYCHAIN     keychain to import into (default: the login keychain)
 
 Re-running replaces the identity with a fresh certificate; re-run
 scripts/install-macos.sh and scripts/allow-writd-firewall.sh afterwards.
@@ -40,7 +40,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 CN="${WRIT_SIGN_IDENTITY_CN:-org.writ.writd signing}"
-KEYCHAIN="${WRIT_SIGN_KEYCHAIN:-$(security default-keychain | tr -d ' "')}"
+# `security default-keychain` prints the path indented and double-quoted; strip
+# only the surrounding indentation and quotes, never spaces inside the path.
+KEYCHAIN="${WRIT_SIGN_KEYCHAIN:-$(security default-keychain | sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//')}"
 
 command -v openssl >/dev/null 2>&1 || { echo "error: openssl is required" >&2; exit 1; }
 command -v security >/dev/null 2>&1 || { echo "error: this script is macOS-only (needs security)" >&2; exit 1; }
@@ -73,17 +75,23 @@ p12_pass="$(openssl rand -hex 16)"
 openssl pkcs12 -export -inkey "$workdir/key.pem" -in "$workdir/cert.pem" \
   -name "$CN" -out "$workdir/identity.p12" -passout "pass:${p12_pass}" >/dev/null 2>&1
 
-# -T /usr/bin/codesign lets codesign use the key; some macOS versions still
-# gate the private key behind a partition list, handled below when a keychain
-# password is provided.
+# Re-running must replace, not accumulate: `security import` does not remove a
+# previous cert+key with the same name, and two identities sharing a common
+# name make `codesign --sign "$CN"` ambiguous (it refuses). Delete any prior
+# writd signing identity in this keychain first.
+while security find-identity -p codesigning "$KEYCHAIN" | grep -Fq "$CN"; do
+  security delete-identity -c "$CN" "$KEYCHAIN" >/dev/null 2>&1 || break
+done
+
+# -T /usr/bin/codesign adds codesign to the key's access-control list, so the
+# first signing prompts once for "Always Allow" rather than being denied. We do
+# NOT touch the keychain's partition list: an unscoped `set-key-partition-list`
+# rewrites every key in a shared login keychain and can strip other apps'
+# access to their own keys, and a reliably-scoped form is not available. A
+# one-time interactive "Always Allow" is the safe path here; automated/CI
+# signing should use a dedicated keychain or an Apple Developer ID (Tier A).
 security import "$workdir/identity.p12" -k "$KEYCHAIN" -P "$p12_pass" \
   -T /usr/bin/codesign -T /usr/bin/security >/dev/null
-
-if [[ -n "${WRIT_SIGN_KEYCHAIN_PASSWORD:-}" ]]; then
-  # Authorise Apple's signing tools to read the key non-interactively.
-  security set-key-partition-list -S apple-tool:,apple: \
-    -k "$WRIT_SIGN_KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1 || true
-fi
 
 echo "imported code-signing identity into ${KEYCHAIN}:"
 # No -v: a self-signed identity is usable for signing but is not "valid"

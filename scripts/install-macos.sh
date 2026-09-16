@@ -25,6 +25,8 @@ Environment overrides:
   WRIT_BIN_DIR          install destination directory (default: ~/.local/bin)
   WRIT_WRITD_IDENTIFIER code-signing identifier for writd (default: org.writ.writd)
   WRIT_SIGN_IDENTITY_CN signing identity common name (default: "org.writ.writd signing")
+  WRIT_SIGN_KEYCHAIN    keychain holding the signing identity, if not on the
+                        default search list (must match create-writd-signing-identity.sh)
 EOF
 }
 
@@ -47,15 +49,26 @@ mkdir -p "$BIN_DIR"
 install -m 0755 "$SRC_DIR/writ"  "$BIN_DIR/writ"
 install -m 0755 "$SRC_DIR/writd" "$BIN_DIR/writd"
 
+# A non-default keychain (WRIT_SIGN_KEYCHAIN) is not on the search list, so the
+# lookup and the signing must both be told which keychain to use, or a real
+# identity would silently fall back to ad-hoc.
+SIGN_KEYCHAIN="${WRIT_SIGN_KEYCHAIN:-}"
+find_args=(-p codesigning)
+[[ -n "$SIGN_KEYCHAIN" ]] && find_args+=("$SIGN_KEYCHAIN")
+
 sign="-"
-if security find-identity -p codesigning 2>/dev/null | grep -Fq "$SIGN_CN"; then
+if security find-identity "${find_args[@]}" 2>/dev/null | grep -Fq "$SIGN_CN"; then
   sign="$SIGN_CN"
 else
   echo "note: signing identity '${SIGN_CN}' not found; signing writd ad-hoc." >&2
   echo "      run scripts/create-writd-signing-identity.sh first for a rebuild-stable requirement." >&2
 fi
 
-codesign --force --sign "$sign" --identifier "$IDENTIFIER" "$BIN_DIR/writd"
+codesign_args=(--force --sign "$sign" --identifier "$IDENTIFIER")
+if [[ "$sign" != "-" && -n "$SIGN_KEYCHAIN" ]]; then
+  codesign_args+=(--keychain "$SIGN_KEYCHAIN")
+fi
+codesign "${codesign_args[@]}" "$BIN_DIR/writd"
 
 echo "installed:"
 echo "  $BIN_DIR/writ"
