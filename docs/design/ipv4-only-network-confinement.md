@@ -124,9 +124,18 @@ ProbeNetworkAbsent -> CreateNetwork -> InspectAndValidate -> InstallFirewall
 the broker endpoint on the broker ports, then `block return` everything else
 from the agent subnet. Both rules match on the session subnet as source,
 because there is no interface to match on yet; that is why this anchor is
-replaced rather than extended once there is. `StartVm` starts the VM under a
-guarded prelaunch command that sets `disable_ipv6=1` and waits; the agent
-command has not run yet.
+replaced rather than extended once there is. `StartVm` starts the VM with
+`--kernel-arg ipv6.disable=1`, so the guest boots with no IPv6 stack at all
+(no `/proc/sys/net/ipv6`, and no router advertisement on the shared vmnet can
+be accepted); the agent command has not run yet, because the container's
+entrypoint is a guarded prelaunch that waits for a host-written start file.
+The kernel boot argument is the guest-side enforcement, and unlike a sysctl it
+cannot be reversed from guest userland. It replaced an exec-time
+`disable_ipv6=1` write once Apple `container`'s vminit (0.45.0, the 1.4.x line)
+began mounting `/proc/sys` read-only, which made that write fail; the write now
+survives only as a guarded defence-in-depth fallback inside the probe step
+below (`IPV4_ONLY_KERNEL_ARGV`, `IPV4_ONLY_CAPABILITY_ARGV` in
+`agent_vm_lifecycle.rs`).
 
 `InstallGuestIpv6Deny` invokes the privileged helper with `--deny-guest-ipv6`.
 The helper, not the daemon, resolves the interface: it runs the fixed

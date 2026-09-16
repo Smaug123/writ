@@ -86,39 +86,65 @@ const IPV4_ONLY_PRELAUNCH_SCRIPT: &str = concat!(
 /// without a `CAP_` prefix; the locked profile uses the unprefixed form too.
 const IPV4_ONLY_CAPABILITY_ARGV: [&str; 2] = ["--cap-drop", "NET_RAW"];
 
+/// The `container run` kernel boot argument for the
+/// [`Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6`] launch.
+///
+/// `ipv6.disable=1` on the guest kernel command line compiles IPv6 out at
+/// runtime: the guest boots with no IPv6 stack, no `/proc/sys/net/ipv6` tree,
+/// and no way for a router advertisement on the shared vmnet to be accepted
+/// (verified on a throwaway container: `ip -6 addr show` is empty and
+/// `/proc/sys/net/ipv6` is absent).
+///
+/// This is the primary enforcement of the no-guest-IPv6 posture, and it
+/// replaces reliance on a writable `/proc/sys`. Apple `container`'s vminit
+/// (0.45.0, shipped in the 1.4.x line) mounts `/proc/sys` read-only by
+/// default, so the historical enforcement — a root `container exec` writing
+/// `disable_ipv6=1` — can no longer take, and the write is now a
+/// defence-in-depth fallback guarded by a writability test (see
+/// [`GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT`]). Unlike that sysctl, a kernel-line
+/// disable is irreversible from guest userland: a root workload cannot
+/// re-enable a stack the kernel never built. `--kernel-arg` has been available
+/// since Apple `container` 1.2.0.
+///
+/// Dual-stack keeps IPv6, so this argument is `Ipv4OnlyNoGuestIpv6`-only, like
+/// the capability drop above.
+const IPV4_ONLY_KERNEL_ARGV: [&str; 2] = ["--kernel-arg", "ipv6.disable=1"];
+
 /// Under [`Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6`], the guest's start sequence
-/// runs this in the guest: it first *enforces* "no guest IPv6" by disabling
-/// IPv6 in the guest kernel, then reports the resulting state for
-/// [`GuestIpv6Inspection`] to validate.
+/// runs this in the guest to *verify* "no guest IPv6" and report the resulting
+/// state for [`GuestIpv6Inspection`] to validate.
 ///
-/// Why enforce, not just observe: the agent network is created `--internal`
-/// and IPv4-only (no `--subnet-v6`), but the host's Apple `container`/vmnet
-/// layer can still advertise IPv6 Router Advertisements on the shared vmnet —
-/// observed after a macOS update (26.5.1 / `container` 0.11.0): a guest with
-/// default `accept_ra` SLAACs a global-scope ULA (`fd…/64 … proto kernel_ra`)
-/// a beat after boot, defeating the no-guest-IPv6 posture. Refusing the RA at
-/// the *network* layer is not in our control (vmnet sends it regardless of the
-/// network's own v6 config), so we refuse it at the *guest kernel* layer:
-/// `disable_ipv6=1` on `all` (which flushes every existing IPv6 address,
-/// including any already SLAAC'd) and `default` (so any interface that appears
-/// later is born without IPv6). Verified on a throwaway container: the write
-/// drops the RA-acquired address immediately.
+/// The enforcement itself is [`IPV4_ONLY_KERNEL_ARGV`] (`ipv6.disable=1` on the
+/// guest kernel boot line): the guest boots with no IPv6 stack, so
+/// `/proc/sys/net/ipv6` is absent and no router advertisement can be accepted.
+/// That matters because the agent network is created `--internal` and
+/// IPv4-only (no `--subnet-v6`), but the host's Apple `container`/vmnet layer
+/// still advertises IPv6 Router Advertisements on the shared vmnet — observed
+/// after a macOS update (26.5.1 / `container` 0.11.0): a guest with default
+/// `accept_ra` SLAACs a global-scope ULA (`fd…/64 … proto kernel_ra`) a beat
+/// after boot. Refusing the RA at the *network* layer is not in our control
+/// (vmnet sends it regardless), so we refuse it at the *guest kernel* layer,
+/// and a kernel-line disable is irreversible from guest userland.
 ///
-/// Enforce and report are one atomic guest exec, so there is no window between
-/// a separate "disable" and "probe" in which a fresh RA could re-add an
-/// address. The report is still load-bearing: if the disable writes had failed
-/// (e.g. a read-only `/proc`), the RA address would remain and
-/// [`GuestIpv6Inspection::require_no_routable_ipv6`] would fail the start — the
-/// validation confirms the enforcement actually took.
-///
-/// Fail-closed enforcement: for each sysctl that EXISTS we write `1` and then
-/// read it back, failing the start unless it actually reads `1`. Only an
-/// *absent* path is tolerated (a guest kernel with no IPv6 has nothing to
-/// disable and cannot acquire an RA address). A present-but-unwritable sysctl
-/// — `container exec` as a non-root user, a read-only `/proc/sys` — must NOT
-/// pass: the read-back is what catches it, independent of why the write didn't
-/// take, rather than trusting the `ip -6` snapshot (which could look clean if
-/// the RA simply has not arrived yet, only to gain the ULA moments later).
+/// This script is the belt to that kernel-line braces. Its report is still
+/// load-bearing: [`GuestIpv6Inspection::require_no_routable_ipv6`] fails the
+/// start unless `ip -6 addr`/`route` come back empty, so a boot argument that
+/// silently did not take is caught rather than trusted. Its per-sysctl loop is
+/// a defence-in-depth fallback for a hypothetical guest kernel where IPv6 is
+/// present: for each `disable_ipv6` that EXISTS *and is writable* it writes `1`
+/// then reads it back, failing the start unless it reads `1`. An *absent* path
+/// is the normal case under the boot argument and is tolerated (no IPv6 stack
+/// to disable). A path that is present but *unwritable* — a read-only
+/// `/proc/sys`, which Apple `container`'s vminit 0.45.0 now mounts by default,
+/// or `container exec` as a non-root user — fails closed at the read-back
+/// (state ≠ 1) with a clean `writ-ipv6-not-disabled` marker. The write runs in
+/// a stderr-suppressed subshell (`( printf 1 > "$path" ) 2>/dev/null`) so a
+/// read-only mount's redirection error is swallowed rather than leaking a raw
+/// `sh: can't create …` line: BusyBox `test -w` reports only permission bits
+/// and does not see the read-only mount, so guarding the write with `[ -w ]`
+/// would not have suppressed it. The read-back, not the `ip -6` snapshot, is
+/// the oracle for the fallback: the snapshot could look clean only because an
+/// RA has not arrived yet.
 ///
 /// The read-back uses `cat` command substitution, not `read`: BusyBox `read`
 /// (the guest image's `sh`) returns non-zero reading `/proc/sys` sysctls even
@@ -131,7 +157,7 @@ const GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT: &str = r#"set -e
 for scope in all default; do
   path="/proc/sys/net/ipv6/conf/$scope/disable_ipv6"
   [ -e "$path" ] || continue
-  printf 1 > "$path" 2>/dev/null || true
+  ( printf 1 > "$path" ) 2>/dev/null || true
   state="$(cat "$path" 2>/dev/null)" || state=
   [ "$state" = 1 ] || { echo "writ-ipv6-not-disabled $path=$state"; exit 1; }
 done
