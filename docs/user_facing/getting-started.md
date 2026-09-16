@@ -34,12 +34,49 @@ The repo is a single Cargo crate that produces two binaries.
 ```bash
 cargo build --release
 # binaries land in ./target/release/{writ,writd}
-# copy them onto your $PATH however you usually do that
-install -m 0755 target/release/writd ~/.local/bin/writd
-install -m 0755 target/release/writ  ~/.local/bin/writ
+```
+
+On Linux, copy them onto your `$PATH` however you usually do
+(`install -m 0755 target/release/{writ,writd} ~/.local/bin/`).
+
+On **macOS**, install through the helper so `writd` gets a stable
+code-signing identity — otherwise the Application Firewall re-blocks its broker
+listener on every rebuild (see [step 2a](#2a-macos-application-firewall)):
+
+```bash
+# one-time: create a persistent self-signed signing identity for writd
+scripts/create-writd-signing-identity.sh
+# each build: install writ + writd to ~/.local/bin and sign writd stably
+scripts/install-macos.sh
 ```
 
 There is also a Nix flake (`flake.nix`) if you prefer.
+
+### 2a. macOS Application Firewall
+
+`writd` binds the broker and UI TCP listeners. macOS's Application Firewall
+filters incoming connections per binary. A blocked `writd` still completes the
+TCP handshake — the kernel ACKs the request — but the firewall detaches the
+socket before `accept()` returns it, so `accept()` yields a not-connected
+socket and the request never reaches the process. From an agent VM this looks
+like a broker that never answers; loopback is exempt, so local tools appear
+fine. (This symptom was long mistaken for an Apple `vmnet` defect; see
+[`docs/vmnet-accept-bug-and-broker-vm-plan.md`](../vmnet-accept-bug-and-broker-vm-plan.md).)
+
+Allow `writd` once:
+
+```bash
+scripts/allow-writd-firewall.sh   # needs sudo
+```
+
+Because `writd` is installed at a stable path and signed with the identity from
+`create-writd-signing-identity.sh`, its firewall designated requirement does
+not change when you rebuild, so this allow **sticks across rebuilds**. Always
+run the daemon from the installed path (`~/.local/bin/writd`), not from
+`target/` or the Nix store — those are different paths, and identities, to the
+firewall. If you distribute `writ` to machines you do not administer, sign it
+with an Apple Developer ID and notarize it instead; the firewall then
+auto-allows it with no per-machine step.
 
 ## 3. Store the private key
 

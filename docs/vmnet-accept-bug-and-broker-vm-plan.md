@@ -1,6 +1,25 @@
 # Agent‑VM broker unreachable on Apple `container`: vmnet `accept()` bug — status & proposed plan
 
-**Status:** root cause identified and reduced to a minimal pure‑C reproduction; no vendor fix yet; a debug‑build workaround is in use. This doc is written to be reviewable without prior context (e.g. by an external model). It marks claims as **[verified]** (observed on this machine), **[inferred]**, or **[proposed]**.
+> **CORRECTION (2026‑09‑16): the root cause below is wrong.** The symptom is not
+> an Apple `vmnet` defect. It is the macOS **Application Firewall**
+> (`socketfilterfw`) blocking `writd`'s listener per binary: a blocked binary
+> completes the TCP handshake and the kernel ACKs the request, but the firewall
+> detaches the socket before `accept()` returns it, producing the
+> not‑connected socket (`getpeername` `EINVAL`, `recv` `ENOTCONN`) described
+> here. This was confirmed by allowing the pure‑C repro server in the firewall,
+> which made the repro pass, and by `socketfilterfw --listapps` showing the
+> release/nix `writd` (and the proof's nix‑built `python3`) as *Block* while the
+> debug `writd` and `/usr/bin/python3` were *Allow* — the debug‑vs‑release split
+> was a per‑binary firewall decision, not build timing. **Host placement works
+> in a release build once `writd` is allowed.** The durable fix is a stable
+> code‑signing identity for `writd` plus a one‑time firewall allow; see
+> `docs/plans/2026-09-16-macos-firewall-stable-identity.md` and the macOS step
+> in `docs/user_facing/getting-started.md`. Nothing needs to be reported to
+> Apple, and `broker_placement = vm` (below) is **not** required to work around
+> this — it stays parked. The vmnet‑layer analysis below is retained as a record
+> of the investigation, but its "Root cause" is superseded by this note.
+
+**Status:** *superseded — see the correction above.* Originally: root cause identified and reduced to a minimal pure‑C reproduction; no vendor fix yet; a debug‑build workaround is in use. This doc is written to be reviewable without prior context (e.g. by an external model). It marks claims as **[verified]** (observed on this machine), **[inferred]**, or **[proposed]**.
 
 ---
 
