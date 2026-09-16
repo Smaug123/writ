@@ -409,7 +409,7 @@ pf_iface_deny_packets() {
 # The interface-scoped IPv4 deny is live on the guest's actual path: a TCP
 # connect from the guest to a host port that is not the broker's must be
 # blocked by that rule and counted by it. The guest's exit code is not the
-# oracle (see assert_reenabled_ipv6_egress_blocked); the host's deny-rule
+# oracle (see assert_guest_ipv6_disable_is_irreversible); the host's deny-rule
 # packet counter is. This exercises the same rule a forged-source frame would
 # hit, but with an in-subnet source: the released workload holds neither
 # NET_RAW nor NET_ADMIN (asserted above), so it cannot forge a source at all,
@@ -432,17 +432,15 @@ assert_forbidden_ipv4_egress_counted() {
   log "pass: host PF blocked $((after - before)) IPv4 packet(s) to the forbidden host port"
 }
 
-assert_reenabled_ipv6_egress_blocked() {
-  log "assert: a root guest that re-enables IPv6 still cannot egress it"
-  # A real IPv6 packet probe is mandatory: without one this assertion could pass
-  # vacuously (a tool that fails before sending returns non-zero, which looks
-  # "blocked") and so could not detect a nonfunctional PF rule. The sender is
-  # busybox wget (required of the image above), which needs no capability. The
-  # released workload holds no CAP_NET_RAW, and `container exec` inherits that,
-  # so busybox ping/ping6 — a raw ICMP socket with no SOCK_DGRAM fallback —
-  # would die before sending anything; it cannot be the sender.
-  # Undo the in-guest disable exactly as a malicious agent would, then nudge the
-  # link so a fresh RA is solicited.
+assert_guest_ipv6_disable_is_irreversible() {
+  log "assert: a root guest cannot re-enable IPv6 (kernel ipv6.disable=1)"
+  # The Ipv4OnlyNoGuestIpv6 launch disables IPv6 on the guest kernel boot line
+  # (`--kernel-arg ipv6.disable=1`), so the P1 attack — a root guest writing
+  # `disable_ipv6=0`, re-soliciting a vmnet RA and reacquiring a ULA — is not
+  # merely blocked at the host but impossible in the guest: there is no IPv6
+  # stack and no `/proc/sys/net/ipv6` to write. Prove that by running the exact
+  # re-enable sequence a malicious root would, then requiring that nothing came
+  # back.
   guest '
     for s in all default eth0; do
       printf 0 > /proc/sys/net/ipv6/conf/$s/disable_ipv6 2>/dev/null || true
@@ -452,45 +450,30 @@ assert_reenabled_ipv6_egress_blocked() {
     ip link set eth0 up 2>/dev/null || true
   ' || true
   sleep 4
-  log "guest IPv6 state after re-enabling:"
-  guest 'ip -6 -o addr show; ip -6 route show' || true
-  # There must be an IPv6 target to probe. The RA restores a default route via the
-  # host bridge; ping that. Fail the proof (not pass) if no route came back, so a
-  # vacuous "nothing to send" can never masquerade as "blocked".
-  local gw
-  gw="$(guest 'ip -6 route show default 2>/dev/null | awk "{print \$3}" | head -n1' | tr -d "[:space:]")"
-  [ -n "$gw" ] \
-    || die "guest reacquired no IPv6 default route after re-enabling; cannot send a routed IPv6 probe to prove the deny (investigate RA timing)"
-  # A link-local gateway (the RA's source) needs the zone of the link it came
-  # in on; a global one does not.
-  local target="$gw"
-  if [[ "$gw" == fe80:* ]]; then
-    target="${gw}%eth0"
+  log "guest IPv6 state after attempting re-enable:"
+  guest 'ip -6 -o addr show 2>&1; ip -6 route show 2>&1; ls -d /proc/sys/net/ipv6 2>&1' || true
+  # Positive proof the stack is gone, not merely that an RA has not arrived yet:
+  # the kernel's IPv6 sysctl tree is absent. If it is present, the boot argument
+  # did not take, so IPv6 is NOT irreversibly disabled and this must fail rather
+  # than trust an empty `ip -6` snapshot.
+  if guest 'test -e /proc/sys/net/ipv6'; then
+    die "guest /proc/sys/net/ipv6 exists after re-enable attempt: the ipv6.disable=1 boot argument did not take, so IPv6 is not irreversibly disabled"
   fi
-  local before
-  before="$(pf_iface_deny_packets inet6)"
-  log "probing IPv6 egress to reacquired gateway ${gw} (deny counter before: ${before})"
-  # A TCP connect over IPv6 to the host bridge. The guest's exit code is not the
-  # oracle: with `block return` PF answers with a reset, and with no deny the
-  # gateway has no IPv6 listener on that port either, so wget fails both ways.
-  # The oracle is the host's deny-rule packet counter: it moves iff an IPv6
-  # frame from the guest reached PF on the bridge and was blocked by exactly
-  # that rule (the connect's SYN, or the neighbour solicitation that precedes
-  # it). A probe that sends nothing leaves it unchanged and fails the proof.
-  # Residual window: the guest kernel's own solicitations after the re-enable
-  # can also hit the deny between the two readings, so a moving counter is
-  # proof that PF blocks the guest's IPv6 on this bridge rather than proof
-  # that it was wget's frame specifically.
-  expect_guest_blocked \
-    "re-enabled guest IPv6 egress to the host bridge is refused" \
-    "wget -q -T 3 -O /dev/null 'http://[${target}]:${BROKER_PORT}/broker.txt'"
-  local after
-  after="$(pf_iface_deny_packets inet6)"
-  log "deny counter after: ${after}"
-  if (( after <= before )); then
-    die "the host IPv6 interface deny counted no packet during the guest's probe (before=${before}, after=${after}); the probe sent nothing, or PF did not see it on the bridge"
+  # And no address or route may have appeared despite the re-enable attempt.
+  local addrs routes
+  addrs="$(guest 'ip -6 -o addr show scope global 2>/dev/null' | tr -d '[:space:]')"
+  routes="$(guest 'ip -6 route show default 2>/dev/null' | tr -d '[:space:]')"
+  if [ -n "$addrs" ] || [ -n "$routes" ]; then
+    die "guest acquired IPv6 after a root re-enable attempt (addr='${addrs}' route='${routes}'); the kernel-line disable is not irreversible"
   fi
-  log "pass: host PF blocked $((after - before)) IPv6 packet(s) from the re-enabled guest"
+  # The host PF interface-scoped `block ... inet6 all` deny is still installed
+  # (assert_pf_anchor_is_interface_scoped checks its presence) as defence in
+  # depth against a guest-kernel compromise. Exercising its counter with a live
+  # IPv6 frame now requires a separate IPv6-enabled probe container, because
+  # this session's workload can no longer emit IPv6 at all; that live-fire test
+  # is the vertical proof's job (docs/plans/2026-09-01-ipv4-only-locked-v1.md,
+  # Stage E3), not this host-placement smoke proof.
+  log "pass: a root guest holds no IPv6 address or route after a re-enable attempt, and /proc/sys/net/ipv6 is absent"
 }
 
 assert_pf_anchor_empty() {
@@ -661,7 +644,9 @@ expect_guest_blocked \
   "nslookup github.com 1.1.1.1 >/dev/null"
 
 # Adversarial: closes the exact P1 — a root guest re-enabling IPv6 post-release.
-assert_reenabled_ipv6_egress_blocked
+# The kernel-line disable makes that re-enable impossible in the guest, so this
+# asserts irreversibility; the host PF IPv6 deny remains as defence in depth.
+assert_guest_ipv6_disable_is_irreversible
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
@@ -681,4 +666,4 @@ assert_no_pf_state_for_guest
 
 cleanup
 trap - EXIT INT TERM
-log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, host IPv6 interface deny holds against a re-enabling root guest, and runner cleanup verified"
+log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"
