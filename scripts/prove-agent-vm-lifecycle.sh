@@ -24,6 +24,11 @@ Environment overrides:
   WRIT_PROVE_SUBNET_INDEX  session subnet index, default 252
   WRIT_PROVE_BROKER_PORT_MIN  minimum allowed broker port, default 49152
   WRIT_PROVE_BROKER_PORT_MAX  maximum allowed broker port, default 65535
+  WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1
+                         carry on past a broker-reach failure whose evidence
+                         exactly matches the known macOS vmnet accept() defect
+                         (docs/vmnet-accept-bug-and-broker-vm-plan.md), so the
+                         firewall legs still run; the proof then exits 2
 EOF
 }
 
@@ -33,7 +38,32 @@ log() {
 
 die() {
   printf '[prove-lifecycle] error: %s\n' "$*" >&2
+  dump_pf_diagnostics
   exit 1
+}
+
+# On failure, before anything is torn down: what PF did with the session's
+# frames. The per-rule counters say which rule of the anchor decided each
+# packet and on which interface; the states say what `keep state` created.
+# Best effort, so a failure before the anchor or VM exists prints nothing.
+dump_pf_diagnostics() {
+  if [[ -z "${PF_ANCHOR:-}" ]]; then
+    return
+  fi
+  printf '[prove-lifecycle] diagnostics: pfctl -a %s -vvsr\n' "$PF_ANCHOR" >&2
+  sudo pfctl -a "$PF_ANCHOR" -vvsr >&2 2>/dev/null || true
+  printf '[prove-lifecycle] diagnostics: pfctl -vss (session subnet only)\n' >&2
+  sudo pfctl -vss 2>/dev/null | grep -B1 -A3 -F "${IPV4_CIDR%.0/24}." >&2 || true
+  printf '[prove-lifecycle] diagnostics: pfctl -s info\n' >&2
+  sudo pfctl -s info >&2 2>/dev/null || true
+  printf '[prove-lifecycle] diagnostics: pfctl -s Interfaces -v (bridge and vmenet)\n' >&2
+  sudo pfctl -s Interfaces -v 2>/dev/null | grep -A8 -E '^(bridge|vmenet)' >&2 || true
+  printf '[prove-lifecycle] diagnostics: ifconfig (bridge and vmenet)\n' >&2
+  ifconfig 2>/dev/null | grep -A12 -E '^(bridge|vmenet)[0-9]+:' >&2 || true
+  if [[ -n "${VM_NAME:-}" ]]; then
+    printf '[prove-lifecycle] diagnostics: guest ip addr / route / neigh\n' >&2
+    container exec "$VM_NAME" sh -lc 'ip -4 addr; ip -4 route; ip neigh' >&2 2>/dev/null || true
+  fi
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -406,10 +436,126 @@ pf_iface_deny_packets() {
   printf '%s\n' "$count"
 }
 
+# The packet and state counters of the session anchor's interface-scoped
+# broker `pass` rules, summed over every interface the firewall installed
+# one on, read the same way as pf_iface_deny_packets. Prints "PACKETS STATES".
+# Dies on format drift rather than reading as zero, for the same reason.
+pf_broker_pass_counters() {
+  local rules
+  rules="$(sudo pfctl -a "$PF_ANCHOR" -vsr 2>/dev/null)" \
+    || die "could not read verbose rules for ${PF_ANCHOR}"
+  local counters
+  counters="$(printf '%s\n' "$rules" | awk '
+    /^pass in quick on (bridge|vmenet)[0-9]+ inet proto tcp from / { rule = 1; next }
+    rule && match($0, /Packets: [0-9]+/) {
+      packets += substr($0, RSTART + 9, RLENGTH - 9)
+      if (match($0, /States: [0-9]+/)) { states += substr($0, RSTART + 8, RLENGTH - 8) }
+      matched = 1; rule = 0; next
+    }
+    /^[^ \t[]/ { rule = 0 }
+    END { if (matched) print packets, states }
+  ')"
+  [[ "$counters" =~ ^[0-9]+\ [0-9]+$ ]] \
+    || die "no interface-scoped broker pass rule with counters rendered in pfctl -vsr for ${PF_ANCHOR}"
+  printf '%s\n' "$counters"
+}
+
+# Broker reachability is the proof's positive control: the one connection the
+# anchor must pass. When it fails, the question is whether PF dropped it or
+# whether the bytes cleared PF and were lost above it. This proof's broker is
+# a host process with a blocking accept(), and on some macOS builds a host
+# accept() of a connection that originates from a container over vmnet hands
+# back a socket the kernel considers not connected (recv -> ENOTCONN), so the
+# request is ACKed by the kernel and never seen by the process. That defect is
+# root-caused, reduced to a pure-C repro, and documented in
+# docs/vmnet-accept-bug-and-broker-vm-plan.md; the product sidesteps it with
+# `broker_placement = vm`. It has been rediscovered from this leg's bare
+# timeout more than once, so on failure this assertion checks for its exact
+# signature, all four parts read on the host:
+#   1. the anchor's broker pass rule counted the guest's packets and created a
+#      state (PF passed the connection);
+#   2. no interface-scoped IPv4 deny counted a packet during the probe (PF did
+#      not drop it);
+#   3. the host holds a PF state for gateway:port <- guest whose TCP phase shows
+#      the handshake COMPLETED on BOTH endpoints (each side ESTABLISHED or a
+#      later graceful-close state, never a SYN_SENT/SYN_RCVD half-open and never
+#      a bare TIME_WAIT that a reset could leave — a broker that never SYN-ACKed,
+#      or answered a dead port with a reset, is a different failure, not waived);
+#   4. the broker logged the loopback control request but never one from the
+#      guest (the bytes reached the host kernel, not the listening process).
+# All four together name the vmnet accept() defect and exonerate the anchor;
+# anything else is reported as an ordinary failure for a human to read.
+# WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 lets the proof carry on past that
+# exact signature (and only that one), so the firewall legs that follow can
+# still be exercised on an affected host; the final summary then says the
+# positive control was waived, and the proof exits non-zero.
+BROKER_REACH_WAIVED=0
+assert_broker_reachable() {
+  local label="VM can reach broker port through host-only gateway"
+  local deny_before pass_before
+  deny_before="$(pf_iface_deny_packets inet)"
+  pass_before="$(pf_broker_pass_counters)"
+  log "assert: ${label}"
+  if guest "wget -q -T 3 -O - '$BROKER_URL' | grep -q '^broker-ok$'"; then
+    log "pass: ${label}"
+    return
+  fi
+  local deny_after pass_after
+  deny_after="$(pf_iface_deny_packets inet)"
+  pass_after="$(pf_broker_pass_counters)"
+  local pass_packets=$(( ${pass_after% *} - ${pass_before% *} ))
+  local pass_states="${pass_after#* }"
+  local deny_packets=$(( deny_after - deny_before ))
+  local host_state handshake_complete=0
+  host_state="$(sudo pfctl -ss 2>/dev/null \
+    | grep -F "tcp ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}:" || true)"
+  # The defect's signature is that the handshake COMPLETED (the host ACKed the
+  # request) yet the process never read it — the original capture showed the
+  # state as ESTABLISHED:FIN_WAIT_2. pfctl prints the TCP state pair as the last
+  # field on the tuple line (`<src-state>:<dst-state>`); read BOTH endpoints.
+  # Waive only if neither endpoint is still pre-establishment
+  # (SYN_SENT/SYN_RCVD/CLOSED/NO_TRAFFIC — this rejects a half-open such as
+  # SYN_SENT:ESTABLISHED, or a SYN to a dead port) AND at least one endpoint is
+  # in a state reachable only after a completed 3-way handshake (ESTABLISHED or
+  # a graceful-close phase). TIME_WAIT is deliberately excluded from that set:
+  # a reset can leave a reset-adjacent state, so a bare TIME_WAIT:TIME_WAIT is
+  # treated as inconclusive rather than proof of completion.
+  local state_pair state_a state_b
+  state_pair="${host_state##* }"
+  state_a="${state_pair%%:*}"
+  state_b="${state_pair##*:}"
+  local pre_handshake_re='^(SYN_SENT|SYN_RCVD|CLOSED|NO_TRAFFIC)$'
+  local post_handshake_re='^(ESTABLISHED|FIN_WAIT_1|FIN_WAIT_2|CLOSING|CLOSE_WAIT|LAST_ACK)$'
+  if [[ -n "$host_state" ]] \
+    && ! [[ "$state_a" =~ $pre_handshake_re ]] \
+    && ! [[ "$state_b" =~ $pre_handshake_re ]] \
+    && { [[ "$state_a" =~ $post_handshake_re ]] || [[ "$state_b" =~ $post_handshake_re ]]; }; then
+    handshake_complete=1
+  fi
+  local guest_logged=0 loopback_logged=0
+  grep -Fq "${GUEST_IPV4} - -" "${TMP_DIR}/broker.log" 2>/dev/null && guest_logged=1
+  grep -Fq "127.0.0.1 - -" "${TMP_DIR}/broker.log" 2>/dev/null && loopback_logged=1
+  log "broker-reach failure evidence:"
+  log "  anchor broker pass rule: +${pass_packets} packet(s) during the probe, ${pass_states} live state(s)"
+  log "  anchor IPv4 interface deny: +${deny_packets} packet(s) during the probe"
+  log "  host PF state for ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}: ${host_state:-none} (handshake complete=${handshake_complete})"
+  log "  broker log: loopback request logged=${loopback_logged}, guest request logged=${guest_logged}"
+  if (( pass_packets > 0 && pass_states > 0 && deny_packets == 0 && loopback_logged == 1 && guest_logged == 0 && handshake_complete == 1 )); then
+    log "diagnosis: PF passed the guest's connection and dropped nothing; the host completed the handshake; the broker process never saw the request. This is the known macOS vmnet accept() defect (a host accept() of a vmnet-originated connection returns a not-connected socket), not a firewall drop. See docs/vmnet-accept-bug-and-broker-vm-plan.md. The session anchor is not implicated, and this host-placement leg cannot pass on an affected host; the product sidesteps it with broker_placement = vm."
+    if [[ "${WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG:-0}" == "1" ]]; then
+      BROKER_REACH_WAIVED=1
+      log "WAIVED: continuing past the positive control because WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1; the proof will exit non-zero"
+      return
+    fi
+    die "expected success: ${label} (known vmnet accept() defect, see diagnosis above; set WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 to exercise the remaining legs anyway)"
+  fi
+  die "expected success: ${label}"
+}
+
 # The interface-scoped IPv4 deny is live on the guest's actual path: a TCP
 # connect from the guest to a host port that is not the broker's must be
 # blocked by that rule and counted by it. The guest's exit code is not the
-# oracle (see assert_reenabled_ipv6_egress_blocked); the host's deny-rule
+# oracle (see assert_guest_ipv6_disable_is_irreversible); the host's deny-rule
 # packet counter is. This exercises the same rule a forged-source frame would
 # hit, but with an in-subnet source: the released workload holds neither
 # NET_RAW nor NET_ADMIN (asserted above), so it cannot forge a source at all,
@@ -432,17 +578,15 @@ assert_forbidden_ipv4_egress_counted() {
   log "pass: host PF blocked $((after - before)) IPv4 packet(s) to the forbidden host port"
 }
 
-assert_reenabled_ipv6_egress_blocked() {
-  log "assert: a root guest that re-enables IPv6 still cannot egress it"
-  # A real IPv6 packet probe is mandatory: without one this assertion could pass
-  # vacuously (a tool that fails before sending returns non-zero, which looks
-  # "blocked") and so could not detect a nonfunctional PF rule. The sender is
-  # busybox wget (required of the image above), which needs no capability. The
-  # released workload holds no CAP_NET_RAW, and `container exec` inherits that,
-  # so busybox ping/ping6 — a raw ICMP socket with no SOCK_DGRAM fallback —
-  # would die before sending anything; it cannot be the sender.
-  # Undo the in-guest disable exactly as a malicious agent would, then nudge the
-  # link so a fresh RA is solicited.
+assert_guest_ipv6_disable_is_irreversible() {
+  log "assert: a root guest cannot re-enable IPv6 (kernel ipv6.disable=1)"
+  # The Ipv4OnlyNoGuestIpv6 launch disables IPv6 on the guest kernel boot line
+  # (`--kernel-arg ipv6.disable=1`), so the P1 attack — a root guest writing
+  # `disable_ipv6=0`, re-soliciting a vmnet RA and reacquiring a ULA — is not
+  # merely blocked at the host but impossible in the guest: there is no IPv6
+  # stack and no `/proc/sys/net/ipv6` to write. Prove that by running the exact
+  # re-enable sequence a malicious root would, then requiring that nothing came
+  # back.
   guest '
     for s in all default eth0; do
       printf 0 > /proc/sys/net/ipv6/conf/$s/disable_ipv6 2>/dev/null || true
@@ -452,45 +596,30 @@ assert_reenabled_ipv6_egress_blocked() {
     ip link set eth0 up 2>/dev/null || true
   ' || true
   sleep 4
-  log "guest IPv6 state after re-enabling:"
-  guest 'ip -6 -o addr show; ip -6 route show' || true
-  # There must be an IPv6 target to probe. The RA restores a default route via the
-  # host bridge; ping that. Fail the proof (not pass) if no route came back, so a
-  # vacuous "nothing to send" can never masquerade as "blocked".
-  local gw
-  gw="$(guest 'ip -6 route show default 2>/dev/null | awk "{print \$3}" | head -n1' | tr -d "[:space:]")"
-  [ -n "$gw" ] \
-    || die "guest reacquired no IPv6 default route after re-enabling; cannot send a routed IPv6 probe to prove the deny (investigate RA timing)"
-  # A link-local gateway (the RA's source) needs the zone of the link it came
-  # in on; a global one does not.
-  local target="$gw"
-  if [[ "$gw" == fe80:* ]]; then
-    target="${gw}%eth0"
+  log "guest IPv6 state after attempting re-enable:"
+  guest 'ip -6 -o addr show 2>&1; ip -6 route show 2>&1; ls -d /proc/sys/net/ipv6 2>&1' || true
+  # Positive proof the stack is gone, not merely that an RA has not arrived yet:
+  # the kernel's IPv6 sysctl tree is absent. If it is present, the boot argument
+  # did not take, so IPv6 is NOT irreversibly disabled and this must fail rather
+  # than trust an empty `ip -6` snapshot.
+  if guest 'test -e /proc/sys/net/ipv6'; then
+    die "guest /proc/sys/net/ipv6 exists after re-enable attempt: the ipv6.disable=1 boot argument did not take, so IPv6 is not irreversibly disabled"
   fi
-  local before
-  before="$(pf_iface_deny_packets inet6)"
-  log "probing IPv6 egress to reacquired gateway ${gw} (deny counter before: ${before})"
-  # A TCP connect over IPv6 to the host bridge. The guest's exit code is not the
-  # oracle: with `block return` PF answers with a reset, and with no deny the
-  # gateway has no IPv6 listener on that port either, so wget fails both ways.
-  # The oracle is the host's deny-rule packet counter: it moves iff an IPv6
-  # frame from the guest reached PF on the bridge and was blocked by exactly
-  # that rule (the connect's SYN, or the neighbour solicitation that precedes
-  # it). A probe that sends nothing leaves it unchanged and fails the proof.
-  # Residual window: the guest kernel's own solicitations after the re-enable
-  # can also hit the deny between the two readings, so a moving counter is
-  # proof that PF blocks the guest's IPv6 on this bridge rather than proof
-  # that it was wget's frame specifically.
-  expect_guest_blocked \
-    "re-enabled guest IPv6 egress to the host bridge is refused" \
-    "wget -q -T 3 -O /dev/null 'http://[${target}]:${BROKER_PORT}/broker.txt'"
-  local after
-  after="$(pf_iface_deny_packets inet6)"
-  log "deny counter after: ${after}"
-  if (( after <= before )); then
-    die "the host IPv6 interface deny counted no packet during the guest's probe (before=${before}, after=${after}); the probe sent nothing, or PF did not see it on the bridge"
+  # And no address or route may have appeared despite the re-enable attempt.
+  local addrs routes
+  addrs="$(guest 'ip -6 -o addr show scope global 2>/dev/null' | tr -d '[:space:]')"
+  routes="$(guest 'ip -6 route show default 2>/dev/null' | tr -d '[:space:]')"
+  if [ -n "$addrs" ] || [ -n "$routes" ]; then
+    die "guest acquired IPv6 after a root re-enable attempt (addr='${addrs}' route='${routes}'); the kernel-line disable is not irreversible"
   fi
-  log "pass: host PF blocked $((after - before)) IPv6 packet(s) from the re-enabled guest"
+  # The host PF interface-scoped `block ... inet6 all` deny is still installed
+  # (assert_pf_anchor_is_interface_scoped checks its presence) as defence in
+  # depth against a guest-kernel compromise. Exercising its counter with a live
+  # IPv6 frame now requires a separate IPv6-enabled probe container, because
+  # this session's workload can no longer emit IPv6 at all; that live-fire test
+  # is the vertical proof's job (docs/plans/2026-09-01-ipv4-only-locked-v1.md,
+  # Stage E3), not this host-placement smoke proof.
+  log "pass: a root guest holds no IPv6 address or route after a re-enable attempt, and /proc/sys/net/ipv6 is absent"
 }
 
 assert_pf_anchor_empty() {
@@ -646,9 +775,7 @@ log "guest IPv4 address is ${GUEST_IPV4}"
 BROKER_URL="http://${IPV4_GATEWAY}:${BROKER_PORT}/broker.txt"
 FORBIDDEN_URL="http://${IPV4_GATEWAY}:${FORBIDDEN_PORT}/forbidden.txt"
 
-expect_guest_success \
-  "VM can reach broker port through host-only gateway" \
-  "wget -q -T 3 -O - '$BROKER_URL' | grep -q '^broker-ok$'"
+assert_broker_reachable
 
 assert_forbidden_ipv4_egress_counted
 
@@ -661,7 +788,9 @@ expect_guest_blocked \
   "nslookup github.com 1.1.1.1 >/dev/null"
 
 # Adversarial: closes the exact P1 — a root guest re-enabling IPv6 post-release.
-assert_reenabled_ipv6_egress_blocked
+# The kernel-line disable makes that re-enable impossible in the guest, so this
+# asserts irreversibility; the host PF IPv6 deny remains as defence in depth.
+assert_guest_ipv6_disable_is_irreversible
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
@@ -681,4 +810,8 @@ assert_no_pf_state_for_guest
 
 cleanup
 trap - EXIT INT TERM
-log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, host IPv6 interface deny holds against a re-enabling root guest, and runner cleanup verified"
+if (( BROKER_REACH_WAIVED == 1 )); then
+  log "runner lifecycle proof INCOMPLETE for ${IPV4_CIDR}: the positive control (broker reachable) was waived under WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 because this host shows the known vmnet accept() defect (docs/vmnet-accept-bug-and-broker-vm-plan.md); every other leg passed: workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"
+  exit 2
+fi
+log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"
