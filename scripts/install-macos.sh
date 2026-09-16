@@ -56,9 +56,17 @@ SIGN_KEYCHAIN="${WRIT_SIGN_KEYCHAIN:-}"
 find_args=(-p codesigning)
 [[ -n "$SIGN_KEYCHAIN" ]] && find_args+=("$SIGN_KEYCHAIN")
 
+# Resolve the identity whose common name is EXACTLY "$SIGN_CN" to its SHA-1
+# fingerprint and sign by that, so neither the lookup nor `codesign --sign`
+# matches a different identity by substring. The quotes around "$SIGN_CN" make
+# the grep a whole-name match against find-identity's `N) <sha1> "<name>"` lines.
 sign="-"
-if security find-identity "${find_args[@]}" 2>/dev/null | grep -Fq "$SIGN_CN"; then
-  sign="$SIGN_CN"
+# `|| true`: grep exits non-zero when the identity is absent, and pipefail +
+# set -e would abort before the ad-hoc fallback could run.
+sha="$(security find-identity "${find_args[@]}" 2>/dev/null \
+  | grep -F "\"${SIGN_CN}\"" | grep -oE '[0-9A-Fa-f]{40}' | head -n1 || true)"
+if [[ -n "$sha" ]]; then
+  sign="$sha"
 else
   echo "note: signing identity '${SIGN_CN}' not found; signing writd ad-hoc." >&2
   echo "      run scripts/create-writd-signing-identity.sh first for a rebuild-stable requirement." >&2

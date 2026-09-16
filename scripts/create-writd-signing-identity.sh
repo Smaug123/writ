@@ -85,9 +85,19 @@ p12_pass="$("$OPENSSL" rand -hex 16)"
 # Re-running must replace, not accumulate: `security import` does not remove a
 # previous cert+key with the same name, and two identities sharing a common
 # name make `codesign --sign "$CN"` ambiguous (it refuses). Delete any prior
-# writd signing identity in this keychain first.
-while security find-identity -p codesigning "$KEYCHAIN" | grep -Fq "$CN"; do
-  security delete-identity -c "$CN" "$KEYCHAIN" >/dev/null 2>&1 || break
+# identity whose common name is EXACTLY "$CN", by SHA-1 fingerprint. Matching
+# must be exact: both `grep -F "$CN"` and `delete-identity -c "$CN"` match
+# substrings, so a default run would otherwise destroy an unrelated identity
+# such as one created with a "$CN ..." CN override. find-identity prints each
+# identity as `  N) <40-hex-sha1> "<name>" (...)`; the surrounding quotes make
+# `"$CN"` a whole-name match, and -Z deletes exactly that certificate.
+while :; do
+  # `|| true`: grep exits non-zero when nothing matches, and pipefail + set -e
+  # would otherwise abort the whole script on the empty-keychain first run.
+  fp="$(security find-identity -p codesigning "$KEYCHAIN" \
+    | grep -F "\"${CN}\"" | grep -oE '[0-9A-Fa-f]{40}' | head -n1 || true)"
+  [[ -n "$fp" ]] || break
+  security delete-identity -Z "$fp" "$KEYCHAIN" >/dev/null 2>&1 || break
 done
 
 # -T /usr/bin/codesign adds codesign to the key's access-control list, so the
@@ -102,8 +112,9 @@ security import "$workdir/identity.p12" -k "$KEYCHAIN" -P "$p12_pass" -f pkcs12 
 
 echo "imported code-signing identity into ${KEYCHAIN}:"
 # No -v: a self-signed identity is usable for signing but is not "valid"
-# (untrusted), so the valid-only listing would hide it.
-security find-identity -p codesigning "$KEYCHAIN" | grep -F "$CN" || {
+# (untrusted), so the valid-only listing would hide it. Match the whole quoted
+# name so a substring collision cannot masquerade as our identity.
+security find-identity -p codesigning "$KEYCHAIN" | grep -F "\"${CN}\"" || {
   echo "error: identity '${CN}' not found after import" >&2
   exit 1
 }
