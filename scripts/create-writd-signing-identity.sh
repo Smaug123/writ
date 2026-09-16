@@ -44,7 +44,14 @@ CN="${WRIT_SIGN_IDENTITY_CN:-org.writ.writd signing}"
 # only the surrounding indentation and quotes, never spaces inside the path.
 KEYCHAIN="${WRIT_SIGN_KEYCHAIN:-$(security default-keychain | sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//')}"
 
-command -v openssl >/dev/null 2>&1 || { echo "error: openssl is required" >&2; exit 1; }
+# Pin macOS's own openssl (LibreSSL). OpenSSL 3 — which Homebrew or a Nix
+# profile can put ahead of it on PATH — exports PKCS#12 with PBES2/AES defaults
+# that macOS's `security import` cannot read, so a PATH-dependent openssl would
+# make identity creation fail (and, since we delete the old identity first,
+# leave none on a rerun). If overriding WRIT_OPENSSL, use a LibreSSL- or
+# OpenSSL-1.x-compatible build, or one where the p12 export is macOS-importable.
+OPENSSL="${WRIT_OPENSSL:-/usr/bin/openssl}"
+command -v "$OPENSSL" >/dev/null 2>&1 || { echo "error: openssl not found at '$OPENSSL' (set WRIT_OPENSSL)" >&2; exit 1; }
 command -v security >/dev/null 2>&1 || { echo "error: this script is macOS-only (needs security)" >&2; exit 1; }
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/writ-signing.XXXXXX")"
@@ -66,13 +73,13 @@ keyUsage           = critical,digitalSignature
 extendedKeyUsage   = critical,codeSigning
 EXT
 
-openssl req -x509 -newkey rsa:2048 -nodes \
+"$OPENSSL" req -x509 -newkey rsa:2048 -nodes \
   -keyout "$workdir/key.pem" -out "$workdir/cert.pem" \
   -days 3650 -config "$workdir/ext.cnf" >/dev/null 2>&1
 
 # security import wants a PKCS#12 bundle for a cert+key pair.
-p12_pass="$(openssl rand -hex 16)"
-openssl pkcs12 -export -inkey "$workdir/key.pem" -in "$workdir/cert.pem" \
+p12_pass="$("$OPENSSL" rand -hex 16)"
+"$OPENSSL" pkcs12 -export -inkey "$workdir/key.pem" -in "$workdir/cert.pem" \
   -name "$CN" -out "$workdir/identity.p12" -passout "pass:${p12_pass}" >/dev/null 2>&1
 
 # Re-running must replace, not accumulate: `security import` does not remove a
@@ -90,7 +97,7 @@ done
 # access to their own keys, and a reliably-scoped form is not available. A
 # one-time interactive "Always Allow" is the safe path here; automated/CI
 # signing should use a dedicated keychain or an Apple Developer ID (Tier A).
-security import "$workdir/identity.p12" -k "$KEYCHAIN" -P "$p12_pass" \
+security import "$workdir/identity.p12" -k "$KEYCHAIN" -P "$p12_pass" -f pkcs12 \
   -T /usr/bin/codesign -T /usr/bin/security >/dev/null
 
 echo "imported code-signing identity into ${KEYCHAIN}:"
