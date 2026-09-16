@@ -477,9 +477,10 @@ pf_broker_pass_counters() {
 #   2. no interface-scoped IPv4 deny counted a packet during the probe (PF did
 #      not drop it);
 #   3. the host holds a PF state for gateway:port <- guest whose TCP phase shows
-#      the handshake COMPLETED (ESTABLISHED or a later closing state, not a
-#      SYN_SENT/SYN_RCVD half-open — a broker that never SYN-ACKed is a
-#      different failure and is not waived);
+#      the handshake COMPLETED on BOTH endpoints (each side ESTABLISHED or a
+#      later graceful-close state, never a SYN_SENT/SYN_RCVD half-open and never
+#      a bare TIME_WAIT that a reset could leave — a broker that never SYN-ACKed,
+#      or answered a dead port with a reset, is a different failure, not waived);
 #   4. the broker logged the loopback control request but never one from the
 #      guest (the bytes reached the host kernel, not the listening process).
 # All four together name the vmnet accept() defect and exonerate the anchor;
@@ -510,16 +511,25 @@ assert_broker_reachable() {
     | grep -F "tcp ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}:" || true)"
   # The defect's signature is that the handshake COMPLETED (the host ACKed the
   # request) yet the process never read it — the original capture showed the
-  # state as ESTABLISHED:FIN_WAIT_2. A state that exists but is still mid-
-  # handshake (SYN_SENT / SYN_RCVD, i.e. the broker never SYN-ACKed) is a
-  # different failure and must NOT be waived. pfctl prints the TCP state pair on
-  # the same line as the tuple, so require a post-handshake phase there.
-  if [[ "$host_state" == *ESTABLISHED* ]] \
-    || [[ "$host_state" == *FIN_WAIT* ]] \
-    || [[ "$host_state" == *CLOSE_WAIT* ]] \
-    || [[ "$host_state" == *CLOSING* ]] \
-    || [[ "$host_state" == *LAST_ACK* ]] \
-    || [[ "$host_state" == *TIME_WAIT* ]]; then
+  # state as ESTABLISHED:FIN_WAIT_2. pfctl prints the TCP state pair as the last
+  # field on the tuple line (`<src-state>:<dst-state>`); read BOTH endpoints.
+  # Waive only if neither endpoint is still pre-establishment
+  # (SYN_SENT/SYN_RCVD/CLOSED/NO_TRAFFIC — this rejects a half-open such as
+  # SYN_SENT:ESTABLISHED, or a SYN to a dead port) AND at least one endpoint is
+  # in a state reachable only after a completed 3-way handshake (ESTABLISHED or
+  # a graceful-close phase). TIME_WAIT is deliberately excluded from that set:
+  # a reset can leave a reset-adjacent state, so a bare TIME_WAIT:TIME_WAIT is
+  # treated as inconclusive rather than proof of completion.
+  local state_pair state_a state_b
+  state_pair="${host_state##* }"
+  state_a="${state_pair%%:*}"
+  state_b="${state_pair##*:}"
+  local pre_handshake_re='^(SYN_SENT|SYN_RCVD|CLOSED|NO_TRAFFIC)$'
+  local post_handshake_re='^(ESTABLISHED|FIN_WAIT_1|FIN_WAIT_2|CLOSING|CLOSE_WAIT|LAST_ACK)$'
+  if [[ -n "$host_state" ]] \
+    && ! [[ "$state_a" =~ $pre_handshake_re ]] \
+    && ! [[ "$state_b" =~ $pre_handshake_re ]] \
+    && { [[ "$state_a" =~ $post_handshake_re ]] || [[ "$state_b" =~ $post_handshake_re ]]; }; then
     handshake_complete=1
   fi
   local guest_logged=0 loopback_logged=0
