@@ -60,16 +60,30 @@ find_args=(-p codesigning)
 # fingerprint and sign by that, so neither the lookup nor `codesign --sign`
 # matches a different identity by substring. The quotes around "$SIGN_CN" make
 # the grep a whole-name match against find-identity's `N) <sha1> "<name>"` lines.
+# -v: codesign uses only *valid* identities, so looking up anything less would
+# hand codesign a fingerprint it then rejects with "no identity found".
 sign="-"
 # `|| true`: grep exits non-zero when the identity is absent, and pipefail +
 # set -e would abort before the ad-hoc fallback could run.
-sha="$(security find-identity "${find_args[@]}" 2>/dev/null \
+sha="$(security find-identity -v "${find_args[@]}" 2>/dev/null \
   | grep -F "\"${SIGN_CN}\"" | grep -oE '[0-9A-Fa-f]{40}' | head -n1 || true)"
 if [[ -n "$sha" ]]; then
   sign="$sha"
+elif security find-identity "${find_args[@]}" 2>/dev/null | grep -qF "\"${SIGN_CN}\""; then
+  # Present but invalid. Failing beats the ad-hoc fallback here: silently
+  # signing ad-hoc would look like a working install while the firewall
+  # requirement quietly degrades to a per-build cdhash.
+  echo "error: signing identity '${SIGN_CN}' exists but is not valid for code signing," >&2
+  echo "       so codesign would refuse it ('no identity found'). Usual cause: its" >&2
+  echo "       certificate is not trusted — re-run scripts/create-writd-signing-identity.sh," >&2
+  echo "       which marks it trusted. (Also check 'security list-keychains' lists a" >&2
+  echo "       keychain path that actually exists.)" >&2
+  exit 1
 else
   echo "note: signing identity '${SIGN_CN}' not found; signing writd ad-hoc." >&2
   echo "      run scripts/create-writd-signing-identity.sh first for a rebuild-stable requirement." >&2
+  echo "      (already ran it? check 'security list-keychains' — a search list naming a" >&2
+  echo "      nonexistent keychain path hides identities from codesign)" >&2
 fi
 
 codesign_args=(--force --sign "$sign" --identifier "$IDENTIFIER")

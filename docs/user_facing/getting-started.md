@@ -50,6 +50,11 @@ scripts/create-writd-signing-identity.sh
 scripts/install-macos.sh
 ```
 
+Expect two one-time dialogs: the identity script asks for your login password
+(it marks the new certificate trusted for code signing — `codesign` refuses an
+untrusted self-signed identity outright), and the first install asks to
+authorise the signing key; click "Always Allow".
+
 There is also a Nix flake (`flake.nix`) if you prefer.
 
 ### 2a. macOS Application Firewall
