@@ -69,7 +69,11 @@ sha="$(security find-identity -v "${find_args[@]}" 2>/dev/null \
   | grep -F "\"${SIGN_CN}\"" | grep -oE '[0-9A-Fa-f]{40}' | head -n1 || true)"
 if [[ -n "$sha" ]]; then
   sign="$sha"
-elif security find-identity "${find_args[@]}" 2>/dev/null | grep -qF "\"${SIGN_CN}\""; then
+# >/dev/null, not -q: -q exits at the first match, and if security is still
+# writing it takes SIGPIPE; under pipefail the pipeline then reads false and a
+# found-but-invalid identity would slip through to the ad-hoc fallback. The
+# consuming form reads the whole listing, so the status is grep's verdict.
+elif security find-identity "${find_args[@]}" 2>/dev/null | grep -F "\"${SIGN_CN}\"" >/dev/null; then
   # Present but invalid. Failing beats the ad-hoc fallback here: silently
   # signing ad-hoc would look like a working install while the firewall
   # requirement quietly degrades to a per-build cdhash.
