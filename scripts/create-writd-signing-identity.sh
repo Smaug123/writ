@@ -19,16 +19,24 @@ This adds ONE code-signing certificate + private key to a keychain. It needs no
 sudo. It does NOT get the firewall's auto-allow (that needs an Apple-anchored
 Developer ID; see the plan's Tier A) — it makes the manual allow durable.
 
-The first time codesign uses the key (scripts/install-macos.sh) macOS asks you
-to authorise it; click "Always Allow" and it will not ask again. Signing does
-not need the key to be trusted, so no trust dialog is involved.
+Expect two one-time macOS dialogs:
+  1. This script marks the new certificate trusted for code signing (user
+     trust domain, code-signing policy only); macOS asks for your login
+     password. Without this step codesign refuses the identity outright
+     ("no identity found"): codesign signs only with *valid* identities, and
+     a self-signed certificate is valid only once trusted.
+  2. The first time codesign uses the key (scripts/install-macos.sh) macOS
+     asks you to authorise it; click "Always Allow" and it will not ask again.
 
 Environment overrides:
   WRIT_SIGN_IDENTITY_CN  certificate common name (default: "org.writ.writd signing")
   WRIT_SIGN_KEYCHAIN     keychain to import into (default: the login keychain)
 
-Re-running replaces the identity with a fresh certificate; re-run
-scripts/install-macos.sh and scripts/allow-writd-firewall.sh afterwards.
+Re-running replaces the identity with a fresh certificate (and asks for trust
+again, since trust is per certificate); re-run scripts/install-macos.sh and
+scripts/allow-writd-firewall.sh afterwards. The old certificate's
+trust-settings entry is left behind — harmless, since its private key is
+destroyed, but removable via Keychain Access if you prefer tidiness.
 
 See docs/plans/2026-09-16-macos-firewall-stable-identity.md (Stage 2).
 EOF
@@ -110,12 +118,26 @@ done
 security import "$workdir/identity.p12" -k "$KEYCHAIN" -P "$p12_pass" -f pkcs12 \
   -T /usr/bin/codesign -T /usr/bin/security >/dev/null
 
+# codesign signs only with *valid* identities, and a self-signed certificate
+# is not valid until it is trusted — untrusted, `codesign --sign <sha1>` fails
+# with "no identity found". Trust it in the user domain (no -d: the admin
+# domain needs sudo and machine-wide scope), restricted to the code-signing
+# policy. macOS asks for your login password here. add-trusted-cert matches
+# the already-imported certificate rather than duplicating it. Reversible:
+#   security remove-trusted-cert <cert.pem>
+security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$workdir/cert.pem" || {
+  echo "error: could not mark '${CN}' trusted for code signing (dialog cancelled?)" >&2
+  echo "       codesign will refuse the identity until it is trusted; re-run this script." >&2
+  exit 1
+}
+
 echo "imported code-signing identity into ${KEYCHAIN}:"
-# No -v: a self-signed identity is usable for signing but is not "valid"
-# (untrusted), so the valid-only listing would hide it. Match the whole quoted
-# name so a substring collision cannot masquerade as our identity.
-security find-identity -p codesigning "$KEYCHAIN" | grep -F "\"${CN}\"" || {
-  echo "error: identity '${CN}' not found after import" >&2
+# -v: codesign uses only *valid* identities, so demanding validity here turns
+# "the trust step did not take" into a hard error now instead of a confusing
+# `codesign: no identity found` later. Match the whole quoted name so a
+# substring collision cannot masquerade as our identity.
+security find-identity -v -p codesigning "$KEYCHAIN" | grep -F "\"${CN}\"" || {
+  echo "error: identity '${CN}' not present as a VALID identity after import + trust" >&2
   exit 1
 }
 echo
