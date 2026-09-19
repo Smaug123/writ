@@ -410,6 +410,11 @@ pub enum Ipv6IsolationMode {
     Ipv4OnlyNoGuestIpv6,
 }
 
+impl Ipv6IsolationMode {
+    /// Every mode, for tests that range over all of them.
+    pub const ALL: [Self; 2] = [Self::DualStackRequired, Self::Ipv4OnlyNoGuestIpv6];
+}
+
 /// What an operator wrote in `ipv6_mode`, before anything decides whether a
 /// session may start under it.
 ///
@@ -513,6 +518,9 @@ pub enum AgentVmSessionStateStatus {
 }
 
 impl AgentVmSessionStateStatus {
+    /// Every status, for tests that range over all of them.
+    pub const ALL: [Self; 2] = [Self::Starting, Self::Running];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
@@ -563,6 +571,25 @@ pub enum StartOutcome {
     ProbeGuestIpv6Failed,
     ValidateGuestIpv6Failed,
     ReleaseGuestCommandFailed,
+}
+
+impl StartOutcome {
+    /// Every outcome, for tests that range over all of them.
+    pub const ALL: [Self; 13] = [
+        Self::Started,
+        Self::NetworkAbsenceProbeFailed,
+        Self::CreateNetworkFailed,
+        Self::InspectNetworkFailed,
+        Self::ParseNetworkInspectionFailed,
+        Self::ValidateNetworkInspectionFailed,
+        Self::InstallFirewallFailed,
+        Self::VmAbsenceProbeFailed,
+        Self::StartVmFailed,
+        Self::InstallGuestIpv6DenyFailed,
+        Self::ProbeGuestIpv6Failed,
+        Self::ValidateGuestIpv6Failed,
+        Self::ReleaseGuestCommandFailed,
+    ];
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -1806,31 +1833,6 @@ mod spec {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use uuid::Uuid;
 
-    fn arb_start_outcome() -> impl Strategy<Value = StartOutcome> {
-        prop_oneof![
-            Just(StartOutcome::Started),
-            Just(StartOutcome::NetworkAbsenceProbeFailed),
-            Just(StartOutcome::CreateNetworkFailed),
-            Just(StartOutcome::InspectNetworkFailed),
-            Just(StartOutcome::ParseNetworkInspectionFailed),
-            Just(StartOutcome::ValidateNetworkInspectionFailed),
-            Just(StartOutcome::InstallFirewallFailed),
-            Just(StartOutcome::VmAbsenceProbeFailed),
-            Just(StartOutcome::StartVmFailed),
-            Just(StartOutcome::InstallGuestIpv6DenyFailed),
-            Just(StartOutcome::ProbeGuestIpv6Failed),
-            Just(StartOutcome::ValidateGuestIpv6Failed),
-            Just(StartOutcome::ReleaseGuestCommandFailed),
-        ]
-    }
-
-    fn arb_ipv6_mode() -> impl Strategy<Value = Ipv6IsolationMode> {
-        prop_oneof![
-            Just(Ipv6IsolationMode::DualStackRequired),
-            Just(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6),
-        ]
-    }
-
     fn arb_broker_ports_and_range() -> impl Strategy<Value = (BrokerPorts, BrokerPortRange)> {
         (
             prop::collection::vec(1024u16..=65535, 1..=4),
@@ -1877,7 +1879,7 @@ mod spec {
             any::<u16>(),
             any::<u8>(),
             arb_broker_ports_and_range(),
-            arb_ipv6_mode(),
+            prop::sample::select(Ipv6IsolationMode::ALL.to_vec()),
             "[a-z][a-z0-9]{0,7}(:[a-z0-9]{1,8})?",
             prop::collection::vec("[a-z][a-z0-9_-]{0,7}", 1..=4),
             1u16..=8,
@@ -1931,13 +1933,6 @@ mod spec {
                     .unwrap()
                 },
             )
-    }
-
-    fn arb_state_status() -> impl Strategy<Value = AgentVmSessionStateStatus> {
-        prop_oneof![
-            Just(AgentVmSessionStateStatus::Starting),
-            Just(AgentVmSessionStateStatus::Running),
-        ]
     }
 
     fn arb_guest_env_value() -> impl Strategy<Value = String> {
@@ -2057,7 +2052,9 @@ mod spec {
         }
 
         #[test]
-        fn start_outcome_maps_to_the_expected_cleanup(outcome in arb_start_outcome()) {
+        fn start_outcome_maps_to_the_expected_cleanup(
+            outcome in prop::sample::select(StartOutcome::ALL.to_vec()),
+        ) {
             let cleanup = plan(7).cleanup_after_start_outcome(outcome);
             let expected_len = match outcome {
                 // Success, or a network-absence-probe failure that created nothing.
@@ -2205,7 +2202,7 @@ mod spec {
         #[test]
         fn persisted_session_state_roundtrips_to_the_same_stop_plan(
             plan in arb_plan(),
-            status in arb_state_status(),
+            status in prop::sample::select(AgentVmSessionStateStatus::ALL.to_vec()),
         ) {
             let state = AgentVmSessionState::from_start_plan(
                 &plan,

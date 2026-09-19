@@ -315,6 +315,15 @@ pub enum TreeEntryKind {
 }
 
 impl TreeEntryKind {
+    /// Every kind, for tests that range over all of them.
+    pub const ALL: [Self; 5] = [
+        Self::Blob,
+        Self::Executable,
+        Self::Symlink,
+        Self::Subtree,
+        Self::Submodule,
+    ];
+
     const fn mode(self) -> &'static str {
         match self {
             Self::Blob => "100644",

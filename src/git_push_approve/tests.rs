@@ -307,7 +307,7 @@ fn runtime_pointed_at(staging_parent: &Path) -> PromoteRuntimeConfig {
     .unwrap()
 }
 
-// ---------- run_approve_with_staging_repo: wiremock-backed ----------
+// ---------- prepare_approve_with_staging_repo: wiremock-backed ----------
 
 /// Replay arm happy path: pre-walk lease matches, walker uploads
 /// the single commit (its empty tree + the commit), post-walk

@@ -37,6 +37,11 @@ pub enum ProbeObservation {
     Indeterminate,
 }
 
+impl ProbeObservation {
+    /// Every observation, for tests that range over all of them.
+    pub const ALL: [Self; 3] = [Self::Reachable, Self::Unreachable, Self::Indeterminate];
+}
+
 /// One host network interface (IPv4 only), as the FFI edge produces it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostIface {
@@ -257,11 +262,7 @@ mod tests {
     }
 
     fn obs() -> impl Strategy<Value = ProbeObservation> {
-        prop_oneof![
-            Just(ProbeObservation::Reachable),
-            Just(ProbeObservation::Unreachable),
-            Just(ProbeObservation::Indeterminate),
-        ]
+        prop::sample::select(ProbeObservation::ALL.to_vec())
     }
 
     proptest! {
