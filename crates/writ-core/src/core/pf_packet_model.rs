@@ -168,8 +168,7 @@ impl Session {
     }
 
     fn broker_ipv6(&self) -> Option<PfHost> {
-        self.ipv6
-            .map(|ipv6| PfHost::Inet6(Ipv6Addr::from(u128::from(ipv6.network()) + 1)))
+        self.ipv6.map(|ipv6| PfHost::Inet6(ipv6.first_host()))
     }
 
     fn bootstrap(&self) -> PfRuleset {

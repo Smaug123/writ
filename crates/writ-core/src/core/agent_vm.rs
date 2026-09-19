@@ -258,6 +258,19 @@ impl Ipv4Cidr {
         self.prefix
     }
 
+    /// The subnet's first host address, `network + 1`: the address Apple's
+    /// `container` gives the gateway of every network it creates, and so the
+    /// one the broker is reached at from inside an agent subnet. Only
+    /// meaningful when the prefix leaves host bits.
+    pub fn first_host(self) -> Ipv4Addr {
+        debug_assert!(
+            self.prefix <= 30,
+            "a /{} has no host addresses",
+            self.prefix
+        );
+        Ipv4Addr::from(u32::from(self.network) + 1)
+    }
+
     pub fn contains_subnet(self, other: Self) -> bool {
         self.prefix <= other.prefix
             && (u32::from(other.network) & ipv4_mask(self.prefix)) == u32::from(self.network)
@@ -295,6 +308,17 @@ impl Ipv6Cidr {
 
     pub fn prefix(self) -> u8 {
         self.prefix
+    }
+
+    /// The subnet's first host address, `network + 1`; see
+    /// [`Ipv4Cidr::first_host`].
+    pub fn first_host(self) -> Ipv6Addr {
+        debug_assert!(
+            self.prefix <= 126,
+            "a /{} has no host addresses",
+            self.prefix
+        );
+        Ipv6Addr::from(u128::from(self.network) + 1)
     }
 
     pub fn contains_subnet(self, other: Self) -> bool {
@@ -452,7 +476,7 @@ impl AgentNetwork {
     }
 
     pub fn ipv4_gateway(self) -> Ipv4Addr {
-        Ipv4Addr::from(u32::from(self.ipv4.network()) + 1)
+        self.ipv4.first_host()
     }
 }
 
@@ -480,12 +504,11 @@ impl AgentFirewallNetwork {
     }
 
     pub fn ipv4_gateway(self) -> Ipv4Addr {
-        Ipv4Addr::from(u32::from(self.ipv4.network()) + 1)
+        self.ipv4.first_host()
     }
 
     pub fn ipv6_gateway(self) -> Option<Ipv6Addr> {
-        self.ipv6
-            .map(|cidr| Ipv6Addr::from(u128::from(cidr.network()) + 1))
+        self.ipv6.map(Ipv6Cidr::first_host)
     }
 }
 
@@ -818,7 +841,7 @@ pub fn session_firewall_pf_ruleset(
         "writ deny agent v4",
     )];
     if let Some(ipv6) = network.ipv6() {
-        let ipv6_gateway = Ipv6Addr::from(u128::from(ipv6.network()) + 1);
+        let ipv6_gateway = ipv6.first_host();
         allow.push(PfAllowRule::new(
             None,
             PfCidr::Inet6(ipv6),
@@ -1374,7 +1397,7 @@ mod tests {
         assert_eq!(allow_v6.source(), PfCidr::Inet6(network.ipv6()));
         assert_eq!(
             allow_v6.destination(),
-            PfHost::Inet6(Ipv6Addr::from(u128::from(network.ipv6().network()) + 1)),
+            PfHost::Inet6(network.ipv6().first_host()),
         );
         assert_eq!(deny_v4.label(), "writ deny agent v4");
         assert_eq!(deny_v6.label(), "writ deny agent v6");
@@ -1580,6 +1603,26 @@ mod tests {
     }
 
     proptest! {
+        /// The first host lies inside its subnet and is not the network
+        /// address, in either family, for every prefix that leaves host bits.
+        #[test]
+        fn ipv4_first_host_is_inside_the_subnet(raw in any::<u32>(), prefix in 0u8..=30) {
+            let cidr = Ipv4Cidr::new(Ipv4Addr::from(raw & ipv4_mask(prefix)), prefix).unwrap();
+            let host = cidr.first_host();
+            prop_assert!(cidr.contains_addr(host));
+            prop_assert_ne!(host, cidr.network());
+        }
+
+        #[test]
+        fn ipv6_first_host_is_inside_the_subnet(raw in any::<u128>(), prefix in 0u8..=126) {
+            let cidr = Ipv6Cidr::new(Ipv6Addr::from(raw & ipv6_mask(prefix)), prefix).unwrap();
+            let host = cidr.first_host();
+            prop_assert!(cidr.contains_addr(host));
+            prop_assert_ne!(host, cidr.network());
+        }
+    }
+
+    proptest! {
         #[test]
         fn ipv4_constructor_rejects_any_host_bit(raw in any::<u32>(), prefix in 0u8..32) {
             let bad = (raw & ipv4_mask(prefix)) | 1;
@@ -1685,7 +1728,7 @@ mod tests {
             let network = pool.allocate(index).unwrap();
             let ruleset = session_pf_ruleset(session_id(), network, &sample_ports());
             let rendered = render_pf(&ruleset);
-            let v6_gateway = Ipv6Addr::from(u128::from(network.ipv6().network()) + 1);
+            let v6_gateway = network.ipv6().first_host();
             let v4_clause = format!(
                 "from {} to {} port $broker_ports",
                 network.ipv4(),

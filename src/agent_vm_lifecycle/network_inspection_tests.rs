@@ -4,7 +4,7 @@
 use super::test_support::*;
 use super::*;
 use crate::core::PfInterface;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[test]
 fn network_inspect_without_ipv6_is_explicitly_mode_dependent() {
