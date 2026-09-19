@@ -2,20 +2,11 @@
 //!
 //! The broker is largely a machine for enforcing size limits: bundle caps,
 //! proxy request and response caps, NAR and narinfo caps, push body caps,
-//! cache eviction ceilings. Before this type they were spelled two ways —
-//! eight of the eleven configured caps as `u64`, the three git-push ones as
-//! `usize` — for one concept, with the conversions written out at whichever
-//! site happened to need them.
-//!
-//! No truncation bug had resulted: every conversion in the tree was either a
-//! widening `len() as u64` (lossless) or a checked `usize::try_from`. The cost
-//! was that nothing *stopped* the next one being neither, and a reader could
-//! not tell from a signature which spelling a given limit used.
-//!
-//! So the point of this type is not that it fixes an outstanding defect. It is
-//! that the narrowing conversion — the only one that can lose information — now
-//! exists in exactly one place ([`ByteSize::to_usize`]), returns an `Option`,
-//! and cannot be written any other way.
+//! cache eviction ceilings. Every one of them is a `ByteSize`, so a signature
+//! says which quantity it bounds, and the narrowing conversion — the only one
+//! that can lose information — exists in exactly one place
+//! ([`ByteSize::to_usize`]), returns an `Option`, and cannot be written any
+//! other way.
 //!
 //! Represented as `u64` because that is what a size limit means independently
 //! of the host's pointer width: a cap on a 64 MiB bundle is 64 MiB whether or
