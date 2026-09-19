@@ -339,60 +339,45 @@ fn resolve_decider_fails_when_no_flag_and_no_user_env() {
     );
 }
 
-/// `BAILIFF_REPO` honours `XDG_DATA_HOME` when
-/// set and falls back to the documented `~/.local/share`
-/// location otherwise. The env-var manipulation is process-
-/// scoped; running other tests concurrently in the same
-/// process could see the temporary unset, so the test serialises
-/// the env access by snapshotting and restoring.
+/// `XDG_DATA_HOME` picks the location when it is set, and `$HOME` the
+/// location otherwise, for both of bailiff's declared paths.
+///
+/// Resolved against a supplied environment rather than the process's.
+/// `set_var` is `unsafe` in a threaded test binary because it changes what
+/// every concurrent test reads, and the pair here is exactly what
+/// [`DefaultPath::resolve_from`] takes as arguments.
 #[test]
 fn default_paths_track_xdg_data_home() {
-    // Snapshot to restore; SAFETY-WISE we never share env access with
-    // other parallel tests in this binary that mutate the same vars.
-    // The `tests` module in this binary doesn't touch XDG_DATA_HOME
-    // anywhere else, so the only risk is concurrent integration
-    // tests — none exist for this binary today.
-    let snapshot = std::env::var_os("XDG_DATA_HOME");
-    unsafe {
-        std::env::set_var("XDG_DATA_HOME", "/data");
-    }
+    let xdg = |dir: &str| Some(std::ffi::OsString::from(dir));
+
     assert_eq!(
-        BAILIFF_REPO.resolve().unwrap(),
+        BAILIFF_REPO.resolve_from(xdg("/data"), None).unwrap(),
         PathBuf::from("/data/bailiff/repo")
     );
     // writd writes and bailiff fetches from the same disk location under stock
     // config. Bailiff names writd's own `NOTES_REPO` constant, so this is an
-    // identity rather than two hand-copied functions that happen to agree —
-    // which is what the deleted `default_writ_repo_path` was, and what the
-    // comment above it could only ask the next reader to preserve.
+    // identity rather than two hand-copied functions that happen to agree.
     assert_eq!(
-        WRIT_NOTES_REPO.resolve().unwrap(),
-        writ::config::default_paths::NOTES_REPO.resolve().unwrap(),
+        WRIT_NOTES_REPO.resolve_from(xdg("/data"), None).unwrap(),
+        writ::config::default_paths::NOTES_REPO
+            .resolve_from(xdg("/data"), None)
+            .unwrap(),
     );
     assert_eq!(
-        WRIT_NOTES_REPO.resolve().unwrap(),
+        WRIT_NOTES_REPO.resolve_from(xdg("/data"), None).unwrap(),
         PathBuf::from("/data/writ/repo")
     );
 
-    unsafe {
-        std::env::remove_var("XDG_DATA_HOME");
-        std::env::set_var("HOME", "/home/test");
-    }
     assert_eq!(
-        BAILIFF_REPO.resolve().unwrap(),
+        BAILIFF_REPO.resolve_from(None, xdg("/home/test")).unwrap(),
         PathBuf::from("/home/test/.local/share/bailiff/repo")
     );
     assert_eq!(
-        WRIT_NOTES_REPO.resolve().unwrap(),
+        WRIT_NOTES_REPO
+            .resolve_from(None, xdg("/home/test"))
+            .unwrap(),
         PathBuf::from("/home/test/.local/share/writ/repo")
     );
-
-    unsafe {
-        match snapshot {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
-    }
 }
 
 /// `bailiff plan review` parses the minimum required flag set
