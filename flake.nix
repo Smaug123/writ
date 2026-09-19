@@ -54,10 +54,18 @@
       # both, for the same reason: a rustflag that differs between the two would
       # make cargo rebuild the dependencies inside the workspace derivation and
       # silently undo the split.
+      #
+      # The package never runs the test suite itself: that is a separate
+      # derivation, `passthru.tests`, exposed as `checks.<system>.tests`. It
+      # reuses the same dependency artifacts, so `nix build .#checks.…tests`
+      # (or `nix flake check`) costs the workspace test compile plus the run,
+      # and the package stays a small, test-free, cacheable store path. CI
+      # builds the check on `main`; the PR path runs the suite in the dev
+      # profile through `cargo test` directly.
       mkWrit = pkgs: {
         pname ? "writ",
         cargoExtraArgs ? "",
-        doCheck ? true,
+        withTests ? true,
         wrapDrv ? lib.id,
         env ? {}
       }:
@@ -73,13 +81,22 @@
           } // env;
           # crane names this `${pname}-deps` itself.
           cargoArtifacts = wrapDrv (craneLib.buildDepsOnly (common // {
-            # Compile the test dependencies too when the workspace build will
-            # run `cargo test`, so that run finds them ready.
-            inherit doCheck;
+            # Compile the test dependencies too when there is a test
+            # derivation to consume them; otherwise it would recompile them
+            # on every run and undo the split for tests.
+            doCheck = withTests;
+          }));
+          tests = wrapDrv (craneLib.cargoTest (common // {
+            inherit cargoArtifacts;
+            # `cargo test` is this derivation's build phase, so the tools the
+            # suite spawns are build inputs here, not check inputs.
+            nativeBuildInputs = common.nativeCheckInputs;
           }));
         in
         wrapDrv (craneLib.buildPackage (common // {
-          inherit cargoArtifacts doCheck;
+          inherit cargoArtifacts;
+          doCheck = false;
+          passthru = lib.optionalAttrs withTests { inherit tests; };
         }));
 
       # ring/libsqlite3-sys/zstd-sys/lzma-sys have build.rs scripts that compile
@@ -132,7 +149,7 @@
             pname = "writ-vm";
             cargoExtraArgs = "--no-default-features --features vm-client --bin writ-vm";
             # Target binaries are not executable on the Darwin builder.
-            doCheck = false;
+            withTests = false;
             # vm-client excludes libsqlite3-sys/zstd-sys/lzma-sys, but still
             # pulls `ring` (reqwest -> rustls), whose build.rs needs `-liconv`
             # on darwin.
@@ -163,7 +180,7 @@
             pname = "writ-agent-vm-guest-init";
             cargoExtraArgs = "-p writ-guest-init --bin writ-agent-vm-guest-init";
             # Target binaries are not executable on the Darwin builder.
-            doCheck = false;
+            withTests = false;
             env = {
               # Fully static: the handoff chowns the whole of `/nix` to the
               # workload, so an initializer that loaded musl's dynamic loader
@@ -215,7 +232,7 @@
             # the writd bin so the broker image doesn't carry the other host bins.
             cargoExtraArgs = "--bin writd";
             # Target binaries are not executable on the Darwin builder.
-            doCheck = false;
+            withTests = false;
             # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
             # lzma-sys, whose build.rs scripts need `-liconv` on darwin.
             wrapDrv = withDarwinBuildIconv buildPkgs pkgs;
@@ -796,6 +813,10 @@
           };
           broker-vm-writd-musl = mkCrossWritd pkgs defaultGuestSystem;
         };
+
+        # The release-profile test run, as its own derivation over the same
+        # dependency artifacts as `packages.default` (see `mkWrit`).
+        checks.tests = writ.tests;
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ writ ];

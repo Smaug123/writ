@@ -104,6 +104,37 @@ jobs:
       run: |
         nix build .#packages.x86_64-linux.default --print-build-logs
 
+  # The release-profile test run under Nix: `checks.tests` compiles the
+  # workspace's test targets in the release profile against the cached
+  # dependency artifacts and runs the whole suite in the sandbox. The PR path
+  # already runs the suite in the dev profile (the Rust job above), so this
+  # duplicate is worth its ~10 minutes only as a gate on what lands on `main`,
+  # not on every push to a PR. Run it by hand with
+  # `nix build .#checks.<system>.tests` or `nix flake check`.
+  nix-tests:
+    name: Nix release-profile tests
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ab0a9732c6464e5bb81efb82a2103c7d98f0946f
+    - name: Enable Nix cache
+      uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
+
+    - name: Use Cachix
+      uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+      with:
+        name: ${{ env.CACHIX_CACHE }}
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+    - name: Run the test suite under Nix
+      run: |
+        nix build .#checks.x86_64-linux.tests --print-build-logs
+
   # The official agent-VM guest image, built for this runner's architecture,
   # then driven for real: the locked-profile initializer is started from the
   # image under exactly the locked capability profile, released with USR1 from
