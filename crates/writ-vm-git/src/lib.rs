@@ -1,8 +1,8 @@
 //! VM-facing Git wire types.
 //!
-//! This module validates the request/response shapes used between the guest
+//! This crate validates the request/response shapes used between the guest
 //! CLI and the host broker. Host-side bundle planning and execution live in
-//! host-only modules behind the `host` feature.
+//! the root crate's `vm_git_*` modules, behind its `host` feature.
 //!
 //! [`RepoRef`] is the repo-wide "owner/name" shape. [`GitCloneRepo`] layers
 //! GitHub-specific owner/name syntax on top because this endpoint always

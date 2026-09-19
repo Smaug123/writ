@@ -635,13 +635,9 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     // concurrent host runs hold N of those 512 and 2N OS threads, and a hung
     // agent holds its share until the daemon restarts.
     //
-    // Nothing bounds N. That is not new — nothing bounded concurrent
-    // `RunAgent` calls on either arm before this either, and the previous
-    // async spawn held tokio tasks instead — but the resource is now a capped
-    // shared pool rather than the scheduler, so the ceiling is closer.
-    // Bounding it properly needs a concurrency policy for agent runs (a limit,
-    // a queue discipline, and a wire answer for "too many in flight") that
-    // covers both arms; tracked separately rather than guessed at here.
+    // N is bounded by the `agent_run_slots` place taken above: past the
+    // limit, a caller is told "too many in flight" on the wire rather than
+    // queued without bound.
     let log_root = spawn_config.log_root.as_path().to_path_buf();
     let captured = tokio::task::spawn_blocking(move || {
         crate::agent_run::run_agent_process(&plan, &prompt, &log_root)
