@@ -177,7 +177,7 @@ fn insert_flake_provision_outcome_row(
 /// Marker selecting the flake-provision `(request, outcome)` pair for the generic
 /// [`EffectAuditTable`](crate::effect_table::EffectAuditTable) guard. Zero-sized;
 /// named only as a type argument. The VM-HTTP `broker_effect` driver records
-/// provisioning through it, so the direct writers below are now the *reference*
+/// provisioning through it, so the direct writers below are the *reference*
 /// implementation the equivalence proptest holds the guard to, not the
 /// production path.
 pub struct FlakeProvisionAuditTable;

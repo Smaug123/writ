@@ -1266,10 +1266,10 @@ impl AuditLog {
     /// forward-only triggers guarantee no `Resolved` row appears in
     /// the result set.
     ///
-    /// The NOT EXISTS clause excludes attempts that a v6 reconciliation
-    /// row already cleared — an `Uncertain` predecessor superseded by
-    /// a successful manual reconciliation is no longer something boot
-    /// reconcile needs to act on.
+    /// The NOT EXISTS clause excludes attempts a reconciliation row has
+    /// already cleared: an `Uncertain` predecessor superseded by a
+    /// successful manual reconciliation is not something boot reconcile
+    /// needs to act on.
     pub fn list_blocking_approve_attempts(
         &self,
     ) -> Result<Vec<GitPushApproveAttemptEntry>, AuditError> {
