@@ -21,7 +21,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
@@ -44,6 +44,7 @@ use crate::github_git_db::GitDataHttp;
 use crate::notes_repo::NotesRepo;
 use crate::openai_chatgpt_auth::ChatgptOauthAuthority;
 use crate::policy::{self, Decision, PolicyConfig};
+use crate::protocol::framing::{MAX_LINE_BYTES, read_line_bounded, write_frame};
 use crate::protocol::{
     ClientMessage, ReconcileOutcome, RejectionReason, ServerMessage, StagedPushAuditView,
     StagedPushDetail, StagedPushSummary,
@@ -820,65 +821,11 @@ pub(crate) fn error_with_source_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
-/// Maximum bytes we will buffer for a single newline-terminated request.
-/// The largest honest [`ClientMessage`] is a `RunAgent` carrying a
-/// 1 MiB [`AgentPrompt`] (the cap pinned by
-/// [`crate::agent_run::MAX_AGENT_PROMPT_BYTES`]); other variants are at
-/// most a few KiB. `serde_json` escapes ASCII control bytes as
-/// `\u00XX`, expanding worst-case input 6:1, so the wire frame for a
-/// 1 MiB control-character prompt is up to 6 MiB before envelope
-/// overhead. Matches the `6 * MAX_X_BYTES + small` convention used by
-/// `vm_http` for the same reason. A peer that writes
-/// non-newline-terminated data still can't make the broker allocate
-/// without bound — without this cap, `read_until(b'\n')` grows the
-/// buffer until the process OOMs.
-const MAX_LINE_BYTES: usize = 6 * crate::agent_run::MAX_AGENT_PROMPT_BYTES + 64 * 1024;
-
 /// Maximum idle time between reads on a connection. The CLI sends one
 /// message and reads one reply, so a healthy peer never approaches
 /// this. A stalled peer that connects and then goes quiet would
 /// otherwise pin a tokio task and an fd forever.
 const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Read one newline-terminated line from `reader`, failing with
-/// `InvalidData` if the line would exceed `max` bytes (exclusive of the
-/// terminator). Returns `Ok(None)` on clean EOF before any bytes are
-/// seen, mirroring `AsyncBufReadExt::read_line`'s convention.
-async fn read_line_bounded<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max: usize,
-) -> io::Result<Option<Vec<u8>>> {
-    let mut buf = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(if buf.is_empty() { None } else { Some(buf) });
-        }
-        if let Some(i) = available.iter().position(|&b| b == b'\n') {
-            if buf.len() + i > max {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("request line exceeds {max}-byte limit"),
-                ));
-            }
-            buf.extend_from_slice(&available[..i]);
-            reader.consume(i + 1);
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            return Ok(Some(buf));
-        }
-        let len = available.len();
-        if buf.len() + len > max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("request line exceeds {max}-byte limit"),
-            ));
-        }
-        buf.extend_from_slice(available);
-        reader.consume(len);
-    }
-}
 
 async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
     stream: UnixStream,
@@ -905,10 +852,7 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
                 let resp = ServerMessage::Error {
                     message: e.to_string(),
                 };
-                let mut json =
-                    serde_json::to_string(&resp).expect("ServerMessage always serializes");
-                json.push('\n');
-                let _ = writer.write_all(json.as_bytes()).await;
+                let _ = write_frame(&mut writer, &resp).await;
                 return Ok(());
             }
             Ok(Err(e)) => return Err(e),
@@ -925,10 +869,10 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
                     message: format!("invalid request: {e}"),
                 };
                 if handshake == handshake::Handshake::AwaitingHello {
-                    write_reply(&mut writer, &reply).await?;
+                    write_frame(&mut writer, &reply).await?;
                     return Ok(());
                 }
-                write_reply(&mut writer, &reply).await?;
+                write_frame(&mut writer, &reply).await?;
                 continue;
             }
         };
@@ -941,11 +885,11 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
         match handshake::admit(handshake, &message) {
             handshake::Admission::Accepted(reply) => {
                 handshake = handshake::Handshake::Negotiated;
-                write_reply(&mut writer, &reply).await?;
+                write_frame(&mut writer, &reply).await?;
                 continue;
             }
             handshake::Admission::Refused(reply) => {
-                write_reply(&mut writer, &reply).await?;
+                write_frame(&mut writer, &reply).await?;
                 return Ok(());
             }
             handshake::Admission::Dispatch => {}
@@ -957,21 +901,9 @@ async fn handle_connection<S: SecretStore + Send + Sync + 'static>(
         // accepted run, its queue place and its registry entry — out of scope
         // unstarted. So a client that has already gone gets no VM booted in its
         // name, rather than one it will never hear about.
-        write_reply(&mut writer, dispatched.reply()).await?;
+        write_frame(&mut writer, dispatched.reply()).await?;
         dispatched.begin_deferred_work();
     }
-}
-
-/// Write one newline-framed [`ServerMessage`]. Factored out because the
-/// handshake added three more reply sites, and a framing that is spelled out
-/// per site is a framing that eventually differs per site.
-async fn write_reply<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    reply: &ServerMessage,
-) -> io::Result<()> {
-    let mut json = serde_json::to_string(reply).expect("ServerMessage always serializes");
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await
 }
 
 /// Bind the listener, handling the stale-socket case safely.

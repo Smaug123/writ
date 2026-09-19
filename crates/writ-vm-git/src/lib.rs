@@ -485,14 +485,34 @@ pub struct VmGitPushRequest {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct GitCloneRepo(RepoRef);
 
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct GitCloneRef(String);
+writ_core::validated_string! {
+    /// A ref a guest may ask to clone at: a branch, tag or other ref name
+    /// in the shape git accepts, without the forbidden sequences that let a
+    /// name act as an option or escape its namespace.
+    pub struct GitCloneRef;
+    error = GitCloneRefError;
+    constructor = new;
+    validate = validate_git_ref;
+}
 
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct GitBranchName(String);
+writ_core::validated_string! {
+    /// A branch name a guest may push to: the part after `refs/heads/`,
+    /// never a full ref or `HEAD`, in the shape git accepts.
+    pub struct GitBranchName;
+    error = GitBranchNameError;
+    constructor = new;
+    validate = validate_git_branch_name;
+}
 
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct GitObjectId(String);
+writ_core::validated_string! {
+    /// A full 40-hex-digit git object id, held lowercase so two spellings
+    /// of one object compare equal.
+    pub struct GitObjectId;
+    error = GitObjectIdError;
+    constructor = new;
+    validate = validate_git_object_id;
+    normalise = |raw: String| raw.to_ascii_lowercase();
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct VmGitPushBodyLimits {
@@ -889,142 +909,9 @@ impl<'de> Deserialize<'de> for GitCloneRepo {
     }
 }
 
-impl GitCloneRef {
-    pub fn new(raw: impl Into<String>) -> Result<Self, GitCloneRefError> {
-        let raw = raw.into();
-        validate_git_ref(&raw)?;
-        Ok(Self(raw))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for GitCloneRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("GitCloneRef").field(&self.0).finish()
-    }
-}
-
-impl std::fmt::Display for GitCloneRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromStr for GitCloneRef {
-    type Err = GitCloneRefError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::new(raw)
-    }
-}
-
-impl Serialize for GitCloneRef {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for GitCloneRef {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        raw.parse().map_err(serde::de::Error::custom)
-    }
-}
-
 impl GitBranchName {
-    pub fn new(raw: impl Into<String>) -> Result<Self, GitBranchNameError> {
-        let raw = raw.into();
-        validate_git_branch_name(&raw)?;
-        Ok(Self(raw))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
     pub fn as_heads_ref(&self) -> String {
         format!("refs/heads/{}", self.0)
-    }
-}
-
-impl std::fmt::Debug for GitBranchName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("GitBranchName").field(&self.0).finish()
-    }
-}
-
-impl std::fmt::Display for GitBranchName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromStr for GitBranchName {
-    type Err = GitBranchNameError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::new(raw)
-    }
-}
-
-impl Serialize for GitBranchName {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for GitBranchName {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        raw.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-impl GitObjectId {
-    pub fn new(raw: impl Into<String>) -> Result<Self, GitObjectIdError> {
-        let raw = raw.into();
-        validate_git_object_id(&raw)?;
-        Ok(Self(raw.to_ascii_lowercase()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for GitObjectId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("GitObjectId").field(&self.0).finish()
-    }
-}
-
-impl std::fmt::Display for GitObjectId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromStr for GitObjectId {
-    type Err = GitObjectIdError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::new(raw)
-    }
-}
-
-impl Serialize for GitObjectId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for GitObjectId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        raw.parse().map_err(serde::de::Error::custom)
     }
 }
 

@@ -3,6 +3,7 @@
 //! parsing/validation.
 use super::test_support::*;
 use super::*;
+use std::net::Ipv6Addr;
 
 #[test]
 fn guest_environment_is_redacted_and_uses_env_file_in_start_invocation() {

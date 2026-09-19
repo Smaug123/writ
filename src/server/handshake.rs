@@ -10,6 +10,7 @@
 //! See [`HOST_PROTOCOL_VERSION`] for why the check exists and what it does and
 //! does not buy.
 
+use crate::protocol::framing::write_frame;
 use crate::protocol::{ClientMessage, HOST_PROTOCOL_VERSION, ServerMessage};
 
 /// Where a connection is in its handshake.
@@ -145,9 +146,7 @@ where
             false,
         ),
     };
-    let mut json = serde_json::to_string(&reply).expect("ServerMessage always serializes");
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await?;
+    write_frame(writer, &reply).await?;
     writer.flush().await?;
     Ok(negotiated)
 }
