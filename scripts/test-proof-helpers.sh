@@ -182,8 +182,9 @@ check 'reachable: the finding is logged as a pass' \
 check 'untestable: wrapper returns 0' 0 "$(run_wrapper 2 stub_die_returns)"
 run_wrapper 2 stub_die_returns >/dev/null
 check 'untestable: nothing fatal is reported' 0 "$FATAL_CALLS"
-check 'untestable: the skip is warned about' \
-  yes "$(reported_has 'log:warning: skipping')"
+check 'inconclusive: warned about, and every finding line reported' \
+  yes "$(reported_has 'log:warning: the host-listener preflight was inconclusive' \
+    'log:  stub finding line one' 'log:  stub finding line two')"
 
 # A fatal reporter that exits stops the run: the default, so a blocked listener
 # costs a second instead of a VM boot.
@@ -199,6 +200,78 @@ run_wrapper 1 stub_die_returns >/dev/null
 check 'unreachable: the fatal reporter is called exactly once' 1 "$FATAL_CALLS"
 check 'unreachable: every finding line is reported, in order' \
   yes "$(reported_has 'log:  stub finding line one' 'log:  stub finding line two')"
+
+printf 'writ_listener_detached_for_peer\n'
+
+# python's http.server frames each failed request as a block: a separator line of
+# dashes, "Exception occurred during processing of request from ('<ip>', <port>)",
+# the traceback, then another separator. The witness only counts if the peer and
+# the not-connected error are in the SAME block: the listener binds 0.0.0.0, so a
+# traceback from some other peer says nothing about the guest's request, and
+# accepting it would waive a real guest failure.
+GUEST=192.168.252.2
+OTHER=10.0.0.9
+
+fixture_block() {  # <peer-ip> <final-error-line>
+  printf -- '----------------------------------------\n'
+  printf "Exception occurred during processing of request from ('%s', 51234)\\n" "$1"
+  printf 'Traceback (most recent call last):\n'
+  printf '  File "/nix/store/x/http/server.py", line 468, in handle_one_request\n'
+  printf '    self.raw_requestline = self.rfile.readline(65537)\n'
+  printf -- '%s\n' "$2"
+  printf -- '----------------------------------------\n'
+}
+
+detached_for() {  # <log-text> <peer> -> the function's verdict
+  printf '%s' "$1" | writ_listener_detached_for_peer "$2"
+}
+
+ENOTCONN='OSError: [Errno 57] Socket is not connected'
+RESET='ConnectionResetError: [Errno 54] Connection reset by peer'
+
+check 'guest block reports ENOTCONN: witness accepted' \
+  1 "$(detached_for "$(fixture_block "$GUEST" "$ENOTCONN")" "$GUEST")"
+
+# The case Codex reproduced: someone else's ENOTCONN plus a different failure for
+# the guest must NOT count. The greps this replaced said 1 here.
+check 'another peer ENOTCONN + guest reset: witness refused' \
+  0 "$(detached_for "$(fixture_block "$OTHER" "$ENOTCONN")$(fixture_block "$GUEST" "$RESET")" "$GUEST")"
+
+check 'another peer ENOTCONN only: witness refused' \
+  0 "$(detached_for "$(fixture_block "$OTHER" "$ENOTCONN")" "$GUEST")"
+
+check 'guest ENOTCONN after an unrelated clean block: witness accepted' \
+  1 "$(detached_for "$(fixture_block "$OTHER" "$RESET")$(fixture_block "$GUEST" "$ENOTCONN")" "$GUEST")"
+
+check 'guest reset only: witness refused' \
+  0 "$(detached_for "$(fixture_block "$GUEST" "$RESET")" "$GUEST")"
+
+check 'access-log lines only: witness refused' \
+  0 "$(detached_for "$(printf '%s - - [19/Sep/2026 08:55:04] "GET / HTTP/1.1" 200 -\n' "$GUEST")" "$GUEST")"
+
+check 'empty log: witness refused' 0 "$(detached_for '' "$GUEST")"
+
+# A peer whose address is a prefix of another must not match it.
+check 'peer 192.168.252.2 does not match 192.168.252.22' \
+  0 "$(detached_for "$(fixture_block 192.168.252.22 "$ENOTCONN")" "$GUEST")"
+
+printf 'writ_classify_offloopback_failure\n'
+
+# A failed off-loopback probe is only *attributable* when the firewall says the
+# listener binary is blocked. If it says permitted, the probe has found something
+# it cannot name — PF on that interface, a VPN, another socket filter — and that
+# says nothing about the host-only path the proof actually uses, so it must not be
+# fatal.
+check 'firewall reports blocked: attributed to the listener' \
+  blocked-listener \
+  "$(writ_classify_offloopback_failure 'Incoming connection to /nix/store/x/python3.14 is blocked.')"
+check 'firewall reports permitted: unattributed' \
+  unattributed \
+  "$(writ_classify_offloopback_failure 'Incoming connection to /nix/store/x/python3.14 is permitted.')"
+check 'no firewall tool: unattributed' \
+  unattributed \
+  "$(writ_classify_offloopback_failure 'no firewall tool at /usr/libexec/ApplicationFirewall/socketfilterfw (not macOS?)')"
+check 'empty verdict: unattributed' unattributed "$(writ_classify_offloopback_failure '')"
 
 printf '\n%d check(s), %d failure(s)\n' "$CHECKS" "$FAILURES"
 (( FAILURES == 0 )) || exit 1

@@ -550,12 +550,12 @@ assert_broker_reachable() {
   local guest_logged=0 loopback_logged=0 listener_detached=0
   grep -Fq "${GUEST_IPV4} - -" "$broker_log" 2>/dev/null && guest_logged=1
   grep -Fq "127.0.0.1 - -" "$broker_log" 2>/dev/null && loopback_logged=1
-  # python's http.server names the peer as `from ('<ip>', <port>)` when a
-  # handler raises, so both witnesses must name the guest before this counts as
-  # a detached socket on the guest's own request.
-  if grep -Fq 'Socket is not connected' "$broker_log" 2>/dev/null \
-    && grep -Fq "from ('${GUEST_IPV4}'" "$broker_log" 2>/dev/null; then
-    listener_detached=1
+  # The witness has to be the guest's own traceback, not merely an ENOTCONN
+  # somewhere in the log and the guest's address somewhere else: this listener
+  # binds 0.0.0.0, so another peer can produce a traceback of its own, and
+  # borrowing it would waive a real guest failure.
+  if [[ -r "$broker_log" ]]; then
+    listener_detached="$(writ_listener_detached_for_peer "$GUEST_IPV4" <"$broker_log")"
   fi
   local phase
   phase="$(writ_tcp_state_pair_phase "$state_pair")"

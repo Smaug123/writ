@@ -54,13 +54,38 @@ writ_alf_verdict() {
   "$WRIT_ALF_TOOL" --getappblocked "$binary" 2>&1 || true
 }
 
+# writ_classify_offloopback_failure <firewall-verdict-text>
+#
+# A probe that served loopback but not a real interface address has found *a*
+# problem; this says whether it has found the one this preflight is competent to
+# name. Prints:
+#
+#   blocked-listener  the firewall says this binary is blocked, which is exactly
+#                     the failure the guest would hit, so it is fatal
+#   unattributed      anything else. The probe cannot say what dropped it, and
+#                     the address it used is not the address the proof uses: a
+#                     filter on the host's LAN or VPN interface, for instance,
+#                     tells us nothing about the host-only gateway the guest
+#                     reaches the broker on. Report it and let the proof run; the
+#                     broker-reach leg grades that path for real.
+writ_classify_offloopback_failure() {
+  local verdict="${1-}"
+  case "$verdict" in
+    *blocked*) printf 'blocked-listener\n' ;;
+    *) printf 'unattributed\n' ;;
+  esac
+}
+
 # writ_probe_host_listener_offloopback
 #
 # Prints findings on stdout. Returns:
 #   0  a host listener is reachable on a non-loopback address
-#   1  it is not; the findings name the cause and the remedy
-#   2  the probe could not run (no non-loopback IPv4 address to test against),
-#      so the caller should warn and carry on rather than fail
+#   1  it is not, and the firewall names this listener's binary as blocked — the
+#      exact failure a guest would hit, so the findings carry the remedy
+#   2  inconclusive, so the caller should warn and carry on rather than fail:
+#      either there was no non-loopback IPv4 address to test against, or the
+#      probe failed for a reason it cannot attribute to the listener (see
+#      writ_classify_offloopback_failure)
 writ_probe_host_listener_offloopback() (
   local iface addr port dir token server_pid=0 log_file ready=0
 
@@ -144,18 +169,24 @@ s.close()' 2>/dev/null)"
     printf 'the listener reported a not-connected socket (ENOTCONN) for that request:\n'
     printf '  a socket filter completed the handshake and then detached the socket\n'
   fi
-  printf 'a guest VM reaches this host over a real interface, never loopback, so the\n'
-  printf 'broker-reach leg of this proof cannot pass while that holds.\n'
-  if [[ "$verdict" == *blocked* ]]; then
+  if [[ "$(writ_classify_offloopback_failure "$verdict")" == blocked-listener ]]; then
+    printf 'a guest VM reaches this host over a real interface, never loopback, so the\n'
+    printf 'broker-reach leg of this proof cannot pass while that holds.\n'
     printf 'remedy (one command, then re-run this proof):\n'
     printf '  sudo %s --unblockapp %q\n' "$WRIT_ALF_TOOL" "$binary"
     printf 'note that a nix store path changes on every version bump, and each new\n'
     printf 'path is a fresh firewall entry that starts out blocked.\n'
-  else
-    printf 'the firewall does not report that binary as blocked, so something else is\n'
-    printf 'dropping it: check PF for rules covering %s, and any other socket filter.\n' "$iface"
+    return 1
   fi
-  return 1
+  # The firewall does not name this binary, so the probe has found something it
+  # cannot attribute — and %s is not the address this proof uses. A filter on the
+  # host's LAN or VPN interface says nothing about the host-only gateway the guest
+  # reaches the broker on, so this is reported and not treated as fatal; the
+  # broker-reach leg grades the real path.
+  printf 'the firewall does not report that binary as blocked, so something else dropped\n'
+  printf 'it: check PF for rules covering %s, a VPN, or another socket filter.\n' "$iface"
+  printf 'this address is not the one the proof uses, so it is not treated as fatal\n'
+  return 2
 )
 
 # writ_require_reachable_host_listener <log-fn> <die-fn>
@@ -180,8 +211,11 @@ writ_require_reachable_host_listener() {
       "$log_fn" "pass: ${findings}"
       ;;
     2)
-      "$log_fn" "warning: skipping the host-listener preflight: ${findings}"
-      "$log_fn" "warning: a firewall-blocked listener will now surface later, as a broker-reach failure"
+      "$log_fn" "warning: the host-listener preflight was inconclusive:"
+      while IFS= read -r line; do
+        "$log_fn" "  ${line}"
+      done <<<"$findings"
+      "$log_fn" "warning: carrying on; if a filter really is eating the broker's traffic, the broker-reach leg will say so"
       ;;
     *)
       while IFS= read -r line; do

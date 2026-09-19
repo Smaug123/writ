@@ -60,6 +60,45 @@ writ_tcp_state_pair_phase() {
   printf 'indeterminate\n'
 }
 
+# writ_listener_detached_for_peer <peer-ip>
+#
+# Reads a python `http.server` log on stdin and prints 1 if that listener
+# reported a not-connected socket *for this peer*, 0 otherwise.
+#
+# The correlation matters. http.server frames each failed request as a block:
+#
+#   ----------------------------------------
+#   Exception occurred during processing of request from ('10.0.0.9', 51234)
+#   Traceback (most recent call last):
+#     ...
+#   OSError: [Errno 57] Socket is not connected
+#   ----------------------------------------
+#
+# The harness's listener binds 0.0.0.0, so anything that can route to this host
+# can produce one of these. A traceback naming some other peer says nothing about
+# the guest's request, and treating it as the guest's witness would waive a real
+# guest failure — the one direction of error that must not happen here. So the
+# peer and the error have to appear in the *same* block.
+writ_listener_detached_for_peer() {
+  local peer="${1-}"
+  if [[ -z "$peer" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  # The trailing quote and comma in the needle stop 192.168.252.2 from matching a
+  # block belonging to 192.168.252.22.
+  awk -v needle="('${peer}'," '
+    /^-+$/ { in_peer_block = 0; next }
+    /^Exception occurred during processing of request from / {
+      in_peer_block = (index($0, needle) > 0)
+      next
+    }
+    in_peer_block && (index($0, "Socket is not connected") > 0 \
+      || index($0, "Errno 57") > 0) { found = 1 }
+    END { print (found ? 1 : 0) }
+  '
+}
+
 # writ_classify_broker_reach_evidence <pass-packets> <pass-states> <deny-packets> \
 #     <loopback-logged> <guest-logged> <state-pair> <listener-detached>
 #
