@@ -9,7 +9,7 @@
 //! crashes are classified by what the fake *actually received*, never
 //! by the audit log under test.
 //!
-//! Implemented endpoints (the six the Git Data client uses, plus the
+//! Implemented endpoints (the five the Git Data client uses, plus the
 //! installation-token mint):
 //!
 //! * `POST /repos/{o}/{n}/git/blobs` / `git/trees` / `git/commits` —
@@ -18,7 +18,6 @@
 //!   `verification` block, unsigned ones with `reason: "unsigned"`,
 //!   matching the contract `GitDataClient::create_commit` enforces.
 //! * `GET /repos/{o}/{n}/git/ref/heads/{branch}` — read the refs map.
-//! * `GET /repos/{o}/{n}` — repo metadata (`default_branch`).
 //! * `PATCH /repos/{o}/{n}/git/refs/heads/{branch}` — move the ref iff
 //!   the new SHA descends from the current tip in the model's commit
 //!   graph (GitHub's `force=false` check is descent-from-current, not
@@ -73,7 +72,6 @@ pub(crate) struct GitHubModel {
     /// most once" without trusting the audit log under test.
     ref_history: HashMap<String, Vec<String>>,
     requests: Vec<RequestRecord>,
-    default_branch: String,
     next_sha: u64,
 }
 
@@ -84,7 +82,6 @@ impl GitHubModel {
             refs: HashMap::new(),
             ref_history: HashMap::new(),
             requests: Vec::new(),
-            default_branch: "main".to_string(),
             next_sha: 1,
         }
     }
@@ -300,19 +297,6 @@ impl FakeGitHub {
                     }
                     model.set_ref(&branch, &new_sha);
                     ResponseTemplate::new(200).set_body_json(ref_body(&branch, &new_sha))
-                },
-            ))
-            .mount(&server)
-            .await;
-
-        let repo_path = format!("/repos/{owner}/{name}");
-        Mock::given(method("GET"))
-            .and(path(repo_path))
-            .respond_with(WithModel(
-                Arc::clone(&model),
-                |model: &mut GitHubModel, _req: &Request| {
-                    ResponseTemplate::new(200)
-                        .set_body_json(json!({ "default_branch": model.default_branch }))
                 },
             ))
             .mount(&server)

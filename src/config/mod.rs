@@ -2124,11 +2124,6 @@ pub fn default_secret_store_path() -> Result<PathBuf, BaseDirError> {
     default_paths::SECRET_STORE.resolve()
 }
 
-/// Default location for the daemon config file.
-pub fn default_config_path() -> Result<PathBuf, BaseDirError> {
-    default_paths::CONFIG_FILE.resolve()
-}
-
 /// Default location for the SQLite audit database. The DB lives in a dedicated
 /// `audit/` directory (not directly under `writ/`) because the broker VM mounts
 /// the audit DB's *parent directory* read-write; anything else in that directory

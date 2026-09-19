@@ -297,6 +297,8 @@ impl GitCloneBaseUrl {
 }
 
 impl GitCloneBundleSource {
+    /// Test convenience: [`Self::new`] against the GitHub base URL.
+    #[cfg(test)]
     pub fn github(request: VmGitCloneRequest) -> Self {
         Self::new(request, GitCloneBaseUrl::github())
     }
@@ -384,6 +386,8 @@ impl std::fmt::Display for GitCloneCommandStep {
 }
 
 impl GitCloneBundlePlan {
+    /// Test convenience: [`Self::new_with_source`] against the GitHub base URL.
+    #[cfg(test)]
     pub fn new(
         git_program: impl Into<PathBuf>,
         request: VmGitCloneRequest,

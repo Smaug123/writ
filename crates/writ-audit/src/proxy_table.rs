@@ -8,11 +8,11 @@
 //! names, the route enum, and the diagnostic label that prefixes
 //! validation errors. This module captures that shape once: a
 //! [`ProxyAuditTable`] descriptor selects the table names, route
-//! enum, and label, and the generic [`AuditLog::record_proxy_request`]
-//! / [`AuditLog::record_proxy_outcome`] writers contain the shared SQL
-//! and validation. Per-backend modules become thin shims that nominate
-//! a descriptor and re-export the generic record types under the
-//! per-backend names.
+//! enum, and label, and `impl_effect_table_for_proxy!` wires each
+//! descriptor into the generic [`EffectAuditTable`](crate::EffectAuditTable)
+//! guard with the shared SQL and validation. Per-backend modules are
+//! thin shims that nominate a descriptor and re-export the generic
+//! record types under the per-backend names.
 
 use rusqlite::{Connection, params};
 // `OptionalExtension` (`.optional()`) is now only used by the test-only read
@@ -266,50 +266,6 @@ impl_effect_table_for_proxy!(crate::openai_proxy::OpenAiProxyAuditTable);
 impl_effect_table_for_proxy!(crate::nix_cache::NixCacheAuditTable);
 
 impl AuditLog {
-    /// Persist a proxy-request audit row on its own, without the guard that
-    /// would force its outcome to follow.
-    ///
-    /// **Test-only.** Production writes go through the guard: `begin_effect` +
-    /// [`complete`](crate::RecordedRequest::complete) makes the request durable
-    /// before the upstream call, and
-    /// [`record_effect_coalesced`](AuditLog::record_effect_coalesced) writes
-    /// both rows in one commit for the authority-free paths. Two things still
-    /// want the unguarded halves: seeding an unpaired row to prove the boot
-    /// sweep and the audit-pair oracle catch one, and the equivalence proptest
-    /// that pins the coalesced writer's rows to be byte-for-byte what this
-    /// two-phase pair produces.
-    #[cfg(test)]
-    pub(super) fn record_proxy_request<T: ProxyAuditTable>(
-        &self,
-        r: &ProxyRequestRecord<'_, T::Route>,
-    ) -> Result<(), AuditError> {
-        validate_proxy_request::<T>(r)?;
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            check_session_open(&tx, r.session_id)?;
-            insert_proxy_request_row::<T>(&tx, r)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
-    /// Append an outcome row to a previously-recorded proxy-request audit row.
-    /// Test-only, for the same reason as
-    /// [`AuditLog::record_proxy_request`].
-    #[cfg(test)]
-    pub(super) fn record_proxy_outcome<T: ProxyAuditTable>(
-        &self,
-        r: &ProxyOutcomeRecord<'_>,
-    ) -> Result<(), AuditError> {
-        validate_proxy_outcome::<T>(r)?;
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            insert_proxy_outcome_row::<T>(&tx, r)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
     /// Read-only check that a session exists and is open. Lets a caller that has
     /// deferred its audit row write (coalescing request+outcome into one commit
     /// after the action) still refuse work against a closed or unknown session
@@ -660,7 +616,7 @@ END;
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
 
-        log.record_proxy_request::<TestTable>(&ProxyRequestRecord {
+        log.seed_effect_request::<TestTable>(&ProxyRequestRecord {
             request_id,
             session_id: s.session_id,
             received_at: UnixMillis::from_millis(1_700_000_400),
@@ -670,7 +626,7 @@ END;
             decision: &ProxyAuditDecision::Allow,
         })
         .unwrap();
-        log.record_proxy_outcome::<TestTable>(&sample_outcome(request_id))
+        log.seed_effect_outcome::<TestTable>(&sample_outcome(request_id))
             .unwrap();
 
         let entries = log
@@ -687,48 +643,6 @@ END;
     }
 
     #[test]
-    fn request_rejects_closed_or_missing_session() {
-        let log = AuditLog::open_in_memory().unwrap();
-        install_test_tables(&log);
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
-            .unwrap();
-
-        let closed = log
-            .record_proxy_request::<TestTable>(&ProxyRequestRecord {
-                request_id: RequestId::new(),
-                session_id: s.session_id,
-                received_at: UnixMillis::from_millis(1_700_000_100),
-                method: "POST",
-                target: "/x",
-                route: TestRoute::A,
-                decision: &ProxyAuditDecision::Allow,
-            })
-            .unwrap_err();
-        assert!(
-            matches!(closed, AuditError::Invariant("session is closed")),
-            "got: {closed:?}"
-        );
-
-        let missing = log
-            .record_proxy_request::<TestTable>(&ProxyRequestRecord {
-                request_id: RequestId::new(),
-                session_id: SessionId::new(),
-                received_at: UnixMillis::from_millis(1_700_000_100),
-                method: "POST",
-                target: "/x",
-                route: TestRoute::A,
-                decision: &ProxyAuditDecision::Allow,
-            })
-            .unwrap_err();
-        assert!(
-            matches!(missing, AuditError::Invariant("session does not exist")),
-            "got: {missing:?}"
-        );
-    }
-
-    #[test]
     fn request_rejects_empty_method_target_and_deny_reason() {
         let log = AuditLog::open_in_memory().unwrap();
         install_test_tables(&log);
@@ -736,7 +650,7 @@ END;
         log.open_session(&s).unwrap();
 
         let empty_method = log
-            .record_proxy_request::<TestTable>(&ProxyRequestRecord {
+            .seed_effect_request::<TestTable>(&ProxyRequestRecord {
                 request_id: RequestId::new(),
                 session_id: s.session_id,
                 received_at: UnixMillis::from_millis(1_700_000_100),
@@ -758,7 +672,7 @@ END;
         );
 
         let empty_target = log
-            .record_proxy_request::<TestTable>(&ProxyRequestRecord {
+            .seed_effect_request::<TestTable>(&ProxyRequestRecord {
                 request_id: RequestId::new(),
                 session_id: s.session_id,
                 received_at: UnixMillis::from_millis(1_700_000_100),
@@ -780,7 +694,7 @@ END;
         );
 
         let empty_deny_reason = log
-            .record_proxy_request::<TestTable>(&ProxyRequestRecord {
+            .seed_effect_request::<TestTable>(&ProxyRequestRecord {
                 request_id: RequestId::new(),
                 session_id: s.session_id,
                 received_at: UnixMillis::from_millis(1_700_000_100),
@@ -811,7 +725,7 @@ END;
         let s = sample_session();
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
-        log.record_proxy_request::<TestTable>(&ProxyRequestRecord {
+        log.seed_effect_request::<TestTable>(&ProxyRequestRecord {
             request_id,
             session_id: s.session_id,
             received_at: UnixMillis::from_millis(1_700_000_100),
@@ -823,7 +737,7 @@ END;
         .unwrap();
 
         let bad_status = log
-            .record_proxy_outcome::<TestTable>(&ProxyOutcomeRecord {
+            .seed_effect_outcome::<TestTable>(&ProxyOutcomeRecord {
                 request_id,
                 completed_at: UnixMillis::from_millis(1_700_000_500),
                 http_status: 99,
@@ -845,7 +759,7 @@ END;
         );
 
         let bad_upstream = log
-            .record_proxy_outcome::<TestTable>(&ProxyOutcomeRecord {
+            .seed_effect_outcome::<TestTable>(&ProxyOutcomeRecord {
                 request_id,
                 completed_at: UnixMillis::from_millis(1_700_000_500),
                 http_status: 502,
@@ -874,7 +788,7 @@ END;
         let s = sample_session();
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
-        log.record_proxy_request::<TestTable>(&ProxyRequestRecord {
+        log.seed_effect_request::<TestTable>(&ProxyRequestRecord {
             request_id,
             session_id: s.session_id,
             received_at: UnixMillis::from_millis(1_700_000_100),
@@ -886,7 +800,7 @@ END;
         .unwrap();
 
         let empty_err = log
-            .record_proxy_outcome::<TestTable>(&ProxyOutcomeRecord {
+            .seed_effect_outcome::<TestTable>(&ProxyOutcomeRecord {
                 request_id,
                 completed_at: UnixMillis::from_millis(1_700_000_500),
                 http_status: 502,
@@ -908,7 +822,7 @@ END;
         );
 
         let too_big = log
-            .record_proxy_outcome::<TestTable>(&ProxyOutcomeRecord {
+            .seed_effect_outcome::<TestTable>(&ProxyOutcomeRecord {
                 request_id,
                 completed_at: UnixMillis::from_millis(1_700_000_500),
                 http_status: 200,
@@ -966,7 +880,7 @@ END;
                 Some(reason) => ProxyAuditDecision::Deny { reason: reason.clone() },
             };
 
-            log.record_proxy_request::<TestTable>(&ProxyRequestRecord {
+            log.seed_effect_request::<TestTable>(&ProxyRequestRecord {
                 request_id,
                 session_id: s.session_id,
                 received_at: UnixMillis::from_millis(1_700_000_400),
@@ -977,7 +891,7 @@ END;
             })
             .unwrap();
 
-            log.record_proxy_outcome::<TestTable>(&ProxyOutcomeRecord {
+            log.seed_effect_outcome::<TestTable>(&ProxyOutcomeRecord {
                 request_id,
                 completed_at: UnixMillis::from_millis(1_700_000_500),
                 http_status,
@@ -995,138 +909,6 @@ END;
                 .list_proxy_requests_for_session_for_test::<TestTable>(s.session_id)
                 .unwrap();
             prop_assert_eq!(entries, vec![(route, decision, Some(http_status))]);
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
-
-        /// Coalescing must be behaviour-preserving: for any valid
-        /// request+outcome pair, writing both in one transaction via
-        /// the generic `record_effect_coalesced` leaves the two tables
-        /// byte-for-byte identical to the two-phase
-        /// `record_proxy_request` + `record_proxy_outcome`. Same inputs,
-        /// same request_id and session — the only difference is the commit
-        /// count, which the persisted rows must not reflect.
-        #[test]
-        fn request_and_outcome_matches_the_two_phase_writers(
-            method in "[\\x01-\\x7e]{1,16}",
-            target in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
-            route_is_a in any::<bool>(),
-            deny_reason in proptest::option::of("[\\x01-\\x7e]{1,80}"),
-            http_status in 100u16..=599,
-            upstream_status in proptest::option::of(100u16..=599),
-            upstream_url in proptest::option::of("[\\x01-\\x7e]{1,80}"),
-            response_bytes in 0u64..=(i64::MAX as u64),
-            error in proptest::option::of("[\\x01-\\x7e]{1,80}"),
-        ) {
-            let two_phase = AuditLog::open_in_memory().unwrap();
-            install_test_tables(&two_phase);
-            let combined = AuditLog::open_in_memory().unwrap();
-            install_test_tables(&combined);
-            let s = sample_session();
-            two_phase.open_session(&s).unwrap();
-            combined.open_session(&s).unwrap();
-
-            let request_id = RequestId::new();
-            let route = if route_is_a { TestRoute::A } else { TestRoute::B };
-            let decision = match &deny_reason {
-                None => ProxyAuditDecision::Allow,
-                Some(reason) => ProxyAuditDecision::Deny { reason: reason.clone() },
-            };
-            let request = ProxyRequestRecord {
-                request_id,
-                session_id: s.session_id,
-                received_at: UnixMillis::from_millis(1_700_000_400),
-                method: &method,
-                target: &target,
-                route,
-                decision: &decision,
-            };
-            let outcome = ProxyOutcomeRecord {
-                request_id,
-                completed_at: UnixMillis::from_millis(1_700_000_500),
-                http_status,
-                upstream_url: upstream_url.as_deref(),
-                upstream_status,
-                response_bytes,
-                error: error.as_deref(),
-            };
-
-            two_phase.record_proxy_request::<TestTable>(&request).unwrap();
-            two_phase.record_proxy_outcome::<TestTable>(&outcome).unwrap();
-            combined
-                .record_effect_coalesced::<TestTable>(&request, &outcome)
-                .unwrap();
-
-            prop_assert_eq!(dump_request_rows(&two_phase), dump_request_rows(&combined));
-            prop_assert_eq!(dump_outcome_rows(&two_phase), dump_outcome_rows(&combined));
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
-
-        /// The generic guard's two-phase path (`begin_effect` + `complete`) must
-        /// be behaviour-preserving: it leaves both tables byte-for-byte identical
-        /// to the direct `record_proxy_request` + `record_proxy_outcome`. This is
-        /// the equivalence that lets the VM-HTTP driver adopt the guard for the
-        /// proxies (a later stage) without changing a single persisted row.
-        #[test]
-        fn begin_then_complete_matches_the_two_phase_writers(
-            method in "[\\x01-\\x7e]{1,16}",
-            target in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
-            route_is_a in any::<bool>(),
-            deny_reason in proptest::option::of("[\\x01-\\x7e]{1,80}"),
-            http_status in 100u16..=599,
-            upstream_status in proptest::option::of(100u16..=599),
-            upstream_url in proptest::option::of("[\\x01-\\x7e]{1,80}"),
-            response_bytes in 0u64..=(i64::MAX as u64),
-            error in proptest::option::of("[\\x01-\\x7e]{1,80}"),
-        ) {
-            let direct = AuditLog::open_in_memory().unwrap();
-            install_test_tables(&direct);
-            let guarded = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
-            install_test_tables(&guarded);
-            let s = sample_session();
-            direct.open_session(&s).unwrap();
-            guarded.open_session(&s).unwrap();
-
-            let request_id = RequestId::new();
-            let route = if route_is_a { TestRoute::A } else { TestRoute::B };
-            let decision = match &deny_reason {
-                None => ProxyAuditDecision::Allow,
-                Some(reason) => ProxyAuditDecision::Deny { reason: reason.clone() },
-            };
-            let request = ProxyRequestRecord {
-                request_id,
-                session_id: s.session_id,
-                received_at: UnixMillis::from_millis(1_700_000_400),
-                method: &method,
-                target: &target,
-                route,
-                decision: &decision,
-            };
-            let outcome = ProxyOutcomeRecord {
-                request_id,
-                completed_at: UnixMillis::from_millis(1_700_000_500),
-                http_status,
-                upstream_url: upstream_url.as_deref(),
-                upstream_status,
-                response_bytes,
-                error: error.as_deref(),
-            };
-
-            direct.record_proxy_request::<TestTable>(&request).unwrap();
-            direct.record_proxy_outcome::<TestTable>(&outcome).unwrap();
-            guarded
-                .begin_effect::<TestTable>(&request)
-                .unwrap()
-                .complete(&outcome)
-                .unwrap();
-
-            prop_assert_eq!(dump_request_rows(&direct), dump_request_rows(&guarded));
-            prop_assert_eq!(dump_outcome_rows(&direct), dump_outcome_rows(&guarded));
         }
     }
 }
