@@ -666,8 +666,14 @@ start_fake_github() {
   python3 "$FAKE_GITHUB_SCRIPT" "$FAKE_GITHUB_PORT" "$PROOF_OWNER" "$PROOF_REPO" "$PROOF_TOKEN" \
     >"$FAKE_GITHUB_LOG" 2>&1 &
   FAKE_GITHUB_PID="$!"
+  # --noproxy '*' on the readiness checks in this file: curl honours
+  # http_proxy and ALL_PROXY, so with a proxy configured and no_proxy not
+  # covering localhost these requests go to the proxy instead of to the
+  # local fake service, and the harness then reports a service that is
+  # running as never having started. Nothing here should be proxied.
   for _ in {1..50}; do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FAKE_GITHUB_PORT}/health" \
+    if curl --silent --fail --noproxy '*' --max-time 1 \
+      "http://127.0.0.1:${FAKE_GITHUB_PORT}/health" \
       >/dev/null 2>&1; then
       return
     fi
@@ -687,7 +693,8 @@ start_fake_git_origin() {
     >"$FAKE_GIT_ORIGIN_LOG" 2>&1 &
   FAKE_GIT_ORIGIN_PID="$!"
   for _ in {1..50}; do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:${FAKE_GIT_ORIGIN_PORT}/health" \
+    if curl --silent --fail --noproxy '*' --max-time 1 \
+      "http://127.0.0.1:${FAKE_GIT_ORIGIN_PORT}/health" \
       >/dev/null 2>&1; then
       return
     fi
