@@ -23,10 +23,9 @@
 //! runs and machines. Callers must skip when `git` is absent (the
 //! constructor returns `None`), matching the `find_in_path("git")` precedent.
 
-use crate::test_support::find_in_path;
+use crate::test_support::{find_in_path, rev_parse, run_git};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -35,7 +34,6 @@ use hyper::{Response, StatusCode};
 
 use crate::vm_git::GitObjectId;
 use crate::vm_git_bundle::GitCloneBaseUrl;
-use writ_core::git_env::apply_clean_git_config;
 
 /// The repository identity every fake-origin test uses; matches
 /// [`crate::fake_github::FakeGitHub`]'s conventional fixture repo.
@@ -216,42 +214,6 @@ fn serve_file(repo_dir: &Path, url_path: &str) -> Response<Full<Bytes>> {
             .expect("static response builds"),
         Err(_) => not_found(),
     }
-}
-
-/// `git -C <repo> <args>` under the hardened, identity-pinned env the
-/// walker tests use; SHAs stay deterministic across runs and machines.
-fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = writ_core::process_spawn::output(
-        apply_clean_git_config(Command::new(git).arg("-C").arg(repo).args(args).env_clear())
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-            .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-            .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
-    )
-    .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
-    assert!(
-        output.status.success(),
-        "git -C {} {args:?} failed with {}: stdout={:?} stderr={}",
-        repo.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    output
-}
-
-fn rev_parse(git: &Path, repo: &Path, rev: &str) -> GitObjectId {
-    let out = run_git(git, repo, &["rev-parse", rev]);
-    let sha = String::from_utf8(out.stdout)
-        .expect("rev-parse output is UTF-8")
-        .trim()
-        .to_string();
-    GitObjectId::new(sha).expect("rev-parse output must be a valid 40-hex SHA")
 }
 
 #[cfg(test)]

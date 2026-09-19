@@ -551,35 +551,8 @@ mod tests {
 
     // ============== Integration test (real git) ==============
 
-    /// Helper for sync git invocations from tests.
-    ///
-    /// Hardened like the production path: these tests build real repos and then
-    /// assert on the object graph the walker reports, so an operator's
-    /// `/etc/gitconfig` (a `core.hooksPath`, an `init.defaultObjectFormat`) can
-    /// change what they observe. This used to run git with the ambient
-    /// environment on purpose, which made the fixture's results partly a
-    /// property of the developer's machine.
     fn run_git(repo: &Path, args: &[&str]) -> String {
-        let output = writ_core::process_spawn::output(
-            writ_core::git_env::apply_clean_git_config(&mut StdCommand::new("git"))
-                .arg("-C")
-                .arg(repo)
-                .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        )
-        .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: stdout={:?}, stderr={:?}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        String::from_utf8(output.stdout)
-            .expect("git stdout utf8")
-            .trim_end_matches('\n')
-            .to_string()
+        crate::test_support::git_stdout(&required_tool("git"), repo, args)
     }
 
     fn run_git_stdin(repo: &Path, args: &[&str], stdin: &[u8]) -> String {

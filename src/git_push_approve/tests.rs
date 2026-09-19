@@ -16,7 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::git_push_promote::UpdateRefError;
 use crate::github_git_db::{CommitIdentity, GitDataError};
-use crate::test_support::find_in_path;
+use crate::test_support::{find_in_path, rev_parse, run_git};
 use crate::vm_git::GitBranchName;
 use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
 use writ_core::git_env::apply_clean_git_config;
@@ -199,38 +199,6 @@ async fn prepare_refuses_pre_existing_staging_dir() {
 }
 
 // ---------- real-git integration: build_real_staging_repo helper ----------
-
-/// Run `git -C <repo> <args>` under the hardened env plus pinned
-/// committer identity so commit SHAs are deterministic across runs.
-fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = writ_core::process_spawn::output(
-        apply_clean_git_config(Command::new(git).arg("-C").arg(repo).args(args).env_clear())
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-            .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-            .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
-    )
-    .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
-    assert!(
-        output.status.success(),
-        "git -C {} {args:?} failed: stdout={:?} stderr={}",
-        repo.display(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    output
-}
-
-fn rev_parse(git: &Path, repo: &Path, rev: &str) -> GitObjectId {
-    let out = run_git(git, repo, &["rev-parse", rev]);
-    let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
-    GitObjectId::new(sha).expect("rev-parse output must be a valid 40-hex SHA")
-}
 
 /// Spin up a non-bare workspace, two empty commits (parent -> child),
 /// then push both into a fresh bare repo to act as the staging repo
