@@ -309,7 +309,7 @@ async fn run_agent_signs_non_zero_exit() {
 /// outcome this test observes has "it finished on its own" as an explanation.
 #[tokio::test]
 async fn a_configured_timeout_ends_a_host_run_and_the_log_says_writ_ended_it() {
-    let sh = find_in_path_any(&["sh", "bash"]);
+    let sh = required_tool_any(&["sh", "bash"]);
     let server = MockServer::start().await;
     let fixture = make_run_agent_state(&server, sh, vec!["-c".into(), "sleep 300".into()])
         .with_agent_timeout(crate::agent_run::AgentRunTimeout::from_secs(1).unwrap());
@@ -369,7 +369,7 @@ async fn a_configured_timeout_ends_a_host_run_and_the_log_says_writ_ended_it() {
 async fn run_agent_captures_stderr_in_envelope() {
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 
-    let sh = find_in_path_any(&["sh", "bash"]);
+    let sh = required_tool_any(&["sh", "bash"]);
     let server = MockServer::start().await;
     let fixture = make_run_agent_state(
         &server,
@@ -438,7 +438,7 @@ async fn run_agent_captures_stderr_in_envelope() {
 async fn run_agent_caps_stream_capture_records_truncation() {
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 
-    let sh = find_in_path_any(&["sh", "bash"]);
+    let sh = required_tool_any(&["sh", "bash"]);
     let server = MockServer::start().await;
     let fixture = make_run_agent_state(
         &server,
@@ -672,7 +672,7 @@ async fn run_agent_rejects_closed_session_id() {
 /// once the wire response is gone.
 #[tokio::test]
 async fn a_host_spawned_run_records_an_audit_pair_naming_its_streams() {
-    let sh = find_in_path_any(&["sh", "bash"]);
+    let sh = required_tool_any(&["sh", "bash"]);
     let server = MockServer::start().await;
     let fixture = make_run_agent_state(
         &server,
@@ -1180,7 +1180,7 @@ fn the_audit_row_and_the_envelope_agree_with_the_bytes_on_disk() {
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let server = rt.block_on(MockServer::start());
-    let sh = find_in_path_any(&["sh", "bash"]);
+    let sh = required_tool_any(&["sh", "bash"]);
 
     let mut config = Config::with_cases(12);
     config.source_file = Some(file!());
@@ -1349,7 +1349,7 @@ async fn agent_vm_messages_fail_when_runtime_is_not_configured() {
 /// fixture that produced it, so a provenance test starts from a genuine run
 /// rather than a hand-built one.
 async fn run_one_agent(args: Vec<String>) -> (RunAgentFixture, SignedRunMetadata, SshSignature) {
-    let sh = find_in_path_any(&["sh", "bash"]);
+    let sh = required_tool_any(&["sh", "bash"]);
     let server = MockServer::start().await;
     let fixture = make_run_agent_state(&server, sh, args);
     let session_id = open_session(&fixture.state).await;
@@ -1443,7 +1443,7 @@ async fn a_note_from_another_daemon_is_reported_as_not_ours() {
 
     // Re-sign the same metadata with a different key, so the note is
     // internally valid — just not this daemon's.
-    const OTHER_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing_other.key");
+    use crate::test_support::ED25519_OTHER_PEM as OTHER_PEM;
     let other = crate::signing::WritSigningKey::from_openssh_pem(OTHER_PEM).unwrap();
     let mut foreign = signed_metadata.clone();
     foreign.signing_key_fingerprint = other.fingerprint();

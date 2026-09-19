@@ -359,53 +359,26 @@ pub enum VerifyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    /// Process-local `SecretStore` for tests — same shape used in
-    /// `server.rs` and `github.rs`. Holds an unordered map under a
-    /// mutex; no I/O, no persistence.
-    #[derive(Default)]
-    struct InMemStore(Mutex<HashMap<String, String>>);
-
-    impl SecretStore for InMemStore {
-        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-        }
-        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.as_str().to_string(), value.to_string());
-            Ok(())
-        }
-        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-            self.0.lock().unwrap().remove(key.as_str());
-            Ok(())
-        }
-    }
+    use crate::test_support::InMemorySecretStore;
 
     fn store_key() -> SecretKey {
         SecretKey::new("writ-signing-key").unwrap()
     }
 
-    const PRIVATE_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const PUBLIC_OPENSSH: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const OTHER_PRIVATE_PEM: &str =
-        include_str!("../tests/fixtures/ed25519_test_signing_other.key");
-    const OTHER_PUBLIC_OPENSSH: &str =
-        include_str!("../tests/fixtures/ed25519_test_signing_other.key.pub");
     /// Real OpenSSH-format Ed25519 private key, AES256-CTR-encrypted under
     /// the passphrase "passphrase". Used solely to exercise the encrypted
     /// branch in `from_openssh_pem`; never used for any signing.
-    const ENCRYPTED_PRIVATE_PEM: &str =
-        include_str!("../tests/fixtures/ed25519_test_encrypted.key");
+    use crate::test_support::ED25519_ENCRYPTED_PEM as ENCRYPTED_PRIVATE_PEM;
+    use crate::test_support::ED25519_OTHER_PEM as OTHER_PRIVATE_PEM;
+    use crate::test_support::ED25519_OTHER_PUB as OTHER_PUBLIC_OPENSSH;
+    use crate::test_support::ED25519_SIGNING_PEM as PRIVATE_PEM;
+    use crate::test_support::ED25519_SIGNING_PUB as PUBLIC_OPENSSH;
     /// Real OpenSSH-format RSA private key, used solely to exercise the
     /// unsupported-algorithm branch in `from_openssh_pem`. Until the
     /// `rsa` Cargo feature is enabled on `ssh-key`, this key cannot
     /// produce signatures — so loading it must fail at construction
     /// rather than only when `sign()` is first called.
-    const RSA_PRIVATE_PEM: &str = include_str!("../tests/fixtures/rsa_test_load_only.key");
+    use crate::test_support::RSA_LOAD_ONLY_PEM as RSA_PRIVATE_PEM;
 
     /// SHA-256 fingerprint produced by `ssh-keygen -lf` on the fixture
     /// public key. Pinning this in a test catches accidental
@@ -611,7 +584,7 @@ mod tests {
     /// string.
     #[test]
     fn load_signing_key_reports_not_found_on_empty_store() {
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         let key = store_key();
         match load_signing_key(&store, &key) {
             Err(SigningKeyStoreError::NotFound { key: k }) => {
@@ -626,7 +599,7 @@ mod tests {
     /// across the store round-trip.
     #[test]
     fn load_signing_key_round_trips_through_store() {
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         let key = store_key();
         store.put(&key, PRIVATE_PEM).unwrap();
 
@@ -639,7 +612,7 @@ mod tests {
     /// store, and return a freshly-tagged outcome.
     #[test]
     fn ensure_signing_key_generates_on_empty_store() {
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         let key = store_key();
         let outcome = ensure_signing_key(&store, &key).unwrap();
         assert!(
@@ -661,7 +634,7 @@ mod tests {
     /// daemon startup path, which calls ensure on every boot.
     #[test]
     fn ensure_signing_key_is_idempotent_across_calls() {
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         let key = store_key();
 
         let first = ensure_signing_key(&store, &key).unwrap();
@@ -681,7 +654,7 @@ mod tests {
     /// its own `verifying_key`, just like a fixture-loaded signer.
     #[test]
     fn generated_signing_key_signs_and_verifies() {
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         let key = store_key();
         let signer = ensure_signing_key(&store, &key).unwrap().into_signing_key();
 
@@ -697,8 +670,8 @@ mod tests {
     /// material.
     #[test]
     fn ensure_signing_key_propagates_unsupported_stored_material() {
-        const RSA_PRIVATE_PEM: &str = include_str!("../tests/fixtures/rsa_test_load_only.key");
-        let store = InMemStore::default();
+        use crate::test_support::RSA_LOAD_ONLY_PEM as RSA_PRIVATE_PEM;
+        let store = InMemorySecretStore::default();
         let key = store_key();
         store.put(&key, RSA_PRIVATE_PEM).unwrap();
 
@@ -720,7 +693,7 @@ mod tests {
     /// SecretStore + ensure_signing_key composition.
     #[test]
     fn distinct_secret_keys_are_independent_signing_slots() {
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         let a = SecretKey::new("writ-signing-key-a").unwrap();
         let b = SecretKey::new("writ-signing-key-b").unwrap();
 
@@ -768,7 +741,7 @@ mod tests {
     #[test]
     fn generated_verifying_key_parses_into_allowed_signers() {
         use crate::run_verify::AllowedSigners;
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         let outcome = ensure_signing_key(&store, &store_key()).unwrap();
         assert!(outcome.was_generated(), "first call generates");
         let signer = outcome.into_signing_key();

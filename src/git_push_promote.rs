@@ -1688,8 +1688,8 @@ mod tests {
         use crate::signing::{GIT_SSHSIG_NAMESPACE, WritSigningKey};
         use ssh_key::SshSig;
 
-        const PRIVATE_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-        const PUBLIC_OPENSSH: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
+        use crate::test_support::ED25519_SIGNING_PEM as PRIVATE_PEM;
+        use crate::test_support::ED25519_SIGNING_PUB as PUBLIC_OPENSSH;
 
         let server = MockServer::start().await;
         let expected = sample_object_id('a');
@@ -1810,7 +1810,7 @@ mod tests {
     async fn execute_refuses_to_publish_branch_when_github_reports_commit_unverified() {
         use crate::signing::WritSigningKey;
 
-        const PRIVATE_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
+        use crate::test_support::ED25519_SIGNING_PEM as PRIVATE_PEM;
 
         let server = MockServer::start().await;
         let expected = sample_object_id('a');

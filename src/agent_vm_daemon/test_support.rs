@@ -7,11 +7,11 @@
 //! items and the parent's private `crate::*` imports; the explicit `use`s
 //! below cover the test-only constructors these helpers call.
 use super::*;
+pub(super) use crate::test_support::{InMemorySecretStore, shell_quote_path};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex as StdMutex;
 use writ_core::byte_size::ByteSize;
 
 use crate::audit::AuditLog;
@@ -21,7 +21,7 @@ use crate::core::{
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
 use crate::nix_binary_cache::NixTrustedPublicKeys;
 use crate::policy::PolicyConfig;
-use crate::secret::{SecretError, SecretKey};
+use crate::secret::SecretKey;
 use crate::vm_git::VmGitPushBodyLimits;
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
@@ -31,33 +31,11 @@ pub(super) const TEST_NIX_CACHE_PUBLIC_KEY: &str =
 pub(super) const SECOND_TEST_NIX_CACHE_PUBLIC_KEY: &str =
     "cache.example-2:KinekIvGUnCJ2dP5u+7MmV9svoga1i9pbI98OXh+zZg=";
 
-#[derive(Default)]
-pub(super) struct InMemStore(StdMutex<std::collections::HashMap<String, String>>);
-
-impl SecretStore for InMemStore {
-    fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-        Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-    }
-
-    fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(key.as_str().to_string(), value.to_string());
-        Ok(())
-    }
-
-    fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-        self.0.lock().unwrap().remove(key.as_str());
-        Ok(())
-    }
-}
-
-pub(super) fn make_state() -> Arc<BrokerState<InMemStore>> {
+pub(super) fn make_state() -> Arc<BrokerState<InMemorySecretStore>> {
     make_state_with_audit(AuditLog::open_in_memory().unwrap())
 }
 
-pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
+pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemorySecretStore>> {
     let key = SecretKey::new("gh-app-pk").unwrap();
     let mut apps = BTreeMap::new();
     apps.insert(
@@ -73,7 +51,7 @@ pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemSto
     Arc::new(BrokerState {
         audit: Arc::new(audit),
         minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
-        secrets: InMemStore::default(),
+        secrets: InMemorySecretStore::default(),
         policy: PolicyConfig {
             writable_repos: Vec::<RepoRef>::new(),
             default_ttl: TtlSeconds::new(3600).unwrap(),
@@ -88,10 +66,6 @@ pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemSto
         mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
         chatgpt_oauth_authority: Default::default(),
     })
-}
-
-pub(super) fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 pub(super) fn write_fake_tool(
@@ -122,9 +96,9 @@ pub(super) fn write_fake_tool(
              esac\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
-        env_path_log = shell_quote(env_path_log),
-        env_log = shell_quote(env_log),
+        args_log = shell_quote_path(args_log),
+        env_path_log = shell_quote_path(env_path_log),
+        env_log = shell_quote_path(env_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -145,7 +119,7 @@ pub(super) fn write_fake_pending_bootstrap_tool(dir: &Path, args_log: &Path) -> 
              printf '%s\\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
+        args_log = shell_quote_path(args_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -174,7 +148,7 @@ pub(super) fn write_fake_hung_inspect_tool(dir: &Path, args_log: &Path) -> PathB
              esac\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
+        args_log = shell_quote_path(args_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -203,7 +177,7 @@ pub(super) fn write_fake_oversized_inspect_tool(dir: &Path, args_log: &Path) -> 
              esac\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
+        args_log = shell_quote_path(args_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -239,7 +213,7 @@ pub(super) fn write_fake_large_failure_tool(dir: &Path, args_log: &Path) -> Path
              esac\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
+        args_log = shell_quote_path(args_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -257,7 +231,7 @@ pub(super) fn write_fake_network_create_failure_tool(dir: &Path, args_log: &Path
              exit 42\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
+        args_log = shell_quote_path(args_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -281,7 +255,7 @@ pub(super) fn write_fake_pf_remove_failure_tool(dir: &Path, args_log: &Path) -> 
              exit 7\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
+        args_log = shell_quote_path(args_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -326,9 +300,9 @@ pub(super) fn write_fake_stop_firewall_remove_failure_tool(
              esac\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
-        env_path_log = shell_quote(env_path_log),
-        env_log = shell_quote(env_log),
+        args_log = shell_quote_path(args_log),
+        env_path_log = shell_quote_path(env_path_log),
+        env_log = shell_quote_path(env_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -357,8 +331,8 @@ pub(super) fn write_fake_vm_present_tool(
              cat {present_file} 2>/dev/null || true\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
-        present_file = shell_quote(present_file),
+        args_log = shell_quote_path(args_log),
+        present_file = shell_quote_path(present_file),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -395,9 +369,9 @@ pub(super) fn write_fake_workspace_failure_tool(
              esac\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
-        env_path_log = shell_quote(env_path_log),
-        env_log = shell_quote(env_log),
+        args_log = shell_quote_path(args_log),
+        env_path_log = shell_quote_path(env_path_log),
+        env_log = shell_quote_path(env_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -434,9 +408,9 @@ pub(super) fn write_fake_workspace_success_tool(
              esac\n\
              fi\n\
              exit 0\n",
-        args_log = shell_quote(args_log),
-        env_path_log = shell_quote(env_path_log),
-        env_log = shell_quote(env_log),
+        args_log = shell_quote_path(args_log),
+        env_path_log = shell_quote_path(env_path_log),
+        env_log = shell_quote_path(env_log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();

@@ -163,7 +163,8 @@ mod tests {
     use writ_core::byte_size::ByteSize;
 
     use super::*;
-    use crate::flake_fixtures::{fake_nix_archiving, no_input_flake_mirror, tool_on_path};
+    use crate::flake_fixtures::{fake_nix_archiving, no_input_flake_mirror};
+    use crate::test_support::find_in_path;
 
     fn bounds() -> FlakeProvisionBounds {
         FlakeProvisionBounds::new(64, ByteSize::gib(1), Duration::from_secs(120)).unwrap()
@@ -220,7 +221,7 @@ mod tests {
     /// audit request row is built from — before any `nix` runs.
     #[tokio::test]
     async fn admission_describes_the_run_it_has_not_yet_performed() {
-        let Some(git_program) = tool_on_path("git") else {
+        let Some(git_program) = find_in_path("git") else {
             eprintln!("skipping: git must be on PATH");
             return;
         };
@@ -267,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn provisions_the_inputs_of_a_cached_no_input_flake() {
-        let (Some(git_program), Some(nix_program)) = (tool_on_path("git"), tool_on_path("nix"))
+        let (Some(git_program), Some(nix_program)) = (find_in_path("git"), find_in_path("nix"))
         else {
             eprintln!("skipping: git and nix must both be on PATH");
             return;

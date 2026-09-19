@@ -1267,27 +1267,11 @@ pub(crate) use writ_core::process_group::kill_process_group;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Locate an executable on `PATH`, preserving the caller-visible path so
-    /// the basename survives `execve` (mirrors the clean_git test helper).
-    pub(super) fn locate_on_path(name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = std::env::var_os("PATH").expect("PATH must be set in tests");
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if let Ok(meta) = std::fs::metadata(&candidate)
-                && meta.is_file()
-                && (meta.permissions().mode() & 0o111) != 0
-            {
-                return candidate;
-            }
-        }
-        panic!("required test tool {name} not found on PATH");
-    }
+    use crate::test_support::required_tool;
 
     #[tokio::test]
     async fn captures_stdout_and_stderr_on_nonzero_exit() {
-        let mut command = Command::new(locate_on_path("sh"));
+        let mut command = Command::new(required_tool("sh"));
         command.arg("-c").arg("printf out; printf err 1>&2; exit 3");
         let outcome = run_supervised(
             &mut command,
@@ -1317,7 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn discarded_stderr_is_empty() {
-        let mut command = Command::new(locate_on_path("sh"));
+        let mut command = Command::new(required_tool("sh"));
         command.arg("-c").arg("printf noise 1>&2; exit 0");
         let outcome = run_supervised(
             &mut command,
@@ -1342,7 +1326,7 @@ mod tests {
         // is fully drained) and must not blow the bound (only the tail is kept),
         // while the final complete line — the informative fatal message — and
         // the line alignment both survive.
-        let mut command = Command::new(locate_on_path("sh"));
+        let mut command = Command::new(required_tool("sh"));
         command.arg("-c").arg(format!(
             "i=0; while [ $i -lt {n} ]; do printf 'noise-line-padding\\n' 1>&2; i=$((i+1)); done; printf 'fatal: the-tail\\n' 1>&2; exit 1",
             n = (STDERR_CAPTURE_TAIL_CAP / 19) + 500,
@@ -1385,7 +1369,7 @@ mod tests {
     async fn stdout_capture_returns_full_output_at_the_cap_boundary() {
         // Exactly `cap` bytes is *not* an overrun (the drain rejects on
         // `len > cap`), so the whole output is returned intact.
-        let mut command = Command::new(locate_on_path("sh"));
+        let mut command = Command::new(required_tool("sh"));
         command.arg("-c").arg("printf aaaa");
         let outcome = run_supervised(
             &mut command,
@@ -1411,7 +1395,7 @@ mod tests {
         // promptly rather than wait for the wall-clock timeout. A 30s timeout
         // with a child that would take minutes to emit 64 MiB proves the kill
         // is driven by the cap, not the clock.
-        let mut command = Command::new(locate_on_path("sh"));
+        let mut command = Command::new(required_tool("sh"));
         // An unbounded shell-builtin writer (no external binary, so no PATH
         // dependency): it keeps writing until the cap trips and we SIGKILL it.
         command
@@ -1560,7 +1544,7 @@ mod tests {
                 perl = perl.display(),
                 escaped = escaped.display(),
             );
-            let mut command = Command::new(locate_on_path("sh"));
+            let mut command = Command::new(required_tool("sh"));
             command.arg("-c").arg(script);
 
             let started = std::time::Instant::now();
@@ -1666,11 +1650,11 @@ mod tests {
 /// different disciplines that each look complete where they are defined.
 #[cfg(test)]
 mod blocking_tests {
-    use super::tests::locate_on_path;
     use super::*;
+    use crate::test_support::required_tool;
 
     fn sh(script: &str) -> std::process::Command {
-        let mut command = std::process::Command::new(locate_on_path("sh"));
+        let mut command = std::process::Command::new(required_tool("sh"));
         command.arg("-c").arg(script);
         command
     }
@@ -2200,7 +2184,7 @@ mod blocking_tests {
     fn kills_a_helper_left_in_the_process_group() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let marker = tmp.path().join("helper.pid");
-        let sleep = locate_on_path("sleep");
+        let sleep = required_tool("sleep");
         let outcome = run_supervised_blocking(
             &mut sh(&format!(
                 "{sleep} 600 & printf '%s' \"$!\" > {marker}; exit 0",

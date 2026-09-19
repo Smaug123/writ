@@ -15,6 +15,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 
 [dev-dependencies]
+# `test-support` exposes writ's shared test scaffolding (in-memory secret store,
+# PATH lookups, key fixtures) to bailiff's tests.
+writ = { path = "../..", features = ["host", "test-support"] }
 proptest = "1"
 tempfile = "3"
 wiremock = "0.6"

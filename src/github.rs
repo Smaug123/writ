@@ -708,9 +708,8 @@ fn truncate_for_display(body: &str) -> String {
 mod tests {
     use super::*;
     use crate::core::{GitHubAccess, MetadataAccess, RepoRef};
+    use crate::test_support::InMemorySecretStore;
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-    use std::collections::HashMap;
-    use std::sync::Mutex;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -721,29 +720,9 @@ mod tests {
     // We ship the private key for fixture 1 (we sign with it) and only
     // the public key for fixture 2 (we only need it to prove that a
     // mismatched-key JWT fails to verify).
-    const TEST_PRIV_1: &str = include_str!("../tests/fixtures/rsa_test_1.pem");
-    const TEST_PUB_1: &str = include_str!("../tests/fixtures/rsa_test_1.pub.pem");
-    const TEST_PUB_2: &str = include_str!("../tests/fixtures/rsa_test_2.pub.pem");
-
-    #[derive(Default)]
-    struct InMemStore(Mutex<HashMap<String, String>>);
-
-    impl SecretStore for InMemStore {
-        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-        }
-        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.as_str().to_string(), value.to_string());
-            Ok(())
-        }
-        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-            self.0.lock().unwrap().remove(key.as_str());
-            Ok(())
-        }
-    }
+    use crate::test_support::RSA_TEST_1_PEM as TEST_PRIV_1;
+    use crate::test_support::RSA_TEST_1_PUB as TEST_PUB_1;
+    use crate::test_support::RSA_TEST_2_PUB as TEST_PUB_2;
 
     fn write_scope(owner: &str, name: &str) -> GitHubGrantedScope {
         GitHubGrantedScope {
@@ -759,16 +738,16 @@ mod tests {
         }
     }
 
-    fn minter_with_key(server: &MockServer) -> (GitHubMinter, InMemStore) {
+    fn minter_with_key(server: &MockServer) -> (GitHubMinter, InMemorySecretStore) {
         minter_with_owner(server, "o")
     }
 
     fn minter_with_owner(
         server: &MockServer,
         installation_owner: &str,
-    ) -> (GitHubMinter, InMemStore) {
+    ) -> (GitHubMinter, InMemorySecretStore) {
         let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         store.put(&pk, TEST_PRIV_1).unwrap();
         let mut apps = BTreeMap::new();
         apps.insert(
@@ -911,7 +890,7 @@ mod tests {
             },
         );
         let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         match minter
             .mint_for_agent_scoped(
                 &store,

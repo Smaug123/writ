@@ -2033,28 +2033,7 @@ fn run_agent_section_rejects_unknown_fields() {
 /// writd relies on.
 #[test]
 fn materialize_persists_signing_key_and_initialises_notes_repo() {
-    use crate::secret::{SecretError, SecretStore};
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct InMem(Mutex<HashMap<String, String>>);
-    impl SecretStore for InMem {
-        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-        }
-        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.as_str().to_string(), value.to_string());
-            Ok(())
-        }
-        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-            self.0.lock().unwrap().remove(key.as_str());
-            Ok(())
-        }
-    }
+    use crate::test_support::InMemorySecretStore;
 
     let tmp = tempfile::tempdir().unwrap();
     let cfg = RunAgentDaemonConfig {
@@ -2065,7 +2044,7 @@ fn materialize_persists_signing_key_and_initialises_notes_repo() {
         spawn_args: vec![],
         spawn_timeout_secs: None,
     };
-    let store = InMem::default();
+    let store = InMemorySecretStore::default();
     let log_root = AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap();
 
     let notes_repo_path = cfg.notes_repo_path_or_default().unwrap();

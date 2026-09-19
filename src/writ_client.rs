@@ -1094,8 +1094,8 @@ mod end_to_end_tests {
     //! The only mock is the GitHub installation-token endpoint, which
     //! `RunAgent` never touches but which `BrokerState` requires a
     //! non-empty registry for.
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::sync::Mutex as AsyncMutex;
@@ -1110,48 +1110,16 @@ mod end_to_end_tests {
     use crate::policy::PolicyConfig;
     use crate::run_envelope::SignedRunEnvelope;
     use crate::run_verify::{AllowedSigners, verify_run_envelope};
-    use crate::secret::{SecretError, SecretKey, SecretStore};
+    use crate::secret::{SecretKey, SecretStore};
     use crate::server::{
         BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
     };
     use crate::signing::WritSigningKey;
+    use crate::test_support::{InMemorySecretStore, find_in_path};
 
-    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const TEST_PRIV: &str = include_str!("../tests/fixtures/rsa_test_1.pem");
-
-    /// In-memory `SecretStore`. The production-grade `FileSecretStore`
-    /// would do here too, but that needs disk and key derivation; for
-    /// a test that only stores the GitHub-app PEM to satisfy
-    /// `BrokerState`'s non-empty registry invariant, an in-memory map
-    /// is the smallest dependency that works.
-    #[derive(Default)]
-    struct InMemStore(Mutex<HashMap<String, String>>);
-
-    impl SecretStore for InMemStore {
-        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-        }
-        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.as_str().to_string(), value.to_string());
-            Ok(())
-        }
-        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-            self.0.lock().unwrap().remove(key.as_str());
-            Ok(())
-        }
-    }
-
-    fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|p| p.join(name))
-                .find(|p| p.is_file())
-        })
-    }
+    use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
+    use crate::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
+    use crate::test_support::RSA_TEST_1_PEM as TEST_PRIV;
 
     /// End-to-end socket round-trip.
     ///
@@ -1184,7 +1152,7 @@ mod end_to_end_tests {
         // smallest dependency that satisfies the invariant.
         let github_server = MockServer::start().await;
         let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         store.put(&pk, TEST_PRIV).unwrap();
         let mut apps = BTreeMap::new();
         apps.insert(
@@ -1363,7 +1331,7 @@ mod end_to_end_tests {
 
         let github_server = MockServer::start().await;
         let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         store.put(&pk, TEST_PRIV).unwrap();
         let mut apps = BTreeMap::new();
         apps.insert(

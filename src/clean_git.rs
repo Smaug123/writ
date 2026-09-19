@@ -362,6 +362,7 @@ pub(crate) async fn resolve_program_for_clean_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::required_tool;
 
     /// The step timeout to hand a probe whose *timing* is not what the test is
     /// about — which is every probe below: they are two-line shell scripts that
@@ -414,26 +415,6 @@ mod tests {
         assert_eq!(CLEAN_GIT_CONFIG_ENV.len(), helper.len());
     }
 
-    /// Locate an executable on `PATH` without resolving symlinks.
-    /// Mirrors `resolve_program_for_clean_env` but preserves the
-    /// caller-visible path so the basename survives into `argv[0]`
-    /// after `execve` — critical on Nix where coreutils is a
-    /// multi-call binary dispatched by `basename(argv[0])`.
-    fn locate_on_path(name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = std::env::var_os("PATH").expect("PATH must be set in tests");
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            match std::fs::metadata(&candidate) {
-                Ok(meta) if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 => {
-                    return candidate;
-                }
-                _ => {}
-            }
-        }
-        panic!("required test tool {name} not found on PATH");
-    }
-
     /// Runtime probe: spawn a subprocess via the clean-git harness and
     /// confirm only the hardened env entries (plus a small allowlist
     /// of shell-startup names) reach the child.
@@ -457,8 +438,8 @@ mod tests {
         use std::collections::BTreeMap;
         use std::os::unix::fs::PermissionsExt;
 
-        let sh = locate_on_path("sh");
-        let env_bin = locate_on_path("env");
+        let sh = required_tool("sh");
+        let env_bin = required_tool("env");
         let tempdir = tempfile::tempdir().expect("tempdir for env probe");
         let probe = tempdir.path().join("env-probe");
         let script = format!("#!{}\nexec {}\n", sh.display(), env_bin.display());
@@ -549,7 +530,7 @@ mod tests {
     async fn run_clean_git_failure_surfaces_redacted_stderr() {
         use std::os::unix::fs::PermissionsExt;
 
-        let sh = locate_on_path("sh");
+        let sh = required_tool("sh");
         let tempdir = tempfile::tempdir().expect("tempdir for fail probe");
         let probe = tempdir.path().join("fail-probe");
         // Echo a diagnostic that embeds the bound secret, then fail. `printf`
@@ -598,7 +579,7 @@ mod tests {
     /// proves the cap, not the clock, ends it.
     #[tokio::test]
     async fn run_clean_git_capture_rejects_unbounded_stdout() {
-        let sh = locate_on_path("sh");
+        let sh = required_tool("sh");
         let invocation = CleanGitInvocation::new(
             sh,
             [
@@ -630,7 +611,7 @@ mod tests {
     async fn run_clean_git_does_not_leak_secret_at_the_truncation_boundary() {
         use std::os::unix::fs::PermissionsExt;
 
-        let sh = locate_on_path("sh");
+        let sh = required_tool("sh");
         let tempdir = tempfile::tempdir().expect("tempdir for flood probe");
         let probe = tempdir.path().join("flood-probe");
         // ~13 KiB of newline-free filler, then the secret (still on that same

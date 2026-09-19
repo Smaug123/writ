@@ -16,6 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::git_push_promote::UpdateRefError;
 use crate::github_git_db::{CommitIdentity, GitDataError};
+use crate::test_support::find_in_path;
 use crate::vm_git::GitBranchName;
 use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
 use writ_core::git_env::apply_clean_git_config;
@@ -45,7 +46,7 @@ fn sample_client(api_base: impl Into<String>) -> GitDataClient {
     )
 }
 
-const PRIVATE_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+use crate::test_support::ED25519_SIGNING_PEM as PRIVATE_PEM;
 
 fn sample_signing_key() -> WritSigningKey {
     // Re-uses the same test fixture the promote/walker tests use so
@@ -199,20 +200,6 @@ async fn prepare_refuses_pre_existing_staging_dir() {
 
 // ---------- real-git integration: build_real_staging_repo helper ----------
 
-/// Locate the system `git` for integration tests. Skips when absent
-/// rather than panicking so the suite stays runnable on hermetic
-/// builders that don't expose a system git.
-fn maybe_git() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("git");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// Run `git -C <repo> <args>` under the hardened env plus pinned
 /// committer identity so commit SHAs are deterministic across runs.
 fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
@@ -250,7 +237,7 @@ fn rev_parse(git: &Path, repo: &Path, rev: &str) -> GitObjectId {
 /// the orchestrator's planner reads from. Returns the staging dir
 /// plus the two SHAs.
 fn build_real_staging_repo() -> (tempfile::TempDir, PathBuf, GitObjectId, GitObjectId) {
-    let git = maybe_git().expect("real-git integration tests need `git` on PATH");
+    let git = find_in_path("git").expect("real-git integration tests need `git` on PATH");
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     let staging = tmp.path().join("staging.git");
@@ -341,7 +328,7 @@ fn ref_response_body(branch: &str, sha: &GitObjectId) -> serde_json::Value {
 fn runtime_pointed_at(staging_parent: &Path) -> PromoteRuntimeConfig {
     // Use the *real* `git` binary so the planner and CatFileObjectSource
     // can run against the staging repo.
-    let git = maybe_git().expect("real-git integration tests need `git` on PATH");
+    let git = find_in_path("git").expect("real-git integration tests need `git` on PATH");
     PromoteRuntimeConfig::new(
         git,
         GitCloneBaseUrl::github(),
@@ -364,7 +351,7 @@ fn runtime_pointed_at(staging_parent: &Path) -> PromoteRuntimeConfig {
 /// counts on each mock plus the returned `new_app_tip`.
 #[tokio::test]
 async fn run_approve_advances_branch_when_bundle_is_fast_forward() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }
@@ -440,7 +427,7 @@ async fn run_approve_advances_branch_when_bundle_is_fast_forward() {
 /// does not issue any upload or PATCH.
 #[tokio::test]
 async fn run_approve_refuses_when_branch_moved_before_walk() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }
@@ -496,7 +483,7 @@ async fn run_approve_refuses_when_branch_moved_before_walk() {
 /// the returned `new_app_tip` is the lease anchor itself.
 #[tokio::test]
 async fn run_approve_returns_noop_after_lease_check_when_bundle_tip_equals_lease() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }
@@ -548,7 +535,7 @@ async fn run_approve_returns_noop_after_lease_check_when_bundle_tip_equals_lease
 /// PATCH) rather than resolve the push as approved.
 #[tokio::test]
 async fn run_approve_noop_refuses_when_branch_moved_away_from_lease() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }
@@ -601,7 +588,7 @@ async fn run_approve_noop_refuses_when_branch_moved_away_from_lease() {
 /// `PostPatchFailure` after it.
 #[tokio::test]
 async fn run_approve_surfaces_update_ref_failure_after_walk() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }
@@ -680,7 +667,7 @@ async fn run_approve_surfaces_update_ref_failure_after_walk() {
 /// it was.
 #[tokio::test]
 async fn prepare_approve_uploads_every_object_but_never_patches() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }
@@ -744,22 +731,6 @@ async fn prepare_approve_uploads_every_object_but_never_patches() {
     server.verify().await;
 }
 
-/// Locate an absolute `sleep`. The stall wrapper below runs under
-/// `env_clear()` (both `CatFileObjectSource::open` and the
-/// clean-git helpers wipe the environment), so it inherits no
-/// `PATH` and cannot resolve `sleep` by name — embed the absolute
-/// path. Mirrors the object-source module's own helper.
-fn maybe_sleep() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("sleep");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// Write a `git` wrapper that behaves like the real binary for every
 /// invocation the approve pipeline makes (`cat-file -t`, `rev-list`)
 /// *except* `cat-file --batch`, which it replaces with an unbounded
@@ -818,11 +789,11 @@ fn write_stalling_cat_file_wrapper(dir: &Path, git: &Path, sleep: &Path) -> Path
 /// CI.
 #[tokio::test]
 async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
-    let Some(git) = maybe_git() else {
+    let Some(git) = find_in_path("git") else {
         eprintln!("skipping: `git` not on PATH");
         return;
     };
-    let Some(sleep) = maybe_sleep() else {
+    let Some(sleep) = find_in_path("sleep") else {
         eprintln!("skipping: `sleep` not on PATH");
         return;
     };
@@ -926,7 +897,7 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
 /// issuing it: the `expect(0)` on the PATCH mock is the assertion.
 #[tokio::test]
 async fn commit_rechecks_lease_and_refuses_when_branch_moved_after_prepare() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }
@@ -1009,7 +980,7 @@ async fn commit_rechecks_lease_and_refuses_when_branch_moved_after_prepare() {
 #[tokio::test]
 #[should_panic(expected = "PATCH authorised by the wrong attempt")]
 async fn commit_under_another_attempts_witness_panics() {
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         // `should_panic` cannot be skipped conditionally, so panic
         // with the expected message to keep a git-less box green.
         panic!("PATCH authorised by the wrong attempt (skipped: `git` not on PATH)");
@@ -1082,7 +1053,7 @@ async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
         eprintln!("skipping: `git` not on PATH");
         return;
     };
-    let git = maybe_git().expect("FakeOrigin::start returned Some, so git exists");
+    let git = find_in_path("git").expect("FakeOrigin::start returned Some, so git exists");
     let work_root = tempfile::tempdir().unwrap();
     let runtime = PromoteRuntimeConfig::new(
         git.clone(),
@@ -1137,7 +1108,7 @@ async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
 /// `bundle unbundle` with usage status.
 #[tokio::test]
 async fn unbundle_invocation_runs_against_real_git() {
-    let Some(git) = maybe_git() else {
+    let Some(git) = find_in_path("git") else {
         eprintln!("skipping: `git` not on PATH");
         return;
     };
@@ -1205,7 +1176,7 @@ async fn unbundle_invocation_runs_against_real_git() {
 /// `RunApproveError::BundleTipNotACommit`.
 #[tokio::test]
 async fn run_approve_rejects_non_commit_bundle_tip() {
-    let Some(git) = maybe_git() else {
+    let Some(git) = find_in_path("git") else {
         eprintln!("skipping: `git` not on PATH");
         return;
     };

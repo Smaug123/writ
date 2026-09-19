@@ -569,8 +569,8 @@ mod tests {
 
     use super::super::tests::{
         FAKE_GIT_REV_PARSE_SHA, bearer, declared_contract, git_clone_config_for_test,
-        make_broker_state, no_services, open_audit_session, required_test_tool, session_for_subnet,
-        shell_single_quote, token, write_fake_git, write_fake_git_with_bundle_epilogue,
+        make_broker_state, no_services, open_audit_session, required_tool, session_for_subnet,
+        shell_quote_path, token, write_fake_git, write_fake_git_with_bundle_epilogue,
     };
     use super::super::{
         VM_HTTP_READ_TIMEOUT, VmHttpProxies, VmHttpRequest, VmHttpServices, VmHttpSession,
@@ -1014,7 +1014,7 @@ mod tests {
             .await;
 
         let temp = tempfile::tempdir().unwrap();
-        let chmod = shell_single_quote(&required_test_tool("chmod"));
+        let chmod = shell_quote_path(&required_tool("chmod"));
         let fake_git = write_fake_git_with_bundle_epilogue(
             temp.path(),
             &format!(

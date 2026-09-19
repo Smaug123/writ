@@ -543,6 +543,7 @@ mod tests {
 
     use super::*;
     use crate::github_git_db::TreeEntryKind;
+    use crate::test_support::required_tool;
 
     fn sample_object_id(nibble: char) -> GitObjectId {
         GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
@@ -612,38 +613,6 @@ mod tests {
             .to_string()
     }
 
-    fn locate_git() -> std::path::PathBuf {
-        // Tests run in the host environment with PATH set, so just
-        // ask `which` via the std lib. resolve_program_for_clean_env
-        // (the real production path) does the same walk.
-        let path = std::env::var_os("PATH").expect("PATH set in tests");
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("git");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-        panic!("git not found on PATH");
-    }
-
-    /// Resolve an absolute path to `sleep` from the host's PATH. The
-    /// wrapper-script-based tests spawn `/bin/sh` under
-    /// `env_clear()`, so the wrapper inherits no `PATH`. POSIX gives
-    /// the shell a default search path, but it omits Nix store
-    /// directories on NixOS — `sleep` then isn't found and the
-    /// wrapper exits 127 before the test can observe it. Embedding
-    /// the absolute path bypasses the PATH lookup entirely.
-    fn locate_sleep() -> std::path::PathBuf {
-        let path = std::env::var_os("PATH").expect("PATH set in tests");
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("sleep");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-        panic!("sleep not found on PATH");
-    }
-
     #[tokio::test]
     async fn cat_file_source_reads_blob_tree_and_commit() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -693,7 +662,7 @@ mod tests {
             .expect("valid sha")
         };
 
-        let git = locate_git();
+        let git = required_tool("git");
         let source = CatFileObjectSource::open(repo, &git, 256 << 20, Duration::from_secs(30))
             .await
             .expect("open cat-file");
@@ -724,7 +693,7 @@ mod tests {
         let repo = tmp.path();
         run_git(repo, &["init", "--bare"]);
 
-        let git = locate_git();
+        let git = required_tool("git");
         let source = CatFileObjectSource::open(repo, &git, 256 << 20, Duration::from_secs(30))
             .await
             .expect("open cat-file");
@@ -763,7 +732,7 @@ mod tests {
         let other_sha = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], other_body);
         let other_id = GitObjectId::new(other_sha).expect("valid sha");
 
-        let git = locate_git();
+        let git = required_tool("git");
         let source = CatFileObjectSource::open(repo, &git, 256 << 20, Duration::from_secs(30))
             .await
             .expect("open cat-file");
@@ -802,7 +771,7 @@ mod tests {
         let nonexistent = tmp.path().join("does-not-exist");
         assert!(!nonexistent.exists());
 
-        let git = locate_git();
+        let git = required_tool("git");
         let source =
             CatFileObjectSource::open(&nonexistent, &git, 256 << 20, Duration::from_secs(30))
                 .await
@@ -840,7 +809,7 @@ mod tests {
         // lifetime. We never actually emit the payload bytes.
         // Absolute sleep path: the wrapper runs with env_clear()'d
         // PATH, so we can't rely on `sleep` resolving via PATH.
-        let sleep = locate_sleep();
+        let sleep = required_tool("sleep");
         let script = format!(
             "#!/bin/sh\n\
              read -r sha\n\
@@ -910,7 +879,7 @@ mod tests {
         // pipe buffers the request) and its `read_line` then blocks
         // until the deadline fires. Absolute sleep path: the wrapper
         // runs with env_clear()'d PATH.
-        let sleep = locate_sleep();
+        let sleep = required_tool("sleep");
         let script = format!("#!/bin/sh\nexec {sleep} 600\n", sleep = sleep.display(),);
         std::fs::write(&wrapper, script).expect("write wrapper");
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
@@ -1030,7 +999,7 @@ mod tests {
         let helper_pid_file = tmp.path().join("helper.pid");
         // Absolute sleep path: the wrapper runs with env_clear()'d
         // PATH, so we can't rely on `sleep` resolving via PATH.
-        let sleep = locate_sleep();
+        let sleep = required_tool("sleep");
         let script = format!(
             "#!/bin/sh\n\
              {sleep} 600 &\n\
@@ -1090,7 +1059,7 @@ mod tests {
         let helper_pid_file = tmp.path().join("helper.pid");
         // Absolute sleep path: the wrapper runs with env_clear()'d
         // PATH, so we can't rely on `sleep` resolving via PATH.
-        let sleep = locate_sleep();
+        let sleep = required_tool("sleep");
         let script = format!(
             "#!/bin/sh\n\
              {sleep} 600 &\n\

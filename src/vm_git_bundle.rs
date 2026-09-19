@@ -889,6 +889,7 @@ mod tests {
     use crate::clean_git::resolve_program_for_clean_env;
     use crate::core::RepoRef;
     use crate::process_supervisor::is_executable_file;
+    use crate::test_support::{required_tool, shell_quote_path};
     use crate::vm_git::GitCloneRef;
     use proptest::prelude::*;
     use std::os::unix::fs::PermissionsExt;
@@ -948,33 +949,6 @@ mod tests {
         GitSecretValue::new("super-secret-token").unwrap()
     }
 
-    fn shell_quote(path: &Path) -> String {
-        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-    }
-
-    fn required_test_tool(name: &str) -> PathBuf {
-        let path = std::env::var_os("PATH")
-            .unwrap_or_else(|| panic!("PATH must contain {name} for vm_git tests"));
-        for dir in std::env::split_paths(&path) {
-            let candidate = if dir.is_absolute() {
-                dir.join(name)
-            } else {
-                std::env::current_dir().unwrap().join(dir).join(name)
-            };
-            match std::fs::metadata(&candidate) {
-                Ok(metadata) if is_executable_file(&metadata) => {
-                    // Preserve symlink spelling: bash changes behaviour when
-                    // invoked through its `sh` symlink.
-                    return candidate;
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => panic!("failed to inspect {}: {err}", candidate.display()),
-            }
-        }
-        panic!("required test tool {name} not found on PATH");
-    }
-
     fn fake_git_program(
         dir: &TempDir,
         clone_extra: &str,
@@ -982,8 +956,8 @@ mod tests {
     ) -> (PathBuf, PathBuf) {
         let git = dir.path().join("fake-git");
         let log = dir.path().join("fake-git.log");
-        let shell = required_test_tool("sh");
-        let mkdir = shell_quote(&required_test_tool("mkdir"));
+        let shell = required_tool("sh");
+        let mkdir = shell_quote_path(&required_tool("mkdir"));
         let script = format!(
             r#"#!{shell}
 set -eu
@@ -1013,7 +987,7 @@ fi
 exit 42
 "#,
             shell = shell.display(),
-            log = shell_quote(&log),
+            log = shell_quote_path(&log),
             mkdir = mkdir,
             clone_extra = clone_extra,
             bundle_extra = bundle_extra,
@@ -1160,8 +1134,8 @@ exit 42
 
     fn descendant_survivor_script(dir: &TempDir) -> PathBuf {
         let script = dir.path().join("descendant-survivor");
-        let shell = required_test_tool("sh");
-        let sleep = shell_quote(&required_test_tool("sleep"));
+        let shell = required_tool("sh");
+        let sleep = shell_quote_path(&required_tool("sleep"));
         // `$1.started` is touched before the sleep so a caller can wait
         // for the descendant to actually exist (and thus be in the
         // parent's process group) before triggering cleanup, instead of
@@ -1716,8 +1690,8 @@ exit 42
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         let link = work.join("link-to-mirror");
-        let ln = shell_quote(&required_test_tool("ln"));
-        let clone_extra = format!("{ln} -s \"$9\" {}\n", shell_quote(&link));
+        let ln = shell_quote_path(&required_tool("ln"));
+        let clone_extra = format!("{ln} -s \"$9\" {}\n", shell_quote_path(&link));
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         let plan = plan_with_paths(
             git,
@@ -1744,13 +1718,13 @@ exit 42
         let work = dir.path().join("work");
         let outside = dir.path().join("outside");
         let link = work.join("link-out");
-        let mkdir = shell_quote(&required_test_tool("mkdir"));
-        let ln = shell_quote(&required_test_tool("ln"));
+        let mkdir = shell_quote_path(&required_tool("mkdir"));
+        let ln = shell_quote_path(&required_tool("ln"));
         let clone_extra = format!(
             "{mkdir} -p {}\n{ln} -s {} {}\n",
-            shell_quote(&outside),
-            shell_quote(&outside),
-            shell_quote(&link)
+            shell_quote_path(&outside),
+            shell_quote_path(&outside),
+            shell_quote_path(&link)
         );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         let plan = plan_with_paths(
@@ -1786,8 +1760,12 @@ exit 42
         // parent — and joining the final component "work" lands exactly on the
         // work dir itself.
         let up = work.join("up");
-        let ln = shell_quote(&required_test_tool("ln"));
-        let clone_extra = format!("{ln} -s {} {}\n", shell_quote(dir.path()), shell_quote(&up));
+        let ln = shell_quote_path(&required_tool("ln"));
+        let clone_extra = format!(
+            "{ln} -s {} {}\n",
+            shell_quote_path(dir.path()),
+            shell_quote_path(&up)
+        );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         // Lexically this is a nested path with no `..` component, so plan-time
         // validation admits it; only the canonical pass can see where it lands.
@@ -1836,8 +1814,8 @@ exit 42
         let survivor_marker = dir.path().join("descendant-survived");
         let clone_extra = format!(
             "{} {} &\nwait\n",
-            shell_quote(&survivor),
-            shell_quote(&survivor_marker)
+            shell_quote_path(&survivor),
+            shell_quote_path(&survivor_marker)
         );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         let work = dir.path().join("work");
@@ -1878,8 +1856,8 @@ exit 42
         let survivor_started_marker = dir.path().join("descendant-survived.started");
         let clone_extra = format!(
             "{} {} &\nwait\n",
-            shell_quote(&survivor),
-            shell_quote(&survivor_marker)
+            shell_quote_path(&survivor),
+            shell_quote_path(&survivor_marker)
         );
         let (git, _log) = fake_git_program(&dir, &clone_extra, "");
         let work = dir.path().join("work");
@@ -1917,8 +1895,8 @@ exit 42
         let survivor_marker = dir.path().join("descendant-survived");
         let clone_extra = format!(
             "{} {} &\n",
-            shell_quote(&survivor),
-            shell_quote(&survivor_marker)
+            shell_quote_path(&survivor),
+            shell_quote_path(&survivor_marker)
         );
         let (git, _) = fake_git_program(&dir, &clone_extra, "");
         let work = dir.path().join("work");

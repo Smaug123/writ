@@ -9,10 +9,11 @@
 //! namespace, notes write, fetch refspec, envelope/reply
 //! agreement, plan-note serialisation — fails this test rather
 //! than getting caught by a downstream consumer.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use writ::test_support::{InMemorySecretStore, find_in_path};
 
 use tokio::sync::Mutex as AsyncMutex;
 use wiremock::MockServer;
@@ -28,49 +29,16 @@ use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
 use writ::notes_repo::NotesRepo;
 use writ::policy::PolicyConfig;
 use writ::run_verify::AllowedSigners;
-use writ::secret::{SecretError, SecretKey, SecretStore};
+use writ::secret::{SecretKey, SecretStore};
 use writ::server::{
     BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
 };
 use writ::signing::WritSigningKey;
 use writ::writ_client::{RunAgentRequest, WritClient};
 
-const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-const SIGNING_PUB: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key.pub");
-const TEST_PRIV: &str = include_str!("../../tests/fixtures/rsa_test_1.pem");
-
-/// In-memory `SecretStore`. Same minimal shim as the writ_client
-/// end-to-end test uses — production runs against
-/// `FileSecretStore`, but for a test that only stores the
-/// GitHub-app PEM to satisfy `BrokerState`'s non-empty registry
-/// invariant, an in-memory map is enough.
-#[derive(Default)]
-struct InMemStore(Mutex<HashMap<String, String>>);
-
-impl SecretStore for InMemStore {
-    fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-        Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-    }
-    fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(key.as_str().to_string(), value.to_string());
-        Ok(())
-    }
-    fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-        self.0.lock().unwrap().remove(key.as_str());
-        Ok(())
-    }
-}
-
-fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|p| p.join(name))
-            .find(|p| p.is_file())
-    })
-}
+use writ::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
+use writ::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
+use writ::test_support::RSA_TEST_1_PEM as TEST_PRIV;
 
 #[tokio::test]
 async fn write_plan_note_completes_after_real_broker_round_trip() {
@@ -83,7 +51,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
 
     let github_server = MockServer::start().await;
     let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemStore::default();
+    let store = InMemorySecretStore::default();
     store.put(&pk, TEST_PRIV).unwrap();
     let mut apps = BTreeMap::new();
     apps.insert(
@@ -242,7 +210,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
 
     let github_server = MockServer::start().await;
     let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemStore::default();
+    let store = InMemorySecretStore::default();
     store.put(&pk, TEST_PRIV).unwrap();
     let mut apps = BTreeMap::new();
     apps.insert(
@@ -398,7 +366,7 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
 
     let github_server = MockServer::start().await;
     let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemStore::default();
+    let store = InMemorySecretStore::default();
     store.put(&pk, TEST_PRIV).unwrap();
     let mut apps = BTreeMap::new();
     apps.insert(

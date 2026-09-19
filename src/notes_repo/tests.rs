@@ -2,6 +2,7 @@
 
 use super::compaction::{CompactionTrigger, LooseObjectCount, PackCount};
 use super::*;
+use crate::test_support::required_tool;
 use std::ffi::OsStr;
 use std::fs;
 use tempfile::TempDir;
@@ -1012,27 +1013,6 @@ fn list_refs_under_prefix_surfaces_corruption_as_error() {
 // workflow forever and a `git for-each-ref` over a corrupted ref namespace could
 // buffer without bound.
 
-/// Absolute path to a real `sleep`, located on the *test process's* PATH.
-///
-/// The fake `git` runs under a synthetic PATH containing nothing but itself, so a
-/// script that needs a long-lived child must name the binary outright rather than
-/// rely on a lookup that would silently fail (and turn "hangs forever" into
-/// "exits 127" — passing the test for the wrong reason).
-fn sleep_program() -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH").expect("PATH must be set in tests");
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("sleep");
-        if let Ok(meta) = std::fs::metadata(&candidate)
-            && meta.is_file()
-            && (meta.permissions().mode() & 0o111) != 0
-        {
-            return candidate;
-        }
-    }
-    panic!("`sleep` must be on PATH for the notes_repo supervision tests");
-}
-
 /// Install an executable `git` in `dir` whose body is `body`, and return an
 /// `InheritedEnv` whose `PATH` finds it and nothing else.
 fn fake_git_env(dir: &Path, body: &str) -> InheritedEnv {
@@ -1056,7 +1036,10 @@ fn run_git_times_out_on_a_child_that_never_exits() {
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
     // Sleep far longer than the test's timeout, writing nothing.
-    let env = fake_git_env(&bin, &format!("exec {} 600", sleep_program().display()));
+    let env = fake_git_env(
+        &bin,
+        &format!("exec {} 600", required_tool("sleep").display()),
+    );
     let started = std::time::Instant::now();
     let err = run_git_with_limits(
         tmp.path(),
@@ -1159,7 +1142,7 @@ fn run_git_kills_a_lingering_helper_in_the_process_group() {
         &bin,
         &format!(
             "{sleep} 600 & printf '%s' \"$!\" > {marker}\nexit 0",
-            sleep = sleep_program().display(),
+            sleep = required_tool("sleep").display(),
             marker = marker.display()
         ),
     );
@@ -2087,7 +2070,7 @@ case "$sub" in
   *) exit 0 ;;
 esac"#,
             attempts = attempts.display(),
-            sleep = sleep_program().display(),
+            sleep = required_tool("sleep").display(),
         ),
     )
 }

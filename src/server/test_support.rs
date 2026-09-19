@@ -6,75 +6,29 @@
 //! not pull in. Helpers are `pub(super)` so the sibling `*_tests`
 //! modules can reach them.
 
+pub(super) use crate::test_support::{InMemorySecretStore, find_in_path, required_tool_any};
 use std::path::PathBuf;
 
 use super::*;
 use crate::core::{AgentKind, RepoRef};
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
 use crate::policy::PolicyConfig;
-use crate::secret::{SecretError, SecretKey, SecretStore};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use crate::secret::{SecretKey, SecretStore};
+use std::collections::BTreeMap;
 use wiremock::MockServer;
-
-#[derive(Default)]
-pub(super) struct InMemStore(Mutex<HashMap<String, String>>);
-
-impl SecretStore for InMemStore {
-    fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-        Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-    }
-    fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(key.as_str().to_string(), value.to_string());
-        Ok(())
-    }
-    fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-        self.0.lock().unwrap().remove(key.as_str());
-        Ok(())
-    }
-}
 
 // Fixture key — same material used in github.rs tests; kept in a
 // file so the test binary doesn't embed the PEM inline and so we
 // can share it across modules without duplicating the bytes.
-const TEST_PRIV: &str = include_str!("../../tests/fixtures/rsa_test_1.pem");
-
-/// Walk `PATH` looking for `name`. Returns the first match.
-/// The `run_agent` tests need real tools (`cat`, `false`,
-/// `sh`/`bash`) and the production `RunAgentSpawnConfig` carries
-/// an absolute path, so tests resolve one at setup. Hardcoding
-/// `/bin/...` or `/usr/bin/...` works on macOS dev hosts but not
-/// in Nix CI sandboxes where coreutils live under `/nix/store/`.
-pub(super) fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-/// Like [`find_in_path`] but tries several names in order. Used
-/// for the shell — Nix stdenv reliably provides `bash` on PATH
-/// but `sh` may be a symlink that isn't always in scope.
-pub(super) fn find_in_path_any(names: &[&str]) -> std::path::PathBuf {
-    for name in names {
-        if let Some(path) = find_in_path(name) {
-            return path;
-        }
-    }
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    panic!("could not locate any of {names:?} in PATH ({path_var:?})");
-}
+use crate::test_support::RSA_TEST_1_PEM as TEST_PRIV;
 
 pub(super) fn make_state(
     server: &MockServer,
     writable: Vec<RepoRef>,
     owner: &str,
-) -> Arc<BrokerState<InMemStore>> {
+) -> Arc<BrokerState<InMemorySecretStore>> {
     let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemStore::default();
+    let store = InMemorySecretStore::default();
     store.put(&pk, TEST_PRIV).unwrap();
     let mut apps = BTreeMap::new();
     apps.insert(
@@ -108,17 +62,19 @@ pub(super) fn make_state(
     })
 }
 
-pub(super) fn make_agent_registry_state(server: &MockServer) -> Arc<BrokerState<InMemStore>> {
+pub(super) fn make_agent_registry_state(
+    server: &MockServer,
+) -> Arc<BrokerState<InMemorySecretStore>> {
     make_agent_registry_state_for_agents(server, &[AgentKind::Claude, AgentKind::Codex])
 }
 
 pub(super) fn make_agent_registry_state_for_agents(
     server: &MockServer,
     agents: &[AgentKind],
-) -> Arc<BrokerState<InMemStore>> {
+) -> Arc<BrokerState<InMemorySecretStore>> {
     let claude_pk = SecretKey::new("claude-pk").unwrap();
     let codex_pk = SecretKey::new("codex-pk").unwrap();
-    let store = InMemStore::default();
+    let store = InMemorySecretStore::default();
     store.put(&claude_pk, TEST_PRIV).unwrap();
     store.put(&codex_pk, TEST_PRIV).unwrap();
     let mut apps = BTreeMap::new();
@@ -171,7 +127,7 @@ pub(super) fn make_agent_registry_state_for_agents(
 /// second return value so a test cannot drop the notes repo and log root out
 /// from under the state it is still dispatching against.
 pub(super) struct RunAgentFixture {
-    pub(super) state: Arc<BrokerState<InMemStore>>,
+    pub(super) state: Arc<BrokerState<InMemorySecretStore>>,
     /// A clone of the key `state` signs with, so a test can verify a
     /// signature and check the fingerprint from the caller's side.
     pub(super) signing_key: crate::signing::WritSigningKey,
@@ -211,7 +167,7 @@ pub(super) fn make_run_agent_state(
 ) -> RunAgentFixture {
     use crate::config::AgentRunLogRoot;
     use crate::signing::WritSigningKey;
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+    use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
 
     let tmp = tempfile::tempdir().unwrap();
     let notes_repo = NotesRepo::init_or_open(tmp.path().join("repo")).unwrap();
@@ -260,7 +216,7 @@ pub(super) fn expiry_str_from_now(secs: i64) -> String {
 /// staging root alive for the duration of the test.
 pub(super) fn make_state_with_staging(
     server: &MockServer,
-) -> (Arc<BrokerState<InMemStore>>, tempfile::TempDir) {
+) -> (Arc<BrokerState<InMemorySecretStore>>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let store = GitPushStagingStore::open(tmp.path().join("staging")).unwrap();
     // Installation owner matches `sample_clone_repo()`'s "owner/repo"
@@ -285,11 +241,11 @@ pub(super) fn make_state_with_staging(
 /// and unbundle.
 pub(super) fn make_state_with_approve_ready(
     server: &MockServer,
-) -> (Arc<BrokerState<InMemStore>>, tempfile::TempDir) {
+) -> (Arc<BrokerState<InMemorySecretStore>>, tempfile::TempDir) {
     use crate::git_push_promote::PromoteRuntimeConfig;
     use crate::signing::WritSigningKey;
+    use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
     use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
 
     let (mut state, tmp) = make_state_with_staging(server);
     let work_root = tmp.path().join("promote");
@@ -354,7 +310,7 @@ pub(super) fn sample_promote_mint_audit() -> PromoteMintAudit {
 /// `Staged` outcome row so the resolution trigger admits operator
 /// decisions against the resulting request id. Returns the request id.
 pub(super) async fn stage_with_staged_outcome(
-    state: &Arc<BrokerState<InMemStore>>,
+    state: &Arc<BrokerState<InMemorySecretStore>>,
     session_id: SessionId,
     bundle: Vec<u8>,
     staged_at: UnixMillis,
@@ -377,7 +333,7 @@ pub(super) async fn stage_with_staged_outcome(
 /// Stage a push on disk *and* record the matching audit row so the
 /// joined Show view has both halves available. Returns the request id.
 pub(super) async fn stage_with_audit(
-    state: &Arc<BrokerState<InMemStore>>,
+    state: &Arc<BrokerState<InMemorySecretStore>>,
     session_id: SessionId,
     bundle: Vec<u8>,
     staged_at: UnixMillis,
@@ -426,7 +382,7 @@ pub(super) async fn stage_with_audit(
 /// otherwise well-formed, so `approve` reaches the carrier/audit
 /// consistency gate. Returns the request id.
 pub(super) async fn stage_carrier_diverging_from_audit(
-    state: &Arc<BrokerState<InMemStore>>,
+    state: &Arc<BrokerState<InMemorySecretStore>>,
     session_id: SessionId,
     carrier: crate::vm_git::VmGitPushMetadata,
     audited: crate::vm_git::VmGitPushMetadata,
@@ -485,7 +441,7 @@ pub(super) fn reason(text: &str) -> RejectionReason {
 /// Mirrors the `Uncertain` survivor case boot reconcile leaves on
 /// disk after a daemon restart.
 pub(super) async fn stage_with_boot_observed_uncertain_attempt(
-    state: &Arc<BrokerState<InMemStore>>,
+    state: &Arc<BrokerState<InMemorySecretStore>>,
     timeline_base_ms: i64,
 ) -> (RequestId, ApproveAttemptId) {
     let session_id = open_session(state).await;
@@ -526,7 +482,7 @@ pub(super) async fn stage_with_boot_observed_uncertain_attempt(
 /// terminal and does not require a boot-observed marker —
 /// reconciliation is admitted directly.
 pub(super) async fn stage_with_post_patch_failure_attempt(
-    state: &Arc<BrokerState<InMemStore>>,
+    state: &Arc<BrokerState<InMemorySecretStore>>,
     timeline_base_ms: i64,
 ) -> (RequestId, ApproveAttemptId) {
     let session_id = open_session(state).await;

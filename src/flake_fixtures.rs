@@ -11,6 +11,7 @@
 //! Used by the host core ([`crate::flake_provision`]), the mirror orchestrator
 //! ([`crate::flake_provision_from_mirror`]), and the VM-HTTP endpoint tests.
 
+use crate::test_support::find_in_path;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -38,15 +39,6 @@ pub(crate) const SSH_INPUT_LOCK: &str = r#"{
         }
     }
 }"#;
-
-/// Locate `name` on PATH. Returns `None` so a test can skip on a machine
-/// without the tool; CI has both `git` and `nix`.
-pub(crate) fn tool_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
 
 /// Render a failed fixture `git` invocation with everything needed to
 /// diagnose it from a CI log alone.
@@ -246,7 +238,7 @@ mod tests {
     /// exactly what already happened almost every time.
     #[test]
     fn a_fixture_commit_leaves_no_background_writer_behind() {
-        let Some(git_program) = tool_on_path("git") else {
+        let Some(git_program) = find_in_path("git") else {
             eprintln!("skipping: git must be on PATH");
             return;
         };
@@ -298,7 +290,7 @@ mod tests {
     /// (that stderr is captured at all) that broke, not the formatting.
     #[test]
     fn a_failed_fixture_git_reports_gits_own_stderr() {
-        let Some(git_program) = tool_on_path("git") else {
+        let Some(git_program) = find_in_path("git") else {
             eprintln!("skipping: git must be on PATH");
             return;
         };

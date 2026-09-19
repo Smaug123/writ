@@ -62,11 +62,11 @@ use writ::signing::WritSigningKey;
 use writ::vm_git::{GitCloneRepo, GitObjectId, WorkspaceWarmMode};
 use writ::writ_client::WritClient;
 
-const SIGNING_PEM: &str = include_str!("fixtures/ed25519_test_signing.key");
-const SIGNING_PUB: &str = include_str!("fixtures/ed25519_test_signing.key.pub");
 /// A key bailiff does not trust, used to force note verification to
 /// fail after an otherwise-successful run.
-const OTHER_PEM: &str = include_str!("fixtures/ed25519_test_signing_other.key");
+use writ::test_support::ED25519_OTHER_PEM as OTHER_PEM;
+use writ::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
+use writ::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
 
 /// The plan body every scenario uses. Also the agent's stdout, since
 /// the planner's stdout *is* the plan body.

@@ -21,8 +21,9 @@
 //! Repos are built with the same hardened, identity-pinned `git`
 //! invocations the walker tests use, so SHAs are deterministic across
 //! runs and machines. Callers must skip when `git` is absent (the
-//! constructor returns `None`), matching the `maybe_git()` precedent.
+//! constructor returns `None`), matching the `find_in_path("git")` precedent.
 
+use crate::test_support::find_in_path;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,7 +65,7 @@ impl FakeOrigin {
     /// `git` is not on `PATH` (callers print a skip note, matching the
     /// suite's convention for real-git tests).
     pub(crate) async fn start() -> Option<Self> {
-        let git = maybe_git()?;
+        let git = find_in_path("git")?;
         let tmp = tempfile::tempdir().expect("fake origin tempdir");
 
         // Work repo: base commit (the prerequisite — what "GitHub"
@@ -215,18 +216,6 @@ fn serve_file(repo_dir: &Path, url_path: &str) -> Response<Full<Bytes>> {
             .expect("static response builds"),
         Err(_) => not_found(),
     }
-}
-
-/// Locate `git` on `PATH`; `None` means the caller should skip.
-pub(crate) fn maybe_git() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("git");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 /// `git -C <repo> <args>` under the hardened, identity-pinned env the
