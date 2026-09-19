@@ -24,7 +24,7 @@
 //! `$XDG_DATA_HOME/writ/repo` for the writ-owned repo bailiff
 //! fetches from. `--bailiff-repo` and `--writ-repo` override either.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{ArgGroup, Parser, Subcommand};
@@ -83,6 +83,43 @@ enum Cmd {
     },
 }
 
+/// The flags every agent-run verb (`submit`, `review`, `implement`) takes:
+/// the prompt, the repo the agent works in, and the two repos plus signer
+/// list bailiff reads envelopes with. [`WorkflowArgs::open`] reads and
+/// validates all of them before the verb's first RPC.
+#[derive(clap::Args)]
+struct WorkflowArgs {
+    /// File containing the agent's prompt. The bytes are read once and
+    /// validated through [`AgentPrompt::try_new`]; `submit` passes them to
+    /// writ verbatim, while `review` and `implement` compose them with the
+    /// verified plan body first.
+    #[arg(long)]
+    prompt_file: PathBuf,
+    /// Repository the agent works in, in `owner/name` form. `submit` and
+    /// `review` grant a single `WorkspaceRead` capability on it;
+    /// `implement` grants `WorkspaceWrite`, which is what lets the
+    /// implementer push.
+    #[arg(long)]
+    repo: String,
+    /// Path to bailiff's bare git repo. Defaults to
+    /// `$XDG_DATA_HOME/bailiff/repo` (or `~/.local/share/bailiff/repo` if
+    /// `XDG_DATA_HOME` is unset). Created on first use via
+    /// [`NotesRepo::init_or_open`].
+    #[arg(long)]
+    bailiff_repo: Option<PathBuf>,
+    /// Path to writ's bare git repo. Defaults to `$XDG_DATA_HOME/writ/repo`.
+    /// Bailiff fetches writ's notes namespace from this path (`review` and
+    /// `implement` twice: once to read the planner's envelope, once after
+    /// the run to verify the new envelope); it does not write to it.
+    #[arg(long)]
+    writ_repo: Option<PathBuf>,
+    /// OpenSSH `allowed_signers` file enumerating which writ signing keys
+    /// bailiff will accept envelopes from. Bootstrap is "writ prints its
+    /// key fingerprint on first run; operator adds it here."
+    #[arg(long)]
+    writ_allowed_signers: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum PlanCmd {
     /// Submit a new plan: open a writ session, run the planner
@@ -90,35 +127,8 @@ enum PlanCmd {
     /// bailiff-side plan note. Prints the plan id to stdout on
     /// success.
     Submit {
-        /// File containing the planner prompt. The bytes are read
-        /// once and passed to writ verbatim; size validation
-        /// happens at the boundary via [`AgentPrompt::try_new`].
-        #[arg(long)]
-        prompt_file: PathBuf,
-        /// Repository the planner is allowed to read, in
-        /// `owner/name` form. Today bailiff grants a single
-        /// `WorkspaceRead` capability on this repo; future slices
-        /// may broaden the set.
-        #[arg(long)]
-        repo: String,
-        /// Path to bailiff's bare git repo. Defaults to
-        /// `$XDG_DATA_HOME/bailiff/repo` (or
-        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
-        /// unset). Created on first use via
-        /// [`NotesRepo::init_or_open`].
-        #[arg(long)]
-        bailiff_repo: Option<PathBuf>,
-        /// Path to writ's bare git repo. Defaults to
-        /// `$XDG_DATA_HOME/writ/repo`. Bailiff fetches writ's
-        /// notes namespace from this path; it does not write to it.
-        #[arg(long)]
-        writ_repo: Option<PathBuf>,
-        /// OpenSSH `allowed_signers` file enumerating which writ
-        /// signing keys bailiff will accept envelopes from.
-        /// Bootstrap is "writ prints its key fingerprint on first
-        /// run; operator adds it here."
-        #[arg(long)]
-        writ_allowed_signers: PathBuf,
+        #[command(flatten)]
+        workflow: WorkflowArgs,
         /// Optional bailiff plan id; one is generated if omitted.
         /// Surfaced for replay and for test scripting; production
         /// callers normally let bailiff allocate it.
@@ -207,37 +217,8 @@ enum PlanCmd {
         /// an existing submission.
         #[arg(long)]
         plan_id: PlanId,
-        /// File containing the reviewer instructions. The bytes are
-        /// read once, validated through [`AgentPrompt::try_new`], and
-        /// passed to [`submit_review`] which composes them with the
-        /// fetched plan body before handing the result to writ.
-        #[arg(long)]
-        prompt_file: PathBuf,
-        /// Repository the reviewer agent is allowed to read, in
-        /// `owner/name` form. D2.5 grants a single `WorkspaceRead`
-        /// capability on this repo (matches `plan submit`'s shape).
-        #[arg(long)]
-        repo: String,
-        /// Path to bailiff's bare git repo. Defaults to
-        /// `$XDG_DATA_HOME/bailiff/repo` (or
-        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
-        /// unset). Created on first use via
-        /// [`NotesRepo::init_or_open`].
-        #[arg(long)]
-        bailiff_repo: Option<PathBuf>,
-        /// Path to writ's bare git repo. Defaults to
-        /// `$XDG_DATA_HOME/writ/repo`. Bailiff fetches writ's notes
-        /// namespace from this path twice during a review: once to
-        /// read the planner's envelope for plan-body extraction, once
-        /// after the reviewer run to verify the reviewer envelope.
-        #[arg(long)]
-        writ_repo: Option<PathBuf>,
-        /// OpenSSH `allowed_signers` file enumerating which writ
-        /// signing keys bailiff will accept envelopes from. Used for
-        /// both the planner re-verify (defence in depth) and the
-        /// reviewer envelope.
-        #[arg(long)]
-        writ_allowed_signers: PathBuf,
+        #[command(flatten)]
+        workflow: WorkflowArgs,
         /// Opaque tag recorded verbatim on writ's audit row and on
         /// the bailiff-side review note. Defaults to
         /// `"plan-review"`. Printable ASCII, at most 128 bytes,
@@ -299,46 +280,8 @@ enum PlanCmd {
         /// presupposes an existing accepted plan.
         #[arg(long)]
         plan_id: PlanId,
-        /// File containing the operator's original feature prompt —
-        /// the request that triggered the plan in the first place.
-        /// The bytes are read once, validated through
-        /// [`AgentPrompt::try_new`], and passed to [`submit_implement`]
-        /// which composes them with the verified plan body before
-        /// handing the result to writ. Crucially this is **not** the
-        /// plan body; `submit_implement` decodes that from the signed
-        /// planner envelope itself.
-        #[arg(long)]
-        prompt_file: PathBuf,
-        /// Repository the implementer agent is allowed to write to,
-        /// in `owner/name` form. Granted as a `WorkspaceWrite`
-        /// capability (the difference from `plan submit` / `plan
-        /// review`, which grant `WorkspaceRead`); the
-        /// `WorkspaceWrite` is what lets the agent push, and is the
-        /// reason the duplicate gate inside `submit_implement` is
-        /// load-bearing.
-        #[arg(long)]
-        repo: String,
-        /// Path to bailiff's bare git repo. Defaults to
-        /// `$XDG_DATA_HOME/bailiff/repo` (or
-        /// `~/.local/share/bailiff/repo` if `XDG_DATA_HOME` is
-        /// unset). Created on first use via
-        /// [`NotesRepo::init_or_open`].
-        #[arg(long)]
-        bailiff_repo: Option<PathBuf>,
-        /// Path to writ's bare git repo. Defaults to
-        /// `$XDG_DATA_HOME/writ/repo`. Bailiff fetches writ's notes
-        /// namespace from this path twice during an implement run:
-        /// once to read the planner's envelope for plan-body
-        /// extraction, once after the implementer run to verify the
-        /// implementer envelope.
-        #[arg(long)]
-        writ_repo: Option<PathBuf>,
-        /// OpenSSH `allowed_signers` file enumerating which writ
-        /// signing keys bailiff will accept envelopes from. Used for
-        /// both the planner re-verify (defence in depth) and the
-        /// implementer envelope.
-        #[arg(long)]
-        writ_allowed_signers: PathBuf,
+        #[command(flatten)]
+        workflow: WorkflowArgs,
         /// Opaque tag recorded verbatim on writ's audit row and on
         /// the bailiff-side implement note. Defaults to
         /// `"plan-implement"`. Printable ASCII, at most 128 bytes, no
@@ -588,11 +531,7 @@ async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::
     match cmd {
         Cmd::Plan { action } => match action {
             PlanCmd::Submit {
-                prompt_file,
-                repo,
-                bailiff_repo,
-                writ_repo,
-                writ_allowed_signers,
+                workflow,
                 plan_id,
                 purpose,
                 label,
@@ -601,11 +540,7 @@ async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::
             } => {
                 plan_submit(
                     socket_path(socket)?,
-                    prompt_file,
-                    repo,
-                    bailiff_repo,
-                    writ_repo,
-                    writ_allowed_signers,
+                    workflow,
                     plan_id,
                     purpose,
                     label,
@@ -623,11 +558,7 @@ async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::
             } => plan_decide(plan_id, accept, reject, decider, bailiff_repo).await,
             PlanCmd::Review {
                 plan_id,
-                prompt_file,
-                repo,
-                bailiff_repo,
-                writ_repo,
-                writ_allowed_signers,
+                workflow,
                 purpose,
                 label,
                 agent,
@@ -636,11 +567,7 @@ async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::
                 plan_review(
                     socket_path(socket)?,
                     plan_id,
-                    prompt_file,
-                    repo,
-                    bailiff_repo,
-                    writ_repo,
-                    writ_allowed_signers,
+                    workflow,
                     purpose,
                     label,
                     agent,
@@ -650,11 +577,7 @@ async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::
             }
             PlanCmd::Implement {
                 plan_id,
-                prompt_file,
-                repo,
-                bailiff_repo,
-                writ_repo,
-                writ_allowed_signers,
+                workflow,
                 purpose,
                 agent,
                 model,
@@ -664,11 +587,7 @@ async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::
                 plan_implement(
                     socket_path(socket)?,
                     plan_id,
-                    prompt_file,
-                    repo,
-                    bailiff_repo,
-                    writ_repo,
-                    writ_allowed_signers,
+                    workflow,
                     purpose,
                     agent,
                     model,
@@ -703,74 +622,25 @@ async fn dispatch(cmd: Cmd, socket: Option<PathBuf>) -> Result<(), Box<dyn std::
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn plan_submit(
     socket_path: PathBuf,
-    prompt_file: PathBuf,
-    repo: String,
-    bailiff_repo: Option<PathBuf>,
-    writ_repo: Option<PathBuf>,
-    writ_allowed_signers: PathBuf,
+    workflow: WorkflowArgs,
     plan_id: Option<PlanId>,
     purpose: RunPurpose,
     label: Option<String>,
     agent: AgentKind,
     model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Resolve and read every on-disk input before opening any RPCs —
-    // a bad prompt path or malformed allowed-signers file should
-    // surface before bailiff makes a side-effecting writ call.
-    let prompt_bytes = std::fs::read(&prompt_file)
-        .map_err(|e| format!("reading prompt file {}: {e}", prompt_file.display()))?;
-    let prompt_str = String::from_utf8(prompt_bytes).map_err(|e| {
-        format!(
-            "prompt file {} is not valid UTF-8: {e}",
-            prompt_file.display()
-        )
-    })?;
-    let prompt = AgentPrompt::try_new(prompt_str)
-        .map_err(|e| format!("prompt from {} rejected: {e}", prompt_file.display()))?;
-
-    let repo: RepoRef = repo
-        .parse()
-        .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
-
-    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
-    let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
-
-    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
-        format!(
-            "reading writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
-        format!(
-            "parsing writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-
-    // `NotesRepo::init_or_open` shells out to git; do it on a
-    // blocking thread so the runtime stays responsive. The
-    // `bailiff_repo_path` is moved into the closure so the spawn
-    // doesn't have to handle a lifetime.
-    let bailiff_repo_path_for_init = bailiff_repo_path.clone();
-    let bailiff =
-        tokio::task::spawn_blocking(move || NotesRepo::init_or_open(bailiff_repo_path_for_init))
-            .await
-            .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
-            .map_err(|e| {
-                format!(
-                    "opening bailiff repo at {}: {e}",
-                    bailiff_repo_path.display()
-                )
-            })?;
-    let bailiff = Arc::new(bailiff);
+    let OpenedWorkflow {
+        prompt,
+        repo,
+        writ_repo_path,
+        allowed,
+        bailiff,
+        writ_output_ref,
+    } = workflow.open().await?;
 
     let plan_id = plan_id.unwrap_or_else(PlanId::new);
-    let writ_output_ref =
-        NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
 
     let inputs = SubmitPlanInputs {
         prompt,
@@ -789,74 +659,27 @@ async fn plan_submit(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn plan_review(
     socket_path: PathBuf,
     plan_id: PlanId,
-    prompt_file: PathBuf,
-    repo: String,
-    bailiff_repo: Option<PathBuf>,
-    writ_repo: Option<PathBuf>,
-    writ_allowed_signers: PathBuf,
+    workflow: WorkflowArgs,
     purpose: RunPurpose,
     label: Option<String>,
     agent: AgentKind,
     model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Same pre-RPC discipline as `plan_submit`: validate every
-    // on-disk input before opening any sockets, so a typo in
-    // `--prompt-file` or `--writ-allowed-signers` fails before
-    // bailiff makes a side-effecting writ call.
-    let prompt_bytes = std::fs::read(&prompt_file)
-        .map_err(|e| format!("reading prompt file {}: {e}", prompt_file.display()))?;
-    let prompt_str = String::from_utf8(prompt_bytes).map_err(|e| {
-        format!(
-            "prompt file {} is not valid UTF-8: {e}",
-            prompt_file.display()
-        )
-    })?;
-    let reviewer_instructions = AgentPrompt::try_new(prompt_str)
-        .map_err(|e| format!("prompt from {} rejected: {e}", prompt_file.display()))?;
-
-    let repo: RepoRef = repo
-        .parse()
-        .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
-
-    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
-    let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
-
-    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
-        format!(
-            "reading writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
-        format!(
-            "parsing writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-
-    let bailiff_repo_path_for_init = bailiff_repo_path.clone();
-    let bailiff =
-        tokio::task::spawn_blocking(move || NotesRepo::init_or_open(bailiff_repo_path_for_init))
-            .await
-            .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
-            .map_err(|e| {
-                format!(
-                    "opening bailiff repo at {}: {e}",
-                    bailiff_repo_path.display()
-                )
-            })?;
-    let bailiff = Arc::new(bailiff);
-
-    let writ_output_ref =
-        NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
+    let OpenedWorkflow {
+        prompt,
+        repo,
+        writ_repo_path,
+        allowed,
+        bailiff,
+        writ_output_ref,
+    } = workflow.open().await?;
 
     let inputs = SubmitReviewInputs {
         plan_id,
-        reviewer_instructions,
+        reviewer_instructions: prompt,
         capabilities: vec![CapabilitySet::WorkspaceRead { repo }],
         purpose,
         writ_output_ref,
@@ -915,67 +738,21 @@ async fn plan_review(
 async fn plan_implement(
     socket_path: PathBuf,
     plan_id: PlanId,
-    prompt_file: PathBuf,
-    repo: String,
-    bailiff_repo: Option<PathBuf>,
-    writ_repo: Option<PathBuf>,
-    writ_allowed_signers: PathBuf,
+    workflow: WorkflowArgs,
     purpose: RunPurpose,
     agent: AgentKind,
     model: String,
     workspace_warm: WorkspaceWarmMode,
     workspace_destination: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Same pre-RPC discipline as `plan_submit` / `plan_review`:
-    // validate every on-disk input before opening any sockets, so a
-    // typo in `--prompt-file` or `--writ-allowed-signers` fails before
-    // bailiff makes a side-effecting writ call.
-    let prompt_bytes = std::fs::read(&prompt_file)
-        .map_err(|e| format!("reading prompt file {}: {e}", prompt_file.display()))?;
-    let prompt_str = String::from_utf8(prompt_bytes).map_err(|e| {
-        format!(
-            "prompt file {} is not valid UTF-8: {e}",
-            prompt_file.display()
-        )
-    })?;
-    let feature_prompt = AgentPrompt::try_new(prompt_str)
-        .map_err(|e| format!("prompt from {} rejected: {e}", prompt_file.display()))?;
-
-    let repo: RepoRef = repo
-        .parse()
-        .map_err(|e| format!("--repo {repo:?} is not 'owner/name': {e}"))?;
-
-    let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
-    let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
-
-    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
-        format!(
-            "reading writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
-        format!(
-            "parsing writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-
-    let bailiff_repo_path_for_init = bailiff_repo_path.clone();
-    let bailiff =
-        tokio::task::spawn_blocking(move || NotesRepo::init_or_open(bailiff_repo_path_for_init))
-            .await
-            .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
-            .map_err(|e| {
-                format!(
-                    "opening bailiff repo at {}: {e}",
-                    bailiff_repo_path.display()
-                )
-            })?;
-    let bailiff = Arc::new(bailiff);
-
-    let writ_output_ref =
-        NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
+    let OpenedWorkflow {
+        prompt,
+        repo,
+        writ_repo_path,
+        allowed,
+        bailiff,
+        writ_output_ref,
+    } = workflow.open().await?;
 
     // Workspace bootstrap routes the run into writd's VM dispatch
     // arm. The bootstrap repo and the `WorkspaceWrite` capability
@@ -988,7 +765,7 @@ async fn plan_implement(
 
     let inputs = SubmitImplementInputs {
         plan_id,
-        feature_prompt,
+        feature_prompt: prompt,
         capabilities: vec![CapabilitySet::WorkspaceWrite { repo }],
         purpose,
         writ_output_ref,
@@ -1035,6 +812,79 @@ async fn plan_implement(
     }
 }
 
+/// What [`WorkflowArgs::open`] yields: every on-disk input read and
+/// validated, and bailiff's repo open, so the verb's first RPC comes after
+/// its last chance to fail on operator input.
+struct OpenedWorkflow {
+    prompt: AgentPrompt,
+    repo: RepoRef,
+    writ_repo_path: PathBuf,
+    allowed: AllowedSigners,
+    bailiff: Arc<NotesRepo>,
+    writ_output_ref: NotesRef,
+}
+
+impl WorkflowArgs {
+    /// Resolve and read every on-disk input before opening any RPCs: a bad
+    /// prompt path or malformed allowed-signers file surfaces before
+    /// bailiff makes a side-effecting writ call.
+    async fn open(self) -> Result<OpenedWorkflow, Box<dyn std::error::Error>> {
+        let prompt = read_prompt(&self.prompt_file)?;
+        let repo: RepoRef = self
+            .repo
+            .parse()
+            .map_err(|e| format!("--repo {:?} is not 'owner/name': {e}", self.repo))?;
+        let bailiff_repo_path = BAILIFF_REPO.or_resolve(self.bailiff_repo)?;
+        let writ_repo_path = WRIT_NOTES_REPO.or_resolve(self.writ_repo)?;
+        let allowed = read_allowed_signers(&self.writ_allowed_signers)?;
+        let bailiff = Arc::new(open_bailiff_repo(bailiff_repo_path).await?);
+        Ok(OpenedWorkflow {
+            prompt,
+            repo,
+            writ_repo_path,
+            allowed,
+            bailiff,
+            writ_output_ref: writ_output_ref(),
+        })
+    }
+}
+
+/// The prompt file's bytes as a validated [`AgentPrompt`].
+fn read_prompt(prompt_file: &Path) -> Result<AgentPrompt, Box<dyn std::error::Error>> {
+    let prompt_bytes = std::fs::read(prompt_file)
+        .map_err(|e| format!("reading prompt file {}: {e}", prompt_file.display()))?;
+    let prompt_str = String::from_utf8(prompt_bytes).map_err(|e| {
+        format!(
+            "prompt file {} is not valid UTF-8: {e}",
+            prompt_file.display()
+        )
+    })?;
+    AgentPrompt::try_new(prompt_str)
+        .map_err(|e| format!("prompt from {} rejected: {e}", prompt_file.display()).into())
+}
+
+/// The OpenSSH `allowed_signers` file, parsed.
+fn read_allowed_signers(path: &Path) -> Result<AllowedSigners, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading writ allowed-signers file {}: {e}", path.display()))?;
+    AllowedSigners::from_openssh_lines(&text)
+        .map_err(|e| format!("parsing writ allowed-signers file {}: {e}", path.display()).into())
+}
+
+/// `NotesRepo::init_or_open` shells out to git; run it on a blocking
+/// thread so the runtime stays responsive.
+async fn open_bailiff_repo(path: PathBuf) -> Result<NotesRepo, Box<dyn std::error::Error>> {
+    let path_for_init = path.clone();
+    tokio::task::spawn_blocking(move || NotesRepo::init_or_open(path_for_init))
+        .await
+        .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
+        .map_err(|e| format!("opening bailiff repo at {}: {e}", path.display()).into())
+}
+
+fn writ_output_ref() -> NotesRef {
+    NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref")
+}
+
 /// Bailiff's own bare repo, declared with writ's [`DefaultPath`] vocabulary
 /// and resolved by writ's resolver — it is bailiff's path, so bailiff owns the
 /// declaration, but there is only one implementation of "where does this go".
@@ -1072,19 +922,7 @@ async fn plan_decide(
     let decider = resolve_decider(decider, user_env)?;
     let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
 
-    // `init_or_open` shells out to git; do it on a blocking thread so
-    // the runtime stays responsive.
-    let bailiff_repo_path_for_init = bailiff_repo_path.clone();
-    let repo =
-        tokio::task::spawn_blocking(move || NotesRepo::init_or_open(bailiff_repo_path_for_init))
-            .await
-            .map_err(|e| format!("bailiff-repo init task failed: {e}"))?
-            .map_err(|e| {
-                format!(
-                    "opening bailiff repo at {}: {e}",
-                    bailiff_repo_path.display()
-                )
-            })?;
+    let repo = open_bailiff_repo(bailiff_repo_path).await?;
 
     // Slice 2: `decide` takes the plan's lock like every other
     // mutating verb. Before, it was the one mutator outside the
@@ -1206,18 +1044,7 @@ async fn plan_show(
     // Pre-RPC discipline: read & parse the allowed-signers file
     // before any git work, so a bad path or malformed file surfaces
     // before bailiff opens its repo.
-    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
-        format!(
-            "reading writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
-        format!(
-            "parsing writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
+    let allowed = read_allowed_signers(&writ_allowed_signers)?;
 
     let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
 
@@ -1286,23 +1113,11 @@ async fn plan_dossier(
         );
     }
 
-    let allowed_signers_text = std::fs::read_to_string(&writ_allowed_signers).map_err(|e| {
-        format!(
-            "reading writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
-    let allowed = AllowedSigners::from_openssh_lines(&allowed_signers_text).map_err(|e| {
-        format!(
-            "parsing writ allowed-signers file {}: {e}",
-            writ_allowed_signers.display()
-        )
-    })?;
+    let allowed = read_allowed_signers(&writ_allowed_signers)?;
 
     let bailiff_repo_path = BAILIFF_REPO.or_resolve(bailiff_repo)?;
     let writ_repo_path = WRIT_NOTES_REPO.or_resolve(writ_repo)?;
-    let writ_output_ref =
-        NotesRef::try_new(WRIT_OUTPUT_REF).expect("WRIT_OUTPUT_REF is a static well-formed ref");
+    let writ_output_ref = writ_output_ref();
 
     let bailiff_repo_path_for_task = bailiff_repo_path.clone();
     let result: Result<_, DossierError> = tokio::task::spawn_blocking(move || {
