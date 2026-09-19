@@ -95,11 +95,11 @@ impl StubBroker {
                 let mut lines = reader.lines();
                 // Record *before* looking for a reply. Draining the request
                 // first is what makes the zero-RPC assertions mean anything:
-                // with no scripted reply an earlier version returned without
-                // reading, so a workflow that sent an RPC before its gate got
-                // an EOF, surfaced a transport error that `expect_err` happily
-                // accepted, and left `observed()` empty — the check passed on
-                // exactly the regression it exists to catch.
+                // a stub that returned without reading when it had no
+                // scripted reply would give a workflow that sent an RPC before
+                // its gate an EOF, a transport error `expect_err` accepts, and
+                // an empty `observed()`, so the check would pass on exactly
+                // the regression it exists to catch.
                 if let Ok(Some(line)) = lines.next_line().await
                     && let Ok(msg) = serde_json::from_str::<ClientMessage>(&line)
                 {

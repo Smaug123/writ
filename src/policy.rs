@@ -43,7 +43,7 @@ pub struct PolicyConfig {
 /// [`CapabilityRequest`] through the policy engine. [`GitHubMinter`]
 /// accepts nothing else, which makes "mint a credential without a policy
 /// decision" a *compile error* rather than a convention: the staged-push
-/// approve path can no longer hand-build a `contents:write` scope and
+/// approve path cannot hand-build a `contents:write` scope and
 /// mint directly, it must call [`decide`] like every other mint site and
 /// so is subject to the `writable_repos` allowlist.
 ///

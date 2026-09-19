@@ -102,7 +102,7 @@ pub struct DaemonConfig {
     /// `Option` rather than a `serde` default because the default is derived
     /// from the environment and can *fail* — an environment with no usable
     /// base directory has nowhere to put a secret store, and inventing one
-    /// under `/tmp` is what this deliberately no longer does. A `serde`
+    /// under `/tmp` is what this refuses to do. A `serde`
     /// default must be infallible, so the resolution moves out of
     /// deserialization and into the boot path, where the failure can be
     /// reported alongside every other config error.
@@ -137,12 +137,10 @@ pub struct DaemonConfig {
     /// holding that run's captured `stdout.log` and `stderr.log`. Defaults to
     /// [`default_agent_run_log_root`].
     ///
-    /// **Today's writer is the VM `RunAgent` arm only**: it materialises the
-    /// streams the guest uploads into `<root>/<run-id>/`. The host-spawn arm
-    /// keeps its child's output in memory and writes no files, so a host-only
-    /// daemon creates this root and leaves it empty. That arm records no audit
-    /// rows either; giving it the pair is the follow-up this key is
-    /// preparation for, and needs on-disk paths to point the rows at.
+    /// Both `RunAgent` arms write here: the VM arm materialises the streams
+    /// the guest uploads into `<root>/<run-id>/`, and the host-spawn arm
+    /// captures its child's output there directly. Each records the run's
+    /// audit pair with these paths for the rows to point at.
     ///
     /// It is top-level rather than under `agent_vm` because neither section
     /// can own it: `ClientMessage::StartAgentRun` reaches the VM arm with no
@@ -281,11 +279,9 @@ impl UiHttpConfig {
 /// 3. uses [`Self::spawn_command`] + [`Self::spawn_args`] as the child
 ///    binary every `RunAgent` invocation drives.
 ///
-/// **KNOWN GAP — per-`AgentKind` spawn dispatch.** [`Self::spawn_command`]
-/// today is a *single* binary for the whole daemon. Slice C's only
-/// agent kind is the planner so this suffices, but slice D (review,
-/// likely a different agent kind) will need per-kind selection. The
-/// follow-up reshapes both this struct and
+/// **Known gap — per-`AgentKind` spawn dispatch.** [`Self::spawn_command`]
+/// is a *single* binary for the whole daemon, so the host arm serves one
+/// agent kind; per-kind selection would reshape both this struct and
 /// [`crate::server::RunAgentSpawnConfig`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

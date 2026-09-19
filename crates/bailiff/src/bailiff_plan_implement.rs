@@ -619,7 +619,7 @@ mod end_to_end_tests {
     /// bailiff's repo and reference the implementer's writ-side OID;
     /// the implementer's session must close.
     #[tokio::test]
-    #[ignore = "re-enabled by slice VM3 once bailiff passes workspace: Some(...) for WorkspaceWrite runs"]
+    #[ignore = "the implementer's WorkspaceWrite run carries a workspace bootstrap, which routes RunAgent to the VM arm; the in-process test broker has no VM to serve it"]
     async fn submit_implement_round_trips_through_open_run_write_close() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
@@ -936,14 +936,14 @@ mod end_to_end_tests {
     /// untouched*, which is what stops a repeat from rewriting a
     /// completed run's audit record.
     ///
-    /// Still `#[ignore]`d pending slice VM3, so this encodes the
+    /// Still `#[ignore]`d (the attribute says why), so this encodes the
     /// intended contract without having been observed to hold. The
     /// runnable half of the same claim is
     /// `several_implementer_attempts_coexist_on_one_plan` in
     /// `bailiff_plan_write::stage_tests`, which drives the note writes
     /// directly.
     #[tokio::test]
-    #[ignore = "re-enabled by slice VM3 once bailiff passes workspace: Some(...) for WorkspaceWrite runs"]
+    #[ignore = "the implementer's WorkspaceWrite run carries a workspace bootstrap, which routes RunAgent to the VM arm; the in-process test broker has no VM to serve it"]
     async fn submit_implement_repeat_call_starts_a_new_attempt() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
@@ -1073,10 +1073,10 @@ mod end_to_end_tests {
     /// that variant means two callers picked the same index, which is
     /// exactly the race the lock exists to prevent.
     ///
-    /// Still `#[ignore]`d pending slice VM3, so this encodes the
+    /// Still `#[ignore]`d (the attribute says why), so this encodes the
     /// intended contract without having been observed to hold.
     #[tokio::test]
-    #[ignore = "re-enabled by slice VM3 once bailiff passes workspace: Some(...) for WorkspaceWrite runs"]
+    #[ignore = "the implementer's WorkspaceWrite run carries a workspace bootstrap, which routes RunAgent to the VM arm; the in-process test broker has no VM to serve it"]
     async fn concurrent_submit_implement_serialises_into_distinct_attempts() {
         let tmp = tempfile::tempdir().unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();

@@ -1,9 +1,8 @@
 //! Bailiff-side client for writ's Unix-socket RPC.
 //!
-//! Speaks the same newline-terminated JSON framing the broker accepts
-//! (see `src/server.rs:1322`). Today the only verb exposed is
-//! [`WritClient::run_agent`]; future bailiff verbs (plan submit,
-//! review attach, …) hang off the same client.
+//! The verbs are [`WritClient::open_session`], [`WritClient::run_agent`]
+//! and [`WritClient::close_session`]: one connection and one version
+//! handshake per call.
 //!
 //! Wire framing: one [`ClientMessage`] per line, one [`ServerMessage`]
 //! per line in reply, read and written through
@@ -631,8 +630,8 @@ mod tests {
     /// Workspace bootstrap on the `RunAgentRequest` lands on the wire
     /// under the `workspace` field of `ClientMessage::RunAgent`, and
     /// the paired `agent_kind` / `agent_model` ride along verbatim.
-    /// Slice VM3 wires bailiff's `submit_implement` to set these so
-    /// the broker dispatches into the per-run VM arm; a regression
+    /// bailiff's `submit_implement` sets these so the broker
+    /// dispatches into the per-run VM arm; a regression
     /// that drops any of the three on the floor would surface here as
     /// a `None` on the captured wire message instead of being noticed
     /// only when the VM dispatch arm rejects the request.
@@ -987,7 +986,7 @@ mod tests {
 
 #[cfg(test)]
 mod end_to_end_tests {
-    //! Slice B's headline contract test: bailiff sends `RunAgent` over
+    //! The headline contract test: bailiff sends `RunAgent` over
     //! the writ Unix socket; writ runs the (no-op) child, signs the
     //! envelope, writes it as a Git note in writ's bare repo, and
     //! returns `RunAgentCompleted`. Bailiff then fetches writ's notes

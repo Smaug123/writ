@@ -541,9 +541,9 @@ mod tests {
         dir
     }
 
-    /// The on-disk path where a stored mirror lives. The cache exposes no read
-    /// API yet (the safe, eviction-pinned read lands with its consumer), so the
-    /// tests assert cache state directly against the layout.
+    /// The on-disk path where a stored mirror lives, so tests can assert cache
+    /// state directly against the layout rather than through
+    /// [`MirrorCache::get`].
     fn stored_mirror(cache: &MirrorCache, key: &MirrorCacheKey) -> PathBuf {
         cache.root().join(key.slug()).join(MIRROR_DIR_NAME)
     }

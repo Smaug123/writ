@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# `process_spawn::spawn_async` is the only host-only surface in this crate;
-# it needs tokio. The parent crate's `host` feature enables `writ-core/host`.
+# The tokio-backed halves of `process_spawn` and `git_env` are the only
+# host-only surface in this crate. The parent crate's `host` feature enables
+# `writ-core/host`.
 host = ["dep:tokio"]
 # `test_support`: PATH lookup, shell quoting and executable test scripts,
 # for downstream crates' tests. Never enabled by a production build.

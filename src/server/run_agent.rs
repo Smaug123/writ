@@ -76,11 +76,12 @@ pub const DEFAULT_MAX_PENDING_AGENT_RUNS: NonZeroUsize = NonZeroUsize::new(64).u
 /// [`tokio::sync::Semaphore`] hands permits out in FIFO order, so "queue" is
 /// what waiting on it already means, and a burst cannot starve its own tail.
 ///
-/// But queueing is only a delay while the queue is finite. Nothing bounded the
-/// waiters themselves, so a submission rate above throughput grew tasks,
-/// connections and buffered prompts without limit, and each caller's wait grew
-/// with it — the failure mode being not an error but an unbounded silence. The
-/// queue-depth bound is what makes the promise "you will be served" checkable
+/// But queueing is only a delay while the queue is finite. Without a bound on
+/// the waiters themselves, a submission rate above throughput would grow
+/// tasks, connections and buffered prompts without limit, and each caller's
+/// wait with it — a failure mode that is not an error but an unbounded
+/// silence. The queue-depth bound is what makes the promise "you will be
+/// served" checkable
 /// before it is made: over it, `enqueue` refuses **at once**,
 /// saying so, rather than admitting a caller to a queue it cannot promise to
 /// drain.
@@ -104,22 +105,10 @@ pub const DEFAULT_MAX_PENDING_AGENT_RUNS: NonZeroUsize = NonZeroUsize::new(64).u
 /// that have not yet reached `AgentRunQueuePlace::wait_for_slot` hold admission
 /// without yet holding the slots they are about to take, so `available()` can
 /// read non-zero at the moment a refusal is issued. Those slots are spoken for,
-/// and the refusal is right.
-///
-/// Two alternatives were tried and are worse, both for the same reason — they
-/// split the decision in two, and a decision in two steps is not atomic:
-///
-/// * Counting waiters in their own semaphore and vacating the place when a slot
-///   was granted. A run passing through an *idle* slot still occupied queue
-///   depth while in transit, so a small `queue_limit` could refuse a request
-///   while execution capacity sat unused.
-/// * Reserving the slot inside admission — `try_acquire` the slot, fall back to
-///   a queue place. This makes "a free slot is never refused" instantaneously
-///   true, but only by taking two permits in sequence: with limits 1 and 1, two
-///   requests can both find the slot full, the running run can then finish, the
-///   first request takes the sole queue place, and the second is refused with a
-///   slot now free. Trading an exact guarantee for a stronger-sounding one that
-///   a race can break is the wrong way round.
+/// and the refusal is right. Any scheme that splits the decision in two (a
+/// separate waiter count, or reserving the slot inside admission) is not
+/// atomic and can refuse with capacity free;
+/// `writd_refuses_exactly_when_it_holds_its_configured_total` spells out both.
 #[derive(Clone, Debug)]
 pub struct AgentRunSlots {
     /// Running plus waiting: `limit + queue_limit` permits, held from
@@ -212,8 +201,8 @@ impl AgentRunSlots {
     ///
     /// Synchronous and immediate by design: the whole point of the bound is that
     /// a caller over it gets an answer now. Refusing is the only thing this
-    /// returns that a caller can act on — the alternative writd used to offer
-    /// was an unbounded wait, which is indistinguishable from being forgotten.
+    /// returns that a caller can act on; an unbounded wait is
+    /// indistinguishable from being forgotten.
     ///
     /// **One atomic step**, and that is the whole of the guarantee: a refusal
     /// means writd was already holding `limit + queue_limit` runs at the instant
@@ -457,11 +446,10 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
 
     // The host-spawn arm requires an open audit session, because the run it
     // is about to perform must be recorded and an `agent_run` row's
-    // `session_id` is a foreign key onto `session`. It used to accept `None`
-    // and mint a `SessionId` that was never opened, stamping it into the
-    // signed envelope — an envelope claiming a session no verifier could
-    // resolve. Reject unknown / already-closed sessions before we spawn, for
-    // the same reason.
+    // `session_id` is a foreign key onto `session`; an envelope stamped with
+    // a session that was never opened would claim a session no verifier
+    // could resolve. Reject unknown / already-closed sessions before we
+    // spawn, for the same reason.
     let Some(session_id) = request_session_id else {
         return ServerMessage::Error {
             message: "RunAgent: host-spawn dispatch requires session_id; \
@@ -635,13 +623,9 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     // concurrent host runs hold N of those 512 and 2N OS threads, and a hung
     // agent holds its share until the daemon restarts.
     //
-    // Nothing bounds N. That is not new — nothing bounded concurrent
-    // `RunAgent` calls on either arm before this either, and the previous
-    // async spawn held tokio tasks instead — but the resource is now a capped
-    // shared pool rather than the scheduler, so the ceiling is closer.
-    // Bounding it properly needs a concurrency policy for agent runs (a limit,
-    // a queue discipline, and a wire answer for "too many in flight") that
-    // covers both arms; tracked separately rather than guessed at here.
+    // N is bounded by the `agent_run_slots` place taken above: past the
+    // limit, a caller is told "too many in flight" on the wire rather than
+    // queued without bound.
     let log_root = spawn_config.log_root.as_path().to_path_buf();
     let captured = tokio::task::spawn_blocking(move || {
         crate::agent_run::run_agent_process(&plan, &prompt, &log_root)

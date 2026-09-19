@@ -1,19 +1,10 @@
 //! Recorded baselines of the writ RPCs each bailiff workflow emits.
 //!
-//! **This exists to be captured before slice 3, not because it is
-//! useful on its own.** Slice 3 of
-//! `docs/plans/2026-07-26-bailiff-workflow-as-data.md` collapses
-//! `submit_plan` / `submit_review` / `submit_implement` into three
-//! values of one `StageSpec` executed by a single interpreter. The
-//! claim that the collapse changes no behaviour is only checkable
-//! against a record of the behaviour taken *beforehand*; captured
-//! afterwards it would merely restate whatever the interpreter does.
-//!
 //! Each scenario drives a real workflow against a stub broker that
 //! records every [`ClientMessage`] it receives, and compares the
 //! sequence to a checked-in fixture under `tests/fixtures/rpc-traces/`.
-//! Set `UPDATE_RPC_TRACES=1` to rewrite the fixtures; a diff in that
-//! rewrite is precisely the review surface slice 3 needs.
+//! Set `UPDATE_RPC_TRACES=1` to rewrite the fixtures, and review the
+//! diff as part of the change that caused it.
 //!
 //! # What is pinned, and what is deliberately not
 //!
@@ -258,9 +249,8 @@ fn assert_trace(name: &str, observed: &[ClientMessage]) {
     });
     assert_eq!(
         rendered, expected,
-        "the writ RPCs emitted by `{name}` no longer match the recorded baseline. If slice 3 \
-         is meant to preserve behaviour, this diff is a bug; if a change is intended, rerun \
-         with UPDATE_RPC_TRACES=1 and review the diff as part of the change.",
+        "the writ RPCs emitted by `{name}` do not match the recorded baseline. If the change \
+         is intended, rerun with UPDATE_RPC_TRACES=1 and review the diff as part of it.",
     );
 }
 
@@ -330,9 +320,8 @@ async fn review_emits_open_run_close() {
 
 /// The implementer run is VM-dispatched: the broker mints and closes
 /// its own audit session, so bailiff sends `RunAgent` alone. That
-/// asymmetry with submit/review is the axis slice 3's `StageSpec` has
-/// to model as a DU rather than a boolean, and this trace is what pins
-/// it.
+/// asymmetry with submit/review is what `run_under_broker_session`
+/// versus `run_under_owned_session` models, and this trace pins it.
 #[tokio::test]
 async fn implement_emits_run_agent_only() {
     let tmp = tempfile::tempdir().unwrap();
@@ -458,11 +447,10 @@ async fn refused_gates_emit_no_rpcs() {
 ///
 /// This is the contract both `submit_plan` and `submit_review`
 /// document at length ("from here on, every early return must close
-/// the session"), and it is the sad path most easily lost in slice 3:
-/// an interpreter that propagates the run error with `?` before its
-/// cleanup arm leaks the session, and no happy-path or pre-RPC fixture
-/// would notice. The plan asks for "happy *and each sad path*"; this
-/// is the half that was missing from the first capture.
+/// the session"), and it is the sad path most easily lost: a stage
+/// runner that propagates the run error with `?` before its cleanup
+/// arm leaks the session, and no happy-path or pre-RPC fixture would
+/// notice.
 ///
 /// The leak would be invisible in writ's audit log too — the session
 /// row simply never closes — so the trace is the cheapest place to
@@ -738,8 +726,8 @@ async fn every_post_open_failure_branch_has_a_trace() {
 
 /// The implementer's post-RPC failures still emit `RunAgent` alone.
 ///
-/// Session ownership is the axis slice 3 must model as a DU, and the
-/// happy path alone does not pin it: an interpreter could plausibly
+/// The happy path alone does not pin session ownership: a stage
+/// runner could plausibly
 /// add caller-side `OpenSession`/`CloseSession` cleanup on the *error*
 /// branch only — precisely where a broker-managed session most looks
 /// like it needs tidying up — and every other implement fixture would

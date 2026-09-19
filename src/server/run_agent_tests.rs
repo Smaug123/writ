@@ -10,10 +10,7 @@ use wiremock::MockServer;
 /// fields (`notes_repo`, `signing_key`, `run_agent_spawn`) is
 /// `None`. Returning an explicit, component-named `Error` rather
 /// than panicking or silently accepting the request lets an
-/// operator see exactly which boot wiring is missing. Until the
-/// writd boot slice lands, every BrokerState used in tests (and
-/// the production daemon) leaves these unset and `RunAgent`
-/// surfaces that fact verbatim.
+/// operator see exactly which boot wiring is missing.
 #[tokio::test]
 async fn run_agent_dispatch_errors_when_not_configured() {
     let server = MockServer::start().await;
@@ -55,7 +52,6 @@ async fn run_agent_dispatch_errors_when_not_configured() {
 /// capability whose `workspace` bootstrap is `None`, *before*
 /// touching broker state — so an unconfigured broker still
 /// rejects with this gate rather than the not-configured message.
-/// Slice VM1's load-bearing invariant.
 #[tokio::test]
 async fn run_agent_rejects_workspace_write_without_workspace_bootstrap() {
     let server = MockServer::start().await;
@@ -95,10 +91,9 @@ async fn run_agent_rejects_workspace_write_without_workspace_bootstrap() {
 /// — the runtime is not configured on this code path — so the VM
 /// dispatch arm must surface a clear "agent VM runtime is not
 /// configured" error rather than a panic or silent fall-through to
-/// the host spawn (which would defeat the point of the field).
-/// Slice VM2b wires the dispatch arm; this test pins the
-/// unconfigured-runtime gate that protects callers from a silent
-/// host-spawn fallback.
+/// the host spawn (which would defeat the point of the field). This
+/// test pins the unconfigured-runtime gate that protects callers from
+/// a silent host-spawn fallback.
 #[tokio::test]
 async fn run_agent_with_workspace_reports_unconfigured_vm_runtime() {
     let server = MockServer::start().await;
@@ -143,10 +138,9 @@ async fn run_agent_with_workspace_reports_unconfigured_vm_runtime() {
 /// envelope into a fresh on-disk notes repo, then read the note
 /// back and verify the signature and content hashes.
 ///
-/// This is the slice-B contract test the plan calls out: bailiff
-/// sends `RunAgent { prompt: "noop", … }`, writ runs a no-op
-/// child, writes a signed note to writ's repo, and a verifier
-/// (this test, standing in for bailiff's read side in slice B5)
+/// The contract: bailiff sends `RunAgent { prompt: "noop", … }`,
+/// writ runs a no-op child, writes a signed note to writ's repo, and
+/// a verifier (this test, standing in for bailiff's read side)
 /// re-derives every signed quantity from the envelope.
 #[tokio::test]
 async fn run_agent_round_trip_signs_and_writes_note() {
@@ -664,12 +658,10 @@ async fn run_agent_rejects_closed_session_id() {
 /// A host-spawned run records the same `(agent_run, agent_run_outcome)`
 /// pair the VM arm records, naming the files its streams landed in.
 ///
-/// Before this, the host arm wrote *no* audit rows at all: bailiff's submit
-/// and review stages ran real agents that left no trace in the log writ
-/// claims is complete by construction ("because the only way to act is to
-/// obtain a grant, the SQLite log *is* the history"). The row is what makes
-/// the run visible; the stream paths are what make its output retrievable
-/// once the wire response is gone.
+/// The row is what makes the run visible in the log writ claims is complete
+/// by construction ("because the only way to act is to obtain a grant, the
+/// SQLite log *is* the history"); the stream paths are what make its output
+/// retrievable once the wire response is gone.
 #[tokio::test]
 async fn a_host_spawned_run_records_an_audit_pair_naming_its_streams() {
     let sh = required_tool_any(&["sh", "bash"]);
@@ -751,9 +743,7 @@ async fn a_host_spawned_run_records_an_audit_pair_naming_its_streams() {
 ///
 /// This is the provenance join a verifier needs: given a signed note from
 /// bailiff's repo, `signed_metadata.run_id` must find the `agent_run` row
-/// that authorised it. The host arm used to mint its envelope run id
-/// independently of any audit row (there was none), so the id in a note
-/// pointed at nothing.
+/// that authorised it.
 #[tokio::test]
 async fn the_signed_envelope_and_the_audit_row_name_the_same_run() {
     let cat = find_in_path("cat").expect("cat must be on PATH");
@@ -797,12 +787,11 @@ async fn the_signed_envelope_and_the_audit_row_name_the_same_run() {
 
 /// A host-spawn `RunAgent` with no `session_id` is refused.
 ///
-/// It used to be accepted, and the broker minted a fresh `SessionId` that it
-/// stamped into the signed envelope *without opening a session row*. The
-/// envelope then claimed a session no verifier could ever resolve, and the
-/// run could not be audited at all: an `agent_run` row's `session_id` is a
-/// foreign key onto `session`. Refusing is the honest answer — bailiff
-/// already opens a session for every host-spawn stage.
+/// An envelope stamped with a minted-but-never-opened session would claim a
+/// session no verifier could resolve, and the run could not be audited at
+/// all: an `agent_run` row's `session_id` is a foreign key onto `session`.
+/// Refusing is the honest answer; bailiff opens a session for every
+/// host-spawn stage.
 #[tokio::test]
 async fn run_agent_refuses_a_host_spawn_with_no_session() {
     let cat = find_in_path("cat").expect("cat must be on PATH");
@@ -1896,9 +1885,8 @@ async fn a_run_over_the_admission_bound_is_refused_rather_than_queued() {
 /// however those runs are distributed, and whether or not any of them has been
 /// polled.
 ///
-/// This is the guarantee stated at the strength the mechanism delivers, which
-/// took three rounds of Codex review to get right. Two stronger-sounding
-/// versions were tried and are false:
+/// This is the guarantee stated at the strength the mechanism delivers. Two
+/// stronger-sounding versions are false:
 ///
 /// * Counting waiters in a semaphore of their own and vacating the place when a
 ///   slot was granted. A run passing through an *idle* slot still held queue
@@ -1914,7 +1902,7 @@ async fn a_run_over_the_admission_bound_is_refused_rather_than_queued() {
 /// So what is asserted is the atomic fact: a refusal coincides with
 /// `limit + queue_limit` runs held. The loop admits them **without awaiting
 /// anything in between** for part of the shapes, since that is the state a
-/// concurrent burst reaches and the state the second attempt above mishandled.
+/// concurrent burst reaches and the state the second version above mishandles.
 #[tokio::test(start_paused = true)]
 async fn writd_refuses_exactly_when_it_holds_its_configured_total() {
     for (limit, queue_limit) in [(2, 1), (1, 1), (3, 1), (2, 2)] {
@@ -1988,15 +1976,13 @@ fn limits_that_are_individually_fine_but_sum_too_high_are_refused() {
 
 const NON_ZERO_ONE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(1).unwrap();
 
-/// Every wait for a slot is unbounded, and that is now the whole story.
+/// Every wait for a slot is unbounded.
 ///
-/// It used to be the asymmetry that needed pinning: the VM path gave up after
-/// five minutes because its client had a deadline and writd never saw its EOF,
-/// so a slot granted later booted a VM nobody could name. `StartAgentRun`
-/// answering before it starts removes the caller with the deadline, and with it
-/// the reason to ever refuse a run writd has already accepted. What replaced the
-/// deadline is the admission bound in front of the queue (refuse early, or wait
-/// as long as it takes) and the ability to stop a queued run by name.
+/// `StartAgentRun` answers before it starts, so no caller waits on the reply
+/// with a deadline, and there is no reason to refuse a run writd has already
+/// accepted. What bounds the system instead is the admission bound in front
+/// of the queue (refuse early, or wait as long as it takes) and the ability
+/// to stop a queued run by name.
 ///
 /// A timeout reintroduced anywhere on this path would be a silent regression:
 /// the run would be dropped after a wait, with its ids already in a caller's

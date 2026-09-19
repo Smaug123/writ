@@ -955,9 +955,8 @@ fn plan_implement_rejects_missing_prompt_file() {
 /// `agent_model` with "VM mode requires agent_model", so accepting
 /// the flag as optional would mean the default `bailiff plan
 /// implement …` invocation fails at the broker rather than at parse
-/// time. Codex review on slice VM3 flagged this — pin the surface
-/// so a regression to `Option<String>` (the shape inherited from
-/// the read-side `plan submit` / `plan review` verbs) fails here.
+/// time. Pinned so a regression to `Option<String>` (the shape of
+/// the `plan submit` / `plan review` flag) fails here.
 #[test]
 fn plan_implement_rejects_missing_model() {
     let plan_id_str = "6e6e6e6e-7e7e-8e8e-9e9e-aeaeaeaeaeae";
@@ -1125,8 +1124,8 @@ fn build_implement_workspace_bootstrap_threads_utf8_destination_and_warm() {
 }
 
 /// `build_implement_workspace_bootstrap` rejects a non-UTF-8
-/// `--workspace-destination` *at the CLI boundary*. Codex review
-/// on slice VM3 flagged that without this check, a non-UTF-8 path
+/// `--workspace-destination` *at the CLI boundary*. Without this
+/// check, a non-UTF-8 path
 /// (entirely legal at the OS level on Unix) flows onto the wire,
 /// where `writ_client::roundtrip` does
 /// `serde_json::to_string(&msg).expect("ClientMessage always
@@ -1156,21 +1155,6 @@ fn build_implement_workspace_bootstrap_rejects_non_utf8_destination() {
         "expected UTF-8 validation failure naming the flag, got: {err}",
     );
 }
-
-// The `implement_lock_blocks_concurrent_acquire_and_releases_on_drop`
-// test lived here until slice 2. It pinned the CLI-layer
-// `acquire_implement_lock` helper, which no longer exists: locking is
-// a library concern now, keyed per plan rather than per repo, and
-// taken by all four mutating verbs rather than by `implement` alone.
-//
-// Its own docstring predicted its removal — it listed "swapping
-// `try_lock` for `lock`" as a regression it would catch, and that is
-// precisely the deliberate change: `PlanGuard::acquire` waits instead
-// of failing fast, because the holder is typically mid-LLM-run and
-// "retry later" is not something a caller can act on. The equivalent
-// coverage is `bailiff_repo_guard::tests`, which asserts exclusion,
-// per-plan granularity, and release-then-reacquire against the real
-// guard.
 
 /// The dossier verb parses its flags, and `--allow-terminal` defaults
 /// off.
