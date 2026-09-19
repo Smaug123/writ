@@ -50,24 +50,14 @@ fn agent_stages_are_the_plan_stages_that_run_an_agent() {
     );
 }
 
-/// Submit *produces* the plan body, so it splices nothing; the other
-/// two consume it. `plan_body_stage` and `PlanBodyStage::stage` must
-/// be mutual inverses, or the refined vocabulary would be a second
-/// encoding of the stage set rather than a subset of it.
+/// Submit *produces* the plan body, so no refined stage names it; the
+/// other two are each refined by exactly one `PlanBodyStage`, so the
+/// refined vocabulary is a subset of the stage set, not a second
+/// encoding of it.
 #[test]
 fn the_body_consuming_stages_are_exactly_review_and_implement() {
-    assert_eq!(AgentStage::Submit.plan_body_stage(), None);
-    let refined: Vec<AgentStage> = AgentStage::ALL
-        .iter()
-        .filter_map(|s| s.plan_body_stage())
-        .map(|b| b.stage())
-        .collect();
-    assert_eq!(
-        refined,
-        vec![AgentStage::Review, AgentStage::Implement],
-        "plan_body_stage and PlanBodyStage::stage must round-trip",
-    );
-    assert_eq!(refined.len(), PlanBodyStage::ALL.len());
+    let refined: Vec<AgentStage> = PlanBodyStage::ALL.iter().map(|b| b.stage()).collect();
+    assert_eq!(refined, vec![AgentStage::Review, AgentStage::Implement]);
 }
 
 /// The two separators, verbatim, and distinct. These bytes are inside

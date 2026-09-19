@@ -38,10 +38,8 @@
 //! instead of threading a rename through bailiff at the same time.
 
 use std::fmt;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::bailiff_decision::{Decider, Decision};
 use writ::core::{NotesRef, SshSignature, UnixMillis};
@@ -56,51 +54,13 @@ use writ::vm_git::GitObjectId;
 /// decisions, each owner-namespace evolves on its own schedule.
 pub const BAILIFF_PLAN_NOTES_REF_PREFIX: &str = "refs/notes/bailiff/v1/plans/";
 
-/// Identifies one bailiff-managed plan workflow. Stable across the
-/// submission, any future reviews, and the decision — every
-/// per-plan artefact attaches to the same ref derived from this id.
-///
-/// UUID v4 under the hood, the same shape (transparent serde, debug
-/// label, FromStr) as writ's other newtypes (`AgentRunId`,
-/// `SessionId`, and the now-removed `agent_plan::PlanId`). Bailiff
-/// allocates the id on submit; writ never sees it.
-#[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PlanId(Uuid);
-
-impl PlanId {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    pub fn as_uuid(self) -> Uuid {
-        self.0
-    }
-}
-
-impl fmt::Display for PlanId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl fmt::Debug for PlanId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BailiffPlanId({})", self.0)
-    }
-}
-
-impl FromStr for PlanId {
-    type Err = uuid::Error;
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(raw)?))
-    }
-}
+writ::uuid_id!(
+    /// Identifies one bailiff-managed plan workflow. Stable across the
+    /// submission, any future reviews, and the decision — every
+    /// per-plan artefact attaches to the same ref derived from this id.
+    /// Bailiff allocates the id on submit; writ never sees it.
+    PlanId
+);
 
 /// Notes ref where bailiff stores every artefact for `plan_id` — the
 /// submission note in slice C, plus any future per-plan curation
