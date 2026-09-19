@@ -111,8 +111,8 @@ impl Harness {
 }
 
 /// Like [`write_fake_tool`] but never signals a bootstrap outcome — the
-/// inspect always reports "pending". Used to exercise the bootstrap wait's
-/// timeout path (the default tool now reports `ok`, since every start waits).
+/// inspect always reports "pending". Exercises the bootstrap wait's timeout
+/// path; the default tool reports `ok`, since every start waits.
 pub(super) fn write_fake_pending_bootstrap_tool(dir: &Path, args_log: &Path) -> PathBuf {
     let path = dir.join("fake-pending-bootstrap-tool");
     let script = format!(

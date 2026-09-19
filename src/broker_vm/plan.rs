@@ -4,9 +4,8 @@
 //! session (paths, networks, container tool, mounts) into the ordered
 //! `ProcessInvocation`s that create the broker VM's networks, launch it, and
 //! inspect/stop it. This module holds only that construction logic (an inherent
-//! `impl` block); the struct and the types it references stay in the parent
-//! module. Split out of `broker_vm.rs` to keep that file readable; behaviour is
-//! unchanged.
+//! `impl` block); the struct and the types it references live in the parent
+//! module.
 
 use super::*;
 

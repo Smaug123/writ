@@ -69,16 +69,13 @@ pub(crate) fn git_failure(args: &[&str], cwd: &Path, out: &std::process::Output)
 /// keeps git from spawning a *detached background process* over the fixture
 /// repository.
 ///
-/// That suppression used to live here, as a local pair of `-c` flags, because
-/// it was unclear whether production wanted it. It does — `writ_core::git_env`
-/// now imposes the auto-maintenance knobs on every git command writd runs
-/// against a repository it owns, and names them in one place — so the fixtures
-/// get it from the shared recipe and the local copy is gone. (Naming the
-/// settings here again is what `tests/shared_hardening_helpers.rs` exists to
-/// prevent, which is why this paragraph does not.)
+/// `writ_core::git_env` imposes the auto-maintenance knobs on every git command
+/// writd runs against a repository it owns, and names them in one place, so the
+/// fixtures get the suppression from the shared recipe. (Naming the settings
+/// here again is what `tests/shared_hardening_helpers.rs` exists to prevent,
+/// which is why this paragraph does not.)
 ///
-/// Worth keeping the motivating failure recorded, since it is the reason the
-/// production recipe changed. `git commit` runs `git maintenance run --auto
+/// The failure it prevents, measured: `git commit` runs `git maintenance run --auto
 /// --quiet --detach`, which keeps writing to `objects/` after `git commit` has
 /// exited and returned to the caller. A fixture that commits and then
 /// immediately clones is racing a writer it never asked for, and lost that race
@@ -282,9 +279,9 @@ mod tests {
 
     /// A failing fixture `git` reports git's own explanation.
     ///
-    /// The regression this pins is a silent one: the helpers used to run
-    /// git with `stderr(Stdio::null())` and assert `"git {args:?}
-    /// failed"`, so a CI failure carried the command and nothing about
+    /// The regression this pins is a silent one: a helper that ran git with
+    /// `stderr(Stdio::null())` and asserted `"git {args:?} failed"` would
+    /// give a CI failure the command and nothing about
     /// why it failed. Asserting on a *real* failing invocation rather
     /// than a synthesised `Output` is the point — it is the plumbing
     /// (that stderr is captured at all) that broke, not the formatting.
