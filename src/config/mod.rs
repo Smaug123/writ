@@ -40,6 +40,7 @@ use crate::vm_http::{
     VmHttpNixCacheConfig, VmHttpNixCacheConfigError, VmHttpOpenAiProxyAuthKind,
     VmHttpOpenAiProxyConfig, VmHttpOpenAiProxyConfigError, VmHttpRuntimeConfig,
 };
+use writ_core::path_shape::{PathShapeError, require_absolute};
 
 pub(crate) mod accumulate;
 pub use accumulate::Errors;
@@ -691,10 +692,8 @@ pub enum AgentVmHttpConfigError {
     OpenAiProxy(#[from] VmHttpOpenAiProxyConfigError),
     #[error(transparent)]
     GitPushBodyLimits(#[from] VmGitPushBodyLimitsError),
-    #[error("git push staging root path must not be empty")]
-    EmptyGitPushStagingRoot,
-    #[error("git push staging root path must be absolute: {0:?}")]
-    RelativeGitPushStagingRoot(PathBuf),
+    #[error(transparent)]
+    PathShape(#[from] PathShapeError),
     #[error("git push staging root {path:?} could not be created: {source}")]
     GitPushStagingRootCreate {
         path: PathBuf,
@@ -717,10 +716,6 @@ pub enum AgentVmHttpConfigError {
          use a dedicated 0700 directory"
     )]
     WorkRootInsecure { path: PathBuf, mode: u32 },
-    #[error("flake input cache dir path must not be empty")]
-    EmptyFlakeInputCacheDir,
-    #[error("flake input cache dir path must be absolute: {0:?}")]
-    RelativeFlakeInputCacheDir(PathBuf),
     #[error("flake input cache dir {path:?} could not be created: {source}")]
     FlakeInputCacheDirCreate {
         path: PathBuf,
@@ -731,23 +726,11 @@ pub enum AgentVmHttpConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("nix pre-warm cache dir path must not be empty")]
-    EmptyNixPrewarmCacheDir,
-    #[error("nix pre-warm cache dir path must be absolute: {0:?}")]
-    RelativeNixPrewarmCacheDir(PathBuf),
     #[error("nix pre-warm cache dir {path:?} exists but is not a listable directory: {source}")]
     NixPrewarmCacheDirUnusable {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("flake mirror cache dir path must not be empty")]
-    EmptyFlakeMirrorCacheDir,
-    #[error("flake mirror cache dir path must be absolute: {0:?}")]
-    RelativeFlakeMirrorCacheDir(PathBuf),
-    #[error("flake materialize scratch dir path must not be empty")]
-    EmptyFlakeMaterializeScratchDir,
-    #[error("flake materialize scratch dir path must be absolute: {0:?}")]
-    RelativeFlakeMaterializeScratchDir(PathBuf),
     #[error(transparent)]
     FlakeProvisionBounds(#[from] FlakeProvisionBoundsError),
 }
@@ -951,12 +934,7 @@ impl AgentRunLogRoot {
     /// The pure half: the same two text checks the `vm_http` roots get, in
     /// this key's own vocabulary.
     pub fn check(path: PathBuf) -> Result<Self, AgentRunLogRootError> {
-        if path.as_os_str().is_empty() {
-            return Err(AgentRunLogRootError::Empty);
-        }
-        if !path.is_absolute() {
-            return Err(AgentRunLogRootError::Relative(path));
-        }
+        require_absolute("agent run log root", &path)?;
         Ok(Self(path))
     }
 
@@ -1037,10 +1015,8 @@ pub enum AgentRunLogRootError {
          root would re-mode and write into whatever it points at"
     )]
     Symlink { path: PathBuf },
-    #[error("agent run log root path must not be empty")]
-    Empty,
-    #[error("agent run log root path must be absolute: {0:?}")]
-    Relative(PathBuf),
+    #[error(transparent)]
+    Shape(#[from] PathShapeError),
     #[error("agent run log root {path:?} could not be created: {source}")]
     Create {
         path: PathBuf,
@@ -1592,23 +1568,12 @@ fn checked_root(
     }
 }
 
-/// Shape-check the configured work root before anything creates it.
-///
-/// Reuses [`GitCloneBundlePlanError`]'s field-tagged variants rather than
-/// inventing a parallel taxonomy: these are the same two checks
-/// [`VmHttpGitCloneConfig::new_with_clone_base_url`] performs, hoisted so they
-/// run before the directory-creating code below rather than after it.
+/// Shape-check the configured work root before anything creates it: the
+/// same two checks [`VmHttpGitCloneConfig::new_with_clone_base_url`] performs,
+/// hoisted so they run before the directory-creating code below rather than
+/// after it.
 fn check_work_root(path: &Path) -> Result<&Path, AgentVmHttpConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(GitCloneBundlePlanError::EmptyPath { field: "work_root" }.into());
-    }
-    if !path.is_absolute() {
-        return Err(GitCloneBundlePlanError::RelativePath {
-            field: "work_root",
-            path: path.to_path_buf(),
-        }
-        .into());
-    }
+    require_absolute("work_root", path)?;
     Ok(path)
 }
 
@@ -1745,17 +1710,11 @@ impl WritableRoot {
         }
     }
 
-    fn empty(self) -> AgentVmHttpConfigError {
+    /// How the root is named in a shape error.
+    fn field(self) -> &'static str {
         match self {
-            Self::GitPushStaging => AgentVmHttpConfigError::EmptyGitPushStagingRoot,
-            Self::FlakeInputCache => AgentVmHttpConfigError::EmptyFlakeInputCacheDir,
-        }
-    }
-
-    fn relative(self, path: PathBuf) -> AgentVmHttpConfigError {
-        match self {
-            Self::GitPushStaging => AgentVmHttpConfigError::RelativeGitPushStagingRoot(path),
-            Self::FlakeInputCache => AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path),
+            Self::GitPushStaging => "git push staging root",
+            Self::FlakeInputCache => "flake input cache dir",
         }
     }
 
@@ -1824,12 +1783,7 @@ fn check_writable_root(
     kind: WritableRoot,
     path: PathBuf,
 ) -> Result<PathBuf, AgentVmHttpConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(kind.empty());
-    }
-    if !path.is_absolute() {
-        return Err(kind.relative(path));
-    }
+    require_absolute(kind.field(), &path)?;
     Ok(path)
 }
 
@@ -1852,12 +1806,7 @@ fn prepare_writable_root(
 /// [`MirrorCache`], so this only fails fast on a misconfigured path rather than
 /// creating or probing anything.
 fn validate_flake_mirror_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(AgentVmHttpConfigError::EmptyFlakeMirrorCacheDir);
-    }
-    if !path.is_absolute() {
-        return Err(AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path));
-    }
+    require_absolute("flake mirror cache dir", &path)?;
     Ok(path)
 }
 
@@ -1883,12 +1832,7 @@ fn validate_flake_mirror_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttp
 /// authoritative and never fall through to the flake-input cache or upstream.
 /// (The broker runs as the invoking user, not root, so the bits are enforced.)
 fn validate_nix_prewarm_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(AgentVmHttpConfigError::EmptyNixPrewarmCacheDir);
-    }
-    if !path.is_absolute() {
-        return Err(AgentVmHttpConfigError::RelativeNixPrewarmCacheDir(path));
-    }
+    require_absolute("nix pre-warm cache dir", &path)?;
     // Listability (read): `read_dir` opens the dir for enumeration.
     match std::fs::read_dir(&path) {
         // Absent: tolerated, so the path can be set before the builder fills it.
@@ -1917,14 +1861,7 @@ fn validate_nix_prewarm_cache_dir(path: PathBuf) -> Result<PathBuf, AgentVmHttpC
 fn validate_flake_materialize_scratch_dir(
     path: PathBuf,
 ) -> Result<PathBuf, AgentVmHttpConfigError> {
-    if path.as_os_str().is_empty() {
-        return Err(AgentVmHttpConfigError::EmptyFlakeMaterializeScratchDir);
-    }
-    if !path.is_absolute() {
-        return Err(AgentVmHttpConfigError::RelativeFlakeMaterializeScratchDir(
-            path,
-        ));
-    }
+    require_absolute("flake materialize scratch dir", &path)?;
     Ok(path)
 }
 

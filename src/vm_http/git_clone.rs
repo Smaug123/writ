@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use writ_core::byte_size::ByteSize;
+use writ_core::path_shape::{require_absolute, require_non_empty};
 
 use crate::clean_git::{
     CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env, run_clean_git_capture_stdout,
@@ -99,20 +100,8 @@ impl VmHttpGitCloneConfig {
     ) -> Result<Self, GitCloneBundlePlanError> {
         let git_program = git_program.into();
         let work_root = work_root.into();
-        if git_program.as_os_str().is_empty() {
-            return Err(GitCloneBundlePlanError::EmptyPath {
-                field: "git_program",
-            });
-        }
-        if work_root.as_os_str().is_empty() {
-            return Err(GitCloneBundlePlanError::EmptyPath { field: "work_root" });
-        }
-        if !work_root.is_absolute() {
-            return Err(GitCloneBundlePlanError::RelativePath {
-                field: "work_root",
-                path: work_root,
-            });
-        }
+        require_non_empty("git_program", &git_program)?;
+        require_absolute("work_root", &work_root)?;
         if timeout.is_zero() {
             return Err(GitCloneBundlePlanError::ZeroTimeout);
         }
