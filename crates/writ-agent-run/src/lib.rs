@@ -719,7 +719,7 @@ impl<'de> Deserialize<'de> for AgentRunTimeout {
 #[cfg(any(feature = "host", feature = "vm-client"))]
 mod process_runner {
     use std::ffi::OsString;
-    use std::fs::{self, File, OpenOptions};
+    use std::fs::{self, File};
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -1973,19 +1973,13 @@ mod process_runner {
     }
 
     fn create_private_dir(path: &Path) -> Result<(), AgentProcessRunError> {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder
-            .create(path)
-            .map_err(|source| AgentProcessRunError::LogDir {
+        writ_core::private_fs::create_dir_all_0700(path).map_err(|source| {
+            AgentProcessRunError::LogDir {
                 operation: "create",
                 path: path.to_path_buf(),
                 source,
-            })?;
-        // DirBuilderExt::mode is still subject to umask, so enforce the
-        // runtime invariant after creation.
-        set_private_dir_permissions(path)
+            }
+        })
     }
 
     fn set_private_dir_permissions(path: &Path) -> Result<(), AgentProcessRunError> {
@@ -2000,15 +1994,12 @@ mod process_runner {
     }
 
     fn create_private_file(path: &Path) -> Result<File, AgentProcessRunError> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
-        options
-            .open(path)
-            .map_err(|source| AgentProcessRunError::StreamFile {
+        writ_core::private_fs::create_new_0600(path).map_err(|source| {
+            AgentProcessRunError::StreamFile {
                 path: path.to_path_buf(),
                 source,
-            })
+            }
+        })
     }
 
     /// The exit code recorded for a process that died by signal rather than by

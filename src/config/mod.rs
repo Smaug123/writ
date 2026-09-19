@@ -1008,9 +1008,11 @@ impl AgentRunLogRoot {
             // creation attempt below, which names the same path.
             Err(_) => {}
         }
-        create_private_dir_all(&self.0).map_err(|source| AgentRunLogRootError::Create {
-            path: self.0.clone(),
-            source,
+        writ_core::private_fs::create_dir_all_0700(&self.0).map_err(|source| {
+            AgentRunLogRootError::Create {
+                path: self.0.clone(),
+                source,
+            }
         })?;
         probe_writable(&self.0, ".writ-agent-run-log-probe").map_err(|source| {
             AgentRunLogRootError::Probe {
@@ -1019,23 +1021,6 @@ impl AgentRunLogRoot {
             }
         })
     }
-}
-
-/// Create `path` and any missing parents with mode 0700, and pin the mode of
-/// `path` itself even when it already existed.
-///
-/// `DirBuilderExt::mode` is masked by the process umask, and says nothing
-/// about a directory that was already there, so the explicit `set_permissions`
-/// is what actually makes the postcondition hold. Only the leaf is pinned: an
-/// existing parent belongs to whoever made it, and tightening it here would be
-/// mutating a directory this config never named.
-fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Faults in the top-level `agent_run_log_root` key.

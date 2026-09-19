@@ -618,135 +618,38 @@ pub(crate) fn staging_dir_for(
         .join(attempt_id.to_string())
 }
 
-/// Atomic-mode `mkdir(path, 0700)` that fails if `path` already
-/// exists, then unconditionally chmods to *exactly* 0o700. Use this
-/// for any directory the caller must own *exclusively* — a duplicate
-/// concurrent caller should be rejected, not silently joined onto
-/// the same path.
-///
-/// Why both an atomic-mode create *and* a follow-up chmod:
-///
-/// - `DirBuilder::mode(0o700)` resolves to a single `mkdir(path,
-///   0700)` syscall. The kernel ANDs `0700` with the inverse of the
-///   process umask, so the *creation* mode is always `≤ 0o700`. That
-///   closes a TOCTOU race a plain `create_dir` + separate
-///   `set_permissions` would open: under a permissive umask (e.g.
-///   `0o000`) the directory would briefly exist at `0o777 & ~umask =
-///   0o777` and a local user holding an `O_PATH` fd to the parent
-///   could `openat` into it during that window and keep the fd
-///   across the chmod (POSIX permission checks fire at `open` time,
-///   not at use time), reading the staged bundle and loose objects
-///   even after the mode tightened.
-/// - The follow-up `set_permissions(0o700)` is *not* a security
-///   measure; it widens the mode back from the umask-clamped result.
-///   Under a restrictive umask (e.g. `0o077`, or a paranoid
-///   `0o777`), `mkdir(path, 0700)` would land the directory at
-///   `0o600` or even `0o000`, at which point the daemon couldn't
-///   create `staged.bundle` inside it and the approve would
-///   self-DoS. The chmod restores exact 0o700 so the owner-writable
-///   bits the daemon needs are present regardless of inherited
-///   umask.
-///
-/// Matches `git_push_staging::create_private_dir`.
+/// [`create_dir_0700`](writ_core::private_fs::create_dir_0700) off the
+/// runtime thread. For a directory this attempt must own exclusively: a
+/// duplicate concurrent caller is refused, not joined onto the same path.
 async fn create_exclusive_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let mut builder = tokio::fs::DirBuilder::new();
-    builder.recursive(false);
-    #[cfg(unix)]
-    {
-        builder.mode(0o700);
-    }
-    builder.create(path).await?;
-    // If the chmod step fails after the mkdir succeeded, unwind:
-    // remove the now-partially-initialized dir so a retry can mkdir
-    // again. Without this, a transient chmod failure would turn into
-    // `StagingDirExists` on every retry, because the helper's
-    // contract is "this call mints the dir" and the on-disk artifact
-    // from a failed call would otherwise collide with the next one.
-    if let Err(chmod_err) = set_private_dir_permissions(path).await {
-        // Best-effort cleanup: if the rmdir itself fails (e.g. we
-        // lost the ability to remove what we just created), surface
-        // the *original* chmod error rather than the cleanup error —
-        // the chmod failure is what the caller actually needs to
-        // react to.
-        let _ = tokio::fs::remove_dir(path).await;
-        return Err(chmod_err);
-    }
-    Ok(())
+    let path = path.to_path_buf();
+    blocking_io(move || writ_core::private_fs::create_dir_0700(&path)).await
 }
 
-/// Ensure `path` exists as a 0700 directory, tolerating the case
-/// where it already exists (and tightening its mode if so). Use this
-/// for *shared* directories like `<work_root>/approve` that any
-/// approve request can lazily materialise — the first caller mints
-/// the directory, later callers just validate the mode is right.
-///
-/// Wraps [`create_exclusive_private_dir`] and absorbs AlreadyExists,
-/// then unconditionally chmods to 0700 to tighten the perms in case
-/// the directory pre-existed at a looser mode (e.g. an operator who
-/// hand-created `work_root` with default umask before pointing the
-/// daemon at it). Matches `git_push_staging::create_private_dir`.
+/// [`ensure_dir_0700`](writ_core::private_fs::ensure_dir_0700) off the
+/// runtime thread. For a shared directory such as `<work_root>/approve` that
+/// any approve may lazily materialise.
 async fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    match create_exclusive_private_dir(path).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            set_private_dir_permissions(path).await
-        }
-        Err(err) => Err(err),
-    }
+    let path = path.to_path_buf();
+    blocking_io(move || writ_core::private_fs::ensure_dir_0700(&path)).await
 }
 
-#[cfg(unix)]
-async fn set_private_dir_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await
-}
-
-#[cfg(not(unix))]
-async fn set_private_dir_permissions(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// Write `body` to `path` with mode 0600 on Unix, refusing to clobber
-/// an existing file. Matches `git_push_staging::write_private_file`.
-///
-/// The `mode(0o600)` request on `OpenOptions` resolves to a single
-/// `open(O_CREAT|O_EXCL, 0600)` syscall, which the kernel ANDs with
-/// the inverse of the process umask — so the *creation* mode is `≤
-/// 0o600`. That closes the same TOCTOU race the dir helper closes:
-/// no transient window at owner-`0o644` / group-readable. The
-/// follow-up chmod on Unix then *widens* the mode back to exactly
-/// 0o600, because under a restrictive umask (e.g. `0o077` or a
-/// paranoid `0o777`) the initial mode would have been `0o000`, and
-/// `git bundle unbundle` reopens the file *by path* after we drop the
-/// fd — losing owner-read would make approve self-DoS even though
-/// the through-fd `write_all` succeeded.
+/// [`write_new_0600`](writ_core::private_fs::write_new_0600) off the runtime
+/// thread: refuses to clobber an existing file, and is durable on return.
 async fn write_private_file(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
-    // tokio's `OpenOptions::mode` is an inherent method on Unix
-    // builds (not a trait), so no `OpenOptionsExt` import is needed
-    // — on non-Unix builds the call simply isn't compiled.
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        options.mode(0o600);
-    }
-    use tokio::io::AsyncWriteExt;
-    let mut file = options.open(path).await?;
-    file.write_all(body).await?;
-    file.sync_all().await?;
-    drop(file);
-    set_private_file_permissions(path).await
+    let path = path.to_path_buf();
+    let body = body.to_vec();
+    blocking_io(move || writ_core::private_fs::write_new_0600(&path, &body)).await
 }
 
-#[cfg(unix)]
-async fn set_private_file_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await
-}
-
-#[cfg(not(unix))]
-async fn set_private_file_permissions(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
+/// Run a filesystem operation on the blocking pool, folding a lost worker
+/// into the I/O error the caller already handles.
+async fn blocking_io(
+    op: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|join| std::io::Error::other(format!("filesystem worker task failed: {join}")))?
 }
 
 /// `git -C <staging_dir> init --bare --quiet`.

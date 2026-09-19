@@ -366,7 +366,7 @@ fn materialize_agent_run_outcome_upload(
         ));
     }
     let run_dir = log_root.join(upload.run_id.to_string());
-    create_private_dir(&run_dir).map_err(|err| {
+    writ_core::private_fs::create_dir_all_0700(&run_dir).map_err(|err| {
         tracing::error!(
             target: AUDIT_WRITE_FAILURE_TARGET,
             kind = "agent_run_log_directory",
@@ -522,47 +522,23 @@ fn is_sha256_hex(raw: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)
-    }
-}
-
+/// [`write_new_0600`](writ_core::private_fs::write_new_0600), except that a
+/// file already holding exactly `body` is fine: a retried upload of the same
+/// stream is idempotent rather than an error.
 fn write_private_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
+    match writ_core::private_fs::write_new_0600(path, body) {
+        Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing = std::fs::read(path)?;
-            if existing == body {
+            if std::fs::read(path)? == body {
                 return Ok(());
             }
-            return Err(std::io::Error::new(
+            Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!("{} already exists with different contents", path.display()),
-            ));
+            ))
         }
-        Err(err) => return Err(err),
-    };
-    use std::io::Write as _;
-    file.write_all(body)?;
-    file.sync_all()
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(test)]
