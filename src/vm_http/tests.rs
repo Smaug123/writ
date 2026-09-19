@@ -26,6 +26,29 @@ use crate::vm_git::VM_GIT_CLONE_PATH;
 use crate::vm_git::{BROKER_IMAGE_REBUILD_COMMAND, VM_FLAKE_PROVISION_PATH, VM_GIT_PUSH_PATH};
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 
+/// Serve a session with no services routed, until `shutdown` says stop:
+/// the runtime's accept loop alone.
+async fn serve_bare(
+    listener: TcpListener,
+    session: VmHttpSession,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    run_vm_http_runtime_until_shutdown::<Box<dyn SecretStore>>(
+        listener,
+        session,
+        VmHttpServices::none(),
+        shutdown,
+    )
+    .await
+}
+
+/// [`serve_bare`] with no shutdown signal: the test stops it by aborting the
+/// task.
+async fn serve_until_aborted(listener: TcpListener, session: VmHttpSession) -> std::io::Result<()> {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    serve_bare(listener, session, shutdown_rx).await
+}
+
 /// The per-step timeout every clone test hands the service. No test asserts on
 /// it: the fake `git` is a shell script that returns at once, and the tests
 /// assert on the response, the audit rows, or the work-root contents.
@@ -1078,9 +1101,16 @@ async fn prepare_vm_http_session_returns_in_range_broker_port_and_redacted_token
     let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
     let source_ipv4 = loopback_net();
 
-    let prepared = prepare_vm_http_session(state, &config, session_id, source_ipv4)
-        .await
-        .unwrap();
+    let prepared = prepare_vm_http_session_with_agent_runs(
+        state,
+        &config,
+        session_id,
+        source_ipv4,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert!(range.contains(prepared.broker_port()));
     assert_eq!(prepared.session().session_id(), session_id);
@@ -1109,9 +1139,16 @@ async fn running_runtime_serves_session_and_shuts_down() {
     );
     let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
     let source_ipv4 = loopback_net();
-    let prepared = prepare_vm_http_session(state, &config, session_id, source_ipv4)
-        .await
-        .unwrap();
+    let prepared = prepare_vm_http_session_with_agent_runs(
+        state,
+        &config,
+        session_id,
+        source_ipv4,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let addr = prepared.local_addr().unwrap();
     let token = prepared.bearer_token().as_str().to_string();
 
@@ -1200,7 +1237,7 @@ async fn vm_http_server_serves_authenticated_session_request() {
         loopback_net(),
         token(),
     );
-    let server = tokio::spawn(run_vm_http(bound.into_listener(), session.clone()));
+    let server = tokio::spawn(serve_until_aborted(bound.into_listener(), session.clone()));
 
     let response = request_over_tcp(
         addr,
@@ -1231,7 +1268,7 @@ async fn vm_http_server_rejects_missing_auth() {
         loopback_net(),
         token(),
     );
-    let server = tokio::spawn(run_vm_http(bound.into_listener(), session));
+    let server = tokio::spawn(serve_until_aborted(bound.into_listener(), session));
 
     let response =
         request_over_tcp(addr, "GET /v1/session HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
@@ -1256,11 +1293,7 @@ async fn vm_http_server_exits_when_shutdown_signal_set() {
         token(),
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = tokio::spawn(run_vm_http_until_shutdown(
-        bound.into_listener(),
-        session,
-        shutdown_rx,
-    ));
+    let server = tokio::spawn(serve_bare(bound.into_listener(), session, shutdown_rx));
 
     shutdown_tx.send(true).unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), server)
@@ -1298,11 +1331,7 @@ async fn nix_cli_can_authenticate_to_vm_http_nix_cache_route_with_netrc() {
         token.clone(),
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = tokio::spawn(run_vm_http_until_shutdown(
-        bound.into_listener(),
-        session,
-        shutdown_rx,
-    ));
+    let server = tokio::spawn(serve_bare(bound.into_listener(), session, shutdown_rx));
 
     let store_url = format!(
         "http://127.0.0.1:{port}{VM_NIX_CACHE_PATH_PREFIX}",
