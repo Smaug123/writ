@@ -148,6 +148,22 @@ stub_die_returns() { FATAL_CALLS=$((FATAL_CALLS + 1)); REPORTED="${REPORTED}fata
 "; }
 stub_die_exits() { printf 'fatal:%s\n' "$1"; exit 1; }
 
+# Bash 3.2 — stock on macOS, and what this script's shebang resolves to on a
+# machine without a newer bash on PATH — misparses an unparenthesised `case`
+# pattern inside a command substitution. So substring assertions live in a
+# function rather than inline in `$(...)`, and this file stays runnable by the
+# oldest bash on any machine that runs the harnesses.
+reported_has() {  # <needle>... -> "yes" if $REPORTED contains all of them, in order
+  local rest="$REPORTED" needle
+  for needle in "$@"; do
+    case "$rest" in
+      *"$needle"*) rest="${rest#*"$needle"}" ;;
+      *) printf '%s\n' "$REPORTED"; return 0 ;;
+    esac
+  done
+  printf 'yes\n'
+}
+
 run_wrapper() {  # <probe-rc> <fatal-fn> -> prints the wrapper's own return code
   STUB_RC="$1"
   REPORTED=""
@@ -161,15 +177,13 @@ check 'reachable: wrapper returns 0' 0 "$(run_wrapper 0 stub_die_returns)"
 run_wrapper 0 stub_die_returns >/dev/null
 check 'reachable: nothing fatal is reported' 0 "$FATAL_CALLS"
 check 'reachable: the finding is logged as a pass' \
-  pass-logged \
-  "$(case "$REPORTED" in *'log:pass: stub finding line one'*) echo pass-logged ;; *) echo "$REPORTED" ;; esac)"
+  yes "$(reported_has 'log:pass: stub finding line one')"
 
 check 'untestable: wrapper returns 0' 0 "$(run_wrapper 2 stub_die_returns)"
 run_wrapper 2 stub_die_returns >/dev/null
 check 'untestable: nothing fatal is reported' 0 "$FATAL_CALLS"
 check 'untestable: the skip is warned about' \
-  warned \
-  "$(case "$REPORTED" in *'log:warning: skipping'*) echo warned ;; *) echo "$REPORTED" ;; esac)"
+  yes "$(reported_has 'log:warning: skipping')"
 
 # A fatal reporter that exits stops the run: the default, so a blocked listener
 # costs a second instead of a VM boot.
@@ -183,12 +197,8 @@ check 'unreachable with a returning reporter: the run continues' \
   0 "$(run_wrapper 1 stub_die_returns)"
 run_wrapper 1 stub_die_returns >/dev/null
 check 'unreachable: the fatal reporter is called exactly once' 1 "$FATAL_CALLS"
-check 'unreachable: every finding line is reported' \
-  both-lines \
-  "$(case "$REPORTED" in
-       *'log:  stub finding line one'*'log:  stub finding line two'*) echo both-lines ;;
-       *) echo "$REPORTED" ;;
-     esac)"
+check 'unreachable: every finding line is reported, in order' \
+  yes "$(reported_has 'log:  stub finding line one' 'log:  stub finding line two')"
 
 printf '\n%d check(s), %d failure(s)\n' "$CHECKS" "$FAILURES"
 (( FAILURES == 0 )) || exit 1
