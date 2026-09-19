@@ -33,14 +33,30 @@ jobs:
     - name: Enable Nix cache
       uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
 
+    # rust-cache computes its key from `rustc -vV` and `Cargo.lock`, so the
+    # devshell's toolchain has to be on PATH for the step itself. The cargo
+    # invocations below still run under `nix develop` for the rest of the
+    # shell's environment; this only lets the cache action see rustc.
+    - name: Expose the devshell toolchain to later steps
+      run: |
+        nix develop --command sh -c 'printf "%s\n" "$PATH" | tr ":" "\n"' >> "$GITHUB_PATH"
+
+    # Restores ~/.cargo (registry, git checkouts) and target/ from the last run
+    # with the same Cargo.lock and toolchain. Without it every run compiles all
+    # ~300 dependency crates from scratch for clippy and again for the test
+    # profile. `cache-on-failure` saves the dependency build even when a later
+    # step fails, so a red run still warms the next one.
+    - name: Cache cargo registry and build artifacts
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        cache-on-failure: true
+
     - name: Run clippy
       run: |
         nix develop --command cargo clippy --all-targets --all-features -- -D warnings
 
-    - name: Run build
-      run: |
-        nix develop --command cargo build --verbose
-
+    # No separate `cargo build`: the test step builds everything it needs, and
+    # the host binaries are covered by the Nix Build job.
     - name: Run tests
       run: |
         nix develop --command cargo test --verbose
