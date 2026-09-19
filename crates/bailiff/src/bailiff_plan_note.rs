@@ -3,16 +3,16 @@
 //! artefact bailiff records about one plan workflow, plus the four
 //! note bodies that live under it today:
 //!
-//! - [`PlanNote`] — slice C's submission attestation: "writ ran agent
+//! - [`PlanNote`] — the submission attestation: "writ ran agent
 //!   run R for plan P and produced the signed envelope at OID O in
 //!   writ's repo."
-//! - [`DecisionNote`] — slice D1's operator verdict: "plan P was
+//! - [`DecisionNote`] — the operator verdict: "plan P was
 //!   accepted/rejected at time T by D."
-//! - [`ReviewNote`] — slice D2's reviewer-run attestation: "writ ran
+//! - [`ReviewNote`] — the reviewer-run attestation: "writ ran
 //!   reviewer agent run R against plan P and produced the signed
 //!   envelope at OID O in writ's repo." Same shape as [`PlanNote`];
 //!   the reviewer's prose lives in the envelope at `writ_output_oid`.
-//! - [`ImplementNote`] — slice E's implementer-run attestation: "writ
+//! - [`ImplementNote`] — the implementer-run attestation: "writ
 //!   ran implementer agent run R against (the accepted) plan P and
 //!   produced the signed envelope at OID O in writ's repo." Same
 //!   shape as [`PlanNote`] / [`ReviewNote`]; the implementer's
@@ -24,18 +24,8 @@
 //! deterministic seed OIDs — [`plan_submission_seed_blob_bytes`],
 //! [`plan_decision_seed_blob_bytes`], [`plan_review_seed_blob_bytes`],
 //! and [`plan_implement_seed_blob_bytes`] — so they coexist without
-//! colliding. Slice C1 of `docs/plans/2026-05-14-bailiff-split.md`
-//! introduced the submission piece; slice D1 of
-//! `docs/plans/2026-05-16-slice-d1-decide.md` added the decision
-//! piece; slice D2 of `docs/plans/2026-05-16-slice-d2-review.md`
-//! added the review piece; slice E1 of the parent split doc adds the
-//! implementer piece. Everything here is pure data with no IO and no
-//! CLI; the write helpers live in [`crate::bailiff_plan_write`].
-//!
-//! `PlanId` is a bailiff-side type, distinct from the `agent_plan::PlanId`
-//! writ used to carry (writ's `agent_plan` module has since been removed).
-//! Keeping them separate let that strip delete `agent_plan` wholesale
-//! instead of threading a rename through bailiff at the same time.
+//! colliding. Everything here is pure data with no IO and no CLI; the
+//! write helpers live in [`crate::bailiff_plan_write`].
 
 use std::fmt;
 
@@ -62,9 +52,9 @@ writ::uuid_id!(
     PlanId
 );
 
-/// Notes ref where bailiff stores every artefact for `plan_id` — the
-/// submission note in slice C, plus any future per-plan curation
-/// notes (decisions, reviews, aborts) in slices D and E. One ref per
+/// Notes ref where bailiff stores every artefact for `plan_id`: the
+/// submission, decision, and review notes and every implement attempt.
+/// One ref per
 /// plan keeps a plan's history under a single git-notes namespace, so
 /// `git notes --ref=<ref> list` is the complete history of one plan
 /// and `git update-ref -d <ref>` deletes one plan's history cleanly.
@@ -143,8 +133,8 @@ pub fn plan_review_seed_blob_bytes(plan_id: PlanId) -> Vec<u8> {
 /// than `/implement` so a reader scanning the seed bytes cannot
 /// mistake the value for a ref subpath.
 ///
-/// Since slice 4 a plan may carry **several** implementer attempts —
-/// that is the fan-out story — so the seed is indexed by
+/// A plan may carry **several** implementer attempts — that is the
+/// fan-out story — so the seed is indexed by
 /// [`ImplementAttempt`]. Attempt zero keeps the original bytes exactly,
 /// because every implement note already in an operator's repo is
 /// attached at them; a change there would orphan all of them.
@@ -216,9 +206,7 @@ impl fmt::Display for ImplementAttempt {
 ///
 /// The submission, review, and implement notes are field-for-field
 /// identical — same five fields, same `deny_unknown_fields`, same
-/// canonicalisation, same one-variant parse error. Before slice 3b
-/// that was three hand-written copies of each, which is three places
-/// for a schema change to land and two places for it to be forgotten.
+/// canonicalisation, same one-variant parse error.
 ///
 /// They stay **three distinct types** rather than collapsing into one,
 /// and that is deliberate: [`crate::bailiff_plan_read::read_plan_body_bytes`]
@@ -229,9 +217,8 @@ impl fmt::Display for ImplementAttempt {
 /// macro removes the duplication at the source; the type system keeps
 /// the distinction at the call sites.
 ///
-/// Follows `plan_enum!` in `bailiff_plan_state.rs`, and slice 1's
-/// recorded lesson behind it: emit the family from one definition so
-/// its members cannot disagree.
+/// Follows `plan_enum!` in `bailiff_plan_state.rs`: emit the family
+/// from one definition so its members cannot disagree.
 macro_rules! stage_note {
     (
         $(#[$doc:meta])*
@@ -301,8 +288,7 @@ stage_note! {
     ///   `refs/notes/writ/v1/agent-outputs` ref — a per-run seed object
     ///   the writ-side `RunAgent` handler hashed from the run id. The
     ///   signed envelope itself lives in the *note body* attached at
-    ///   this target (per slice B's "envelope in note body, not a
-    ///   separate blob" decision), so a reader fetches
+    ///   this target, so a reader fetches
     ///   `refs/notes/writ/v1/agent-outputs` into bailiff's repo and runs
     ///   `git notes --ref=refs/notes/writ/v1/agent-outputs show
     ///   <writ_output_oid>` to retrieve the envelope bytes. `cat-file
@@ -427,8 +413,7 @@ stage_note! {
     ///   `refs/notes/writ/v1/agent-outputs` ref — the per-run seed object
     ///   writ-side `RunAgent` hashed from the reviewer run id. The signed
     ///   envelope (carrying the reviewer's prose stdout) lives in the
-    ///   *note body* attached at this target, per slice B's "envelope in
-    ///   note body" decision.
+    ///   *note body* attached at this target.
     /// - `signed_metadata`: the full [`SignedRunMetadata`] writ returned
     ///   for the reviewer run. Carries the prompt hash, output envelope
     ///   hash, granted capabilities, exit code, completion time, session
@@ -442,19 +427,13 @@ stage_note! {
     /// the result" attestations. They are kept as parallel types rather
     /// than unified under a shared struct so a future schema bump on one
     /// (e.g. a structured verdict field on `ReviewNote`) does not force
-    /// a parallel migration on the other. See
-    /// `docs/plans/2026-05-16-slice-d2-review.md` §"Risks and tradeoffs."
+    /// a parallel migration on the other.
     ///
-    /// **D2 ships unsigned.** Same as [`PlanNote`] and [`DecisionNote`]:
-    /// the parent split doc defers bailiff's own signing primitives.
-    /// Writ's submission signature on the embedded envelope remains the
-    /// trust anchor for the reviewer run.
+    /// **Unsigned by bailiff.** Writ's signature on the embedded
+    /// envelope is the trust anchor for the reviewer run.
     ///
-    /// **D2 is idempotent.** The write helper rejects a second review for
-    /// the same plan id rather than silently overwriting. Multi-review
-    /// history is the documented `v1` → `v2` ref-prefix migration; the
-    /// seed-OID convention pinned by [`plan_review_seed_blob_bytes`] is
-    /// the migration target.
+    /// **Idempotent.** The write helper rejects a second review for the
+    /// same plan id rather than silently overwriting.
     ///
     /// `deny_unknown_fields` catches an unexpected key at parse time
     /// rather than silently dropping it. Same defence the sibling notes
@@ -490,20 +469,15 @@ stage_note! {
     /// kept as parallel types rather than unified under a shared struct
     /// so a future schema bump on one (e.g. a structured side-effect
     /// field on `ImplementNote` recording the branch the agent pushed)
-    /// does not force a parallel migration on the others. Same rationale
-    /// `ReviewNote`'s docstring records, repeated here so the rule is
-    /// visible at each declaration site.
+    /// does not force a parallel migration on the others.
     ///
-    /// **Slice E ships unsigned by bailiff.** Same as the older three
-    /// notes: writ's submission signature on the embedded envelope is the
-    /// trust anchor for the implementer run. The parent split doc defers
-    /// bailiff's own signing primitives.
+    /// **Unsigned by bailiff.** Writ's signature on the embedded
+    /// envelope is the trust anchor for the implementer run.
     ///
-    /// **Slice E is idempotent.** The write helper rejects a second
-    /// implement for the same plan id rather than silently overwriting.
-    /// Multi-implement history is the documented `v1` → `v2` ref-prefix
-    /// migration; the seed-OID convention pinned by
-    /// [`plan_implement_seed_blob_bytes`] is the migration target.
+    /// **Idempotent per attempt.** The write helper rejects a second
+    /// note at the same `(plan, attempt)` rather than silently
+    /// overwriting; a further attempt gets a further seed from
+    /// [`plan_implement_seed_blob_bytes`].
     ///
     /// `deny_unknown_fields` catches an unexpected key at parse time
     /// rather than silently dropping it. Same defence the sibling notes
@@ -1338,9 +1312,8 @@ mod tests {
     /// format, or a stray space keeps every key in its position and
     /// still rewrites the bytes on disk.
     ///
-    /// Slice 3b generated the three note types from one macro; this
-    /// pins that the generated form is byte-identical to the three
-    /// hand-written ones it replaced.
+    /// The three note types come from one macro; this pins the
+    /// generated form byte for byte.
     #[test]
     fn stage_note_canonical_bytes_are_the_checked_in_wire_form() {
         const GOLDEN: &str = "{\"plan_id\":\"11111111-2222-4333-8444-555555555555\",\"purpose\":\"plan-stage\",\"writ_output_oid\":\"cccccccccccccccccccccccccccccccccccccccc\",\"signed_metadata\":{\"run_id\":\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\",\"session_id\":\"3f2504e0-4f89-41d3-9a0c-0305e82c3301\",\"prompt_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"output_envelope_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"capabilities\":[{\"kind\":\"workspace_read\",\"repo\":\"smaug123/writ\"}],\"exit_code\":0,\"completed_at\":1700000000000,\"signing_key_fingerprint\":\"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"signature\":\"-----BEGIN SSH SIGNATURE-----\\nU1NIU0lHAAAAAQ...\\n-----END SSH SIGNATURE-----\"}";

@@ -1,4 +1,4 @@
-//! Slice-E4b workflow function that drives `bailiff plan implement`:
+//! Workflow function that drives `bailiff plan implement`:
 //! read the planner's submission note, gate on bailiff's decision note
 //! recording an *accepted* verdict, fetch + verify the signed planner
 //! envelope, decode the planner's stdout as the plan body, compose the
@@ -14,15 +14,11 @@
 //! `read_plan_body_bytes` helper. The two novelties of the implement
 //! workflow are:
 //!
-//! 1. The workflow gate. Per slice E of
-//!    `docs/plans/2026-05-14-bailiff-split.md`: "the *is the plan
-//!    accepted?* gate lives in bailiff's read-side: refuse to compose
-//!    unless bailiff's own decision note says accepted." Since slice 1
-//!    (`docs/plans/2026-07-26-bailiff-workflow-as-data.md`) that gate
-//!    is one call to [`crate::bailiff_plan_state::allows`] rather than
-//!    a hand-rolled chain, and it additionally requires a review — the
+//! 1. The workflow gate: refuse to compose unless bailiff's own notes
+//!    say the plan is `Accepted`, which requires a review and a verdict.
+//!    The gate is one call to [`crate::bailiff_plan_state::allows`]; the
 //!    single `IllegalTransition` variant names the observed state, so
-//!    an operator still sees exactly which precondition tripped.
+//!    an operator sees exactly which precondition tripped.
 //! 2. The composed prompt uses the separator
 //!    [`crate::bailiff_stage::PlanBodyStage::Implement`] names
 //!    (`# Approved plan`), not the reviewer's `# Proposed plan`. The
@@ -37,13 +33,11 @@
 //! in a structured plan-body type first) to avoid unwrapping them
 //! again for signing.
 //!
-//! Reviewer feedback stays *out* of the composed prompt: per
-//! `docs/plans/2026-05-11-agent-plans.md` §"Implementer prompt
-//! construction" reviewer feedback drives the *decision*, not the
-//! execution. The review note is therefore not read for prompt
-//! composition — though since slice 1 the workflow does require one
-//! to exist, because `implement` runs only from `accepted` and a
-//! verdict is only reachable through `review`.
+//! Reviewer feedback stays *out* of the composed prompt: it drives the
+//! *decision*, not the execution. The review note is therefore not
+//! read for prompt composition, though the workflow requires one to
+//! exist, because `implement` runs only from `accepted` and a verdict
+//! is only reachable through `review`.
 //!
 //! # Error handling
 //!
@@ -381,10 +375,7 @@ pub enum SubmitImplementError {
     ReadPlanState(#[source] SummarizePlanError),
     /// The plan is not in a state from which `implement` may run.
     ///
-    /// Replaces the five separate variants this gate used to raise
-    /// (`PlanSubmissionMissing`, `PlanNotDecided`, `PlanRejected`,
-    /// `AlreadyImplemented`, and their read-error siblings): the
-    /// wrapped [`IllegalTransition`] names the observed state, the
+    /// The wrapped [`IllegalTransition`] names the observed state, the
     /// blocked stage, and the operator's next command, all derived
     /// from the one transition relation rather than hand-written per
     /// failure mode. Pre-RPC: no session was opened.
@@ -447,18 +438,6 @@ pub enum SubmitImplementError {
         source: JoinError,
     },
 }
-
-// `compose_tests` moved to `crate::bailiff_stage::tests` in slice 3,
-// along with the composer it covered. The implementer's framing is now
-// `PlanBodyStage::Implement`, and its exact-concatenation, byte-cap,
-// and three-segment property tests live beside the single definition.
-
-// `build_request_tests` moved to `crate::bailiff_stage::tests` in
-// slice 3, along with the binding it covered. The invariants it
-// asserted — workspace bootstrap threaded verbatim, agent kind and
-// model present, `session_id: None` — are now properties of
-// `broker_run_agent_request`, which is the only way a VM-dispatched
-// request gets built.
 
 #[cfg(test)]
 mod end_to_end_tests {
@@ -872,18 +851,10 @@ mod end_to_end_tests {
         broker_task.stop().await;
     }
 
-    /// Pre-RPC: a plan that has already been implemented surfaces
-    /// `IllegalTransition` on a repeat call, without opening a new
-    /// session or running the implementer agent a second time. Guards
-    /// the codex-flagged footgun: the implementer holds
-    /// Behaviour delta (slice 1): implementing a reviewed plan that
-    /// has **no verdict yet** is refused, pre-RPC.
-    ///
-    /// The pre-slice gate never read the review note at all, so it
-    /// could not distinguish these states; and because the operator's
-    /// verdict is the last gate before a `WorkspaceWrite`-capable
-    /// agent run, "reviewed but nobody has decided" must not reach
-    /// it.
+    /// Implementing a reviewed plan that has **no verdict yet** is
+    /// refused, pre-RPC: the operator's verdict is the last gate before
+    /// a `WorkspaceWrite`-capable agent run, so "reviewed but nobody
+    /// has decided" must not reach it.
     ///
     /// Unlike its siblings this test needs no VM: the gate fires
     /// before any RPC, so it does not depend on the workspace

@@ -1,20 +1,9 @@
 //! The phase vocabulary the three agent-run workflows are composed
 //! from: gate, compose, run.
 //!
-//! Slice 3 of `docs/plans/2026-07-26-bailiff-workflow-as-data.md`.
-//! `submit_plan`, `submit_review`, and `submit_implement` were three
-//! near-identical 120-line bodies — read inputs, take the guard, gate,
-//! read and verify the prior envelope, compose a prompt, run the
-//! agent, write a signed note — with three near-identical
-//! `Inputs`/`Outcome`/`Error` triples. The rule of three was met; this
-//! module is the extraction.
-//!
 //! # Why phases rather than one interpreter
 //!
-//! The plan's original sketch was a single `StageSpec` value driven by
-//! a single `run_stage` returning a single `StageError`. Written out
-//! against the real failure surface, only one of the four failure
-//! groups is universal:
+//! Only one of the four failure groups is universal:
 //!
 //! | Failure group | Submit | Review | Implement |
 //! |---|---|---|---|
@@ -23,14 +12,12 @@
 //! | open session, session-id cross-check, close | ✓ | ✓ | — |
 //! | run agent, write note, write-task join | ✓ | ✓ | ✓ |
 //!
-//! A single union error therefore makes three illegal states
+//! A single union error would therefore make three illegal states
 //! representable at once: a submit failure naming a planner envelope
 //! it never read, an implement failure naming a session bailiff never
 //! opened, and — since the implement path has no session id until
 //! `RunAgent` returns — a `RunAgent` variant whose `session_id` widens
-//! to `Option<SessionId>` for one arm's benefit. That is the same
-//! defect this plan exists to remove (one encoding, wrong for every
-//! specific case), reintroduced at the error layer.
+//! to `Option<SessionId>` for one arm's benefit.
 //!
 //! So the data is a *phase vocabulary*, and each stage is the
 //! composition of its phases. Every error type here is total for its
@@ -86,7 +73,7 @@ use writ::writ_client::{RunAgentCompleted, RunAgentRequest, WritClient, WritClie
 /// prompt for the decide stage" and "write the decide stage's agent
 /// envelope" are states this type makes unrepresentable.
 ///
-/// Both static axes — the precondition slice 1's relation gates on,
+/// Both static axes — the precondition the transition relation gates on,
 /// and the framing the plan body is spliced under — are *derived from*
 /// this one value rather than stored beside it, so they cannot
 /// disagree with the stage or with each other.
@@ -149,12 +136,9 @@ impl AgentStage {
 ///
 /// The framing is *derived* here rather than living in a second enum
 /// beside this one. The two would be bijective, and a bijective pair
-/// of enums is a pair that can disagree — the defect this whole plan
-/// removes. The distinction they encode is load-bearing and was got
-/// wrong once: slice 1 shipped the stage order inverted, which turned
-/// the reviewer's `# Proposed plan` heading into a lie about an
-/// already-decided plan (see the plan doc, "The stage order was
-/// wrong").
+/// of enums is a pair that can disagree. The distinction they encode
+/// is load-bearing: a reviewer prompt framed as an approved plan would
+/// be a lie about an undecided one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PlanBodyStage {
     /// The reviewer. Its feedback is an input to the verdict, so the
@@ -169,8 +153,8 @@ pub enum PlanBodyStage {
 ///
 /// A refinement of [`AgentStage`], not a duplicate of it: submit and
 /// review each own exactly one slot on a plan, while implement owns
-/// one *per attempt* since slice 4 made fan-out N implementer runs
-/// under one plan. Carrying the attempt here rather than on
+/// one *per attempt*, because fan-out is N implementer runs under one
+/// plan. Carrying the attempt here rather than on
 /// [`AgentStage`] is what keeps "the third submission" unrepresentable
 /// — `AgentStage` still answers the gate and the prompt, which have no
 /// attempt.
@@ -202,9 +186,8 @@ impl StageNoteSlot {
     /// The seed families are disjoint by construction, which is what
     /// lets all of a plan's notes coexist under one ref. Routing every
     /// slot through this projection is what lets `write_stage_note` be
-    /// one function: before slice 3b each write helper named its own
-    /// seed, so the seed and the note body were chosen in two places
-    /// that could disagree.
+    /// one function, with the seed and the note body chosen in one
+    /// place.
     pub fn seed(self, plan_id: PlanId) -> Vec<u8> {
         match self {
             StageNoteSlot::Submission => plan_submission_seed_blob_bytes(plan_id),
@@ -233,10 +216,9 @@ impl PlanBodyStage {
     pub const ALL: [PlanBodyStage; 2] = [PlanBodyStage::Review, PlanBodyStage::Implement];
 
     /// The separator spliced between the operator's instructions and
-    /// the plan body. Byte-identical to the private constants the
-    /// review and implement modules held before slice 3 — the RPC
-    /// trace fixtures record composed prompts verbatim, so any drift
-    /// here fails `review_happy` / `implement_happy` with a diff.
+    /// the plan body. The RPC trace fixtures record composed prompts
+    /// verbatim, so any drift here fails `review_happy` /
+    /// `implement_happy` with a diff.
     pub const fn separator(self) -> &'static str {
         match self {
             PlanBodyStage::Review => "\n\n---\n\n# Proposed plan\n\n",
@@ -286,8 +268,8 @@ pub fn splice_plan_body(
 /// rejection can undo a `WorkspaceWrite` agent run.
 ///
 /// Takes a [`PlanStage`], not an [`AgentStage`], because `decide` runs
-/// this phase too — it is the one mutating verb with no agent run, and
-/// slice 2's whole point was that it stops being the exception.
+/// this phase too: it is the one mutating verb with no agent run, and
+/// it must not be the exception.
 pub async fn open_plan_stage(
     bailiff_repo: Arc<NotesRepo>,
     plan_id: PlanId,
@@ -535,10 +517,8 @@ pub fn broker_run_agent_request(inputs: StageRunInputs, session: BrokerSession) 
 /// `write_*_note` helpers because those return three distinct error
 /// types: a DU would force a three-arm union of which each caller can
 /// reach exactly one, which is the unreachable-variant shape this
-/// module exists to avoid. Leaving it generic in `N` also keeps
-/// `bailiff_plan_write.rs` out of slice 3's diff entirely. Every call
-/// site builds the closure on the line above the call, so control flow
-/// stays local.
+/// module exists to avoid. Every call site builds the closure on the
+/// line above the call, so control flow stays local.
 ///
 /// All six [`OwnedSessionRunError`] variants are reachable from both
 /// callers.
