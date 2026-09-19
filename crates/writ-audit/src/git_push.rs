@@ -269,13 +269,13 @@ pub enum RejectBlocker {
     PostPatchUncertain { attempt_id: ApproveAttemptId },
 }
 
-/// LEFT JOIN view of one staged push by `push_request_id`. Mirrors
-/// `GIT_PUSH_AUDIT_ENTRY_BY_SESSION_SQL` minus the session-wide
-/// `ORDER BY` clause. Schema v5 dropped `git_push_attempt` so this
-/// view no longer joins on it; outcome columns alone describe the
-/// broker-visible request lifecycle and `git_push_resolution` carries
-/// the operator decision.
-const GIT_PUSH_AUDIT_ENTRY_BY_REQUEST_SQL: &str = "
+/// LEFT JOIN view of a staged push, in the column order
+/// [`git_push_audit_entry_from_row`] reads; the caller appends the
+/// `WHERE` (and any `ORDER BY`). Schema v5 dropped `git_push_attempt`
+/// so this view no longer joins on it; outcome columns alone describe
+/// the broker-visible request lifecycle and `git_push_resolution`
+/// carries the operator decision.
+const GIT_PUSH_AUDIT_ENTRY_SELECT_SQL: &str = "
     SELECT
         r.push_request_id,
         r.session_id,
@@ -300,38 +300,6 @@ const GIT_PUSH_AUDIT_ENTRY_BY_REQUEST_SQL: &str = "
     FROM git_push_request r
     LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
     LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
-    WHERE r.push_request_id = ?1
-";
-
-/// LEFT JOIN view of every staged push in one session, ordered by
-/// arrival so callers can read the staged-push timeline.
-const GIT_PUSH_AUDIT_ENTRY_BY_SESSION_SQL: &str = "
-    SELECT
-        r.push_request_id,
-        r.session_id,
-        r.received_at,
-        r.repo,
-        r.branch,
-        r.expected_remote_head,
-        r.new_head AS request_new_head,
-        r.correlation_id,
-        o.completed_at,
-        o.result,
-        o.github_status,
-        o.message,
-        res.decided_at,
-        res.decision,
-        res.operator,
-        res.reason,
-        res.mint_jti,
-        res.mint_github_app_id,
-        res.mint_issued_at,
-        res.mint_expires_at
-    FROM git_push_request r
-    LEFT JOIN git_push_outcome o ON o.push_request_id = r.push_request_id
-    LEFT JOIN git_push_resolution res ON res.push_request_id = r.push_request_id
-    WHERE r.session_id = ?1
-    ORDER BY r.received_at ASC, r.rowid ASC
 ";
 
 /// Metadata about a quarantined predecessor attempt that a
