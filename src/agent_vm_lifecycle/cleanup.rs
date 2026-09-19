@@ -5,10 +5,8 @@
 //! invocations, poll `container`/network resources until each is provably
 //! absent (bounded retries), and fold the per-step [`super::ProcessInvocationError`]s
 //! into a single [`super::CleanupErrors`]. The plan construction lives in
-//! [`super::plan`]; the shared low-level helpers this module leans on
-//! (`resource_list_contains_exact_line`, `shell_quote`, `derive_session_network`)
-//! stay at the module root and are reached via `super`. Extracted from
-//! `agent_vm_lifecycle.rs` to keep that file readable; behaviour is unchanged.
+//! [`super::plan`]; the shared low-level helpers this module leans on stay at
+//! the module root and are reached via `super`.
 
 use super::*;
 
