@@ -221,6 +221,13 @@ impl PfInstallPhase {
         }
     }
 
+    /// Parse the spelling [`Self::as_str`] writes, and nothing else. The
+    /// session state store persists the phase this way, so the two directions
+    /// are one definition apart.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|phase| phase.as_str() == text)
+    }
+
     /// Whether a failure in this phase leaves the session anchor possibly
     /// loaded. `Load` itself counts: a load that reports failure may still
     /// have replaced the anchor's rules.

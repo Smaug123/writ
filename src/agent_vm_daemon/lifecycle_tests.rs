@@ -4,6 +4,7 @@
 use super::test_support::*;
 use super::*;
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
+use crate::agent_vm_locked_lifecycle::{LockedLifecycle, LockedPhase};
 use crate::audit::{NixCacheAuditDecision, NixCacheAuditEntry, NixCacheAuditRoute};
 use crate::core::RequestId;
 use crate::vm_git::{DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode};
@@ -2545,4 +2546,167 @@ async fn a_dispatched_start_boots_a_vm_only_once_its_reply_is_begun() {
         .stop_session(&state, session_id)
         .await
         .expect("stopping the run this test started");
+}
+
+// --- locked-session reconciliation ------------------------------------------
+//
+// Stage E1 of docs/plans/2026-09-01-ipv4-only-locked-v1.md. No production path
+// can create one of these records yet (Stage E2 opens the profile), so they
+// are written directly; what is being pinned is that reconciliation, which
+// already treats every persisted session as a teardown obligation, keeps doing
+// so for a locked record at *any* phase — and in particular never re-sends the
+// release signal, which would be the one way boot could hand a guest its
+// authority back.
+
+/// Every phase, with its facts, as a persisted lifecycle.
+fn locked_lifecycle_at(phase: LockedPhase) -> LockedLifecycle {
+    use crate::agent_vm_locked_lifecycle::{Claimed, FirewallFacts, GuestFacts};
+    let firewall = FirewallFacts::new(
+        vec![
+            crate::core::PfInterface::new("bridge100").unwrap(),
+            crate::core::PfInterface::new("vmenet0").unwrap(),
+        ],
+        crate::agent_vm_firewall::PfInstallPhase::Reresolve,
+    );
+    let guest = GuestFacts::new(1);
+    let started = Claimed::new().network_validated().agent_vm_started();
+    match phase {
+        LockedPhase::Claimed => Claimed::new().lifecycle(),
+        LockedPhase::NetworkValidated => Claimed::new().network_validated().lifecycle(),
+        LockedPhase::AgentVmStarted => started.lifecycle(),
+        LockedPhase::FinalFirewallInstalled => {
+            started.final_firewall_installed(firewall).lifecycle()
+        }
+        LockedPhase::GuestSecurityLocked => started
+            .final_firewall_installed(firewall)
+            .guest_security_locked(guest)
+            .lifecycle(),
+        LockedPhase::ReleaseAttempted => started
+            .final_firewall_installed(firewall)
+            .guest_security_locked(guest)
+            .release_attempted()
+            .lifecycle(),
+        LockedPhase::WorkloadReleased => started
+            .final_firewall_installed(firewall)
+            .guest_security_locked(guest)
+            .release_attempted()
+            .workload_released()
+            .lifecycle(),
+    }
+}
+
+/// A boot that finds a locked session cleans it up, whatever phase its start
+/// reached — and never sends the release signal, at any phase.
+///
+/// The second half is the one with teeth. `ReleaseAttempted` says "the signal
+/// may or may not have been delivered"; a reconciler that resolved that
+/// ambiguity by sending it again would be handing a workload its authority
+/// during boot, after the daemon has decided to tear the session down.
+#[tokio::test]
+async fn daemon_reconcile_cleans_a_locked_session_at_every_phase_and_never_releases_it() {
+    for phase in LockedPhase::ALL {
+        let Harness {
+            dir: _dir,
+            args_log,
+            state_store,
+            daemon,
+            ..
+        } = Harness::new();
+        occupy_subnet(&state_store, 252);
+        let legacy = state_store.load_all().unwrap().pop().unwrap();
+        let session_id = legacy.session_id();
+        let locked = legacy.with_locked_lifecycle_for_test(locked_lifecycle_at(phase));
+        state_store.overwrite_for_test(&locked).unwrap();
+        assert_eq!(
+            state_store.load(session_id).unwrap().locked_phase(),
+            Some(phase)
+        );
+
+        let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+        audit
+            .open_session(&SessionRecord {
+                session_id,
+                label: None,
+                agent_kind: Some(AgentKind::Claude),
+                agent_model: None,
+                opened_at: UnixMillis::from_millis(1_700_000_000),
+                closed_at: None,
+            })
+            .unwrap();
+
+        let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+
+        assert_eq!(report.cleaned(), &[session_id], "{phase}");
+        assert!(report.failed().is_empty(), "{phase}: {:?}", report.failed());
+        assert!(
+            state_store.load_all().unwrap().is_empty(),
+            "{phase}: the teardown obligation is discharged"
+        );
+        assert!(
+            audit
+                .get_session(session_id)
+                .unwrap()
+                .unwrap()
+                .closed_at
+                .is_some(),
+            "{phase}: authority is revoked"
+        );
+
+        let log = fs::read_to_string(&args_log).unwrap_or_default();
+        assert!(
+            !log.contains("--signal"),
+            "{phase}: reconcile must never send the release signal: {log}"
+        );
+        // And it tears down in the order the design requires: the VM's absence
+        // is proved before PF is removed, so a session whose VM survived keeps
+        // its confinement rather than losing it to a cleanup that ran anyway.
+        let lines: Vec<&str> = log.lines().collect();
+        let vm_absence = lines
+            .iter()
+            .position(|line| line.trim() == "list --all --quiet")
+            .unwrap_or_else(|| panic!("{phase}: no VM-absence probe in {log}"));
+        let pf_removed = lines
+            .iter()
+            .position(|line| line.contains("remove --session-id"))
+            .unwrap_or_else(|| panic!("{phase}: PF was not removed in {log}"));
+        assert!(
+            vm_absence < pf_removed,
+            "{phase}: PF must be removed only after the VM is proved absent: {log}"
+        );
+    }
+}
+
+/// The two phases either side of the unknowable `kill` reconcile identically,
+/// because the daemon cannot tell them apart and must not pretend it can.
+#[tokio::test]
+async fn reconcile_treats_release_attempted_exactly_as_workload_released() {
+    /// The invocation log with the harness's temporary directory replaced, so
+    /// two runs are comparable.
+    async fn invocations_for(phase: LockedPhase) -> Vec<String> {
+        let Harness {
+            dir,
+            args_log,
+            state_store,
+            daemon,
+            ..
+        } = Harness::new();
+        occupy_subnet(&state_store, 252);
+        let legacy = state_store.load_all().unwrap().pop().unwrap();
+        let locked = legacy.with_locked_lifecycle_for_test(locked_lifecycle_at(phase));
+        state_store.overwrite_for_test(&locked).unwrap();
+        let audit = Arc::new(AuditLog::open_in_memory().unwrap());
+        daemon.reconcile_persisted_sessions(&audit).await.unwrap();
+        let root = dir.path().display().to_string();
+        fs::read_to_string(&args_log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.replace(&root, "<harness>"))
+            .collect()
+    }
+
+    assert_eq!(
+        invocations_for(LockedPhase::ReleaseAttempted).await,
+        invocations_for(LockedPhase::WorkloadReleased).await,
+        "a session found at the gate is torn down exactly as one found past it"
+    );
 }
