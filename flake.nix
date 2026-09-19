@@ -4,9 +4,10 @@
     flake-utils.url = "github:numtide/flake-utils";
     nix2container.url = "github:nlewo/nix2container";
     nix2container.inputs.nixpkgs.follows = "nixpkgs";
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { nixpkgs, flake-utils, nix2container, ... }:
+  outputs = { nixpkgs, flake-utils, nix2container, crane, ... }:
     let
       inherit (nixpkgs) lib;
 
@@ -35,29 +36,51 @@
             || lib.hasPrefix "tests/" rel;
         };
 
-      # NOTE: these are `buildFeatures` / `buildNoDefaultFeatures`, the public
-      # buildRustPackage argument names — NOT `cargoBuildFeatures` /
-      # `cargoBuildNoDefaultFeatures`. buildRustPackage assigns
-      # `cargoBuildFeatures = buildFeatures` internally, so passing the
-      # `cargoBuild*` names directly gets silently clobbered back to the empty
-      # defaults and the feature flags never reach `cargo build` (which built
-      # writ-vm with default `host` features for a long time — see the cross
-      # helpers below). `cargoBuildFlags` is a genuine passthrough and stays.
+      # Every Rust build here is two derivations: the dependency graph, keyed
+      # only by Cargo.lock and the stripped Cargo.toml files (crane's
+      # `buildDepsOnly` compiles it against stub sources), and the workspace
+      # crates on top of it. A source change therefore rebuilds our seven crates
+      # and fetches the ~300 dependencies from the cache, instead of recompiling
+      # everything from `proc-macro2` up. The same split applies to the
+      # cross-compiled guest binaries: `crane.mkLib` over a `pkgsCross` set
+      # configures `CARGO_BUILD_TARGET`, the linker and the cc-crate variables
+      # for that target on its own.
+      #
+      # `cargoExtraArgs` is the one knob for features and `--bin`/`-p`
+      # selection, and it is applied to the dependency build too, so the
+      # artifacts match what the workspace build asks for. `wrapDrv` is applied
+      # to both derivations, because build scripts compile in the dependency
+      # one (see `withDarwinBuildIconv`). Extra attributes (`env`) also go to
+      # both, for the same reason: a rustflag that differs between the two would
+      # make cargo rebuild the dependencies inside the workspace derivation and
+      # silently undo the split.
       mkWrit = pkgs: {
         pname ? "writ",
-        buildFeatures ? [],
-        cargoBuildFlags ? [],
-        buildNoDefaultFeatures ? false,
-        doCheck ? true
+        cargoExtraArgs ? "",
+        doCheck ? true,
+        wrapDrv ? lib.id,
+        env ? {}
       }:
-        pkgs.rustPlatform.buildRustPackage {
-          inherit pname;
-          version = "0.1.0";
-          src = mkRustSource pkgs;
-          cargoLock.lockFile = ./Cargo.lock;
-          nativeCheckInputs = [ pkgs.git pkgs.procps ];
-          inherit buildFeatures cargoBuildFlags buildNoDefaultFeatures doCheck;
-        };
+        let
+          craneLib = crane.mkLib pkgs;
+          common = {
+            inherit pname;
+            version = "0.1.0";
+            src = mkRustSource pkgs;
+            strictDeps = true;
+            cargoExtraArgs = lib.concatStringsSep " " ([ "--locked" ] ++ lib.optional (cargoExtraArgs != "") cargoExtraArgs);
+            nativeCheckInputs = [ pkgs.buildPackages.git pkgs.buildPackages.procps ];
+          } // env;
+          # crane names this `${pname}-deps` itself.
+          cargoArtifacts = wrapDrv (craneLib.buildDepsOnly (common // {
+            # Compile the test dependencies too when the workspace build will
+            # run `cargo test`, so that run finds them ready.
+            inherit doCheck;
+          }));
+        in
+        wrapDrv (craneLib.buildPackage (common // {
+          inherit cargoArtifacts doCheck;
+        }));
 
       # ring/libsqlite3-sys/zstd-sys/lzma-sys have build.rs scripts that compile
       # as build-platform (darwin) executables. rustc's late_link_args for
@@ -107,16 +130,16 @@
           pkgs = buildPkgs.pkgsCross.${cross.pkgsCross};
           writVm = mkWrit pkgs {
             pname = "writ-vm";
-            buildFeatures = [ "vm-client" ];
-            cargoBuildFlags = [ "--bin" "writ-vm" ];
-            buildNoDefaultFeatures = true;
+            cargoExtraArgs = "--no-default-features --features vm-client --bin writ-vm";
             # Target binaries are not executable on the Darwin builder.
             doCheck = false;
+            # vm-client excludes libsqlite3-sys/zstd-sys/lzma-sys, but still
+            # pulls `ring` (reqwest -> rustls), whose build.rs needs `-liconv`
+            # on darwin.
+            wrapDrv = withDarwinBuildIconv buildPkgs pkgs;
           };
         in
-        # vm-client excludes libsqlite3-sys/zstd-sys/lzma-sys, but still pulls
-        # `ring` (reqwest -> rustls), whose build.rs needs `-liconv` on darwin.
-        (withDarwinBuildIconv buildPkgs pkgs writVm).overrideAttrs (old: {
+        writVm.overrideAttrs (old: {
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
@@ -138,19 +161,22 @@
           pkgs = buildPkgs.pkgsCross.${cross.pkgsCross};
           guestInit = mkWrit pkgs {
             pname = "writ-agent-vm-guest-init";
-            cargoBuildFlags = [ "-p" "writ-guest-init" "--bin" "writ-agent-vm-guest-init" ];
+            cargoExtraArgs = "-p writ-guest-init --bin writ-agent-vm-guest-init";
             # Target binaries are not executable on the Darwin builder.
             doCheck = false;
+            env = {
+              # Fully static: the handoff chowns the whole of `/nix` to the
+              # workload, so an initializer that loaded musl's dynamic loader
+              # or libc from the store would depend on files the released
+              # workload can replace, and a restarted container would run them
+              # with the initial capabilities. With crt-static there is no
+              # interpreter and no store reference; the image build asserts
+              # both.
+              CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+            };
           };
         in
         guestInit.overrideAttrs (old: {
-          # Fully static: the handoff chowns the whole of `/nix` to the
-          # workload, so an initializer that loaded musl's dynamic loader or
-          # libc from the store would depend on files the released workload can
-          # replace, and a restarted container would run them with the initial
-          # capabilities. With crt-static there is no interpreter and no store
-          # reference; the image build asserts both.
-          RUSTFLAGS = "-C target-feature=+crt-static";
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
@@ -187,14 +213,15 @@
             pname = "writd";
             # Default features include `host` (which `writd` requires); build only
             # the writd bin so the broker image doesn't carry the other host bins.
-            cargoBuildFlags = [ "--bin" "writd" ];
+            cargoExtraArgs = "--bin writd";
             # Target binaries are not executable on the Darwin builder.
             doCheck = false;
+            # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
+            # lzma-sys, whose build.rs scripts need `-liconv` on darwin.
+            wrapDrv = withDarwinBuildIconv buildPkgs pkgs;
           };
         in
-        # writd's `host` feature pulls in libsqlite3-sys, ring, zstd-sys, and
-        # lzma-sys, whose build.rs scripts need `-liconv` on darwin.
-        (withDarwinBuildIconv buildPkgs pkgs writd).overrideAttrs (old: {
+        writd.overrideAttrs (old: {
           passthru = (old.passthru or {}) // {
             inherit guestSystem;
             rustTarget = cross.rustTarget;
