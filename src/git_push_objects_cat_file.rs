@@ -284,10 +284,6 @@ impl Drop for CatFileObjectSource {
     }
 }
 
-/// RAII guard that SIGKILLs a process group on drop unless
-/// explicitly disarmed. Used inside [`CatFileObjectSource::close`]
-/// to keep the kill scheduled across `await` points so a future
-/// cancellation or panic still cleans the group up.
 impl CatFileObjectSource {
     fn child_mutex(&self) -> &Mutex<CatFileChild> {
         self.inner
@@ -1020,7 +1016,7 @@ mod tests {
         // process group. The wrapper `exec sleep`s, so it never
         // observes the EOF that `close()` writes to its stdin —
         // the only way to cancel cleanup is to drop the future.
-        // Without the local PgidCleanupGuard inside `close()` the
+        // Without the local ProcessGroupCleanupGuard inside `close()` the
         // outer Drop sees `inner == None` and skips `killpg`,
         // leaking the helper.
         use std::os::unix::fs::PermissionsExt;

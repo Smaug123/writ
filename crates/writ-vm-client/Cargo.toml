@@ -21,6 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+writ-core = { path = "../writ-core", features = ["test-support"] }
 # `test-support` exposes the panicking `AgentPrompt::new` used in this crate's
 # tests.
 writ-agent-run = { path = "../writ-agent-run", features = ["vm-client", "test-support"] }

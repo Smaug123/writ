@@ -1,3 +1,10 @@
+//! Test scaffolding every crate's tests may need and none should re-type:
+//! finding a tool on `PATH`, quoting for a shell script, and writing the
+//! executable stand-ins tests put on `PATH` in place of `git`, `container`
+//! and friends. Compiled only under `cfg(test)` or the `test-support`
+//! feature, which downstream crates enable as a dev-dependency; nothing here
+//! reaches a production build. The root crate's `test_support` re-exports it.
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
