@@ -32,8 +32,8 @@ pub use parse::{
 };
 mod state_store;
 pub use state_store::{
-    AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStore,
-    default_agent_vm_state_dir,
+    AgentVmSessionState, AgentVmSessionStateError, AgentVmSessionStateStore, RecordedRelease,
+    ReleaseSignal, SessionLifecycle, StateSchema, default_agent_vm_state_dir,
 };
 mod network_health;
 #[cfg(unix)]
@@ -1785,6 +1785,8 @@ mod configured_profile_tests {
     }
 }
 
+#[cfg(test)]
+mod state_schema_tests;
 #[cfg(test)]
 mod state_store_tests;
 #[cfg(test)]

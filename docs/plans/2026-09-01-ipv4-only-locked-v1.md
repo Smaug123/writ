@@ -420,6 +420,39 @@ produces only a stop plan.
 - Every v2 record in `proptest-regressions` and the existing state-store tests
   still loads, as cleanup-only, and is never reported as locked.
 
+**Landed, with four notes.**
+
+`QuarantineInstalled` and `BrokerReady` are not in the code. Vm placement
+refuses new sessions (#396), so a phase no session can be in would be a
+representable state nothing can reach — the same argument that keeps
+`Ipv6IsolationMode` a smaller set than `ConfiguredIpv6Profile`. They land with
+the placement, and the design record says so.
+
+The model is two types, because moving forward and looking back are different
+problems. The typestates carry a live start; each is constructible only by
+consuming its predecessor, so the stage's "`ReleaseAttempted` is
+unconstructible from any other pair of phases" is the compile-time fact the
+oracle allowed for rather than a test. The snapshot `LockedLifecycle` is what
+a record says: a union with one variant per phase carrying that phase's facts,
+so the reader refuses a released session that names no interfaces instead of
+handing teardown an empty list.
+
+"Persisted before the signal is sent" is structural, not ordered by hand.
+`ReleaseSignal` wraps the `container kill --signal USR1` and has no
+constructor outside the state store, which mints it only after writing
+`ReleaseAttempted`; `advance_locked` refuses to write that phase at all, so
+there is one door and it is the one that hands over the signal. The test
+covers the outcomes that matter — the kill succeeded, failed, or never ran
+(where a timeout and a daemon that died before sending both land, since
+neither leaves the host any more certain).
+
+Locked records exist only in tests until E2, through two `#[cfg(test)]`
+helpers (`with_locked_lifecycle_for_test`, `overwrite_for_test`). They bypass
+no gate: admission is `ConfiguredIpv6Profile::admit`, which refuses the
+profile outright, and nothing in production builds a `LockedLifecycle` because
+nothing builds the typestates that make one. E2 replaces them with the real
+start path and should re-run the phase sweep against it.
+
 ---
 
 ## Stage E2: Host-placement locked start, and the profile opens
