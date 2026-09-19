@@ -62,7 +62,7 @@ Environment overrides:
   WRIT_PREWARM_MEMORY    builder container memory, default 8192m
   WRIT_PREWARM_TOOLS_NIXPKGS
                          nixpkgs flakeref for the injected grep/find/jq/flock
-                         (the production guest image strips them). Default: the
+                         (pinned, rather than taken from the guest image). Default: the
                          nixpkgs writ itself pins (trusted) — NOT the warmed
                          repo's, which runs as root near the signing key.
 
@@ -247,8 +247,8 @@ rev="$(git -C "$checkout" rev-parse HEAD)"
 echo "    rev $rev"
 
 # --- 2. nixpkgs for the injected toolset -------------------------------------
-# The production guest image strips grep/find/sed/awk (no-egress posture); init
-# needs `find` and warm needs `grep`, so ride a real toolset in via `nix shell`.
+# init needs `find` and warm needs `grep`; ride a pinned toolset in via `nix
+# shell` rather than trust whatever the guest image happens to ship.
 #
 # TRUST: source the toolset from WRIT's OWN pinned nixpkgs — a trusted, reviewed
 # ref — NEVER the warmed repo's flake.lock. The driver runs these tools as root,

@@ -749,9 +749,8 @@ fn every_state() -> Vec<(&'static str, GitPushApproveAttemptState)> {
 }
 
 /// Every *position*: a row state crossed with whether the attempt has a
-/// v7 ledger row. The ledger is part of the machine's state — two schema
-/// triggers judge writes against it — so the grid has to sweep it, and
-/// the reviewer who spotted that it did not was right.
+/// ledger row (migration 0007). The ledger is part of the machine's state
+/// — two schema triggers judge writes against it — so the grid sweeps it.
 ///
 /// Combinations the schema cannot represent are dropped rather than
 /// papered over: a resolved row with a NULL mint alongside a ledger row
@@ -937,8 +936,7 @@ fn capture_from_uncertain_is_stricter_than_the_schema() {
 }
 
 /// A `Started` attempt that has already minted may not adopt a different
-/// credential — the case the first draft of this machine got wrong,
-/// because it could not see the ledger at all.
+/// credential.
 #[test]
 fn a_minted_attempt_refuses_a_second_credential() {
     let attempt = ApproveAttempt {
@@ -1080,10 +1078,9 @@ fn positions_enumerate_the_legal_column_shapes() {
 
 /// **The generated SQL selects exactly what the Rust predicate selects.**
 ///
-/// This is what lets the two queries that used to spell out
-/// "started|uncertain|resolved+post_patch" in SQL derive their clause from
-/// `blocks_resolution` instead: seed one row per position, run the
-/// generated clause against it, and compare with the predicate.
+/// The two queries that need the blocking set derive their clause from
+/// `blocks_resolution`, so: seed one row per position, run the generated
+/// clause against it, and compare with the predicate.
 #[test]
 fn sql_predicate_selects_what_rust_selects() {
     for predicate in [
@@ -1240,23 +1237,18 @@ fn empty_position_set_is_refused() {
     position_predicate_sql(&[], "state", "outcome", 1);
 }
 
-/// The trigger message the crate matches on is the one the schema
-/// actually raises *now*.
+/// The trigger message the crate matches on is the one the live schema
+/// raises.
 ///
 /// SQLite gives a `RAISE(ABORT, …)` no machine-readable identity, so the
-/// text is load-bearing — and text shared between a `.sql` file and a
-/// Rust constant is exactly the drift the reviewer predicted. (The
-/// comment that used to accompany the shell-side copy of this literal
-/// cited `migrations/0005_approve_attempt_state_machine.sql`, a file that
-/// does not exist.)
+/// text is load-bearing, and text shared between a `.sql` file and a
+/// Rust constant can drift.
 ///
-/// Read from `sqlite_master`, not from the migration list: v5 created
-/// this trigger and v6 dropped and recreated it with a supersession
-/// filter, so the *old* definition's text is still sitting in the v5
-/// migration. A test that searched the migrations would go on passing
-/// after the live trigger was reworded — which is precisely the failure
-/// it exists to catch, and precisely what the first version of this test
-/// did when the message was mutated.
+/// Read from `sqlite_master`, not from the migration list: migration 0003
+/// created this trigger and 0004 dropped and recreated it with a
+/// supersession filter, so the *old* definition's text is still in 0003.
+/// A test that searched the migrations would go on passing after the live
+/// trigger was reworded.
 #[test]
 fn trigger_message_matches_the_live_trigger() {
     let (log, _) = staged_log();

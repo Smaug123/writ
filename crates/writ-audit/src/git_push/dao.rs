@@ -374,7 +374,7 @@ impl AuditLog {
         self.with_conn_mut(|c| insert_git_push_outcome_row(c, r))
     }
 
-    /// Persist an operator decision on a staged push. The v13 schema's
+    /// Persist an operator decision on a staged push. The schema's
     /// `BEFORE INSERT` trigger requires `git_push_outcome.result = 'staged'`
     /// for this request id, and the table's primary key prevents a
     /// second decision being recorded — both constraints surface as
@@ -1266,10 +1266,10 @@ impl AuditLog {
     /// forward-only triggers guarantee no `Resolved` row appears in
     /// the result set.
     ///
-    /// The NOT EXISTS clause excludes attempts that a v6 reconciliation
-    /// row already cleared — an `Uncertain` predecessor superseded by
-    /// a successful manual reconciliation is no longer something boot
-    /// reconcile needs to act on.
+    /// The NOT EXISTS clause excludes attempts a reconciliation row has
+    /// already cleared: an `Uncertain` predecessor superseded by a
+    /// successful manual reconciliation is not something boot reconcile
+    /// needs to act on.
     pub fn list_blocking_approve_attempts(
         &self,
     ) -> Result<Vec<GitPushApproveAttemptEntry>, AuditError> {

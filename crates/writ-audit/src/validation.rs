@@ -14,8 +14,7 @@ use writ_core::core::SessionId;
 ///
 /// This is the single home for the open-session guard every two-phase
 /// request-row writer needs: the proxy tables (via `proxy_table`) and the
-/// hand-rolled `agent_run` / `flake_provision` / `grant` / `git_push` DAOs, which
-/// each previously inlined a byte-identical copy of this `SELECT`-and-`match`.
+/// hand-rolled `agent_run` / `flake_provision` / `grant` / `git_push` DAOs.
 pub(super) fn check_session_open(
     conn: &Connection,
     session_id: SessionId,
@@ -114,12 +113,10 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
-        /// The single shared guard must classify the three session states exactly
-        /// as the five now-removed per-DAO copies did: an open session is `Ok`, a
-        /// closed one is `Invariant("session is closed")`, and an id that was never
-        /// opened is `Invariant("session does not exist")`. Every hand-rolled
-        /// two-phase writer relied on precisely this trichotomy, so a divergence
-        /// here is a behaviour change in all of them at once.
+        /// The guard classifies the three session states: an open session is
+        /// `Ok`, a closed one is `Invariant("session is closed")`, and an id that
+        /// was never opened is `Invariant("session does not exist")`. Every
+        /// two-phase writer relies on this trichotomy.
         #[test]
         fn check_session_open_classifies_open_closed_and_missing(
             close: bool,

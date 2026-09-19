@@ -1,11 +1,10 @@
 //! The one definition of "SIGKILL a process group we created".
 //!
-//! It lives here, rather than beside its first caller, because there are now
-//! two of them in different crates: the root crate's `process_supervisor`,
-//! which runs short helper commands to a deadline, and `writ-agent-run`, which
-//! runs agents and cannot depend on the root crate. Two copies of this would be
-//! two places to get the benign-errno argument wrong, and that argument took
-//! three rounds of review to state correctly the first time.
+//! It lives here because it has two callers in different crates: the root
+//! crate's `process_supervisor`, which runs short helper commands to a
+//! deadline, and `writ-agent-run`, which runs agents and cannot depend on the
+//! root crate. Two copies would be two places to get the benign-errno argument
+//! wrong.
 //!
 //! **The precondition every caller owes.** A group kill is only safe while the
 //! caller still holds the group's **leader unreaped**. The leader's pid is then
@@ -64,12 +63,9 @@ pub fn pid_has_exited_without_reaping(pid: libc::pid_t) -> std::io::Result<bool>
 /// until the child exits and then leaves the zombie in place, so the pid — and
 /// with it the pgid — is still ours when the caller goes on to sweep the group.
 ///
-/// This exists because "wait for the child" and "keep the group addressable"
-/// used to be in conflict: the only blocking wait available was
-/// [`std::process::Child::wait`], which reaps, and a caller that reaped could
-/// not then safely signal the group. Polling would have bought the same
-/// property at the cost of a timer on a path that has no deadline, which is
-/// worse code for no gain.
+/// [`std::process::Child::wait`] reaps, after which the caller cannot safely
+/// signal the group; polling would keep the group addressable at the cost of a
+/// timer on a path that has no deadline.
 ///
 /// Retries on `EINTR`. A blocking `waitid` is interruptible by any signal the
 /// process handles, and returning early from those would report a child as
@@ -175,15 +171,10 @@ pub fn sweep_process_group(pgid: libc::pid_t, empty_group_is_benign: bool) -> st
 /// leader's pid is then still claimed, so the pgid — which equals it — cannot
 /// have been recycled onto a group we do not own; and since the group was
 /// created with `process_group(0)`, the only way we can fail to signal our own
-/// group is that every member has already exited.
-///
-/// This was previously gated on having *observed* the leader exit, which is a
-/// strictly narrower condition than the argument requires, and it left the
-/// timeout arms exposed: a child that exits between the deadline and the kill —
-/// or that takes `SIGPIPE` when a capture pipe closes — empties the group, and
-/// a plain timeout surfaced as a kill failure. Reproduced at roughly 1 run in
-/// 24 before the fix. Two earlier rounds of review each fixed one arm of this;
-/// naming the real precondition is what stops it recurring in a third.
+/// group is that every member has already exited. That happens on the timeout
+/// arms whenever the child exits between the deadline and the kill, or takes
+/// `SIGPIPE` when a capture pipe closes, so a plain timeout must not surface as
+/// a kill failure.
 #[cfg(unix)]
 pub fn kill_process_group(pgid: libc::pid_t, empty_group_is_benign: bool) -> std::io::Result<()> {
     // The child was spawned with process_group(0), making its pid the process

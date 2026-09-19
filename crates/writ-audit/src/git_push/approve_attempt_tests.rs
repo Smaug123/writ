@@ -265,8 +265,7 @@ fn start_approve_attempt_refused_when_prior_post_patch_failure() {
 }
 
 /// `pre_patch_failure` proves the PATCH was never issued, so a
-/// fresh attempt is safe and admitted. This is the only retry path
-/// before slice C's reconciliation tooling.
+/// fresh attempt is safe and admitted.
 #[test]
 fn start_approve_attempt_allowed_after_pre_patch_failure() {
     let log = AuditLog::open_in_memory().unwrap();

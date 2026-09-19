@@ -1,4 +1,5 @@
-//! `writ-core`: the dependency-free foundation of writ.
+//! `writ-core`: the foundation of writ, with no dependency on the rest of the
+//! workspace.
 //!
 //! Pure data types (`core`), shared low-level helpers (`bearer`, `git_env`,
 //! `process_spawn`), and operator telemetry (`telemetry`). These modules
