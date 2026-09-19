@@ -583,13 +583,33 @@ impl NotesRepo {
             &self.inherited_env,
             HashWrite::Persist,
         )?;
-        // `notes add` creates a commit on the notes ref, so it
-        // needs an author identity. The shared hardened env recipe we
-        // run under deliberately denies git every config source except
-        // the repo's local file, so we inject the identity via `-c`
-        // flags rather than rely on operator gitconfig. The values are placeholders — the
-        // commit author is not part of the audit trail; the signed
-        // envelope inside the note body is.
+        self.notes_add(notes_ref, &body_oid, &target_oid)?;
+        Ok(target_oid)
+    }
+
+    /// Attach the blob `body_oid` as the note at `target_oid` under
+    /// `notes_ref`: the one `git notes add` both writers issue.
+    ///
+    /// `notes add` creates a commit on the notes ref, so it needs an author
+    /// identity. The hardened env recipe this runs under denies git every
+    /// config source except the repo's local file, so the identity comes in
+    /// via `-c` flags rather than operator gitconfig. The values are
+    /// placeholders: the commit author is not part of the audit trail; the
+    /// signed envelope inside the note body is.
+    ///
+    /// Without `-f`, `notes add` refuses when an annotation already exists
+    /// ("Cannot add notes. Found existing notes..."), so a born-dead replay
+    /// cannot double-apply: it either writes the note the killed child did
+    /// not, or fails loudly. The guarantee is *no silent double-apply*, not
+    /// *no spurious failure*: a child killed between committing the ref and
+    /// exiting would report the replay's refusal, which is the safe
+    /// direction.
+    fn notes_add(
+        &self,
+        notes_ref: &NotesRef,
+        body_oid: &GitObjectId,
+        target_oid: &GitObjectId,
+    ) -> Result<(), NotesRepoError> {
         run_git(
             &self.canonical_path,
             [
@@ -607,16 +627,9 @@ impl NotesRepo {
             None,
             CaptureOutput::Discard,
             &self.inherited_env,
-            // `notes add` without `-f` refuses when an annotation already
-            // exists ("Cannot add notes. Found existing notes..."), so a
-            // replay cannot double-apply: it either writes the note the
-            // killed child did not, or fails loudly. Note the guarantee is
-            // *no silent double-apply*, not *no spurious failure* — a child
-            // killed between committing the ref and exiting would report the
-            // replay's refusal. That is the safe direction.
             OnBornDead::Retry,
-        )?;
-        Ok(target_oid)
+        )
+        .map(|_| ())
     }
 
     /// Idempotent variant of [`Self::write_note`]: returns
@@ -666,32 +679,7 @@ impl NotesRepo {
             &self.inherited_env,
             HashWrite::Persist,
         )?;
-        run_git(
-            &self.canonical_path,
-            [
-                "-c",
-                "user.name=bailiff",
-                "-c",
-                "user.email=bailiff@localhost",
-                "notes",
-                &format!("--ref={}", notes_ref.as_str()),
-                "add",
-                "-C",
-                body_oid.as_str(),
-                target_oid.as_str(),
-            ],
-            None,
-            CaptureOutput::Discard,
-            &self.inherited_env,
-            // `notes add` without `-f` refuses when an annotation already
-            // exists ("Cannot add notes. Found existing notes..."), so a
-            // replay cannot double-apply: it either writes the note the
-            // killed child did not, or fails loudly. Note the guarantee is
-            // *no silent double-apply*, not *no spurious failure* — a child
-            // killed between committing the ref and exiting would report the
-            // replay's refusal. That is the safe direction.
-            OnBornDead::Retry,
-        )?;
+        self.notes_add(notes_ref, &body_oid, &target_oid)?;
         Ok(WriteOutcome::Written(target_oid))
     }
 
