@@ -9,7 +9,6 @@
 mod broker;
 mod fixtures;
 mod git;
-mod path;
 mod sample;
 mod secret;
 
@@ -19,12 +18,12 @@ pub use broker::{
 };
 pub use fixtures::*;
 pub use git::{commit_empty, commit_merge, git_stdout, init_test_repo, rev_parse, run_git};
-pub use path::{
-    find_in_path, required_tool, required_tool_any, shell_quote_path, shell_single_quote,
-    write_executable_script,
-};
 pub use sample::{
     sample_branch, sample_clone_repo, sample_identity, sample_object_id, sample_push_metadata,
     sample_repo, sample_signature,
 };
 pub use secret::InMemorySecretStore;
+pub use writ_core::test_support::{
+    find_in_path, required_tool, required_tool_any, shell_quote_path, shell_single_quote,
+    write_executable_script,
+};

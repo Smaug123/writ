@@ -149,7 +149,7 @@ fn write_fake_git(dir: &Path) -> PathBuf {
          fi\n\
          fi\n\
          exit 64\n",
-        log = shell_quote(&log),
+        log = writ_core::test_support::shell_quote_path(&log),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -158,32 +158,12 @@ fn write_fake_git(dir: &Path) -> PathBuf {
     path
 }
 
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-}
-
 fn leaked_bundle_count(dir: &Path) -> usize {
     fs::read_dir(dir)
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".writ-vm-"))
         .count()
-}
-
-fn required_test_tool(name: &str) -> PathBuf {
-    let path = std::env::var_os("PATH")
-        .unwrap_or_else(|| panic!("PATH must contain {name} for vm_client tests"));
-    for dir in std::env::split_paths(&path) {
-        let candidate = if dir.is_absolute() {
-            dir.join(name)
-        } else {
-            std::env::current_dir().unwrap().join(dir).join(name)
-        };
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("{name} not found on PATH for vm_client tests");
 }
 
 /// `run_test_git` for the callers that need stdout back.
@@ -595,7 +575,7 @@ async fn clone_from_broker_counts_streamed_bundle_bytes_when_length_is_missing()
 #[test]
 fn clone_bundle_with_real_git_supports_full_head_refs_from_bundles() {
     let dir = tempfile::tempdir().unwrap();
-    let git = required_test_tool("git");
+    let git = writ_core::test_support::required_tool("git");
     let source = dir.path().join("source");
     let bundle = dir.path().join("main.bundle");
     let checkout_parent = tempfile::tempdir().unwrap();
@@ -677,7 +657,7 @@ fn provision_request() -> VmFlakeProvisionRequest {
 #[test]
 fn resolve_head_object_id_returns_the_checked_out_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let git = required_test_tool("git");
+    let git = writ_core::test_support::required_tool("git");
     let repo_dir = dir.path().join("repo");
     let expected = commit_one_file(&git, &repo_dir);
 
@@ -689,7 +669,7 @@ fn resolve_head_object_id_returns_the_checked_out_commit() {
 #[tokio::test]
 async fn provision_best_effort_posts_repo_and_resolved_rev() {
     let dir = tempfile::tempdir().unwrap();
-    let git = required_test_tool("git");
+    let git = writ_core::test_support::required_tool("git");
     let repo_dir = dir.path().join("repo");
     let rev = commit_one_file(&git, &repo_dir);
 
@@ -727,7 +707,7 @@ async fn provision_best_effort_posts_repo_and_resolved_rev() {
 #[tokio::test]
 async fn provision_best_effort_skips_when_warm_is_none() {
     let dir = tempfile::tempdir().unwrap();
-    let git = required_test_tool("git");
+    let git = writ_core::test_support::required_tool("git");
     let repo_dir = dir.path().join("repo");
     commit_one_file(&git, &repo_dir);
     let (broker_url, captured) = serve_once(http_response(
@@ -821,7 +801,7 @@ async fn post_flake_provision_tolerates_a_plain_text_disabled_endpoint() {
 #[test]
 fn workspace_init_creates_clean_main_branch_tracking_origin_from_bundle() {
     let dir = tempfile::tempdir().unwrap();
-    let git = required_test_tool("git");
+    let git = writ_core::test_support::required_tool("git");
     let source = dir.path().join("source");
     let bundle = dir.path().join("main.bundle");
     let checkout = dir.path().join("checkout");
@@ -1213,9 +1193,9 @@ fn write_fake_git_push(
          ;;\n\
          esac\n\
          exit 64\n",
-        log = shell_quote(&log),
-        payload = shell_quote(&bundle_payload),
-        list_heads = shell_quote(&list_heads_payload),
+        log = writ_core::test_support::shell_quote_path(&log),
+        payload = writ_core::test_support::shell_quote_path(&bundle_payload),
+        list_heads = writ_core::test_support::shell_quote_path(&list_heads_payload),
         oid = rev_parse_oid,
     );
     fs::write(&path, script).unwrap();
@@ -1814,7 +1794,7 @@ proptest! {
 #[tokio::test]
 async fn every_broker_request_the_guest_originates_declares_its_contract_version() {
     let dir = tempfile::tempdir().unwrap();
-    let real_git = required_test_tool("git");
+    let real_git = writ_core::test_support::required_tool("git");
     let sample_run_id: AgentRunId = "00000000-0000-0000-0000-000000000501".parse().unwrap();
 
     let mut observed: BTreeSet<(String, String)> = BTreeSet::new();
