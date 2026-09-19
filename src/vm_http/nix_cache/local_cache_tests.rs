@@ -9,24 +9,21 @@
 //! local-only view: the same local archives, but a miss is a `404` and the
 //! upstream is never contacted.
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::super::tests::{make_broker_state, open_audit_session, session_for_subnet};
+use super::super::tests::{broker_with_open_session, loopback_net};
+
 use super::test_support::*;
 use super::*;
-use crate::core::Ipv4Cidr;
 use crate::nix_binary_cache::NixTrustedPublicKeys;
 
 #[tokio::test]
 async fn local_archive_narinfo_and_nar_are_served_without_upstream() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, narinfo_bytes, compressed) =
@@ -93,9 +90,7 @@ async fn local_archive_narinfo_and_nar_are_served_without_upstream() {
 #[tokio::test]
 async fn local_archive_narinfo_head_returns_length_and_admits_the_nar() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, narinfo_bytes, compressed) =
@@ -129,9 +124,7 @@ async fn local_archive_narinfo_head_returns_length_and_admits_the_nar() {
 #[tokio::test]
 async fn local_cache_miss_falls_through_to_signed_upstream() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     // An empty local cache dir: every hash is a local miss.
     let cache = tempfile::tempdir().unwrap();
     let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
@@ -188,9 +181,7 @@ async fn local_signed_input_addressed_narinfo_and_nar_are_served_with_trusted_ke
     // local-first, exactly as it serves a self-certifying CA flake input -- this
     // is the capability PW1 adds on top of FK's CA-only local serving.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let key_pair = test_ed25519_key_pair();
     let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -274,9 +265,7 @@ async fn local_signed_narinfo_with_untrusted_key_fails_closed() {
     // (untrusted key), so it fails closed against the dead upstream rather than
     // serving an unvouched-for path. This is the security gate PW1 rests on.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let key_pair = test_ed25519_key_pair();
     let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -326,9 +315,7 @@ async fn prewarm_dir_is_served_local_first_ahead_of_the_flake_input_dir() {
     // the pre-warm dir and the flake-input dir is empty. The pre-warm dir serves
     // it local-first.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let prewarm = tempfile::tempdir().unwrap();
     let flake_input = tempfile::tempdir().unwrap();
     let key_pair = test_ed25519_key_pair();
@@ -403,9 +390,7 @@ async fn a_hash_absent_from_the_first_dir_is_served_and_nar_routed_from_the_seco
     // AND fetch its NAR from that same (second) dir — the dir-routing invariant.
     // A routing bug that read the NAR from the first dir would 502 (missing).
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let prewarm = tempfile::tempdir().unwrap(); // present but lacks this hash
     let flake_input = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
@@ -462,9 +447,7 @@ async fn cache_info_synthesised_when_only_the_prewarm_dir_is_nonempty() {
     // `nix-cache-info` is synthesised (not proxied) when *any* local dir has a
     // servable narinfo — here only the pre-warm dir does.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let prewarm = tempfile::tempdir().unwrap();
     let flake_input = tempfile::tempdir().unwrap(); // empty
     let key_pair = test_ed25519_key_pair();
@@ -515,9 +498,7 @@ async fn cache_info_synthesised_when_only_the_prewarm_dir_is_nonempty() {
 #[tokio::test]
 async fn local_cache_info_is_served_synthetically_without_upstream() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     // A *provisioned* local archive + a dead upstream: the mandatory cache-info
     // pre-flight is served synthetically so the guest reaches the local-first
@@ -554,9 +535,7 @@ async fn local_cache_info_is_served_synthetically_without_upstream() {
 #[tokio::test]
 async fn cache_info_proxies_upstream_when_local_cache_empty() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     // A configured-but-empty local archive has nothing to serve, so cache-info
     // is proxied (not synthesised): a still-unprovisioned broker stays
     // byte-identical to upstream-only and the upstream sees the request.
@@ -597,9 +576,7 @@ async fn cache_info_proxies_upstream_when_local_cache_empty() {
 #[tokio::test]
 async fn cache_info_ignores_stale_provisioning_temp_narinfo_and_proxies_upstream() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     // Provisioning was interrupted after copying a narinfo to its temp sibling
     // (`.writ-tmp-<uuid>-<hash>.narinfo`) but before the final rename, so the
     // only `.narinfo`-suffixed file is one `try_serve_local_narinfo` will never
@@ -636,9 +613,7 @@ async fn cache_info_ignores_stale_provisioning_temp_narinfo_and_proxies_upstream
 #[tokio::test]
 async fn local_narinfo_present_but_not_self_certifying_fails_closed() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let hash = "00000000000000000000000000000000";
     // A narinfo whose CA is `text:` rather than the required recursive
@@ -685,9 +660,7 @@ async fn local_narinfo_present_but_not_self_certifying_fails_closed() {
 #[tokio::test]
 async fn local_narinfo_over_metadata_budget_fails_closed() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let (hash, _, _) =
         write_local_ca_entry(cache.path(), "source", "input.nar.xz", b"local nar body");
@@ -723,9 +696,7 @@ async fn local_nar_body_is_served_verbatim_trusting_the_mount() {
     // not something the broker spends a full xz-decode + SHA-256 catching on
     // every substitution.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, _, _) =
@@ -779,9 +750,7 @@ async fn local_nar_body_is_served_verbatim_trusting_the_mount() {
 #[tokio::test]
 async fn closed_session_is_refused_before_any_upstream_fetch() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     state
         .audit
         .close_session(session.session_id(), crate::core::UnixMillis::now())
@@ -821,9 +790,7 @@ async fn closed_session_is_refused_before_any_upstream_fetch() {
 #[tokio::test]
 async fn upstream_admitted_nar_is_not_shadowed_by_a_local_file() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
     let nar_body = test_xz_nar_body();
@@ -902,9 +869,7 @@ async fn upstream_admitted_nar_is_not_shadowed_by_a_local_file() {
 #[tokio::test]
 async fn local_admitted_nar_missing_on_disk_fails_closed() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, _, _) = write_local_ca_entry(cache.path(), "source", nar_file, b"present then gone");
@@ -954,9 +919,7 @@ async fn local_nar_non_regular_file_is_refused_not_opened() {
     // narinfo is admitted from a regular file; the NAR is then swapped for a
     // symlink to a valid sibling and must fail closed (not be followed).
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, _, _) = write_local_ca_entry(cache.path(), "source", nar_file, b"regular then link");
@@ -1004,9 +967,7 @@ async fn local_nar_fifo_does_not_block_and_is_refused() {
     use std::os::unix::ffi::OsStrExt as _;
 
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, _, _) = write_local_ca_entry(cache.path(), "source", nar_file, b"regular then fifo");
@@ -1057,9 +1018,7 @@ async fn local_nar_fifo_does_not_block_and_is_refused() {
 #[tokio::test]
 async fn local_nar_head_returns_content_length_without_the_body() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, _, compressed) =
@@ -1103,9 +1062,7 @@ async fn prewarm_view_serves_a_trusted_signed_closure_path_without_upstream() {
     // the pre-warm dir is served (narinfo + NAR) through `/v1/nix/prewarm`
     // against a dead upstream, proving the view needs no proxy.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let prewarm = tempfile::tempdir().unwrap();
     let key_pair = test_ed25519_key_pair();
     let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1176,9 +1133,7 @@ async fn prewarm_view_serves_the_flake_input_dir_too() {
     // pre-warm view serves the whole ordered dir list, with the NAR routed from
     // the dir that admitted it (here the second, flake-input dir).
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let prewarm = tempfile::tempdir().unwrap(); // present but lacks this hash
     let flake_input = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
@@ -1237,9 +1192,7 @@ async fn prewarm_view_narinfo_miss_is_a_404_not_an_upstream_proxy() {
     // request through `/v1/nix/cache` proxies). `expect(0)` proves the pre-warm
     // view never contacted the upstream.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap(); // empty: every hash is a local miss
     let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
     Mock::given(method("GET"))
@@ -1289,9 +1242,7 @@ async fn prewarm_view_cache_info_is_synthetic_even_when_archives_are_empty() {
     // valid cache that misses every narinfo, and Nix rejects a substituter
     // whose cache-info errors.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap(); // empty
     Mock::given(method("GET"))
         .and(path("/nix-cache-info"))
@@ -1330,9 +1281,7 @@ async fn prewarm_view_narinfo_present_but_inadmissible_fails_closed_not_404() {
     // its dir and fails closed with a 502, exactly as on the proxied view — it
     // must not be soft-missed into "never warmed".
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let key_pair = test_ed25519_key_pair();
     let store_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1378,9 +1327,7 @@ async fn prewarm_view_refuses_an_upstream_admitted_nar() {
     // NAR to the upstream; asking the pre-warm view for that NAR must fail
     // closed rather than proxy. `expect(0)` on the NAR endpoint proves it.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
     Mock::given(method("GET"))
         .and(path(format!("/{hash}.narinfo")))
@@ -1433,9 +1380,7 @@ async fn nar_admitted_via_prewarm_view_is_served_locally_through_the_cache_view(
     // archive via the pre-warm view serves its NAR from that same dir even
     // when the NAR is requested through the proxied `/v1/nix/cache` view.
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let cache = tempfile::tempdir().unwrap();
     let nar_file = "input.nar.xz";
     let (hash, _, compressed) =

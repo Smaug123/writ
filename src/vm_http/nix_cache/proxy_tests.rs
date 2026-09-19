@@ -11,19 +11,17 @@ use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::super::tests::{make_broker_state, open_audit_session, session_for_subnet};
+use super::super::tests::{broker_with_open_session, loopback_net};
+
 use super::super::{VM_HTTP_READ_TIMEOUT, dispatch_vm_http_head_and_body};
 use super::test_support::*;
 use super::*;
-use crate::core::Ipv4Cidr;
 use crate::nix_binary_cache::NixNarCompression;
 
 #[tokio::test]
 async fn nix_cache_info_route_proxies_bounded_upstream_metadata() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let upstream_body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n";
     Mock::given(method("GET"))
         .and(path("/cache/nix-cache-info"))
@@ -76,9 +74,7 @@ async fn nix_cache_info_route_proxies_bounded_upstream_metadata() {
 #[tokio::test]
 async fn nix_cache_narinfo_route_proxies_valid_narinfo_paths() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
     Mock::given(method("GET"))
         .and(path(format!("/{hash}.narinfo")))
@@ -118,9 +114,7 @@ async fn nix_cache_narinfo_route_proxies_valid_narinfo_paths() {
 #[tokio::test]
 async fn nix_cache_narinfo_route_rejects_admitted_nar_size_above_limit() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
     Mock::given(method("GET"))
         .and(path(format!("/{hash}.narinfo")))
@@ -156,9 +150,7 @@ async fn nix_cache_narinfo_route_rejects_admitted_nar_size_above_limit() {
 #[tokio::test]
 async fn nix_cache_narinfo_route_rejects_conflicting_admission_for_same_nar_file() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let key_pair = test_ed25519_key_pair();
     let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
     let hash_a = "00000000000000000000000000000000";
@@ -248,9 +240,7 @@ async fn nix_cache_narinfo_route_rejects_unverifiable_nar_hash_shapes_at_admissi
     ];
     for (hash, nar_hash, expected_error) in cases {
         let upstream = MockServer::start().await;
-        let state = make_broker_state(&upstream);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&upstream, loopback_net());
         let key_pair = test_ed25519_key_pair();
         let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
         let body = signed_test_narinfo(
@@ -302,9 +292,7 @@ async fn nix_cache_narinfo_route_rejects_unsafe_nar_urls() {
         "nar/proof.nar.xz?download=1",
     ] {
         let upstream = MockServer::start().await;
-        let state = make_broker_state(&upstream);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&upstream, loopback_net());
         let hash = "00000000000000000000000000000000";
         Mock::given(method("GET"))
             .and(path(format!("/{hash}.narinfo")))
@@ -343,9 +331,7 @@ async fn nix_cache_narinfo_route_rejects_unsafe_nar_urls() {
 #[tokio::test]
 async fn nix_cache_narinfo_route_rejects_duplicate_nar_urls() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let hash = "00000000000000000000000000000000";
     Mock::given(method("GET"))
         .and(path(format!("/{hash}.narinfo")))
@@ -389,9 +375,7 @@ async fn nix_cache_narinfo_route_rejects_duplicate_nar_urls() {
 #[tokio::test]
 async fn nix_cache_narinfo_route_rejects_store_path_hash_mismatch() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let requested_hash = "00000000000000000000000000000000";
     let upstream_hash = "11111111111111111111111111111111";
     Mock::given(method("GET"))
@@ -452,9 +436,7 @@ async fn nix_cache_narinfo_route_requires_trusted_signature() {
 
     for (body, expected_error) in cases {
         let upstream = MockServer::start().await;
-        let state = make_broker_state(&upstream);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&upstream, loopback_net());
         let hash = "rzv95bakh41zrn5ji23pfc11x5vq2z4d";
         Mock::given(method("GET"))
             .and(path(format!("/{hash}.narinfo")))
@@ -488,9 +470,7 @@ async fn nix_cache_narinfo_route_requires_trusted_signature() {
 #[tokio::test]
 async fn nix_cache_nar_route_requires_prior_signed_narinfo_admission() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let service = signed_nix_cache_service_for_test(&state, &upstream, 1024);
 
     let response = route_nix_cache_with_service(
@@ -517,9 +497,7 @@ async fn nix_cache_nar_route_requires_prior_signed_narinfo_admission() {
 #[tokio::test]
 async fn nix_cache_nar_route_buffers_verifies_and_audits_nar_body() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let nar_body = test_xz_nar_body();
     Mock::given(method("GET"))
         .and(path(format!("/nar/{TEST_NAR_FILE}")))
@@ -569,9 +547,7 @@ async fn nix_cache_nar_route_buffers_verifies_and_audits_nar_body() {
 #[tokio::test]
 async fn nix_cache_nar_route_verifies_uncompressed_nar_body() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let key_pair = test_ed25519_key_pair();
     let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
     let hash = "00000000000000000000000000000000";
@@ -638,9 +614,7 @@ async fn nix_cache_nar_route_verifies_uncompressed_nar_body() {
 #[tokio::test]
 async fn nix_cache_nar_route_verifies_zstd_nar_body() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let key_pair = test_ed25519_key_pair();
     let trusted_key = trusted_public_key_for_test(TEST_SIGNING_KEY_NAME, &key_pair);
     let hash = "00000000000000000000000000000000";
@@ -709,9 +683,7 @@ async fn nix_cache_nar_route_verifies_zstd_nar_body() {
 #[tokio::test]
 async fn nix_cache_nar_route_rejects_hash_mismatch_before_forwarding_body() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let mut raw = test_raw_nar_body();
     let tampered_index = raw.len() - 2;
     raw[tampered_index] ^= 0x01;
@@ -753,9 +725,7 @@ async fn nix_cache_nar_route_rejects_hash_mismatch_before_forwarding_body() {
 #[tokio::test]
 async fn nix_cache_nar_route_rejects_decoded_size_mismatch() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let mut raw = test_raw_nar_body();
     raw.push(0);
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
@@ -793,9 +763,7 @@ async fn nix_cache_nar_route_rejects_decoded_size_mismatch() {
 #[tokio::test]
 async fn nix_cache_nar_head_is_bounded_and_requires_admission() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     Mock::given(method("HEAD"))
         .and(path(format!("/nar/{TEST_NAR_FILE}")))
         .respond_with(
@@ -834,9 +802,7 @@ async fn nix_cache_nar_head_is_bounded_and_requires_admission() {
 #[tokio::test]
 async fn nix_cache_nar_route_rejects_oversized_declared_nar() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     Mock::given(method("GET"))
         .and(path(format!("/nar/{TEST_NAR_FILE}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 129]))
@@ -872,9 +838,7 @@ async fn nix_cache_nar_route_rejects_oversized_declared_nar() {
 #[tokio::test]
 async fn nix_cache_route_maps_upstream_404_to_controlled_miss() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let hash = "00000000000000000000000000000000";
     Mock::given(method("GET"))
         .and(path(format!("/{hash}.narinfo")))
@@ -907,9 +871,7 @@ async fn nix_cache_route_maps_upstream_404_to_controlled_miss() {
 #[tokio::test]
 async fn nix_cache_route_rejects_oversized_upstream_metadata() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     Mock::given(method("GET"))
         .and(path("/nix-cache-info"))
         .respond_with(ResponseTemplate::new(200).set_body_string("123456"))
@@ -938,9 +900,7 @@ async fn nix_cache_route_rejects_oversized_upstream_metadata() {
 #[tokio::test]
 async fn nix_cache_route_audits_unsupported_upstream_status() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     Mock::given(method("GET"))
         .and(path("/nix-cache-info"))
         .respond_with(ResponseTemplate::new(500).set_body_string("backend detail"))
@@ -969,9 +929,7 @@ async fn nix_cache_route_audits_unsupported_upstream_status() {
 #[tokio::test]
 async fn nix_cache_route_normalizes_non_standard_upstream_status_for_audit() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     Mock::given(method("GET"))
         .and(path("/nix-cache-info"))
         .respond_with(ResponseTemplate::new(700).set_body_string("backend detail"))
@@ -1000,9 +958,7 @@ async fn nix_cache_route_normalizes_non_standard_upstream_status_for_audit() {
 #[tokio::test]
 async fn nix_cache_route_rejects_non_get_head_without_contacting_upstream() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let service = nix_cache_service_for_test(&state, &upstream, 1024);
 
     let response =
@@ -1024,9 +980,7 @@ async fn nix_cache_route_rejects_non_get_head_without_contacting_upstream() {
 #[tokio::test]
 async fn nix_cache_auth_denial_is_audited_without_contacting_upstream() {
     let upstream = MockServer::start().await;
-    let state = make_broker_state(&upstream);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&upstream, loopback_net());
     let service = nix_cache_service_for_test(&state, &upstream, 1024);
 
     let response = dispatch_vm_http_head_and_body(

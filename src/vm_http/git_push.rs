@@ -403,6 +403,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use super::super::tests::{broker_with_open_session, loopback_net};
+
     use super::super::tests::{
         bearer, declared_contract, make_broker_state, no_services, open_audit_session,
         session_for_subnet, token,
@@ -418,8 +420,8 @@ mod tests {
     use crate::server::BrokerState;
     use crate::vm_git::VM_HTTP_CONTRACT_HEADER;
     use crate::vm_git::{
-        GitBranchName, GitCloneRepo, GitObjectId, VmGitPushMetadata, VmGitPushRequest,
-        VmGitPushStagedReceipt, encode_vm_git_push_request_body,
+        VmGitPushMetadata, VmGitPushRequest, VmGitPushStagedReceipt,
+        encode_vm_git_push_request_body,
     };
 
     fn test_body_limits() -> VmGitPushBodyLimits {
@@ -439,24 +441,9 @@ mod tests {
         VmHttpGitPushService::new(Arc::clone(state), staging, test_body_limits())
     }
 
-    fn sample_repo() -> GitCloneRepo {
-        "owner/repo".parse().unwrap()
-    }
-
-    fn sample_branch() -> GitBranchName {
-        "feature/x".parse().unwrap()
-    }
-
-    fn oid(nibble: char) -> GitObjectId {
-        std::iter::repeat_n(nibble, 40)
-            .collect::<String>()
-            .parse()
-            .unwrap()
-    }
-
-    fn sample_metadata() -> VmGitPushMetadata {
-        VmGitPushMetadata::new(sample_repo(), sample_branch(), Some(oid('a')), oid('b'))
-    }
+    use crate::test_support::{
+        sample_branch, sample_clone_repo, sample_object_id, sample_push_metadata,
+    };
 
     fn encoded_body(metadata: VmGitPushMetadata, bundle: Vec<u8>) -> Vec<u8> {
         let request = VmGitPushRequest::new(metadata, bundle).unwrap();
@@ -506,7 +493,7 @@ mod tests {
     async fn enabled_git_push_route_is_not_found_for_non_post_methods() {
         let github = wiremock::MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
         let request = VmHttpRequest::new(
@@ -559,9 +546,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_rejects_malformed_body_without_audit() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
@@ -583,12 +568,12 @@ mod tests {
     async fn git_push_unknown_session_returns_unauthorized_without_audit_row() {
         let github = wiremock::MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         // No `open_audit_session` — the session is unknown to the audit log.
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
-        let body = encoded_body(sample_metadata(), b"bundle bytes".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"bundle bytes".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
 
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
@@ -607,9 +592,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_closed_session_returns_gone_without_audit_row() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         state
             .audit
             .close_session(session.session_id(), UnixMillis::now())
@@ -617,7 +600,7 @@ mod tests {
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
-        let body = encoded_body(sample_metadata(), b"bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"bundle".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
 
         assert_eq!(response.status, VmHttpStatus::Gone);
@@ -636,13 +619,11 @@ mod tests {
     #[tokio::test]
     async fn git_push_stages_bundle_and_returns_receipt() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"PACK bundle bytes".to_vec();
         let body = encoded_body(metadata.clone(), bundle.clone());
         let response = handle_git_push_request(&session, body, service).await;
@@ -680,14 +661,12 @@ mod tests {
     #[tokio::test]
     async fn git_push_handler_satisfies_audit_pair_oracle() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
         let before = state.audit.table_row_count_for_test("git_push_outcome");
-        let body = encoded_body(sample_metadata(), b"PACK bundle bytes".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"PACK bundle bytes".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
         assert_eq!(response.status, VmHttpStatus::Ok);
 
@@ -716,9 +695,7 @@ mod tests {
         use crate::core::AgentKind;
 
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let correlation = CorrelationId::try_new("feat-42_xyz").unwrap();
         state
             .audit
@@ -734,7 +711,7 @@ mod tests {
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();
 
-        let body = encoded_body(sample_metadata(), b"tagged bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"tagged bundle".to_vec());
         let response = handle_git_push_request(
             &session,
             body,
@@ -758,12 +735,10 @@ mod tests {
     #[tokio::test]
     async fn git_push_without_agent_run_leaves_correlation_id_null() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
-        let body = encoded_body(sample_metadata(), b"untagged bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"untagged bundle".to_vec());
         let response = handle_git_push_request(
             &session,
             body,
@@ -791,9 +766,7 @@ mod tests {
         use crate::core::AgentKind;
 
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         state
             .audit
             .record_agent_run(&AgentRunAuditRecord {
@@ -808,7 +781,7 @@ mod tests {
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();
 
-        let body = encoded_body(sample_metadata(), b"untagged-run bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"untagged-run bundle".to_vec());
         let response = handle_git_push_request(
             &session,
             body,
@@ -833,12 +806,10 @@ mod tests {
         // staging store's perspective. The staging store's own idempotency
         // path is exercised in its unit tests.
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"bundle".to_vec();
         let body_one = encoded_body(metadata.clone(), bundle.clone());
         let body_two = encoded_body(metadata, bundle);
@@ -867,13 +838,16 @@ mod tests {
     #[tokio::test]
     async fn git_push_branch_creation_round_trips_with_null_expected_head() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
-        let metadata = VmGitPushMetadata::new(sample_repo(), sample_branch(), None, oid('c'));
+        let metadata = VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            None,
+            sample_object_id('c'),
+        );
         let body = encoded_body(metadata.clone(), b"create-bundle".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
 
@@ -887,15 +861,13 @@ mod tests {
     #[tokio::test]
     async fn git_push_full_dispatch_stages_and_audits() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
         let bearer_auth = bearer(token().as_str());
         let declared = declared_contract();
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let body = encoded_body(metadata.clone(), b"PACK from dispatch".to_vec());
         let content_length = body.len().to_string();
         let response = dispatch_vm_http_head_and_body(
@@ -923,9 +895,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_dispatch_rejects_body_exceeding_limit() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         // Tight body cap so an oversized request is cheap to construct.
         let tight = VmGitPushBodyLimits::new(
@@ -984,8 +954,7 @@ mod tests {
         // One counting run to learn how many crash points the handler has.
         let n = {
             let state = make_broker_state(&github);
-            let session =
-                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            let session = session_for_subnet(loopback_net());
             open_audit_session(&state, session.session_id());
             let (staging, _tmp) = open_test_staging_store();
             let plan = CrashPlan::count();
@@ -993,7 +962,7 @@ mod tests {
                 &plan,
                 handle_git_push_request(
                     &session,
-                    encoded_body(sample_metadata(), b"bundle".to_vec()),
+                    encoded_body(sample_push_metadata(), b"bundle".to_vec()),
                     git_push_service_for_test(&state, staging),
                 ),
             )
@@ -1014,8 +983,7 @@ mod tests {
         let mut saw_git_push_interruption = false;
         for k in 0..n {
             let state = make_broker_state(&github);
-            let session =
-                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            let session = session_for_subnet(loopback_net());
             open_audit_session(&state, session.session_id());
             let (staging, _tmp) = open_test_staging_store();
             let plan = CrashPlan::crash_at(k);
@@ -1023,7 +991,7 @@ mod tests {
                 &plan,
                 handle_git_push_request(
                     &session,
-                    encoded_body(sample_metadata(), b"bundle".to_vec()),
+                    encoded_body(sample_push_metadata(), b"bundle".to_vec()),
                     git_push_service_for_test(&state, Arc::clone(&staging)),
                 ),
             )
@@ -1088,8 +1056,7 @@ mod tests {
 
         let idx = {
             let state = make_broker_state(&github);
-            let session =
-                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            let session = session_for_subnet(loopback_net());
             open_audit_session(&state, session.session_id());
             let (staging, _tmp) = open_test_staging_store();
             let plan = CrashPlan::count();
@@ -1097,7 +1064,7 @@ mod tests {
                 &plan,
                 handle_git_push_request(
                     &session,
-                    encoded_body(sample_metadata(), b"x".to_vec()),
+                    encoded_body(sample_push_metadata(), b"x".to_vec()),
                     git_push_service_for_test(&state, staging),
                 ),
             )
@@ -1109,9 +1076,7 @@ mod tests {
                 .expect("handler must have a carrier_staged crash point")
         };
 
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
         let audit_for_action = Arc::clone(&state.audit);
@@ -1133,7 +1098,7 @@ mod tests {
             &plan,
             handle_git_push_request(
                 &session,
-                encoded_body(sample_metadata(), b"x".to_vec()),
+                encoded_body(sample_push_metadata(), b"x".to_vec()),
                 git_push_service_for_test(&state, Arc::clone(&staging)),
             ),
         )

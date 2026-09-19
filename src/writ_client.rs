@@ -420,11 +420,10 @@ mod tests {
     use super::*;
     use crate::agent_run::AgentPrompt;
     use crate::core::{
-        AgentKind, NotesRef, RepoRef, SessionId, Sha256Hex, SshKeyFingerprint, SshSignature,
-        UnixMillis,
+        AgentKind, NotesRef, RepoRef, SessionId, Sha256Hex, SshKeyFingerprint, UnixMillis,
     };
     use crate::protocol::{ClientMessage, SignedRunMetadata};
-    use crate::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
+    use crate::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 
     fn sample_request() -> RunAgentRequest {
         RunAgentRequest {
@@ -451,12 +450,7 @@ mod tests {
         }
     }
 
-    fn sample_object_id() -> GitObjectId {
-        std::iter::repeat_n('a', 40)
-            .collect::<String>()
-            .parse()
-            .unwrap()
-    }
+    use crate::test_support::{sample_object_id, sample_signature};
 
     fn sample_session_id() -> SessionId {
         "00000000-0000-0000-0000-000000000001".parse().unwrap()
@@ -480,13 +474,6 @@ mod tests {
             )
             .unwrap(),
         }
-    }
-
-    fn sample_signature() -> SshSignature {
-        SshSignature::try_new(
-            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQ...\n-----END SSH SIGNATURE-----",
-        )
-        .unwrap()
     }
 
     /// One-shot test broker bound to a tempdir socket. Holds a queue
@@ -645,7 +632,7 @@ mod tests {
     /// `RunAgentCompleted`, client decodes the structured reply.
     #[tokio::test]
     async fn run_agent_round_trips_completed_reply() {
-        let oid = sample_object_id();
+        let oid = sample_object_id('a');
         let meta = sample_signed_metadata();
         let sig = sample_signature();
         let broker = StubBroker::start(ServerMessage::RunAgentCompleted {
@@ -673,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn run_agent_serializes_request_fields_verbatim() {
         let broker = StubBroker::start(ServerMessage::RunAgentCompleted {
-            output_oid: sample_object_id(),
+            output_oid: sample_object_id('a'),
             signed_metadata: sample_signed_metadata(),
             signature: sample_signature(),
         })
@@ -709,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn run_agent_serializes_workspace_and_agent_identity_verbatim() {
         let broker = StubBroker::start(ServerMessage::RunAgentCompleted {
-            output_oid: sample_object_id(),
+            output_oid: sample_object_id('a'),
             signed_metadata: sample_signed_metadata(),
             signature: sample_signature(),
         })
@@ -758,7 +745,7 @@ mod tests {
         // the client should fail before writing. `start` is enough — the
         // broker queues one reply that simply goes unused.
         let broker = StubBroker::start(ServerMessage::RunAgentCompleted {
-            output_oid: sample_object_id(),
+            output_oid: sample_object_id('a'),
             signed_metadata: sample_signed_metadata(),
             signature: sample_signature(),
         })

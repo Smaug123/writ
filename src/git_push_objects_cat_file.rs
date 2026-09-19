@@ -545,9 +545,7 @@ mod tests {
     use crate::github_git_db::TreeEntryKind;
     use crate::test_support::required_tool;
 
-    fn sample_object_id(nibble: char) -> GitObjectId {
-        GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
-    }
+    use crate::test_support::sample_object_id;
 
     // ============== Integration test (real git) ==============
 
