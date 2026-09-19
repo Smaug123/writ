@@ -28,11 +28,14 @@ fn plan_submit_parses_minimum_required_flags() {
     let Cmd::Plan {
         action:
             PlanCmd::Submit {
-                prompt_file,
-                repo,
-                bailiff_repo,
-                writ_repo,
-                writ_allowed_signers,
+                workflow:
+                    WorkflowArgs {
+                        prompt_file,
+                        repo,
+                        bailiff_repo,
+                        writ_repo,
+                        writ_allowed_signers,
+                    },
                 plan_id,
                 purpose,
                 label,
@@ -92,8 +95,12 @@ fn plan_submit_accepts_every_optional_flag() {
     let Cmd::Plan {
         action:
             PlanCmd::Submit {
-                bailiff_repo,
-                writ_repo,
+                workflow:
+                    WorkflowArgs {
+                        bailiff_repo,
+                        writ_repo,
+                        ..
+                    },
                 plan_id,
                 purpose,
                 label,
@@ -415,11 +422,14 @@ fn plan_review_parses_minimum_required_flags() {
         action:
             PlanCmd::Review {
                 plan_id,
-                prompt_file,
-                repo,
-                bailiff_repo,
-                writ_repo,
-                writ_allowed_signers,
+                workflow:
+                    WorkflowArgs {
+                        prompt_file,
+                        repo,
+                        bailiff_repo,
+                        writ_repo,
+                        writ_allowed_signers,
+                    },
                 purpose,
                 label,
                 agent,
@@ -479,8 +489,12 @@ fn plan_review_accepts_every_optional_flag() {
         action:
             PlanCmd::Review {
                 plan_id,
-                bailiff_repo,
-                writ_repo,
+                workflow:
+                    WorkflowArgs {
+                        bailiff_repo,
+                        writ_repo,
+                        ..
+                    },
                 purpose,
                 label,
                 agent,
@@ -783,11 +797,14 @@ fn plan_implement_parses_minimum_required_flags() {
         action:
             PlanCmd::Implement {
                 plan_id,
-                prompt_file,
-                repo,
-                bailiff_repo,
-                writ_repo,
-                writ_allowed_signers,
+                workflow:
+                    WorkflowArgs {
+                        prompt_file,
+                        repo,
+                        bailiff_repo,
+                        writ_repo,
+                        writ_allowed_signers,
+                    },
                 purpose,
                 agent,
                 model,
@@ -844,8 +861,12 @@ fn plan_implement_accepts_every_optional_flag() {
         action:
             PlanCmd::Implement {
                 plan_id,
-                bailiff_repo,
-                writ_repo,
+                workflow:
+                    WorkflowArgs {
+                        bailiff_repo,
+                        writ_repo,
+                        ..
+                    },
                 purpose,
                 agent,
                 model,

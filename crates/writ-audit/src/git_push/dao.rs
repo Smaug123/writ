@@ -171,14 +171,15 @@ fn write_attempt_state(
     Ok(())
 }
 
-/// The v7 ledger mint recorded against an attempt, if any. Read inside
-/// the caller's transaction so a resolve copies the same value the
-/// eligibility check saw.
+/// The v7 ledger mint recorded against an attempt, if any. Resolve reads
+/// it inside its own transaction so it copies the same value the
+/// eligibility check saw; boot reconcile reads it on the bare
+/// connection.
 fn read_attempt_ledger_mint(
-    tx: &rusqlite::Transaction<'_>,
+    conn: &rusqlite::Connection,
     attempt_id: ApproveAttemptId,
 ) -> Result<Option<PromoteMintAudit>, AuditError> {
-    let row = tx
+    let row = conn
         .query_row(
             "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
                FROM git_push_approve_attempt_mint
@@ -451,7 +452,9 @@ impl AuditLog {
         push_request_id: RequestId,
     ) -> Result<Option<GitPushAuditEntry>, AuditError> {
         self.with_conn(|c| {
-            let mut stmt = c.prepare(GIT_PUSH_AUDIT_ENTRY_BY_REQUEST_SQL)?;
+            let mut stmt = c.prepare(&format!(
+                "{GIT_PUSH_AUDIT_ENTRY_SELECT_SQL} WHERE r.push_request_id = ?1"
+            ))?;
             let row = stmt
                 .query_row(
                     params![push_request_id.as_uuid().to_string()],
@@ -462,12 +465,18 @@ impl AuditLog {
         })
     }
 
+    /// Every staged push in one session, ordered by arrival so callers
+    /// can read the staged-push timeline.
     pub fn list_git_pushes_for_session(
         &self,
         id: SessionId,
     ) -> Result<Vec<GitPushAuditEntry>, AuditError> {
         self.with_conn(|c| {
-            let mut stmt = c.prepare(GIT_PUSH_AUDIT_ENTRY_BY_SESSION_SQL)?;
+            let mut stmt = c.prepare(&format!(
+                "{GIT_PUSH_AUDIT_ENTRY_SELECT_SQL}
+                 WHERE r.session_id = ?1
+                 ORDER BY r.received_at ASC, r.rowid ASC"
+            ))?;
             let rows = stmt
                 .query_map(
                     params![id.as_uuid().to_string()],
@@ -657,39 +666,7 @@ impl AuditLog {
         &self,
         attempt_id: ApproveAttemptId,
     ) -> Result<Option<PromoteMintAudit>, AuditError> {
-        self.with_conn(|c| {
-            let row = c
-                .query_row(
-                    "SELECT mint_jti, mint_github_app_id, mint_issued_at, mint_expires_at
-                       FROM git_push_approve_attempt_mint
-                      WHERE attempt_id = ?1",
-                    params![attempt_id.as_uuid().to_string()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((jti_str, app_id, issued_at, expires_at)) = row else {
-                return Ok(None);
-            };
-            let jti = uuid::Uuid::parse_str(&jti_str)
-                .map(Jti::from_uuid)
-                .map_err(|_| AuditError::Invariant("attempt mint ledger: jti is not a uuid"))?;
-            let github_app_id = u64::try_from(app_id).map_err(|_| {
-                AuditError::Invariant("attempt mint ledger: github_app_id is negative")
-            })?;
-            Ok(Some(PromoteMintAudit {
-                jti,
-                github_app_id,
-                issued_at: UnixMillis::from_millis(issued_at),
-                expires_at: UnixMillis::from_millis(expires_at),
-            }))
-        })
+        self.with_conn(|c| read_attempt_ledger_mint(c, attempt_id))
     }
 
     /// Transition a `Started` attempt to `Uncertain`, persisting the

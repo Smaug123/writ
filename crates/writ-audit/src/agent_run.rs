@@ -405,87 +405,19 @@ impl AuditLog {
         })
     }
 
-    /// Most-recent `agent_run.run_id` for a session — by `requested_at`
-    /// descending, with `run_id` as a tiebreak so the answer does not
-    /// depend on SQLite's unspecified tie order (see the
-    /// `LATEST_RUN_ORDER` constant). `None` if no run row exists. Used by the UI
-    /// HTTP join to give the operator a stable handle to follow from a
-    /// VM into a run view; the run itself is exposed through
-    /// `/v1/agent-runs/<id>` and not inlined here.
-    pub fn latest_agent_run_id_for_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<AgentRunId>, AuditError> {
-        self.with_conn(|c| {
-            let raw: Option<String> = c
-                .query_row(
-                    &format!(
-                        "SELECT run_id FROM agent_run
-                         WHERE session_id = ?1
-                         ORDER BY {LATEST_RUN_ORDER}
-                         LIMIT 1"
-                    ),
-                    params![session_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            raw.map(|s| {
-                uuid::Uuid::parse_str(&s)
-                    .map(AgentRunId::from_uuid)
-                    .map_err(|_| AuditError::Invariant("agent run row: run_id not a uuid"))
-            })
-            .transpose()
-        })
-    }
-
-    /// Lookup of the `correlation_id` belonging to an agent run on the
-    /// given session. Returns `None` for sessions with no agent run
-    /// (e.g. raw `start_agent_vm_session` flows) or with an untagged
-    /// run. The VM HTTP git-push handler uses this to inherit the
-    /// correlation id from the run onto the push it stages, so a
-    /// `--correlation-id`'d run's pushes share the same join key.
-    ///
-    /// Today's product flow creates one run per session. Ordering by
-    /// `requested_at` descending with a `run_id` tiebreak (the
-    /// `LATEST_RUN_ORDER` constant) is defensive against a future N>1
-    /// case so the answer stays deterministic; if the invariant is ever
-    /// loosened, the policy "most recent run wins" is the obvious one
-    /// and the audit row stores everything needed to revisit it.
-    pub fn correlation_id_for_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<CorrelationId>, AuditError> {
-        self.with_conn(|c| {
-            let raw: Option<Option<String>> = c
-                .query_row(
-                    &format!(
-                        "SELECT correlation_id FROM agent_run
-                         WHERE session_id = ?1
-                         ORDER BY {LATEST_RUN_ORDER}
-                         LIMIT 1"
-                    ),
-                    params![session_id.as_uuid().to_string()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match raw.flatten() {
-                None => Ok(None),
-                Some(value) => CorrelationId::try_new(value)
-                    .map(Some)
-                    .map_err(|_| AuditError::Invariant("agent run row: correlation_id is invalid")),
-            }
-        })
-    }
-
     /// The most-recently-requested `agent_run` belonging to a session,
-    /// or `None` if the session has no run.
+    /// or `None` if the session has no run (a raw `start_agent_vm_session`
+    /// flow opens a session without recording one). The VM git-push
+    /// handler reads the run's correlation id through this so a
+    /// `--correlation-id`'d run's pushes share its join key; the UI join
+    /// reads the run id as a handle to follow from a VM into a run view.
     ///
     /// Today the product invariant is one run per session; ordering by
     /// `requested_at` descending with a `run_id` tiebreak (the
     /// `LATEST_RUN_ORDER` constant) is defensive against a future N>1
-    /// case so the answer stays deterministic. "Most recent run wins" matches
-    /// the corresponding choice in
-    /// [`Self::correlation_id_for_session`].
+    /// case so the answer stays deterministic. "Most recent run wins" is
+    /// the obvious policy, and the row stores everything needed to
+    /// revisit it.
     pub fn agent_run_for_session(
         &self,
         session_id: SessionId,
@@ -514,7 +446,7 @@ impl AuditLog {
     /// number of queries rather than two per session.
     ///
     /// Equivalent to calling [`Self::get_session`] and
-    /// [`Self::latest_agent_run_id_for_session`] for each id — that
+    /// [`Self::agent_run_for_session`] (taking its `run_id`) for each id — that
     /// equivalence is the property the tests assert, against those
     /// methods as the reference. Ids absent from the log map to a
     /// `SessionRunSummary` with both fields `None`, so the returned map
@@ -1245,73 +1177,6 @@ mod tests {
         }
     }
 
-    /// `correlation_id_for_session` returns:
-    ///   - `Some(id)` when the session's run was tagged,
-    ///   - `None` when the run is untagged, and
-    ///   - `None` when no run exists for the session at all (this is
-    ///     the raw-VM-session case — `start_agent_vm_session` opens a
-    ///     session without recording an `agent_run`).
-    ///
-    /// The VM git-push handler relies on the third case to leave the
-    /// push correlation NULL for non-run flows.
-    #[test]
-    fn correlation_id_for_session_returns_run_value_or_none() {
-        let log = AuditLog::open_in_memory().unwrap();
-
-        // Session with no run — used by `start_agent_vm_session`.
-        let no_run = sample_session();
-        log.open_session(&no_run).unwrap();
-        assert!(
-            log.correlation_id_for_session(no_run.session_id)
-                .unwrap()
-                .is_none()
-        );
-
-        // Session whose run is untagged.
-        let untagged = SessionRecord {
-            session_id: SessionId::new(),
-            ..sample_session()
-        };
-        log.open_session(&untagged).unwrap();
-        log.record_agent_run(&AgentRunAuditRecord {
-            run_id: AgentRunId::new(),
-            session_id: untagged.session_id,
-            requested_at: UnixMillis::from_millis(1_700_000_100),
-            agent_kind: AgentKind::Claude,
-            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
-            correlation_id: None,
-            purpose: None,
-        })
-        .unwrap();
-        assert!(
-            log.correlation_id_for_session(untagged.session_id)
-                .unwrap()
-                .is_none()
-        );
-
-        // Session whose run carries a correlation id.
-        let tagged = SessionRecord {
-            session_id: SessionId::new(),
-            ..sample_session()
-        };
-        log.open_session(&tagged).unwrap();
-        let correlation = CorrelationId::try_new("feat-42_xyz").unwrap();
-        log.record_agent_run(&AgentRunAuditRecord {
-            run_id: AgentRunId::new(),
-            session_id: tagged.session_id,
-            requested_at: UnixMillis::from_millis(1_700_000_200),
-            agent_kind: AgentKind::Claude,
-            prompt: writ_agent_run::AgentPrompt::new("prompt").summary(),
-            correlation_id: Some(correlation.clone()),
-            purpose: None,
-        })
-        .unwrap();
-        assert_eq!(
-            log.correlation_id_for_session(tagged.session_id).unwrap(),
-            Some(correlation)
-        );
-    }
-
     /// `agent_run_for_session` returns the latest run on a session and
     /// `None` when the session has no run.
     #[test]
@@ -1327,19 +1192,10 @@ mod tests {
                 .is_none(),
         );
 
-        // After recording two runs on the same session, the later one
-        // wins (defensive against a future N>1 case).
+        // After recording two runs on the same session, the later
+        // `requested_at` wins regardless of insertion order (defensive
+        // against a future N>1 case).
         let earlier_run_id = AgentRunId::new();
-        log.record_agent_run(&AgentRunAuditRecord {
-            run_id: earlier_run_id,
-            session_id: session.session_id,
-            requested_at: UnixMillis::from_millis(1_700_000_100),
-            agent_kind: AgentKind::Claude,
-            prompt: writ_agent_run::AgentPrompt::new("plan this").summary(),
-            correlation_id: None,
-            purpose: None,
-        })
-        .unwrap();
         let later_run_id = AgentRunId::new();
         log.record_agent_run(&AgentRunAuditRecord {
             run_id: later_run_id,
@@ -1347,6 +1203,16 @@ mod tests {
             requested_at: UnixMillis::from_millis(1_700_000_200),
             agent_kind: AgentKind::Claude,
             prompt: writ_agent_run::AgentPrompt::new("review the plan").summary(),
+            correlation_id: None,
+            purpose: None,
+        })
+        .unwrap();
+        log.record_agent_run(&AgentRunAuditRecord {
+            run_id: earlier_run_id,
+            session_id: session.session_id,
+            requested_at: UnixMillis::from_millis(1_700_000_100),
+            agent_kind: AgentKind::Claude,
+            prompt: writ_agent_run::AgentPrompt::new("plan this").summary(),
             correlation_id: None,
             purpose: None,
         })
@@ -1361,54 +1227,6 @@ mod tests {
         // A session that is unknown to the audit log resolves to None.
         let other = SessionId::new();
         assert!(log.agent_run_for_session(other).unwrap().is_none());
-    }
-
-    #[test]
-    fn latest_agent_run_id_returns_most_recent_or_none() {
-        let log = AuditLog::open_in_memory().unwrap();
-
-        // No run on the session.
-        let bare = sample_session();
-        log.open_session(&bare).unwrap();
-        assert!(
-            log.latest_agent_run_id_for_session(bare.session_id)
-                .unwrap()
-                .is_none()
-        );
-
-        // Two runs; the later requested_at wins regardless of insertion order.
-        let session = SessionRecord {
-            session_id: SessionId::new(),
-            ..sample_session()
-        };
-        log.open_session(&session).unwrap();
-        let earlier = AgentRunId::new();
-        let later = AgentRunId::new();
-        log.record_agent_run(&AgentRunAuditRecord {
-            run_id: later,
-            session_id: session.session_id,
-            requested_at: UnixMillis::from_millis(1_700_000_500),
-            agent_kind: AgentKind::Claude,
-            prompt: writ_agent_run::AgentPrompt::new("p").summary(),
-            correlation_id: None,
-            purpose: None,
-        })
-        .unwrap();
-        log.record_agent_run(&AgentRunAuditRecord {
-            run_id: earlier,
-            session_id: session.session_id,
-            requested_at: UnixMillis::from_millis(1_700_000_100),
-            agent_kind: AgentKind::Claude,
-            prompt: writ_agent_run::AgentPrompt::new("p").summary(),
-            correlation_id: None,
-            purpose: None,
-        })
-        .unwrap();
-        assert_eq!(
-            log.latest_agent_run_id_for_session(session.session_id)
-                .unwrap(),
-            Some(later)
-        );
     }
 
     /// A session, how many runs it has, and whether the log knows it at
@@ -1495,32 +1313,11 @@ mod tests {
                 prop_assert_eq!(&got.session, &log.get_session(*id).unwrap());
                 prop_assert_eq!(
                     &got.latest_run_id,
-                    &log.latest_agent_run_id_for_session(*id).unwrap()
+                    &log.agent_run_for_session(*id).unwrap().map(|run| run.run_id)
                 );
             }
         }
 
-        /// Every reader of "the session's most recent run" picks the
-        /// same one, including when runs tie on `requested_at`.
-        ///
-        /// Asserted separately from the batch property because these
-        /// three are used in different places for different reasons —
-        /// the git-push handler inherits a correlation id, the UI shows
-        /// a handle — and nothing but this test stops one of them being
-        /// reordered on its own.
-        #[test]
-        fn the_per_session_lookups_agree_on_which_run_is_latest(
-            runs in 1usize..=4,
-        ) {
-            let log = AuditLog::open_in_memory().unwrap();
-            let ids = seed_sessions(&log, &[SessionPlan { opened: true, runs }]);
-            let id = ids[0];
-
-            let by_id = log.latest_agent_run_id_for_session(id).unwrap();
-            let by_record = log.agent_run_for_session(id).unwrap().map(|r| r.run_id);
-            prop_assert_eq!(by_id, by_record);
-            prop_assert!(by_id.is_some());
-        }
     }
 
     /// A repeated id is answered once, not counted twice — the caller
@@ -1542,7 +1339,7 @@ mod tests {
         assert_eq!(batched.len(), 1);
         assert_eq!(
             batched[&id].latest_run_id,
-            log.latest_agent_run_id_for_session(id).unwrap()
+            log.agent_run_for_session(id).unwrap().map(|run| run.run_id)
         );
     }
 
