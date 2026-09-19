@@ -627,34 +627,13 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
+    use crate::vm_git::GitObjectId;
     use proptest::prelude::*;
-    use std::str::FromStr as _;
     use tempfile::TempDir;
 
-    fn sample_object_id(nibble: char) -> GitObjectId {
-        std::iter::repeat_n(nibble, 40)
-            .collect::<String>()
-            .parse()
-            .unwrap()
-    }
-
-    fn sample_repo() -> GitCloneRepo {
-        "owner/repo".parse().unwrap()
-    }
-
-    fn sample_branch() -> GitBranchName {
-        GitBranchName::from_str("feature/x").unwrap()
-    }
-
-    fn sample_metadata() -> VmGitPushMetadata {
-        VmGitPushMetadata::new(
-            sample_repo(),
-            sample_branch(),
-            Some(sample_object_id('a')),
-            sample_object_id('b'),
-        )
-    }
+    use crate::test_support::{
+        sample_branch, sample_clone_repo, sample_object_id, sample_push_metadata,
+    };
 
     fn open_store() -> (GitPushStagingStore, TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -676,7 +655,7 @@ mod tests {
     fn stage_then_load_returns_same_entry() {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"PACK bundle bytes".to_vec();
         let staged_at = UnixMillis::from_millis(1_700_000_000_123);
 
@@ -702,7 +681,7 @@ mod tests {
     fn stage_twice_with_same_payload_is_idempotent() {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "22222222-2222-2222-2222-222222222222".parse().unwrap();
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"identical bundle".to_vec();
         let staged_at = UnixMillis::from_millis(42);
 
@@ -719,9 +698,9 @@ mod tests {
     fn stage_twice_with_different_metadata_errors_conflict() {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "33333333-3333-3333-3333-333333333333".parse().unwrap();
-        let metadata_a = sample_metadata();
+        let metadata_a = sample_push_metadata();
         let metadata_b = VmGitPushMetadata::new(
-            sample_repo(),
+            sample_clone_repo(),
             sample_branch(),
             Some(sample_object_id('a')),
             sample_object_id('c'), // different new_head
@@ -742,7 +721,7 @@ mod tests {
     fn stage_twice_with_different_bundle_errors_conflict() {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "44444444-4444-4444-4444-444444444444".parse().unwrap();
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let staged_at = UnixMillis::from_millis(9);
 
         store
@@ -766,7 +745,7 @@ mod tests {
         // surfaced rather than silently overwriting.
         let (store, _tmp) = open_store();
         let request_id: RequestId = "55555555-5555-5555-5555-555555555555".parse().unwrap();
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"bundle".to_vec();
 
         store
@@ -804,7 +783,7 @@ mod tests {
                 .stage(
                     *id,
                     UnixMillis::from_millis(i as i64),
-                    sample_metadata(),
+                    sample_push_metadata(),
                     format!("bundle-{i}").into_bytes(),
                 )
                 .unwrap();
@@ -844,7 +823,7 @@ mod tests {
             .stage(
                 request_id,
                 UnixMillis::from_millis(0),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"ok".to_vec(),
             )
             .unwrap();
@@ -866,7 +845,7 @@ mod tests {
             .stage(
                 request_id,
                 UnixMillis::from_millis(0),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"ok".to_vec(),
             )
             .unwrap();
@@ -896,7 +875,7 @@ mod tests {
             .stage(
                 request_id,
                 UnixMillis::from_millis(0),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"ok".to_vec(),
             )
             .unwrap();
@@ -924,8 +903,12 @@ mod tests {
     fn branch_creation_roundtrips_with_null_expected_head() {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "99999999-9999-9999-9999-999999999999".parse().unwrap();
-        let metadata =
-            VmGitPushMetadata::new(sample_repo(), sample_branch(), None, sample_object_id('d'));
+        let metadata = VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            None,
+            sample_object_id('d'),
+        );
         let receipt = store
             .stage(
                 request_id,
@@ -950,7 +933,7 @@ mod tests {
         let (store, _tmp) = open_store();
         let request_id: RequestId = "bbbbbbbb-0000-0000-0000-000000000000".parse().unwrap();
         let staged_at = UnixMillis::from_millis(2024);
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"identical bundle bytes".to_vec();
 
         let expected_receipt = VmGitPushStagedReceipt::new(
@@ -983,7 +966,7 @@ mod tests {
             .stage(
                 request_id,
                 UnixMillis::from_millis(0),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"secret".to_vec(),
             )
             .unwrap();
@@ -1002,7 +985,7 @@ mod tests {
             .stage(
                 request_id,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"to be deleted".to_vec(),
             )
             .unwrap();
@@ -1031,7 +1014,7 @@ mod tests {
             .stage(
                 request_id,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"twice".to_vec(),
             )
             .unwrap();
@@ -1060,7 +1043,7 @@ mod tests {
                 .stage(
                     *id,
                     UnixMillis::from_millis(1),
-                    sample_metadata(),
+                    sample_push_metadata(),
                     b"b".to_vec(),
                 )
                 .unwrap();
@@ -1101,7 +1084,7 @@ mod tests {
             .stage(
                 healthy,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"ok".to_vec(),
             )
             .unwrap();
@@ -1109,7 +1092,7 @@ mod tests {
             .stage(
                 torn,
                 UnixMillis::from_millis(2),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"torn".to_vec(),
             )
             .unwrap();
@@ -1150,7 +1133,7 @@ mod tests {
             .stage(
                 id,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"gone".to_vec(),
             )
             .unwrap();
@@ -1177,7 +1160,7 @@ mod tests {
             .stage(
                 id,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"orig".to_vec(),
             )
             .unwrap();
@@ -1208,7 +1191,7 @@ mod tests {
             .stage(
                 id,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"b".to_vec(),
             )
             .unwrap();
@@ -1238,7 +1221,7 @@ mod tests {
             .stage(
                 id,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"b".to_vec(),
             )
             .unwrap();
@@ -1295,7 +1278,7 @@ mod tests {
                 .stage(
                     id,
                     UnixMillis::from_millis(1),
-                    sample_metadata(),
+                    sample_push_metadata(),
                     b"b".to_vec(),
                 )
                 .unwrap();
@@ -1330,7 +1313,7 @@ mod tests {
             .stage(
                 id,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"b".to_vec(),
             )
             .unwrap();
@@ -1350,7 +1333,7 @@ mod tests {
             .stage(
                 healthy,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"ok".to_vec(),
             )
             .unwrap();
@@ -1383,7 +1366,7 @@ mod tests {
             .stage(
                 healthy,
                 UnixMillis::from_millis(1),
-                sample_metadata(),
+                sample_push_metadata(),
                 b"ok".to_vec(),
             )
             .unwrap();
@@ -1440,7 +1423,7 @@ mod tests {
         ) {
             let (store, _tmp) = open_store();
             let metadata = VmGitPushMetadata::new(
-                sample_repo(),
+                sample_clone_repo(),
                 sample_branch(),
                 expected.clone(),
                 new_head.clone(),
@@ -1467,7 +1450,7 @@ mod tests {
         ) {
             let (store, _tmp) = open_store();
             let metadata = VmGitPushMetadata::new(
-                sample_repo(),
+                sample_clone_repo(),
                 sample_branch(),
                 expected,
                 new_head,
@@ -1491,7 +1474,7 @@ mod tests {
                     .stage(
                         *id,
                         UnixMillis::from_millis(i as i64),
-                        sample_metadata(),
+                        sample_push_metadata(),
                         format!("bundle-{i}").into_bytes(),
                     )
                     .unwrap();

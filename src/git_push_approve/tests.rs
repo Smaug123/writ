@@ -16,16 +16,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::git_push_promote::UpdateRefError;
 use crate::github_git_db::{CommitIdentity, GitDataError};
-use crate::test_support::{find_in_path, rev_parse, run_git};
+use crate::test_support::{find_in_path, rev_parse, run_git, sample_object_id};
 use crate::vm_git::GitBranchName;
 use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
 use writ_core::git_env::apply_clean_git_config;
 
 // ---------- shared fixtures ----------
-
-fn sample_object_id(nibble: char) -> GitObjectId {
-    GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
-}
 
 fn sample_repo() -> GitCloneRepo {
     GitCloneRepo::new(RepoRef::from_str("owner/name").unwrap()).unwrap()
