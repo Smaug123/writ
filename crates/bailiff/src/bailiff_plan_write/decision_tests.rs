@@ -1,5 +1,5 @@
-//! Tests for [`write_decision_note`] — the slice D1.3 idempotent
-//! write helper. Each test drives the helper directly against a
+//! Tests for [`write_decision_note`] — the idempotent write helper.
+//! Each test drives the helper directly against a
 //! tempdir-backed bare repo (no broker, no writ side).
 use super::test_support::*;
 use super::*;
@@ -26,8 +26,7 @@ fn sample_decision_note(plan_id: PlanId, outcome: Decision) -> DecisionNote {
 /// A note write leaves bailiff's repo compacted-if-needed, not merely written.
 ///
 /// Writ suppresses git's background auto-maintenance in every repo it owns, so
-/// nothing else will ever pack this one; before this, nothing called
-/// `compact_if_needed` for bailiff at all. What is asserted is the *wiring* —
+/// nothing else will ever pack this one. What is asserted is the *wiring* —
 /// that the repo was measured — rather than a repack, because a fixture repo
 /// holds a handful of objects and git's own `gc.auto` threshold is 6700, so the
 /// honest outcome here is `Skipped`.

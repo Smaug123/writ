@@ -305,8 +305,8 @@ fn run_agent_accepts_payload_without_workspace_field() {
 
 /// When the caller supplies `agent_kind` and `agent_model`, both
 /// fields appear on the wire under those exact names and
-/// round-trip byte-equal. Slice VM2b adds the pair so VM-mode
-/// `RunAgent` callers can pick the model the broker pins onto the
+/// round-trip byte-equal. The pair lets VM-mode `RunAgent` callers
+/// pick the model the broker pins onto the
 /// VM's `/v1/agent-runs/<id>/config` response — the host path
 /// ignores both fields, but the wire shape carries them
 /// regardless so a single decoder serves both modes.
@@ -1025,8 +1025,7 @@ fn run_agent_completed_roundtrips() {
 }
 
 /// Pin the wire type tag and the public field names. A regression
-/// in any of these would silently break bailiff at parse time once
-/// slice B starts emitting real responses.
+/// in any of these would silently break bailiff at parse time.
 #[test]
 fn run_agent_completed_pins_wire_shape() {
     let msg = ServerMessage::RunAgentCompleted {

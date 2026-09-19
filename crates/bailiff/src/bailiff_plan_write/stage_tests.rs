@@ -1,14 +1,7 @@
 //! Tests for [`write_stage_note`], parameterised over the three
-//! envelope-bearing stages.
+//! envelope-bearing stages. Every case runs for all three.
 //!
-//! Replaces `plan_tests`, `review_tests`, and `implement_tests`, which
-//! between them were 1,168 lines carrying the same test names modulo
-//! the noun — the test-layer half of the triplication slice 3b removes.
-//! Every case here runs for all three stages, so the coverage is
-//! strictly larger than the three modules it replaces: several
-//! properties were previously pinned for only one or two of them.
-//!
-//! Harness shape is unchanged: a tempdir-backed writ repo holding one
+//! Harness: a tempdir-backed writ repo holding one
 //! signed envelope, a sibling bailiff repo, and an `AllowedSigners`
 //! keyring. The full broker handshake stays in `end_to_end_tests`.
 
@@ -138,12 +131,6 @@ fn happy_path_round_trips_for_every_stage() {
 }
 
 /// Idempotent by error, for **every** stage.
-///
-/// Before slice 3b the submission was the odd one out: `write_note`
-/// refused a duplicate with a generic git failure where its siblings
-/// returned the typed conflict. Both refused; only one said why. This
-/// test running for `Submit` is the record of that delta — under the
-/// old code it would have failed for that stage alone.
 #[test]
 fn a_second_write_is_refused_and_the_first_body_survives() {
     for stage in AgentStage::ALL {
@@ -315,10 +302,6 @@ fn a_missing_writ_repo_surfaces_as_a_fetch_failure() {
 
 /// Two plans are independent: the same envelope backs a note under
 /// each, and neither write disturbs the other.
-///
-/// Previously pinned for the submission alone
-/// (`supports_two_plans_referencing_one_writ_envelope`) and, in a
-/// different form, for review and implement.
 #[test]
 fn distinct_plans_are_independent_for_every_stage() {
     for stage in AgentStage::ALL {
@@ -448,10 +431,8 @@ fn all_four_notes_coexist_under_one_ref() {
 /// helper enforces one invariant only (one note per plan-and-stage),
 /// and ordering is the state machine's job under the plan lock.
 ///
-/// Previously pinned as `does_not_require_pre_existing_submission` for
-/// review and implement; it holds for all three, and stating it for
-/// all three is what keeps a precondition from creeping back into the
-/// write layer where the gate could not see it.
+/// Stating it for all three is what keeps a precondition from creeping
+/// back into the write layer where the gate could not see it.
 #[test]
 fn any_stage_writes_with_no_other_note_present() {
     for stage in AgentStage::ALL {
@@ -553,12 +534,10 @@ fn several_implementer_attempts_coexist_on_one_plan() {
 /// A gap in the attempt sequence is refused, not silently truncated —
 /// **at every width**, and however far past the hole the next note is.
 ///
-/// Parameterised over the gap width because the first version of the
-/// scanner probed exactly one slot past the miss, which catches width
-/// one and nothing else: `{0, 3}` looked identical to `{0}`, so
-/// attempt 3 was invisible to every reader while the next run refilled
-/// slot 1. Codex review caught that; a width-1-only test could not
-/// have. The widths here straddle the old check's reach on both sides.
+/// Parameterised over the gap width because a scanner that probed one
+/// slot past the miss would catch width one and nothing else: `{0, 3}`
+/// would look identical to `{0}`, so attempt 3 would be invisible to
+/// every reader while the next run refilled slot 1.
 #[test]
 fn a_gap_in_the_attempt_sequence_is_refused_at_any_width() {
     for present in [vec![0u32, 2], vec![0, 3], vec![0, 1, 5], vec![0, 9]] {

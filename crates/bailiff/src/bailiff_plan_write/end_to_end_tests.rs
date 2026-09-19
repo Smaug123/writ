@@ -136,7 +136,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     broker_task.stop().await;
 }
 
-/// Full slice-D2 handshake against a real writ broker: bailiff
+/// Full handshake against a real writ broker: bailiff
 /// sends `RunAgent` for a reviewer run, writ signs and persists
 /// the envelope, then bailiff drives `write_review_note` to fetch
 /// the envelope, verify it, and store a `ReviewNote` keyed on the

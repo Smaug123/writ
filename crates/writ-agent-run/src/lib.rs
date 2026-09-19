@@ -1628,12 +1628,9 @@ mod process_runner {
     /// Signal the agent's whole process group. Returns whether it was
     /// signalled.
     ///
-    /// Delegates to `writ_core::process_group`, which is the codebase's single
-    /// definition of this — the errno cases it tolerates and the reason it is
-    /// safe to tolerate them took several rounds of review to state, and a
-    /// second copy here would be a second place to get them wrong. The
-    /// precondition that definition requires is that the leader is still
-    /// unreaped; every caller here kills before it waits.
+    /// Delegates to `writ_core::process_group`, the codebase's single
+    /// definition of this. The precondition that definition requires is that
+    /// the leader is still unreaped; every caller here kills before it waits.
     ///
     /// `empty_group_is_benign` is true because that is exactly the case at
     /// hand: the agent may have exited between the last poll and this kill,
@@ -2191,8 +2188,7 @@ mod process_runner {
         /// This is what makes the sweep that follows safe. Production kills the
         /// group between the wait and the reap, and a wait that reaped would
         /// free the pid for the OS to hand to somebody else, so the kill could
-        /// land on a group writ never created. The unbounded path used to reap
-        /// here, which was fine only while it never swept.
+        /// land on a group writ never created.
         ///
         /// Driven through `wait_to_deadline(None)` — the path production takes
         /// — rather than a method only this test calls.
@@ -2236,10 +2232,9 @@ mod process_runner {
         ///
         /// The same `ECHILD` hazard `a_probe_that_finds_the_pid_gone_disarms_the_guard`
         /// covers for the polling path. It needs its own test because it is a
-        /// second call site with its own disarm: the unbounded path no longer
-        /// takes the child before waiting — it cannot, since the sweep needs it
-        /// — so the protection that used to be structural is now explicit, and
-        /// explicit code is what regresses silently.
+        /// second call site with its own disarm: the unbounded path cannot take
+        /// the child before waiting, since the sweep needs it, so the disarm is
+        /// explicit code rather than structure.
         #[test]
         fn an_unbounded_wait_that_finds_the_pid_gone_disarms_the_guard() {
             let mut child = writ_core::process_spawn::spawn(
@@ -2629,8 +2624,7 @@ mod tests {
 
     /// A wire payload with an unknown extra key must be rejected at
     /// parse time. Pinned because `deny_unknown_fields` is the only
-    /// guard now that the hand-rolled visitor (which previously
-    /// enforced the field set) is gone.
+    /// guard.
     #[test]
     fn vm_agent_run_config_response_rejects_unknown_field() {
         let json = r#"{
@@ -3413,11 +3407,10 @@ mod tests {
     /// A run that ends by itself tears down what it started — with no deadline
     /// configured at all.
     ///
-    /// This is the default path, and until now it swept nothing: an agent that
-    /// exited in milliseconds left the run blocked in the capture-thread join
-    /// for as long as a descendant held the stream pipes, and that descendant
-    /// then outlived the run entirely. A finished run is supposed to be
-    /// finished.
+    /// This is the default path. Without the sweep, an agent that exited in
+    /// milliseconds would leave the run blocked in the capture-thread join for
+    /// as long as a descendant held the stream pipes, and that descendant would
+    /// outlive the run entirely. A finished run is supposed to be finished.
     ///
     /// The fake's descendant would hold the pipes for a minute and the plan
     /// carries no timeout, so a run that returns in a fraction of that has had
