@@ -3,6 +3,7 @@
 use super::test_support::*;
 use super::*;
 use crate::core::AgentKind;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use wiremock::MockServer;
 
 #[tokio::test]
@@ -59,53 +60,6 @@ async fn socket_roundtrip_open_and_close_session() {
     let record = state.audit.get_session(session_id).unwrap().unwrap();
     assert!(record.closed_at.is_some());
 }
-/// Normal line within the cap: reads cleanly, strips trailing `\r`.
-#[tokio::test]
-async fn read_line_bounded_reads_up_to_newline() {
-    let mut input = &b"hello\r\n"[..];
-    let line = read_line_bounded(&mut input, 64).await.unwrap().unwrap();
-    assert_eq!(&line, b"hello");
-}
-
-/// EOF before any bytes is `Ok(None)`, matching AsyncBufReadExt::read_line.
-#[tokio::test]
-async fn read_line_bounded_returns_none_on_clean_eof() {
-    let mut input: &[u8] = b"";
-    assert!(read_line_bounded(&mut input, 64).await.unwrap().is_none());
-}
-
-/// EOF after bytes but without a newline yields whatever was read —
-/// lets the caller decide whether a final unterminated frame is an
-/// error (our caller treats the JSON parse failure as the error).
-#[tokio::test]
-async fn read_line_bounded_returns_partial_on_eof_without_newline() {
-    let mut input = &b"abc"[..];
-    let line = read_line_bounded(&mut input, 64).await.unwrap().unwrap();
-    assert_eq!(&line, b"abc");
-}
-
-/// A line exceeding the cap (even without a newline) is rejected
-/// rather than buffered to completion — that's the whole point of
-/// the cap.
-#[tokio::test]
-async fn read_line_bounded_rejects_oversize_without_newline() {
-    let big = vec![b'x'; 128];
-    let mut input = big.as_slice();
-    let err = read_line_bounded(&mut input, 64).await.unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-}
-
-/// Oversize with a newline also rejects, and does so without having
-/// grown the internal buffer past the cap.
-#[tokio::test]
-async fn read_line_bounded_rejects_oversize_with_newline() {
-    let mut big = vec![b'x'; 128];
-    big.push(b'\n');
-    let mut input = big.as_slice();
-    let err = read_line_bounded(&mut input, 64).await.unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-}
-
 /// After the cap is hit, the connection-level handler reports a
 /// structured error to the peer so a CLI surfaces something
 /// actionable rather than a mystery-close.

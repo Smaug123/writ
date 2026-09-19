@@ -11,77 +11,45 @@
 //! and surfaces as a `RunAgent` error. Tighten this when a real abuse
 //! case turns up.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
 const REFS_PREFIX: &str = "refs/";
 
-/// A validated git ref name suitable for naming a notes ref.
-///
-/// Constructed only via [`NotesRef::try_new`] (or its `FromStr`/
-/// `Deserialize` equivalents). The wrapped string is the verbatim ref
-/// name, e.g. `refs/notes/writ/agent-outputs`.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct NotesRef(String);
-
-impl NotesRef {
-    /// Validate a candidate string and wrap it. The rules are listed at
+crate::validated_string! {
+    /// A validated git ref name suitable for naming a notes ref.
+    ///
+    /// Constructed only via [`NotesRef::try_new`] (or its `FromStr`/
+    /// `Deserialize` equivalents). The wrapped string is the verbatim ref
+    /// name, e.g. `refs/notes/writ/agent-outputs`. The rules are listed at
     /// the module level; the goal is "obvious misuse rejected at the
     /// wire", not full git-refname coverage.
-    pub fn try_new(s: impl Into<String>) -> Result<Self, NotesRefError> {
-        let s = s.into();
-        if s.is_empty() {
-            return Err(NotesRefError::Empty);
-        }
-        if s.contains('\0') {
-            return Err(NotesRefError::NulByte);
-        }
-        if s.chars().any(char::is_whitespace) {
-            return Err(NotesRefError::Whitespace);
-        }
-        if !s.starts_with(REFS_PREFIX) {
-            return Err(NotesRefError::MissingRefsPrefix);
-        }
-        // Reject `..` traversal and empty components in one pass.
-        for component in s.split('/') {
-            if component.is_empty() {
-                return Err(NotesRefError::EmptyComponent);
-            }
-            if component == ".." || component == "." {
-                return Err(NotesRefError::TraversalComponent);
-            }
-        }
-        Ok(Self(s))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+    pub struct NotesRef;
+    error = NotesRefError;
+    constructor = try_new;
+    validate = validate_notes_ref;
 }
 
-impl std::fmt::Display for NotesRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+fn validate_notes_ref(s: &str) -> Result<(), NotesRefError> {
+    if s.is_empty() {
+        return Err(NotesRefError::Empty);
     }
-}
-
-impl std::str::FromStr for NotesRef {
-    type Err = NotesRefError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::try_new(s)
+    if s.contains('\0') {
+        return Err(NotesRefError::NulByte);
     }
-}
-
-impl Serialize for NotesRef {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
+    if s.chars().any(char::is_whitespace) {
+        return Err(NotesRefError::Whitespace);
     }
-}
-
-impl<'de> Deserialize<'de> for NotesRef {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        Self::try_new(s).map_err(serde::de::Error::custom)
+    if !s.starts_with(REFS_PREFIX) {
+        return Err(NotesRefError::MissingRefsPrefix);
     }
+    // Reject `..` traversal and empty components in one pass.
+    for component in s.split('/') {
+        if component.is_empty() {
+            return Err(NotesRefError::EmptyComponent);
+        }
+        if component == ".." || component == "." {
+            return Err(NotesRefError::TraversalComponent);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -103,7 +71,18 @@ pub enum NotesRefError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
+    use proptest::prelude::*;
+
+    fn candidates() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "refs/[a-z]{1,6}(/[a-z.]{1,6}){0,3}",
+            "(refs/)?[a-z./ ]{0,20}",
+            Just("refs/notes/writ/agent-outputs".to_string()),
+            any::<String>(),
+        ]
+    }
+
+    crate::validated_string_laws!(NotesRef, try_new, validate_notes_ref, candidates());
 
     #[test]
     fn accepts_a_normal_notes_ref() {
@@ -173,41 +152,6 @@ mod tests {
         assert_eq!(
             NotesRef::try_new("refs/./writ"),
             Err(NotesRefError::TraversalComponent)
-        );
-    }
-
-    #[test]
-    fn from_str_uses_try_new() {
-        assert_eq!(
-            NotesRef::from_str("refs/notes/writ").unwrap().as_str(),
-            "refs/notes/writ"
-        );
-        assert!(NotesRef::from_str("").is_err());
-    }
-
-    #[test]
-    fn serialises_as_bare_string() {
-        let r = NotesRef::try_new("refs/notes/writ/agent-outputs").unwrap();
-        let j = serde_json::to_string(&r).unwrap();
-        assert_eq!(j, r#""refs/notes/writ/agent-outputs""#);
-    }
-
-    #[test]
-    fn deserialises_through_try_new() {
-        let back: NotesRef = serde_json::from_str(r#""refs/notes/writ/agent-outputs""#).unwrap();
-        assert_eq!(back.as_str(), "refs/notes/writ/agent-outputs");
-    }
-
-    /// A wire payload whose ref is invalid must be rejected at parse
-    /// time, not silently wrapped. The error message must contain the
-    /// concrete rule so the operator can fix the input.
-    #[test]
-    fn deserialise_rejects_invalid_with_descriptive_error() {
-        let err = serde_json::from_str::<NotesRef>(r#""no-refs-prefix""#).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("refs/"),
-            "expected descriptive error mentioning `refs/`, got: {msg}"
         );
     }
 }

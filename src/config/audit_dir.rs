@@ -88,31 +88,17 @@ fn is_audit_artifact(name: &std::ffi::OsStr, basename: &std::ffi::OsStr) -> bool
 /// under another name/directory. A SQLite database and its sidecars are singly
 /// linked; a multiply-linked file in the audit directory would expose (and let
 /// the guest overwrite) the same inode elsewhere on the host.
-#[cfg(unix)]
 fn has_single_link(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     meta.nlink() == 1
 }
 
-/// Non-Unix hosts have no hard-link count to check; writ's broker VM is Unix-only.
-#[cfg(not(unix))]
-fn has_single_link(_meta: &std::fs::Metadata) -> bool {
-    true
-}
-
 /// The filesystem identity (device, inode) of `meta`, used to recognise a
 /// directory entry regardless of the (possibly case-differing) name it was
-/// opened under. `None` off Unix, where writ's broker VM does not run and the
-/// name-based fallback suffices on the case-sensitive filesystems in use.
-#[cfg(unix)]
-fn file_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+/// opened under.
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    None
+    (meta.dev(), meta.ino())
 }
 
 /// Enforce that the audit DB's directory — the one the broker VM mounts
@@ -189,7 +175,7 @@ pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotD
     // The configured DB basename and the DB's filesystem identity (to recognise
     // its own entry regardless of the case-aliased name it was opened under).
     let configured_basename = abs.file_name().map(|n| n.to_os_string());
-    let db_identity = std::fs::metadata(&abs).ok().and_then(|m| file_identity(&m));
+    let db_identity = std::fs::metadata(&abs).ok().map(|m| file_identity(&m));
 
     // Collect the entries (rejecting any non-regular-file eagerly, skipping any
     // deleted mid-scan) so the DB's own on-disk entry name can be located by
@@ -252,13 +238,13 @@ pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotD
     let dirent_basename = db_identity.and_then(|id| {
         files
             .iter()
-            .find(|(_, meta)| file_identity(meta) == Some(id))
+            .find(|(_, meta)| file_identity(meta) == id)
             .map(|(entry, _)| entry.file_name())
     });
 
     for (entry, metadata) in &files {
         let name = entry.file_name();
-        let is_db = db_identity.is_some_and(|id| file_identity(metadata) == Some(id));
+        let is_db = db_identity == Some(file_identity(metadata));
         let is_named_artifact = configured_basename
             .as_deref()
             .is_some_and(|base| is_audit_artifact(&name, base))
