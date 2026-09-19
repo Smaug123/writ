@@ -192,8 +192,8 @@ impl GitDataHttp {
     }
 }
 
-const ACCEPT_HEADER: &str = "application/vnd.github+json";
-const API_VERSION_HEADER: &str = "2022-11-28";
+pub(crate) const ACCEPT_HEADER: &str = "application/vnd.github+json";
+pub(crate) const API_VERSION_HEADER: &str = "2022-11-28";
 /// GitHub's REST API rejects requests without a `User-Agent`. We set
 /// it per-request rather than via `reqwest::ClientBuilder::user_agent`
 /// so a caller that passes in a default-constructed `reqwest::Client`

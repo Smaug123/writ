@@ -380,8 +380,11 @@ impl GitHubMinter {
             self.http
                 .post(&url)
                 .bearer_auth(jwt)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("Accept", crate::github_git_db::ACCEPT_HEADER)
+                .header(
+                    "X-GitHub-Api-Version",
+                    crate::github_git_db::API_VERSION_HEADER,
+                )
                 .json(&body)
                 .send()
                 .await?

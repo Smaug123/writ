@@ -1,24 +1,13 @@
 //! Bailiff-side read helpers for per-plan notes. Sibling to
 //! [`crate::bailiff_plan_write`]: where the write helpers attach the
 //! bailiff-owned notes a plan accumulates, the read helpers project
-//! them back into typed Rust values.
+//! them back into typed Rust values. Every reader pins the same seed-OID
+//! convention its writer uses, so a round-trip through the per-plan ref
+//! depends on nothing beyond the deterministic seed bytes.
 //!
-//! Slice D1.4 of `docs/plans/2026-05-16-slice-d1-decide.md` introduced
-//! the decision read; slice D2.3 of
-//! `docs/plans/2026-05-16-slice-d2-review.md` added the review read at
-//! the third seed-OID; slice D2.4a of the same review plan adds the
-//! submission read so the `submit_review` workflow (D2.4b) can fetch
-//! the planner's `writ_output_oid` and resolve it back to a plan body;
-//! slice E3 of `docs/plans/2026-05-14-bailiff-split.md` adds the
-//! implement read at the fourth seed-OID. All four read helpers pin
-//! the same seed-OID convention the matching writers use, so a
-//! round-trip through the per-plan ref doesn't depend on any registry
-//! beyond the deterministic seed bytes.
-//!
-//! Slice E4a of the same plan lifts `read_plan_body_bytes` here from
-//! `bailiff_plan_review` so the future `submit_implement` workflow can
-//! reuse the same fetch-verify-decode chain without depending on the
-//! review module; pure refactor, zero behaviour change.
+//! `read_plan_body_bytes` lives here rather than in the review module so
+//! the review and implement workflows share one fetch-verify-decode
+//! chain for the planner's output.
 
 use std::path::Path;
 use std::string::FromUtf8Error;
@@ -55,263 +44,139 @@ use crate::bailiff_plan_view::{
 /// name a reader looks up.
 const WRIT_AGENT_OUTPUTS_REF: &str = "refs/notes/writ/v1/agent-outputs";
 
-/// Read the decision note for `plan_id`, if one has been recorded.
-/// Returns `Ok(None)` when no decision exists yet — both the
-/// no-such-plan-id case (no notes ref for that plan) and the
-/// plan-exists-but-undecided case (ref present, no annotation at the
-/// decision seed's target OID) fold into the same `None` because both
-/// mean "operator has not yet ruled on this plan."
+/// A note body bailiff reads back out of a plan's ref: parsed from its
+/// canonical bytes, and carrying the plan id it was written for.
+pub trait NoteBody: Sized + std::fmt::Debug {
+    /// The noun errors name the note by.
+    const NOUN: &'static str;
+    type ParseError: std::error::Error + 'static;
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, Self::ParseError>;
+    fn plan_id(&self) -> PlanId;
+}
+
+macro_rules! note_body {
+    ($Note:ident, $Err:ident, $noun:literal) => {
+        impl NoteBody for $Note {
+            const NOUN: &'static str = $noun;
+            type ParseError = $Err;
+            fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, $Err> {
+                $Note::from_canonical_bytes(bytes)
+            }
+            fn plan_id(&self) -> PlanId {
+                self.plan_id
+            }
+        }
+    };
+}
+
+note_body!(DecisionNote, DecisionNoteParseError, "decision");
+note_body!(PlanNote, PlanNoteParseError, "plan submission");
+note_body!(ReviewNote, ReviewNoteParseError, "review");
+note_body!(ImplementNote, ImplementNoteParseError, "implement");
+
+/// Read the note of type `N` attached at `seed` under `plan_id`'s ref, if
+/// one has been recorded. `Ok(None)` covers both "no ref for that plan"
+/// and "ref present, nothing at this seed": both mean the note has not
+/// been written yet.
 ///
-/// Sibling to [`crate::bailiff_plan_write::write_decision_note`]: the
-/// writer hashes [`plan_decision_seed_blob_bytes`] to pick the attach
-/// OID, the reader hashes the same seed bytes to recover it, and
-/// content-addressed storage makes the round-trip work without any
-/// separate registry. The submission note ([`crate::bailiff_plan_note::PlanNote`])
-/// is **not** consulted: D1 keeps decisions independently readable so
-/// a future caller can ask "has this plan been decided?" without
-/// gating on the submission being present.
+/// Sibling to [`crate::bailiff_plan_write::write_stage_note`] and
+/// [`crate::bailiff_plan_write::write_decision_note`]: the writer hashes
+/// the seed to pick the attach OID and the reader hashes the same bytes to
+/// find it, so the round-trip needs no registry. No other note is
+/// consulted, so every note stays independently readable: "has this plan
+/// been decided?" needs nothing else to be present.
+fn read_note_at<N: NoteBody>(
+    bailiff_repo: &NotesRepo,
+    plan_id: PlanId,
+    seed: &[u8],
+) -> Result<Option<N>, ReadNoteError<N>> {
+    let Some(body) = bailiff_repo
+        .read_note_at_seed(&plan_notes_ref(plan_id), seed)
+        .map_err(ReadNoteError::ReadNote)?
+    else {
+        return Ok(None);
+    };
+    let note = N::from_canonical_bytes(&body).map_err(ReadNoteError::Decode)?;
+    if note.plan_id() != plan_id {
+        return Err(ReadNoteError::PlanIdMismatch {
+            requested: plan_id,
+            found: note.plan_id(),
+        });
+    }
+    Ok(Some(note))
+}
+
+/// Tagged failure modes of reading a note of type `N`. The variants keep
+/// apart "reading the bytes failed" (a filesystem or git problem, such as
+/// a misconfigured repo path), "bytes came back but did not parse"
+/// (on-disk corruption or a schema regression; the writers' canonical
+/// JSON plus `deny_unknown_fields` makes this near-impossible for a body
+/// bailiff wrote itself), and "parsed, but for another plan" (bytes planted
+/// under the wrong seed by hand, which a caller must refuse rather than
+/// act on: a gate must never rule on plan A from plan B's note). Absence
+/// never surfaces here; it is `Ok(None)` at the reader.
+#[derive(Debug, Error)]
+pub enum ReadNoteError<N: NoteBody> {
+    #[error("reading the {noun} note from bailiff's repo failed: {0}", noun = N::NOUN)]
+    ReadNote(#[source] NotesRepoError),
+    #[error("decoding the {noun} note body failed: {0}", noun = N::NOUN)]
+    Decode(#[source] N::ParseError),
+    #[error(
+        "{noun} note at plan {requested} carries embedded plan_id {found}; refusing to surface a cross-plan {noun}",
+        noun = N::NOUN
+    )]
+    PlanIdMismatch { requested: PlanId, found: PlanId },
+}
+
+pub type ReadDecisionError = ReadNoteError<DecisionNote>;
+pub type ReadReviewError = ReadNoteError<ReviewNote>;
+pub type ReadPlanError = ReadNoteError<PlanNote>;
+
+/// The decision note for `plan_id`, if the operator has ruled.
 pub fn read_decision_note(
     bailiff_repo: &NotesRepo,
     plan_id: PlanId,
 ) -> Result<Option<DecisionNote>, ReadDecisionError> {
-    let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_decision_seed_blob_bytes(plan_id);
-    let Some(body) = bailiff_repo
-        .read_note_at_seed(&plan_ref, &seed)
-        .map_err(ReadDecisionError::ReadNote)?
-    else {
-        return Ok(None);
-    };
-    let note = DecisionNote::from_canonical_bytes(&body).map_err(ReadDecisionError::Decode)?;
-    if note.plan_id != plan_id {
-        return Err(ReadDecisionError::PlanIdMismatch {
-            requested: plan_id,
-            found: note.plan_id,
-        });
-    }
-    Ok(Some(note))
+    read_note_at(
+        bailiff_repo,
+        plan_id,
+        &plan_decision_seed_blob_bytes(plan_id),
+    )
 }
 
-/// Tagged failure modes of [`read_decision_note`]. The two variants
-/// distinguish "reading the bytes failed" from "bytes came back but
-/// did not parse as a [`DecisionNote`]" so a caller can react
-/// appropriately: the former is a filesystem or git problem
-/// (operator-misconfigured repo path), the latter is on-disk
-/// corruption or a schema regression.
-#[derive(Debug, Error)]
-pub enum ReadDecisionError {
-    /// Reading the underlying note body from bailiff's repo failed
-    /// for any reason other than absence. Absence (no decision yet)
-    /// is folded into `Ok(None)` by [`read_decision_note`] and never
-    /// surfaces here.
-    #[error("reading the decision note from bailiff's repo failed: {0}")]
-    ReadNote(#[source] NotesRepoError),
-    /// The note body existed but did not parse as a
-    /// [`DecisionNote`]. Indicates wire-level corruption — the
-    /// canonical JSON shape is fixed and `deny_unknown_fields` plus
-    /// the field-type validators make this near-impossible for any
-    /// body [`crate::bailiff_plan_write::write_decision_note`] itself
-    /// produced.
-    #[error("decoding the decision note body failed: {0}")]
-    Decode(#[source] DecisionNoteParseError),
-    /// The note parsed cleanly but its embedded `plan_id` does not
-    /// match the plan we were asked to read. Unreachable through
-    /// [`crate::bailiff_plan_write::write_decision_note`] (which always
-    /// derives the attach seed from `decision_note.plan_id`), so this
-    /// surfaces only when bytes were planted via the low-level
-    /// [`writ::notes_repo::NotesRepo::write_note`] path or pasted by
-    /// hand after manual repo repair. Treat it as semantic corruption:
-    /// a future acceptance gate must not be fooled into ruling on
-    /// plan A by reading plan B's verdict.
-    #[error(
-        "decision note at plan {requested} carries embedded plan_id {found}; refusing to surface a cross-plan verdict"
-    )]
-    PlanIdMismatch { requested: PlanId, found: PlanId },
-}
-
-/// Read the review note for `plan_id`, if one has been recorded.
-/// Returns `Ok(None)` when no review exists yet — both the
-/// no-such-plan-id case (no notes ref for that plan) and the
-/// plan-exists-but-unreviewed case (ref present, no annotation at the
-/// review seed's target OID) fold into the same `None` because both
-/// mean "writ has not produced a reviewer envelope for this plan."
-///
-/// Sibling to [`crate::bailiff_plan_write::write_stage_note`]: the
-/// writer hashes [`plan_review_seed_blob_bytes`] to pick the attach
-/// OID, the reader hashes the same seed bytes to recover it, and
-/// content-addressed storage makes the round-trip work without any
-/// separate registry. Neither the submission nor the decision note is
-/// consulted: D2 keeps reviews independently readable so a future
-/// caller can ask "has this plan been reviewed?" without gating on
-/// either of the other notes being present.
+/// The review note for `plan_id`, if writ has produced a reviewer envelope.
 pub fn read_review_note(
     bailiff_repo: &NotesRepo,
     plan_id: PlanId,
 ) -> Result<Option<ReviewNote>, ReadReviewError> {
-    let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_review_seed_blob_bytes(plan_id);
-    let Some(body) = bailiff_repo
-        .read_note_at_seed(&plan_ref, &seed)
-        .map_err(ReadReviewError::ReadNote)?
-    else {
-        return Ok(None);
-    };
-    let note = ReviewNote::from_canonical_bytes(&body).map_err(ReadReviewError::Decode)?;
-    if note.plan_id != plan_id {
-        return Err(ReadReviewError::PlanIdMismatch {
-            requested: plan_id,
-            found: note.plan_id,
-        });
-    }
-    Ok(Some(note))
+    read_note_at(bailiff_repo, plan_id, &plan_review_seed_blob_bytes(plan_id))
 }
 
-/// Tagged failure modes of [`read_review_note`]. Same three-variant
-/// shape as [`ReadDecisionError`]: filesystem/git read failure vs.
-/// bytes-came-back-but-did-not-parse vs. semantic corruption
-/// (cross-plan body planted under another plan's seed).
-#[derive(Debug, Error)]
-pub enum ReadReviewError {
-    /// Reading the underlying note body from bailiff's repo failed
-    /// for any reason other than absence. Absence (no review yet) is
-    /// folded into `Ok(None)` by [`read_review_note`] and never
-    /// surfaces here.
-    #[error("reading the review note from bailiff's repo failed: {0}")]
-    ReadNote(#[source] NotesRepoError),
-    /// The note body existed but did not parse as a [`ReviewNote`].
-    /// Indicates wire-level corruption — the canonical JSON shape is
-    /// fixed and `deny_unknown_fields` plus the field-type validators
-    /// make this near-impossible for any body
-    /// [`crate::bailiff_plan_write::write_stage_note`] itself produced.
-    #[error("decoding the review note body failed: {0}")]
-    Decode(#[source] ReviewNoteParseError),
-    /// The note parsed cleanly but its embedded `plan_id` does not
-    /// match the plan we were asked to read. Unreachable through
-    /// [`crate::bailiff_plan_write::write_stage_note`] (which always
-    /// derives the attach seed from the `plan_id` argument it
-    /// embeds in the note), so this surfaces only when bytes were
-    /// planted via the low-level
-    /// [`writ::notes_repo::NotesRepo::write_note`] path or pasted by
-    /// hand after manual repo repair. Treat it as semantic corruption:
-    /// a future reader rendering reviewer prose must not be fooled
-    /// into displaying plan B's review when asked about plan A.
-    #[error(
-        "review note at plan {requested} carries embedded plan_id {found}; refusing to surface a cross-plan review"
-    )]
-    PlanIdMismatch { requested: PlanId, found: PlanId },
-}
-
-/// Read the submission note for `plan_id`, if one has been recorded.
-/// Returns `Ok(None)` when no submission exists yet — both the
-/// no-such-plan-id case (no notes ref for that plan) and the
-/// plan-exists-but-not-submitted case (ref present, no annotation at
-/// the submission seed's target OID) fold into the same `None`
-/// because both mean "writ has not produced a planner envelope for
-/// this plan yet."
-///
-/// Sibling to [`crate::bailiff_plan_write::write_stage_note`]: the
-/// writer hashes [`crate::bailiff_stage::StageNoteSlot::seed`] to pick the
-/// attach OID, the reader hashes the same seed bytes to recover it,
-/// and content-addressed storage makes the round-trip work without
-/// any separate registry. Neither the decision nor the review note
-/// is consulted: the submission stays independently readable so a
-/// caller can ask "what planner envelope was submitted for this
-/// plan?" without gating on the other two notes being present.
+/// The submission note for `plan_id`, if writ has produced a planner
+/// envelope.
 pub fn read_plan_note(
     bailiff_repo: &NotesRepo,
     plan_id: PlanId,
 ) -> Result<Option<PlanNote>, ReadPlanError> {
-    let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_submission_seed_blob_bytes(plan_id);
-    let Some(body) = bailiff_repo
-        .read_note_at_seed(&plan_ref, &seed)
-        .map_err(ReadPlanError::ReadNote)?
-    else {
-        return Ok(None);
-    };
-    let note = PlanNote::from_canonical_bytes(&body).map_err(ReadPlanError::Decode)?;
-    if note.plan_id != plan_id {
-        return Err(ReadPlanError::PlanIdMismatch {
-            requested: plan_id,
-            found: note.plan_id,
-        });
-    }
-    Ok(Some(note))
+    read_note_at(
+        bailiff_repo,
+        plan_id,
+        &plan_submission_seed_blob_bytes(plan_id),
+    )
 }
 
-/// Tagged failure modes of [`read_plan_note`]. Same three-variant
-/// shape as [`ReadDecisionError`] / [`ReadReviewError`]:
-/// filesystem/git read failure vs. bytes-came-back-but-did-not-parse
-/// vs. semantic corruption (cross-plan body planted under another
-/// plan's seed).
-#[derive(Debug, Error)]
-pub enum ReadPlanError {
-    /// Reading the underlying note body from bailiff's repo failed
-    /// for any reason other than absence. Absence (no submission
-    /// yet) is folded into `Ok(None)` by [`read_plan_note`] and
-    /// never surfaces here.
-    #[error("reading the plan submission note from bailiff's repo failed: {0}")]
-    ReadNote(#[source] NotesRepoError),
-    /// The note body existed but did not parse as a [`PlanNote`].
-    /// Indicates wire-level corruption — the canonical JSON shape is
-    /// fixed and `deny_unknown_fields` plus the field-type validators
-    /// make this near-impossible for any body
-    /// [`crate::bailiff_plan_write::write_stage_note`] itself produced.
-    #[error("decoding the plan submission note body failed: {0}")]
-    Decode(#[source] PlanNoteParseError),
-    /// The note parsed cleanly but its embedded `plan_id` does not
-    /// match the plan we were asked to read. Unreachable through
-    /// [`crate::bailiff_plan_write::write_stage_note`] (which always
-    /// derives the attach seed from the `plan_id` argument it embeds
-    /// in the note), so this surfaces only when bytes were planted
-    /// via the low-level [`writ::notes_repo::NotesRepo::write_note`]
-    /// path or pasted by hand after manual repo repair. Treat it as
-    /// semantic corruption: the upcoming `submit_review` workflow
-    /// must not be fooled into composing a reviewer prompt from
-    /// plan B's body when asked about plan A.
-    #[error(
-        "plan submission note at plan {requested} carries embedded plan_id {found}; refusing to surface a cross-plan submission"
-    )]
-    PlanIdMismatch { requested: PlanId, found: PlanId },
-}
-
-/// Read the implement note for `plan_id`, if one has been recorded.
-/// Returns `Ok(None)` when no implement exists yet — both the
-/// no-such-plan-id case (no notes ref for that plan) and the
-/// plan-exists-but-unimplemented case (ref present, no annotation at
-/// the implement seed's target OID) fold into the same `None` because
-/// both mean "writ has not produced an implementer envelope for this
-/// plan yet."
-///
-/// Sibling to [`crate::bailiff_plan_write::write_stage_note`]: the
-/// writer hashes [`plan_implement_seed_blob_bytes`] to pick the attach
-/// OID, the reader hashes the same seed bytes to recover it, and
-/// content-addressed storage makes the round-trip work without any
-/// separate registry. None of the other three notes is consulted: the
-/// implement stays independently readable so a caller can ask "has
-/// this plan been implemented?" without gating on the others being
-/// present.
+/// The implement note for `plan_id`'s `attempt`, if that attempt has been
+/// recorded.
 pub fn read_implement_note(
     bailiff_repo: &NotesRepo,
     plan_id: PlanId,
     attempt: ImplementAttempt,
-) -> Result<Option<ImplementNote>, ReadImplementError> {
-    let plan_ref = plan_notes_ref(plan_id);
-    let seed = plan_implement_seed_blob_bytes(plan_id, attempt);
-    let Some(body) = bailiff_repo
-        .read_note_at_seed(&plan_ref, &seed)
-        .map_err(ReadImplementError::ReadNote)?
-    else {
-        return Ok(None);
-    };
-    let note = ImplementNote::from_canonical_bytes(&body).map_err(ReadImplementError::Decode)?;
-    if note.plan_id != plan_id {
-        return Err(ReadImplementError::PlanIdMismatch {
-            requested: plan_id,
-            found: note.plan_id,
-        });
-    }
-    Ok(Some(note))
+) -> Result<Option<ImplementNote>, ReadNoteError<ImplementNote>> {
+    read_note_at(
+        bailiff_repo,
+        plan_id,
+        &plan_implement_seed_blob_bytes(plan_id, attempt),
+    )
 }
 
 /// Every implementer attempt on `plan_id`, in order, and the first
@@ -387,19 +252,12 @@ pub struct ImplementAttempts {
     pub next_free: Option<ImplementAttempt>,
 }
 
-/// Tagged failure modes of [`read_implement_note`]. Same three-variant
-/// shape as [`ReadDecisionError`] / [`ReadReviewError`] /
-/// [`ReadPlanError`]: filesystem/git read failure vs.
-/// bytes-came-back-but-did-not-parse vs. semantic corruption
-/// (cross-plan body planted under another plan's seed).
+/// Tagged failure modes of [`read_implement_attempts`]: one attempt's read
+/// failing, or a hole in the attempt sequence.
 #[derive(Debug, Error)]
 pub enum ReadImplementError {
-    /// Reading the underlying note body from bailiff's repo failed
-    /// for any reason other than absence. Absence (no implement yet)
-    /// is folded into `Ok(None)` by [`read_implement_note`] and never
-    /// surfaces here.
-    #[error("reading the implement note from bailiff's repo failed: {0}")]
-    ReadNote(#[source] NotesRepoError),
+    #[error(transparent)]
+    Note(#[from] ReadNoteError<ImplementNote>),
     /// Attempt `missing` has no note but a later one does, so the
     /// plan's attempts are not dense from zero and no count over them
     /// is trustworthy. Manual repo surgery; reported rather than
@@ -412,28 +270,6 @@ pub enum ReadImplementError {
         plan_id: PlanId,
         missing: ImplementAttempt,
     },
-    /// The note body existed but did not parse as an [`ImplementNote`].
-    /// Indicates wire-level corruption — the canonical JSON shape is
-    /// fixed and `deny_unknown_fields` plus the field-type validators
-    /// make this near-impossible for any body
-    /// [`crate::bailiff_plan_write::write_stage_note`] itself
-    /// produced.
-    #[error("decoding the implement note body failed: {0}")]
-    Decode(#[source] ImplementNoteParseError),
-    /// The note parsed cleanly but its embedded `plan_id` does not
-    /// match the plan we were asked to read. Unreachable through
-    /// [`crate::bailiff_plan_write::write_stage_note`] (which
-    /// always derives the attach seed from the `plan_id` argument it
-    /// embeds in the note), so this surfaces only when bytes were
-    /// planted via the low-level [`writ::notes_repo::NotesRepo::write_note`]
-    /// path or pasted by hand after manual repo repair. Treat it as
-    /// semantic corruption: a future caller rendering implementer
-    /// output must not be fooled into surfacing plan B's implement
-    /// when asked about plan A.
-    #[error(
-        "implement note at plan {requested} carries embedded plan_id {found}; refusing to surface a cross-plan implement"
-    )]
-    PlanIdMismatch { requested: PlanId, found: PlanId },
 }
 
 /// Enumerate every plan-id bailiff has any notes for, in the
@@ -614,7 +450,7 @@ pub enum SummarizePlanError {
     #[error("reading review note: {0}")]
     ReadReview(#[from] ReadReviewError),
     #[error("reading implement note: {0}")]
-    ReadImplement(#[from] ReadImplementError),
+    ReadImplement(#[from] ReadNoteError<ImplementNote>),
 }
 
 /// Read the [`SignedRunEnvelope`] writ produced at `oid` from
@@ -1171,15 +1007,11 @@ mod dossier_tests;
 #[cfg(test)]
 mod full_plan_tests;
 #[cfg(test)]
-mod implement_tests;
-#[cfg(test)]
 mod list_tests;
-#[cfg(test)]
-mod plan_tests;
 #[cfg(test)]
 mod read_plan_body_tests;
 #[cfg(test)]
-mod review_tests;
+mod stage_read_tests;
 #[cfg(test)]
 mod test_support;
 
