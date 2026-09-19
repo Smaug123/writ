@@ -11,6 +11,7 @@
 
 use super::*;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentVmSessionStateError {
@@ -632,11 +633,7 @@ impl AgentVmSessionStateStore {
         if create {
             options.create(true);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        options.mode(0o600);
         let file = options
             .open(&path)
             .map_err(|source| AgentVmSessionStateError::Io {
@@ -691,37 +688,13 @@ impl AgentVmSessionStateStore {
     }
 
     fn ensure_dir(&self) -> Result<(), AgentVmSessionStateError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder
-                .create(&self.dir)
-                .map_err(|source| AgentVmSessionStateError::Io {
-                    operation: "create directory",
-                    path: self.dir.clone(),
-                    source,
-                })?;
-            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700)).map_err(
-                |source| AgentVmSessionStateError::Io {
-                    operation: "set directory permissions",
-                    path: self.dir.clone(),
-                    source,
-                },
-            )?;
-            Ok(())
-        }
-
-        #[cfg(not(unix))]
-        {
-            fs::create_dir_all(&self.dir).map_err(|source| AgentVmSessionStateError::Io {
+        writ_core::private_fs::create_dir_all_0700(&self.dir).map_err(|source| {
+            AgentVmSessionStateError::Io {
                 operation: "create directory",
                 path: self.dir.clone(),
                 source,
-            })
-        }
+            }
+        })
     }
 
     fn sync_dir(&self) -> Result<(), AgentVmSessionStateError> {
@@ -798,36 +771,17 @@ impl From<PersistedIpv6IsolationMode> for Ipv6IsolationMode {
     }
 }
 
+/// Create `path` exclusively at mode 0600, write `contents`, and fsync.
 fn write_complete_file(path: &Path, contents: &[u8]) -> Result<(), AgentVmSessionStateError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|source| AgentVmSessionStateError::Io {
-            operation: "create",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.write_all(contents)
-        .map_err(|source| AgentVmSessionStateError::Io {
+    writ_core::private_fs::write_new_0600(path, contents).map_err(|source| {
+        AgentVmSessionStateError::Io {
             operation: "write",
             path: path.to_path_buf(),
             source,
-        })?;
-    file.sync_all()
-        .map_err(|source| AgentVmSessionStateError::Io {
-            operation: "sync",
-            path: path.to_path_buf(),
-            source,
-        })
+        }
+    })
 }
 
-#[cfg(unix)]
 fn lock_file_exclusive(file: &File, path: &Path) -> Result<(), AgentVmSessionStateError> {
     // SAFETY: `flock` only observes the valid file descriptor borrowed from
     // `file`; the descriptor remains open for the lifetime of the returned
@@ -842,11 +796,6 @@ fn lock_file_exclusive(file: &File, path: &Path) -> Result<(), AgentVmSessionSta
             source: std::io::Error::last_os_error(),
         })
     }
-}
-
-#[cfg(not(unix))]
-fn lock_file_exclusive(_file: &File, _path: &Path) -> Result<(), AgentVmSessionStateError> {
-    Ok(())
 }
 
 fn parse_state_ipv4_cidr(
