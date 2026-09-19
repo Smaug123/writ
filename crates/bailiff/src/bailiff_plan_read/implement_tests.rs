@@ -221,7 +221,7 @@ fn read_implement_note_does_not_cross_read_between_plans() {
 
 /// A semantically-corrupt body — one that parses cleanly as an
 /// [`ImplementNote`] but whose embedded `plan_id` belongs to a
-/// different plan — surfaces as `ReadImplementError::PlanIdMismatch`
+/// different plan — surfaces as `ReadNoteError::PlanIdMismatch`
 /// rather than `Ok(Some(other_plans_implement))`. A future caller
 /// rendering implementer output must never surface plan B's
 /// implement when asked about plan A; the threat model has manual
@@ -250,7 +250,7 @@ fn read_implement_note_returns_plan_id_mismatch_when_body_carries_other_plan_id(
 
     let err = read_implement_note(&bailiff, queried, ImplementAttempt::FIRST).unwrap_err();
     match err {
-        ReadImplementError::PlanIdMismatch { requested, found } => {
+        ReadNoteError::PlanIdMismatch { requested, found } => {
             assert_eq!(requested, queried);
             assert_eq!(found, other);
         }
@@ -259,7 +259,7 @@ fn read_implement_note_returns_plan_id_mismatch_when_body_carries_other_plan_id(
 }
 
 /// A corrupt body at the implement seed's target surfaces as
-/// `ReadImplementError::Decode`, not as `Ok(None)` or as a generic
+/// `ReadNoteError::Decode`, not as `Ok(None)` or as a generic
 /// `ReadNote` error. Construct the case by planting non-JSON bytes
 /// directly via `NotesRepo::write_note` at the implement seed —
 /// bypassing `write_implement_note` is the only way to produce
@@ -278,7 +278,7 @@ fn read_implement_note_returns_decode_error_on_corrupt_body() {
 
     let err = read_implement_note(&bailiff, plan_id, ImplementAttempt::FIRST).unwrap_err();
     assert!(
-        matches!(err, ReadImplementError::Decode(_)),
+        matches!(err, ReadNoteError::Decode(_)),
         "expected Decode error, got: {err:?}",
     );
 }
