@@ -222,9 +222,14 @@ wait_for_host_http() {
   local label="$2"
   local path="$3"
   local expected="$4"
+  # --noproxy '*': curl honours http_proxy/ALL_PROXY, so with a proxy configured
+  # and no_proxy not covering localhost this readiness check goes to the proxy
+  # instead of to the listener, and the harness then blames the listener for
+  # never starting. Nothing here should ever be proxied: the listener is on this
+  # host, and so is every address this proof talks to.
   for _ in {1..50}; do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:${port}/${path}" \
-      | grep -q "^${expected}$"; then
+    if curl --silent --fail --noproxy '*' --max-time 1 \
+      "http://127.0.0.1:${port}/${path}" | grep -q "^${expected}$"; then
       return 0
     fi
     sleep 0.1
