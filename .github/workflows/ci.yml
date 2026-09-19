@@ -73,10 +73,16 @@ jobs:
     - name: Enable Nix cache
       uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
 
+    # With the token the action's post step pushes every store path this job
+    # built, so the next run whose sources hash the same fetches the result
+    # instead of rebuilding it. Without the token the cache was pull-only, and
+    # nothing had ever been pushed for x86_64-linux, so every run rebuilt from
+    # scratch.
     - name: Use Cachix
       uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
       with:
         name: ${{ env.CACHIX_CACHE }}
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
     - name: Build Nix package
       run: |
@@ -102,10 +108,16 @@ jobs:
     - name: Enable Nix cache
       uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
 
+    # With the token the action's post step pushes every store path this job
+    # built, so the next run whose sources hash the same fetches the result
+    # instead of rebuilding it. Without the token the cache was pull-only, and
+    # nothing had ever been pushed for x86_64-linux, so every run rebuilt from
+    # scratch.
     - name: Use Cachix
       uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
       with:
         name: ${{ env.CACHIX_CACHE }}
+        authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
     - name: Build the guest image
       run: |
