@@ -487,7 +487,7 @@ fn parses_agent_vm_config_with_oauth_claude_proxy_auth_kind() {
 /// The single failure a config with exactly one mistake in it must produce.
 ///
 /// Asserting *soleness* rather than "the first failure matches" is what keeps
-/// accumulation honest: now that validation no longer stops at the first
+/// accumulation honest: because validation does not stop at the first
 /// error, a check that fires spuriously alongside the real one — or a root
 /// cause that cascades into echoes of itself — shows up right here instead of
 /// as noise in an operator's terminal.
@@ -1043,16 +1043,15 @@ fn checking_the_daemon_sections_creates_the_agent_run_log_root() {
     assert!(checked.agent_vm.is_none());
 }
 
-/// The preflight resolves the environment-derived defaults that used to be
-/// resolved at their point of use.
+/// The preflight resolves the environment-derived defaults (the secret store
+/// and the bearer path) rather than leaving them to their points of use.
 ///
-/// Both moved here for the same reason and one extra. The shared reason is the
-/// report: resolving with `?` in `writd` returns *before* this function runs,
-/// so an operator with an unusable environment and a bad `ui_http.bind` learns
-/// about them one restart apart. The extra one is the bearer path, whose point
-/// of use is after directories are created, the audit DB reconciled, signing
-/// state materialised, and listeners bound — exiting there over a path that
-/// was knowable at boot is exactly what "check before irreversible steps"
+/// Resolving with `?` in `writd` would return *before* this function runs, so
+/// an operator with an unusable environment and a bad `ui_http.bind` would
+/// learn about them one restart apart. The bearer path's point of use is
+/// after directories are created, the audit DB reconciled, signing state
+/// materialised, and listeners bound; exiting there over a path that was
+/// knowable at boot is exactly what "check before irreversible steps"
 /// forbids.
 ///
 /// This pins the wiring; the failure path is structural (`record_from`, not

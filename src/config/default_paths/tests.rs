@@ -115,7 +115,7 @@ proptest! {
 
     /// With nothing to derive from, writ refuses instead of guessing.
     ///
-    /// Named for the specific guess it used to make: `/tmp`, a world-writable
+    /// Named for the specific guess it must not make: `/tmp`, a world-writable
     /// sticky directory, for the audit database and the secret store. The
     /// assertion is on the error rather than on the absence of `/tmp` in some
     /// resolved path, because "does not start with /tmp" would pass for any

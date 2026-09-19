@@ -1,7 +1,8 @@
-//! Persistent secret storage. In v1 this holds one long-lived secret — the
-//! GitHub App RSA private key used to sign installation-token JWTs.
+//! Persistent secret storage for the daemon's long-lived secrets: the GitHub
+//! App private keys that sign installation-token JWTs and the writ signing
+//! key.
 //!
-//! The `SecretStore` trait has two implementations on day one (file and
+//! The `SecretStore` trait has two implementations (file and
 //! keyring), which justifies the abstraction rather than violating
 //! "no interface for one implementation". A future third backend (e.g.
 //! Vault for shared team use) would slot in behind the same trait without

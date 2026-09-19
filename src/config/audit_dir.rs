@@ -273,9 +273,7 @@ pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotD
 /// [`AUDIT_DB`](super::default_paths::AUDIT_DB). The two are a pair: this one says where
 /// the old database would be and that one says where the new one goes, so any
 /// divergence between them is a migration the guard fails to notice. Sharing
-/// one resolver is what keeps them from drifting — they were previously two
-/// hand-copied `if let Some(dir) = var_os(..)` blocks held together by this
-/// comment.
+/// one resolver is what keeps them from drifting.
 pub fn legacy_default_audit_db_path() -> Result<PathBuf, super::BaseDirError> {
     super::default_paths::LEGACY_AUDIT_DB.resolve()
 }

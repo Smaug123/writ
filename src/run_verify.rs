@@ -581,14 +581,13 @@ mod tests {
         }
     }
 
-    /// End-to-end slice B round-trip: writ writes a signed envelope
+    /// End-to-end round-trip: writ writes a signed envelope
     /// as a Git note in its own bare repo, bailiff fetches the writ
     /// notes ref into its own bare repo, and the verifier confirms
     /// the round-tripped envelope under an allowed-signers list
     /// parsed from writ's published public key.
     ///
-    /// This is the operational picture slice B is delivering: every
-    /// hop in the chain — note write, git fetch, byte-exact note
+    /// Every hop in the chain — note write, git fetch, byte-exact note
     /// read, sshsig verification — is exercised against the real git
     /// binary and the real crypto, with no mocks. A regression in any
     /// one component (envelope encoding, notes-write stripspace,

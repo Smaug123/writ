@@ -6,8 +6,8 @@
 //! [`SignedRunMetadata`] it signed, and the detached SSHSIG signature
 //! over those metadata bytes. Together these form one
 //! [`SignedRunEnvelope`], which writ encodes and stores as the body
-//! of a Git note in writ's bare repo (see `bailiff-split` plan,
-//! slice B). Bailiff fetches the notes ref later, decodes the
+//! of a Git note in writ's bare repo. Bailiff fetches the notes ref
+//! later, decodes the
 //! envelope, verifies the signature, and re-derives the prompt and
 //! output digests.
 //!

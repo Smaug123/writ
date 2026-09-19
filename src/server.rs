@@ -89,9 +89,8 @@ pub(crate) use run_agent::{AgentRunQueuePlace, AgentRunSlot};
 /// checked once at boot and handed to both `RunAgent` arms; this field
 /// is the host arm's copy of that same validated value.
 ///
-/// Slice B accepts a single fixed command for the whole daemon; the
-/// agent-kind selection that bailiff will eventually drive arrives in
-/// slice C alongside the session-per-workflow refinement.
+/// One fixed command for the whole daemon; per-kind selection is a known
+/// gap (see [`crate::config::RunAgentDaemonConfig`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunAgentSpawnConfig {
     pub command: std::path::PathBuf,
