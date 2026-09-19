@@ -403,6 +403,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use super::super::tests::{broker_with_open_session, loopback_net};
+
     use super::super::tests::{
         bearer, declared_contract, make_broker_state, no_services, open_audit_session,
         session_for_subnet, token,
@@ -491,7 +493,7 @@ mod tests {
     async fn enabled_git_push_route_is_not_found_for_non_post_methods() {
         let github = wiremock::MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
         let request = VmHttpRequest::new(
@@ -544,9 +546,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_rejects_malformed_body_without_audit() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
@@ -568,7 +568,7 @@ mod tests {
     async fn git_push_unknown_session_returns_unauthorized_without_audit_row() {
         let github = wiremock::MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         // No `open_audit_session` — the session is unknown to the audit log.
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
@@ -592,9 +592,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_closed_session_returns_gone_without_audit_row() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         state
             .audit
             .close_session(session.session_id(), UnixMillis::now())
@@ -621,9 +619,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_stages_bundle_and_returns_receipt() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
@@ -665,9 +661,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_handler_satisfies_audit_pair_oracle() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
@@ -701,9 +695,7 @@ mod tests {
         use crate::core::AgentKind;
 
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let correlation = CorrelationId::try_new("feat-42_xyz").unwrap();
         state
             .audit
@@ -743,9 +735,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_without_agent_run_leaves_correlation_id_null() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
         let body = encoded_body(sample_push_metadata(), b"untagged bundle".to_vec());
@@ -776,9 +766,7 @@ mod tests {
         use crate::core::AgentKind;
 
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         state
             .audit
             .record_agent_run(&AgentRunAuditRecord {
@@ -818,9 +806,7 @@ mod tests {
         // staging store's perspective. The staging store's own idempotency
         // path is exercised in its unit tests.
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
         let metadata = sample_push_metadata();
@@ -852,9 +838,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_branch_creation_round_trips_with_null_expected_head() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
@@ -877,9 +861,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_full_dispatch_stages_and_audits() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
@@ -913,9 +895,7 @@ mod tests {
     #[tokio::test]
     async fn git_push_dispatch_rejects_body_exceeding_limit() {
         let github = wiremock::MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
         // Tight body cap so an oversized request is cheap to construct.
         let tight = VmGitPushBodyLimits::new(
@@ -974,8 +954,7 @@ mod tests {
         // One counting run to learn how many crash points the handler has.
         let n = {
             let state = make_broker_state(&github);
-            let session =
-                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            let session = session_for_subnet(loopback_net());
             open_audit_session(&state, session.session_id());
             let (staging, _tmp) = open_test_staging_store();
             let plan = CrashPlan::count();
@@ -1004,8 +983,7 @@ mod tests {
         let mut saw_git_push_interruption = false;
         for k in 0..n {
             let state = make_broker_state(&github);
-            let session =
-                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            let session = session_for_subnet(loopback_net());
             open_audit_session(&state, session.session_id());
             let (staging, _tmp) = open_test_staging_store();
             let plan = CrashPlan::crash_at(k);
@@ -1078,8 +1056,7 @@ mod tests {
 
         let idx = {
             let state = make_broker_state(&github);
-            let session =
-                session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+            let session = session_for_subnet(loopback_net());
             open_audit_session(&state, session.session_id());
             let (staging, _tmp) = open_test_staging_store();
             let plan = CrashPlan::count();
@@ -1099,9 +1076,7 @@ mod tests {
                 .expect("handler must have a carrier_staged crash point")
         };
 
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
         let audit_for_action = Arc::clone(&state.audit);

@@ -567,6 +567,8 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use super::super::tests::{broker_with_open_session, loopback_net};
+
     use super::super::tests::{
         FAKE_GIT_REV_PARSE_SHA, bearer, declared_contract, git_clone_config_for_test,
         make_broker_state, no_services, open_audit_session, required_tool, session_for_subnet,
@@ -705,7 +707,7 @@ mod tests {
     async fn enabled_git_clone_route_is_not_found_for_non_post_methods() {
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         let temp = tempfile::tempdir().unwrap();
         let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
         let request = VmHttpRequest::new(
@@ -786,7 +788,7 @@ mod tests {
     async fn enabled_git_clone_non_post_route_does_not_read_declared_body() {
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         let temp = tempfile::tempdir().unwrap();
         let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
         let bearer_auth = bearer(token().as_str());
@@ -833,7 +835,7 @@ mod tests {
     async fn git_clone_route_rejects_malformed_json_without_minting() {
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         let temp = tempfile::tempdir().unwrap();
         let service = git_clone_service_for_test(&state, &temp, write_fake_git(temp.path()));
 
@@ -855,7 +857,7 @@ mod tests {
     async fn git_clone_route_maps_inactive_sessions_to_client_errors() {
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
+        let session = session_for_subnet(loopback_net());
         let temp = tempfile::tempdir().unwrap();
         let clone_repo = GitCloneRepo::new(repo("o", "n")).unwrap();
         let request_body = serde_json::to_vec(&VmGitCloneRequest::new(clone_repo, None)).unwrap();
@@ -903,9 +905,7 @@ mod tests {
     #[tokio::test]
     async fn git_clone_route_hides_host_mint_errors_from_vm_response() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
             .respond_with(
@@ -952,9 +952,7 @@ mod tests {
     #[tokio::test]
     async fn a_granted_clone_records_the_mints_pair() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -997,9 +995,7 @@ mod tests {
     #[tokio::test]
     async fn git_clone_route_reports_cleanup_failure_without_returning_bundle() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -1047,9 +1043,7 @@ work_root=${{work_dir%/*}}
     #[tokio::test]
     async fn git_clone_retains_the_mirror_when_a_cache_is_configured() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_net());
         Mock::given(method("POST"))
             .and(path("/app/installations/999/access_tokens"))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -1107,7 +1101,7 @@ work_root=${{work_dir%/*}}
         let state = make_broker_state(&github);
         let session = VmHttpSession::new(
             "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-            Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            loopback_net(),
             token(),
         );
         open_audit_session(&state, session.session_id());
@@ -1211,7 +1205,7 @@ work_root=${{work_dir%/*}}
         let state = make_broker_state(&github);
         let session = VmHttpSession::new(
             "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-            Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            loopback_net(),
             token(),
         );
         open_audit_session(&state, session.session_id());
