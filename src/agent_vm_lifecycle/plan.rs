@@ -335,7 +335,7 @@ impl AgentVmSessionPlan {
                         actual: ipv6_subnet,
                     });
                 }
-                let expected_gateway = Ipv6Addr::from(u128::from(expected_ipv6.network()) + 1);
+                let expected_gateway = expected_ipv6.first_host();
                 if ipv6_gateway != expected_gateway {
                     return Err(NetworkInspectionError::Ipv6GatewayMismatch {
                         expected: expected_gateway,
