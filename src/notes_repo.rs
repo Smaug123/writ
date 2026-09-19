@@ -1,8 +1,7 @@
 //! Bare-repo helpers shared by writ and bailiff for note storage.
 //!
-//! Under the cross-daemon ownership model pinned in slice B4 of
-//! `docs/plans/2026-05-14-bailiff-split.md`, each daemon owns its own
-//! host-side bare repo: writ persists every signed run as a Git note
+//! Each daemon owns its own host-side bare repo: writ persists every
+//! signed run as a Git note
 //! in its repo, bailiff curates plan-shaped views in its repo, and
 //! bailiff fetches writ's notes refs as a Git remote rather than
 //! writing into a shared repo. This module is the thin wrapper both
@@ -17,8 +16,7 @@
 //! operator error and on-disk corruption, not against an attacker who
 //! can write to the daemon's filesystem: a host that can mutate the
 //! repo can also forge the signing key, so adversarial-config
-//! rejections buy nothing on top. The minimum check surface — pinned
-//! at the top of the slice before any code was written — is:
+//! rejections buy nothing on top. The minimum check surface is:
 //!
 //! * `HEAD` present (a directory with no HEAD is not a Git repo).
 //! * `core.bare = true` via `git config --bool --get`, which uses
@@ -74,17 +72,12 @@
 //! stdout cap (`NOTES_GIT_STDOUT_CAP`), a tail-capped stderr, and a
 //! process-group SIGKILL on the way out.
 //!
-//! This module used to have a spawn retry and none of the above, while
-//! the broker's `clean_git` had all of the above and no spawn retry —
-//! two carefully-built disciplines with no overlap, each looking
-//! complete where it was defined. The consequence here was concrete:
-//! bailiff drives these calls as workflow steps, so a `git` that wedged
-//! (a fetch source on a stalled filesystem, a stuck `index.lock`) hung
-//! a workflow forever with no diagnosis, and a `for-each-ref` over a
-//! corrupted ref namespace could buffer without bound. The spawn retry
-//! now comes from `crate::process_spawn` and the supervision from
-//! `process_supervisor`, so neither can drift from the other callers
-//! again.
+//! Bailiff drives these calls as workflow steps, so a `git` that wedges
+//! (a fetch source on a stalled filesystem, a stuck `index.lock`) would
+//! hang a workflow forever with no diagnosis, and a `for-each-ref` over
+//! a corrupted ref namespace could buffer without bound. The spawn
+//! retry comes from `crate::process_spawn` and the supervision from
+//! `process_supervisor`, so neither can drift from the other callers.
 //!
 //! ## Replaying a killed invocation
 //!
@@ -230,9 +223,9 @@ const GC_ARGV: [&str; 4] = ["gc", "--quiet", GC_PRUNE_GRACE, "--cruft"];
 ///
 /// Compaction is the one command in this module whose *legitimate* cost grows
 /// with the repo's total history: a plain `gc` rewrites all packs, while the
-/// threshold that fires it counts only the recent backlog. Bounding it like a
-/// `notes add` is what let a repo grow large enough that no attempt could ever
-/// finish, at which point compaction stops working permanently — the retry gate
+/// threshold that fires it counts only the recent backlog. Bounded like a
+/// `notes add`, a repo could grow large enough that no attempt ever finishes,
+/// at which point compaction stops working permanently — the retry gate
 /// bounds the waste but cannot make the work fit.
 ///
 /// So this deadline is not sized to a legitimate repack; it is sized to be past
@@ -252,8 +245,8 @@ const GC_ARGV: [&str; 4] = ["gc", "--quiet", GC_PRUNE_GRACE, "--cruft"];
 ///
 /// ## Why not make the operation cheaper instead
 ///
-/// Because the obvious substitution does not work, which is worth recording so
-/// it is not re-proposed. `git repack -d` looks like the fix — pack the loose
+/// Because the obvious substitution does not work. `git repack -d` looks like
+/// the fix — pack the loose
 /// objects without rewriting existing packs, so cost matches trigger — but writ
 /// needs `--cruft`, and git-repack(1) defines `--cruft` as "same as `-a`". A
 /// `repack -d --cruft` therefore runs `pack-objects --all --reflog
@@ -740,8 +733,7 @@ impl NotesRepo {
     /// Writ suppresses git's own background auto-maintenance in every repo it
     /// owns (see [`writ_core::git_env`]): a detached `git maintenance` child is
     /// a writer writd never spawned, cannot wait for, and whose lifetime no
-    /// writd operation bounds. That removed the compaction the repo used to get
-    /// for free, so this is where writ does it deliberately instead. Call it
+    /// writd operation bounds. So writ compacts deliberately, here. Call it
     /// after a note write; it is cheap when there is nothing to do (one
     /// `count-objects -v`) and it decides for itself whether to spend a repack.
     ///
@@ -774,11 +766,9 @@ impl NotesRepo {
     ///
     /// git's documentation is candid that these "fall short of a complete
     /// solution, so users who run commands concurrently have to live with some
-    /// risk of corruption (which seems to be low in practice)". Writ's position
-    /// is that this is strictly better than the status quo it replaces: the
-    /// writer being removed was an *unsupervised* one racing whatever writd was
-    /// doing, and this one is bounded, logged, and serialised against every
-    /// in-process writer.
+    /// risk of corruption (which seems to be low in practice)". This writer is
+    /// bounded, logged, and serialised against every in-process writer, which
+    /// git's own detached maintenance would not be.
     ///
     /// ## Why not spawn it in the background
     ///
@@ -801,8 +791,8 @@ impl NotesRepo {
     ///
     /// What is bounded is the damage: `COMPACTION_RETRY_BACKOFF` holds off the
     /// next attempt, so that state costs one killed `gc` per hour rather than one
-    /// per request, and writ degrades to the behaviour it had before compaction
-    /// existed. The gate covers the whole attempt, not just the repack: it is
+    /// per request, and the repo merely stops being compacted. The gate covers
+    /// the whole attempt, not just the repack: it is
     /// consulted before anything runs (measuring is a git invocation against the
     /// same object directory and can itself be the slow thing), it closes on any
     /// failure whichever step raised it, and it closes on a `gc` that returns
