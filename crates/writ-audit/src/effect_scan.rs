@@ -157,15 +157,15 @@ impl AuditLog {
 mod tests {
     use super::*;
     use crate::claude_proxy::{
-        ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
-        ClaudeProxyRequestRecord,
+        ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyAuditTable,
+        ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
     };
     use crate::test_support::sample_session;
     use std::collections::BTreeSet;
     use writ_core::core::{RequestId, SessionId, UnixMillis};
 
     fn record_request(log: &AuditLog, session_id: SessionId, request_id: RequestId) {
-        log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
+        log.seed_effect_request::<ClaudeProxyAuditTable>(&ClaudeProxyRequestRecord {
             request_id,
             session_id,
             received_at: UnixMillis::from_millis(1_700_000_200),
@@ -178,7 +178,7 @@ mod tests {
     }
 
     fn record_outcome(log: &AuditLog, request_id: RequestId) {
-        log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+        log.seed_effect_outcome::<ClaudeProxyAuditTable>(&ClaudeProxyOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_240),
             http_status: 200,

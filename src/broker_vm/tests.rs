@@ -455,40 +455,10 @@ fn route_fix_prologue_targets_the_internal_subnet_and_demotes_it() {
 }
 
 #[test]
-fn stop_invocations_remove_vm_then_egress_then_shared_internal_network() {
-    let stops: Vec<Vec<String>> = sample_plan()
-        .stop_invocations()
-        .iter()
-        .map(ProcessInvocation::args_lossy)
-        .collect();
-    assert_eq!(
-        stops,
-        vec![
-            vec![
-                "rm".to_string(),
-                "-f".to_string(),
-                "writ-broker-vm-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string(),
-            ],
-            vec![
-                "network".to_string(),
-                "rm".to_string(),
-                "writ-broker-egress-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string(),
-            ],
-            vec![
-                "network".to_string(),
-                "rm".to_string(),
-                "writ-agent-net-51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".to_string(),
-            ],
-        ]
-    );
-}
-
-#[test]
-fn removal_invocations_from_identity_match_the_plan_in_order() {
+fn removal_invocations_remove_vm_then_egress_then_shared_internal_network() {
     // The daemon cleanup and dry-run reconstruct teardown from session
-    // identity; it must be exactly the plan's stop sequence, in order: broker
-    // VM, egress network, shared internal network.
-    let plan = sample_plan();
+    // identity, in order: broker VM, egress network, then the shared internal
+    // network (free only once the agent VM has also been stopped).
     let names = BrokerVmNames::for_session(session_id());
     let from_identity = broker_vm_removal_invocations(
         Path::new("/usr/local/bin/container"),
@@ -498,7 +468,6 @@ fn removal_invocations_from_identity_match_the_plan_in_order() {
     let args = |invs: &[ProcessInvocation]| -> Vec<Vec<String>> {
         invs.iter().map(ProcessInvocation::args_lossy).collect()
     };
-    assert_eq!(args(&from_identity), args(&plan.stop_invocations()));
     assert_eq!(
         args(&from_identity),
         vec![

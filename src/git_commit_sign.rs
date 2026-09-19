@@ -39,7 +39,7 @@
 //! the format and the parse, but the round-trip surface is honest
 //! about it.
 
-use crate::core::{SshSignature, SshSignatureError};
+use crate::core::SshSignature;
 use crate::github_git_db::CommitIdentity;
 use crate::signing::{WritSigningKey, WritSigningKeyError};
 use crate::vm_git::GitObjectId;
@@ -190,12 +190,6 @@ pub enum CommitSignError {
     Canonicalise(#[from] CanonicalCommitError),
     #[error("SSH commit signing failed: {0}")]
     Sign(WritSigningKeyError),
-    /// The signed bytes round-tripped through the SSHSIG armorer
-    /// produced a value that does not match the
-    /// [`SshSignature`] wire-validation regex. Indicates a bug in
-    /// the SSHSIG encoder rather than a bad input.
-    #[error("SSHSIG armor did not pass wire validation: {0}")]
-    Newtype(SshSignatureError),
 }
 
 #[cfg(test)]

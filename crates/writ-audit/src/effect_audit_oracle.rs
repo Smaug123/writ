@@ -1,30 +1,20 @@
-//! Stage-0 oracle for the "complete by construction" audit-pair invariant.
+//! Test-support oracle for the audit-pair invariant.
 //!
 //! The broker's central promise is that *no brokered effect happens without a
 //! durable audit pair* — a `*_request` row recorded before the effect and a
-//! matching `*_outcome` row recorded after. Today that promise is kept by
-//! discipline at each of ~7 effect handlers (see
-//! `docs/plans/2026-07-18-brokered-effect-audit-enforcement.md`); nothing in the
-//! type system forces a handler that performs an effect to record the pair.
-//!
-//! This module is the *executable oracle* for that invariant: after driving any
+//! matching `*_outcome` row recorded after. The [`EffectAuditTable`](crate::EffectAuditTable)
+//! guard enforces that at the type level for every write; this module is the
+//! *executable oracle* that checks the persisted result: after driving any
 //! effect, a test asserts that every `*_request` row has its `*_outcome`
-//! partner. It is deliberately **table-name based** rather than typed, so one
-//! primitive covers every effect regardless of its column shape — the pairs
-//! differ in columns (proxy `method/target/route`, git-push `repo/branch/heads`,
-//! flake `dirs/archive-metrics`) but they all share the shape *"a request row
-//! joined to an outcome row on one key column"*. The key column is the only
-//! per-effect parameter: `request_id` for the proxies and the host grant,
-//! `push_request_id` for git-push, `run_id` for agent-runs.
+//! partner.
 //!
-//! It is the executable form of the reviewer's finding: drive a handler that
-//! forgets its outcome row and the oracle goes RED (see the `tests` below, and
-//! `git_push.rs::git_push_handler_satisfies_audit_pair_oracle` for the same
-//! assertion applied to a real current handler). As effects are ported onto the
-//! single `broker_effect` driver in later stages, each port wires its handler
-//! drive through [`AuditLog::assert_effect_audit_pairs_complete`], so this one
-//! oracle grows to cover every capability — including future ones — by
-//! construction.
+//! It is deliberately **table-name based** rather than typed, so one primitive
+//! covers every effect regardless of its column shape — the pairs differ in
+//! columns but all share the shape *"a request row joined to an outcome row on
+//! one key column"*. The key column is the only per-effect parameter:
+//! `request_id` for the proxies and the host grant, `push_request_id` for
+//! git-push, `run_id` for agent-runs. Handler tests wire their drive through
+//! [`AuditLog::assert_effect_audit_pairs_complete`].
 
 use crate::AuditLog;
 
@@ -92,8 +82,8 @@ mod tests {
     use writ_core::core::{RequestId, UnixMillis};
 
     use crate::claude_proxy::{
-        ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyOutcomeRecord,
-        ClaudeProxyRequestRecord,
+        ClaudeProxyAuditDecision, ClaudeProxyAuditRoute, ClaudeProxyAuditTable,
+        ClaudeProxyOutcomeRecord, ClaudeProxyRequestRecord,
     };
 
     const REQ: &str = "claude_proxy_request";
@@ -105,7 +95,7 @@ mod tests {
         session_id: writ_core::core::SessionId,
         request_id: RequestId,
     ) {
-        log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
+        log.seed_effect_request::<ClaudeProxyAuditTable>(&ClaudeProxyRequestRecord {
             request_id,
             session_id,
             received_at: UnixMillis::from_millis(1_700_000_200),
@@ -118,7 +108,7 @@ mod tests {
     }
 
     fn record_outcome(log: &AuditLog, request_id: RequestId) {
-        log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+        log.seed_effect_outcome::<ClaudeProxyAuditTable>(&ClaudeProxyOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_240),
             http_status: 200,
