@@ -745,6 +745,110 @@ fn push_staged_receipt_rejects_missing_expected_remote_head_key() {
     );
 }
 
+/// The wire keys each push struct requires, each with a valid JSON value.
+const PUSH_METADATA_FIELDS: &[(&str, &str)] = &[
+    ("repo", "\"owner/repo\""),
+    ("branch", "\"feature/x\""),
+    (
+        "expected_remote_head",
+        "\"1111111111111111111111111111111111111111\"",
+    ),
+    ("new_head", "\"2222222222222222222222222222222222222222\""),
+];
+
+const PUSH_RECEIPT_FIELDS: &[(&str, &str)] = &[
+    ("repo", "\"owner/repo\""),
+    ("branch", "\"feature/x\""),
+    (
+        "expected_remote_head",
+        "\"1111111111111111111111111111111111111111\"",
+    ),
+    ("new_head", "\"2222222222222222222222222222222222222222\""),
+    (
+        "push_request_id",
+        "\"00000000-0000-4000-8000-000000000000\"",
+    ),
+    ("staged_at", "1700000000123"),
+];
+
+/// Which keys a JSON object carries, in order: index `i < fields.len()`
+/// names `fields[i]`, and `fields.len()` names a key the struct does not
+/// have. Half the cases are a permutation of every required key (the
+/// accepted shape); the rest may omit, repeat or invent keys.
+fn key_slots(fields: &[(&str, &str)]) -> impl Strategy<Value = Vec<usize>> {
+    let n = fields.len();
+    prop_oneof![
+        Just((0..n).collect::<Vec<_>>()).prop_shuffle(),
+        proptest::collection::vec(0..=n, 0..n + 3),
+    ]
+}
+
+/// The JSON text for `slots`, built by hand because `serde_json::Value`
+/// cannot express a repeated key.
+fn wire_object(fields: &[(&str, &str)], slots: &[usize], null_expected_head: bool) -> String {
+    let members: Vec<String> = slots
+        .iter()
+        .map(|&slot| match fields.get(slot) {
+            None => "\"extra\":0".to_string(),
+            Some((key, value)) => {
+                let value = if *key == "expected_remote_head" && null_expected_head {
+                    "null"
+                } else {
+                    value
+                };
+                format!("\"{key}\":{value}")
+            }
+        })
+        .collect();
+    format!("{{{}}}", members.join(","))
+}
+
+/// The accept rule both structs share: every required key exactly once and
+/// no other key. A missing `expected_remote_head` in particular must not
+/// read as `null`, since the two mean different things to the staging area.
+fn every_required_key_once(fields: &[(&str, &str)], slots: &[usize]) -> bool {
+    (0..fields.len()).all(|i| slots.iter().filter(|&&s| s == i).count() == 1)
+        && !slots.contains(&fields.len())
+}
+
+proptest! {
+    #[test]
+    fn push_metadata_accepts_exactly_the_objects_with_every_key_once(
+        slots in key_slots(PUSH_METADATA_FIELDS),
+        null_expected_head: bool,
+    ) {
+        let text = wire_object(PUSH_METADATA_FIELDS, &slots, null_expected_head);
+        let parsed = serde_json::from_str::<VmGitPushMetadata>(&text);
+        prop_assert_eq!(
+            parsed.is_ok(),
+            every_required_key_once(PUSH_METADATA_FIELDS, &slots),
+            "{}",
+            text
+        );
+        if let Ok(metadata) = parsed {
+            prop_assert_eq!(metadata.expected_remote_head().is_none(), null_expected_head);
+        }
+    }
+
+    #[test]
+    fn push_staged_receipt_accepts_exactly_the_objects_with_every_key_once(
+        slots in key_slots(PUSH_RECEIPT_FIELDS),
+        null_expected_head: bool,
+    ) {
+        let text = wire_object(PUSH_RECEIPT_FIELDS, &slots, null_expected_head);
+        let parsed = serde_json::from_str::<VmGitPushStagedReceipt>(&text);
+        prop_assert_eq!(
+            parsed.is_ok(),
+            every_required_key_once(PUSH_RECEIPT_FIELDS, &slots),
+            "{}",
+            text
+        );
+        if let Ok(receipt) = parsed {
+            prop_assert_eq!(receipt.expected_remote_head().is_none(), null_expected_head);
+        }
+    }
+}
+
 #[test]
 fn push_request_debug_reports_bundle_length_not_bundle_bytes() {
     let request = VmGitPushRequest::new(push_metadata(), b"secret bundle bytes".to_vec()).unwrap();
