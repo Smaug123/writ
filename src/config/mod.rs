@@ -1512,16 +1512,16 @@ impl AgentVmHttpConfig {
         let nix_cache = nix_cache
             .with_trusted_public_keys(trusted_public_keys)
             .with_local_cache_dirs(local_cache_dirs);
-        let runtime = VmHttpRuntimeConfig::new_with_proxies(
+        let runtime = VmHttpRuntimeConfig::new(
             self.bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
-            claude_proxy,
-            openai_proxy,
             git_push_staging_root.clone(),
             git_push_body_limits,
         )
+        .with_claude_proxy(claude_proxy)
+        .with_openai_proxy(openai_proxy)
         .with_flake_provision(flake_provision)
         .with_nix_prewarm_cache_dir(nix_prewarm_cache_dir);
         // The directories are named but not yet created; `materialize` does
