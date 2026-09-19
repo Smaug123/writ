@@ -24,6 +24,7 @@ use crate::core::{
 };
 use crate::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
 
+pub mod framing;
 mod views;
 pub use views::{
     AgentVmSessionInfo, MAX_REJECTION_REASON_BYTES, ReconcileOutcome, RejectionReason,
