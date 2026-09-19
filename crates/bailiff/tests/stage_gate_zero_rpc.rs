@@ -39,13 +39,7 @@
 //! state it was asked for, so a mistake here fails as a planting
 //! error rather than as a mysterious gate result.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
 
 use bailiff::bailiff_decision::{Decider, Decision};
 use bailiff::bailiff_plan_implement::{
@@ -61,140 +55,15 @@ use bailiff::bailiff_plan_review::{SubmitReviewError, SubmitReviewInputs, submit
 use bailiff::bailiff_plan_state::{NotePresence, PlanState, allows};
 use bailiff::bailiff_plan_submit::{SubmitPlanError, SubmitPlanInputs, submit_plan};
 use bailiff::bailiff_stage::AgentStage;
-use writ::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
-use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, SessionId, UnixMillis};
+use writ::agent_run::AgentPrompt;
+use writ::core::{AgentKind, CapabilitySet, UnixMillis};
 use writ::notes_repo::NotesRepo;
-use writ::protocol::{ClientMessage, SignedRunMetadata};
-use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
-use writ::run_verify::AllowedSigners;
-use writ::signing::WritSigningKey;
-use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, GitObjectId, WorkspaceWarmMode};
+use writ::protocol::ClientMessage;
+use writ::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 use writ::writ_client::WritClient;
 
-use writ::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
-use writ::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
-const PLAN_BODY: &str = "# Plan\n\nReplace bar with baz.\n";
-const WRIT_OUTPUT_REF: &str = "refs/notes/writ/v1/agent-outputs";
-
-fn repo_ref() -> RepoRef {
-    RepoRef {
-        owner: "smaug123".into(),
-        name: "writ".into(),
-    }
-}
-
-fn writ_output_ref() -> NotesRef {
-    NotesRef::try_new(WRIT_OUTPUT_REF).unwrap()
-}
-
-fn allowed_signers() -> AllowedSigners {
-    AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap()
-}
-
-/// Records every [`ClientMessage`] it receives and replies to none of
-/// them.
-///
-/// Never replying is deliberate. Every case here either refuses before
-/// any RPC (so there is nothing to reply to) or is an allowed case
-/// where the assertion is "at least one RPC was sent" — for which the
-/// workflow's subsequent transport failure is irrelevant. Recording
-/// happens *before* the hang-up, so an RPC sent by a workflow that
-/// should have refused is still observed.
-struct RecordingBroker {
-    socket_path: PathBuf,
-    requests: Arc<AsyncMutex<Vec<ClientMessage>>>,
-    _task: JoinHandle<()>,
-    _dir: tempfile::TempDir,
-}
-
-impl RecordingBroker {
-    async fn start() -> Self {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket_path = dir.path().join("writ.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let requests = Arc::new(AsyncMutex::new(Vec::new()));
-        let req_clone = Arc::clone(&requests);
-        let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let (reader, mut writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
-                if let Ok(Some(line)) = lines.next_line().await
-                    && let Ok(msg) = serde_json::from_str::<ClientMessage>(&line)
-                {
-                    req_clone.lock().await.push(msg);
-                }
-                let _ = writer.shutdown().await;
-            }
-        });
-        Self {
-            socket_path,
-            requests,
-            _task: task,
-            _dir: dir,
-        }
-    }
-
-    async fn observed(&self) -> Vec<ClientMessage> {
-        self.requests.lock().await.clone()
-    }
-}
-
-/// A writ repo holding one signed envelope whose stdout is
-/// [`PLAN_BODY`], so the pre-RPC envelope read succeeds and a refusal
-/// can only come from the gate.
-struct WritSide {
-    repo_path: PathBuf,
-    oid: GitObjectId,
-    metadata: SignedRunMetadata,
-    signature: writ::core::SshSignature,
-}
-
-fn build_writ_side(dir: &Path) -> WritSide {
-    let repo = NotesRepo::init_or_open(dir.join("writ-bare")).unwrap();
-    let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-    let output = OutputEnvelope {
-        stdout: PLAN_BODY.as_bytes().to_vec(),
-        stderr: Vec::new(),
-        stdout_truncated_at: None,
-        stderr_truncated_at: None,
-    };
-    let output_bytes = output.to_bytes();
-    let metadata = SignedRunMetadata {
-        run_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-            .parse::<AgentRunId>()
-            .unwrap(),
-        session_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
-            .parse::<SessionId>()
-            .unwrap(),
-        prompt_sha256: sha256_hex(b"prompt"),
-        output_envelope_sha256: sha256_hex(&output_bytes),
-        capabilities: vec![CapabilitySet::WorkspaceRead { repo: repo_ref() }],
-        exit_code: 0,
-        completed_at: UnixMillis::from_millis(1_700_000_000_000),
-        signing_key_fingerprint: signing_key.fingerprint(),
-    };
-    let signature = signing_key.sign(&metadata.canonical_bytes()).unwrap();
-    let envelope = SignedRunEnvelope {
-        metadata: metadata.clone(),
-        output: output_bytes,
-        signature: signature.clone(),
-    };
-    let oid = repo
-        .write_note(
-            &writ_output_ref(),
-            b"stage-gate-seed",
-            &serde_json::to_vec(&envelope).unwrap(),
-        )
-        .unwrap();
-    WritSide {
-        repo_path: repo.path().to_path_buf(),
-        oid,
-        metadata,
-        signature,
-    }
-}
+mod common;
+use common::*;
 
 /// The note set to plant for `state`.
 ///
@@ -397,7 +266,12 @@ async fn a_forbidden_stage_emits_no_rpcs_and_an_allowed_one_emits_some() {
             let plan_id = PlanId::new();
             plant(&bailiff, &writ, plan_id, state);
 
-            let broker = RecordingBroker::start().await;
+            // No scripted replies: a forbidden case refuses before any
+            // RPC, and an allowed case need only have its first RPC
+            // recorded before the stub hangs up on it. The stub answers
+            // the version handshake, so what it records is the
+            // workflow's own RPC and never the client's `Hello`.
+            let broker = StubBroker::start(Vec::new()).await;
             let client = WritClient::new(&broker.socket_path);
             let outcome = drive(stage, &client, Arc::clone(&bailiff), &writ, plan_id).await;
             let observed = broker.observed().await;
@@ -430,6 +304,16 @@ async fn a_forbidden_stage_emits_no_rpcs_and_an_allowed_one_emits_some() {
                         !observed.is_empty(),
                         "{stage:?} from {state} is legal but emitted no writ RPC at all; the \
                          zero-RPC assertions above would pass vacuously against this",
+                    );
+                    // The stub answers the version handshake before it
+                    // records, so a recorded `Hello` would mean the recorder
+                    // had regressed to counting the connection itself as the
+                    // RPC, which is what an earlier recorder here did: it
+                    // never answered the handshake, so the client's `Hello`
+                    // was the only message it ever saw.
+                    assert!(
+                        !matches!(observed[0], ClientMessage::Hello { .. }),
+                        "{stage:?} from {state} recorded the handshake as its RPC: {observed:?}",
                     );
                 }
             }
