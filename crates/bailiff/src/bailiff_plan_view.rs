@@ -88,22 +88,16 @@ impl BailiffPlanSummary {
         }
     }
 
-    /// Derived workflow state.
-    ///
-    /// Before slice 1 this method held its own derivation — "the
-    /// highest workflow step reached" — which was a fourth encoding of
-    /// the transition relation and disagreed with the three gates in
-    /// the workflows. It now delegates, so a note set the workflows
-    /// would refuse to produce renders as [`PlanState::Corrupt`]
-    /// instead of being silently labelled with a stage it never
-    /// legally reached. See
-    /// `docs/plans/2026-07-26-bailiff-workflow-as-data.md`.
+    /// Derived workflow state. Delegates to [`derive_state`], so a note
+    /// set the workflows would refuse to produce renders as
+    /// [`PlanState::Corrupt`] instead of being labelled with a stage it
+    /// never legally reached.
     pub fn state(&self) -> PlanState {
         derive_state(&self.presence())
     }
 }
 
-/// Aggregate per-plan view used by `bailiff plan show` (slice F4).
+/// Aggregate per-plan view used by `bailiff plan show`.
 /// Returned by [`crate::bailiff_plan_read::read_full_plan`] after composing the four
 /// `read_*_note` helpers and, for every available signed note,
 /// pairing it with the writ envelope referenced by its
@@ -124,16 +118,15 @@ pub struct PlanFullView {
     pub plan: Option<VerifiedSection<PlanNote>>,
     pub decision: Option<DecisionNote>,
     pub review: Option<VerifiedSection<ReviewNote>>,
-    /// Every implementer attempt, in order. A list since slice 4
-    /// made `implement` repeatable: fan-out is N implementer runs on
-    /// one accepted plan, and this is the read path where that becomes
-    /// visible. Empty for a plan that has not been implemented.
+    /// Every implementer attempt, in order. A list because `implement`
+    /// is repeatable: fan-out is N implementer runs on one accepted
+    /// plan. Empty for a plan that has not been implemented.
     pub implement: Vec<(ImplementAttempt, VerifiedSection<ImplementNote>)>,
 }
 
 /// Pairs a bailiff-side signed note with the outcome of verifying its
 /// referenced writ envelope. The five-way split mirrors what
-/// `bailiff plan show` (slice F4) must surface:
+/// `bailiff plan show` must surface:
 ///
 /// - [`VerifiedSection::Verified`]: envelope present, decoded,
 ///   end-to-end verified by [`writ::run_verify::verify_run_envelope`], **and** the
