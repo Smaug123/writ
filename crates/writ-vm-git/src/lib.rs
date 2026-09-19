@@ -574,6 +574,11 @@ pub enum WorkspaceWarmMode {
     DevShell,
 }
 
+impl WorkspaceWarmMode {
+    /// Every mode, for tests that range over all of them.
+    pub const ALL: [Self; 3] = [Self::None, Self::Sources, Self::DevShell];
+}
+
 pub fn default_workspace_destination(repo: &GitCloneRepo) -> PathBuf {
     PathBuf::from(DEFAULT_WORKSPACE_ROOT).join(&repo.as_repo_ref().name)
 }

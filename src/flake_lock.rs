@@ -669,8 +669,13 @@ mod tests {
     const NAR_HASH: &str = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
     fn github_locked(owner: &str, repo: &str) -> Value {
+        forge_locked("github", owner, repo)
+    }
+
+    /// A fully-pinned forge-shorthand locked node (`github`/`gitlab`/`sourcehut`).
+    fn forge_locked(source_type: &str, owner: &str, repo: &str) -> Value {
         json!({
-            "type": "github",
+            "type": source_type,
             "owner": owner,
             "repo": repo,
             "rev": REV,
@@ -1100,12 +1105,22 @@ mod tests {
 
     prop_compose! {
         fn public_inputs_strategy(max: usize)(
-            ids in prop::collection::hash_set(node_id_strategy(), 1..=max)
+            inputs in prop::collection::hash_map(node_id_strategy(), public_locked_strategy(), 1..=max)
         ) -> Vec<(String, Value)> {
-            ids.into_iter()
-                .map(|id| (id, github_locked("owner", "repo")))
-                .collect()
+            inputs.into_iter().collect()
         }
+    }
+
+    /// A pinned locked node of each kind `classify_locked` admits as
+    /// `Public`: the three forge shorthands and a content-addressed tarball
+    /// on a public host.
+    fn public_locked_strategy() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(forge_locked("github", "owner", "repo")),
+            Just(forge_locked("gitlab", "owner", "repo")),
+            Just(forge_locked("sourcehut", "~owner", "repo")),
+            Just(tarball_locked("https://example.com/src.tar.gz")),
+        ]
     }
 
     proptest! {
