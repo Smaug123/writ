@@ -157,7 +157,7 @@ fn only_git_env_defines_the_hardened_git_recipe() {
             "src/clean_git.rs",
             "src/notes_repo/tests.rs",
             "src/git_push_approve/tests.rs",
-            "src/git_push_walker/branch_creation_plan_tests.rs",
+            "src/git_push_walker/fast_forward_plan_tests.rs",
             "src/vm_git_bundle.rs",
         ],
     );

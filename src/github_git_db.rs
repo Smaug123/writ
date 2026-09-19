@@ -12,12 +12,9 @@
 //!
 //! * POST `git/blobs`, `git/trees`, `git/commits` — the create-side
 //!   primitives the walker uses to upload bundle objects one at a time.
-//! * GET `repos/{o}/{r}` and `repos/{o}/{r}/git/ref/heads/{branch}` —
-//!   the lookup primitives the replay orchestrator uses to resolve
-//!   the App-side default branch tip when an agent's push creates a
-//!   new branch with no prior `expected_remote_head`. The tip is then
-//!   fetched into the staging repo and passed by SHA to
-//!   [`crate::git_push_walker::plan_branch_creation_via_rev_list`].
+//! * GET `repos/{o}/{r}/git/ref/heads/{branch}` — the lookup the
+//!   promote workflow uses to check the App-side branch tip against the
+//!   `expected_remote_head` the staged receipt declares.
 //! * PATCH `repos/{o}/{r}/git/refs/heads/{branch}` — the publish step
 //!   the promote workflow uses to fast-forward the App-side branch
 //!   to the new commit chain the walker uploaded.
@@ -28,7 +25,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use crate::core::RepoRef;
-use crate::vm_git::{GitBranchName, GitBranchNameError, GitObjectId};
+use crate::vm_git::{GitBranchName, GitObjectId};
 
 /// The `GitDataClient` request methods (blob/tree/commit creation, ref
 /// read/update) live here; the struct and its supporting types stay in this
@@ -244,16 +241,6 @@ pub enum GitDataError {
     ApiError {
         status: reqwest::StatusCode,
         body: String,
-    },
-    /// GitHub returned a repo whose `default_branch` field is not a
-    /// valid git branch name. The field is operator-set on GitHub,
-    /// so a bad value is server-side data corruption rather than a
-    /// transport issue — we surface it separately so the caller can
-    /// distinguish "bad input from GitHub" from "transport error".
-    #[error("GitHub returned an invalid default_branch name: {source}")]
-    InvalidDefaultBranch {
-        #[source]
-        source: GitBranchNameError,
     },
     /// `GET /repos/{o}/{r}/git/ref/heads/{branch}` returned an
     /// object whose `type` is not `commit`. Branches in GitHub
@@ -560,16 +547,6 @@ struct CommitVerification {
 struct UpdateRefBody<'a> {
     sha: &'a GitObjectId,
     force: bool,
-}
-
-/// Subset of `GET /repos/{owner}/{repo}` we care about. The
-/// response carries many other fields (description, language stats,
-/// permissions, etc.) — serde with `deny_unknown_fields` would force
-/// us to track every one of GitHub's schema additions, so we
-/// deliberately accept extras and pull only the field we need.
-#[derive(serde::Deserialize)]
-struct RepoMetadataResponse {
-    default_branch: String,
 }
 
 /// `GET /repos/{owner}/{repo}/git/ref/{ref}` response. The wire
