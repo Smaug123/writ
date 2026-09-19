@@ -33,7 +33,9 @@ Environment overrides:
                          says a host socket filter ate the request above PF
                          (on macOS: the Application Firewall blocking the
                          listener's binary), so the firewall legs still run;
-                         the proof then exits 2
+                         the proof then exits 2. This also downgrades the
+                         host-listener preflight to a warning, since that gate
+                         predicts exactly the failure being waived
 EOF
 }
 
@@ -53,6 +55,15 @@ die() {
 die_before_setup() {
   printf '[prove-lifecycle] error: %s\n' "$*" >&2
   exit 1
+}
+
+# Stands in for die_before_setup when WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1:
+# it returns instead of exiting, so the run carries on to the legs the waiver
+# exists to exercise. assert_broker_reachable then grades the failure for real and
+# forces the non-zero exit, so waiving the preflight cannot turn into a green run.
+warn_before_setup() {
+  printf '[prove-lifecycle] warning: %s\n' "$*" >&2
+  printf '[prove-lifecycle] warning: continuing because WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1; the proof will exit non-zero\n' >&2
 }
 
 # On failure, before anything is torn down: what PF did with the session's
@@ -719,7 +730,16 @@ require_cmd uuidgen
 # socket filter that blocks it is invisible to every loopback check the harness
 # makes. Catch that here, in about a second, rather than after a build, a sudo
 # prompt, a PF anchor, and a VM boot.
-writ_require_reachable_host_listener log die_before_setup
+#
+# Under the waiver this must warn rather than exit. The waiver's whole purpose is
+# to exercise the remaining legs on a host whose listener is blocked, and a fatal
+# preflight would make it unreachable: the run would stop here, long before
+# assert_broker_reachable, which is where the waiver is implemented.
+if [[ "${WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER:-0}" == "1" ]]; then
+  writ_require_reachable_host_listener log warn_before_setup
+else
+  writ_require_reachable_host_listener log die_before_setup
+fi
 
 choose_cargo
 

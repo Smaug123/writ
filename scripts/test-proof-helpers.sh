@@ -10,14 +10,18 @@ set -Eeuo pipefail
 # wrongly, and a wrong explanation sends a human off to debug the wrong
 # subsystem.
 #
-# Usage: scripts/test-proof-helpers.sh [path-to-broker-reach-evidence.sh]
+# Usage: scripts/test-proof-helpers.sh [evidence-lib] [preflight-lib]
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVIDENCE_LIB="${1:-${ROOT_DIR}/scripts/lib/broker-reach-evidence.sh}"
+PREFLIGHT_LIB="${2:-${ROOT_DIR}/scripts/lib/host-listener-preflight.sh}"
 
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=lib/broker-reach-evidence.sh
 source "$EVIDENCE_LIB"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/host-listener-preflight.sh
+source "$PREFLIGHT_LIB"
 
 FAILURES=0
 CHECKS=0
@@ -122,6 +126,69 @@ check_verdict 'no PF state but an ENOTCONN witness: blocked listener' \
   listener-never-saw-request state_pair='' listener_detached=1
 check_verdict 'no PF state and no witness: inconclusive' \
   inconclusive state_pair=''
+
+printf 'writ_require_reachable_host_listener\n'
+
+# The probe itself needs a network stack and a spare port, so these stub it and
+# test the wrapper's contract instead: which reporter gets called for each
+# outcome, and — the part a waiver depends on — whether the run continues when
+# the caller's fatal reporter chooses to return rather than exit.
+STUB_RC=0
+writ_probe_host_listener_offloopback() {
+  printf 'stub finding line one\n'
+  printf 'stub finding line two\n'
+  return "$STUB_RC"
+}
+
+REPORTED=""
+FATAL_CALLS=0
+stub_log() { REPORTED="${REPORTED}log:$1
+"; }
+stub_die_returns() { FATAL_CALLS=$((FATAL_CALLS + 1)); REPORTED="${REPORTED}fatal:$1
+"; }
+stub_die_exits() { printf 'fatal:%s\n' "$1"; exit 1; }
+
+run_wrapper() {  # <probe-rc> <fatal-fn> -> prints the wrapper's own return code
+  STUB_RC="$1"
+  REPORTED=""
+  FATAL_CALLS=0
+  local rc=0
+  writ_require_reachable_host_listener stub_log "$2" || rc=$?
+  printf '%s\n' "$rc"
+}
+
+check 'reachable: wrapper returns 0' 0 "$(run_wrapper 0 stub_die_returns)"
+run_wrapper 0 stub_die_returns >/dev/null
+check 'reachable: nothing fatal is reported' 0 "$FATAL_CALLS"
+check 'reachable: the finding is logged as a pass' \
+  pass-logged \
+  "$(case "$REPORTED" in *'log:pass: stub finding line one'*) echo pass-logged ;; *) echo "$REPORTED" ;; esac)"
+
+check 'untestable: wrapper returns 0' 0 "$(run_wrapper 2 stub_die_returns)"
+run_wrapper 2 stub_die_returns >/dev/null
+check 'untestable: nothing fatal is reported' 0 "$FATAL_CALLS"
+check 'untestable: the skip is warned about' \
+  warned \
+  "$(case "$REPORTED" in *'log:warning: skipping'*) echo warned ;; *) echo "$REPORTED" ;; esac)"
+
+# A fatal reporter that exits stops the run: the default, so a blocked listener
+# costs a second instead of a VM boot.
+( run_wrapper 1 stub_die_exits >/dev/null ) >/dev/null 2>&1 && wrapper_rc=0 || wrapper_rc=$?
+check 'unreachable with an exiting reporter: the run stops' 1 "$wrapper_rc"
+
+# A fatal reporter that RETURNS lets the run continue. This is the contract the
+# lifecycle proof's waiver rides on: WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1
+# must reach the later legs, which a fatal preflight would make unreachable.
+check 'unreachable with a returning reporter: the run continues' \
+  0 "$(run_wrapper 1 stub_die_returns)"
+run_wrapper 1 stub_die_returns >/dev/null
+check 'unreachable: the fatal reporter is called exactly once' 1 "$FATAL_CALLS"
+check 'unreachable: every finding line is reported' \
+  both-lines \
+  "$(case "$REPORTED" in
+       *'log:  stub finding line one'*'log:  stub finding line two'*) echo both-lines ;;
+       *) echo "$REPORTED" ;;
+     esac)"
 
 printf '\n%d check(s), %d failure(s)\n' "$CHECKS" "$FAILURES"
 (( FAILURES == 0 )) || exit 1

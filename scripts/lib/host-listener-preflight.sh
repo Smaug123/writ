@@ -104,8 +104,8 @@ s.close()' 2>/dev/null)"
 
   local _
   for _ in {1..50}; do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:${port}/probe.txt" \
-      2>/dev/null | grep -Fqx "$token"; then
+    if curl --silent --fail --noproxy '*' --max-time 1 \
+      "http://127.0.0.1:${port}/probe.txt" 2>/dev/null | grep -Fqx "$token"; then
       ready=1
       break
     fi
@@ -122,8 +122,11 @@ s.close()' 2>/dev/null)"
     return 1
   fi
 
-  if curl --silent --fail --max-time 3 "http://${addr}:${port}/probe.txt" \
-    2>/dev/null | grep -Fqx "$token"; then
+  # --noproxy '*' on both requests: curl otherwise honours http_proxy/ALL_PROXY,
+  # and a no_proxy that covers only localhost would send this one through a proxy
+  # that cannot reach a private address — failing a perfectly healthy listener.
+  if curl --silent --fail --noproxy '*' --max-time 3 \
+    "http://${addr}:${port}/probe.txt" 2>/dev/null | grep -Fqx "$token"; then
     printf 'a host listener on %s:%s is reachable off-loopback\n' "$addr" "$port"
     return 0
   fi
@@ -160,6 +163,12 @@ s.close()' 2>/dev/null)"
 # Wraps the probe in the caller's own reporting. The caller passes the names of
 # its `log` and `die` functions rather than the library assuming they exist,
 # because each harness prefixes its output differently.
+#
+# <die-fn> decides whether an unreachable listener is fatal: if it exits, the run
+# stops here; if it returns, this function returns 0 and the run continues. That
+# is deliberate, and it is how a harness honours a waiver — a fatal preflight
+# would make an opt-in "carry on past a blocked listener" knob unreachable, since
+# the run would die before it got to the leg that implements the waiver.
 writ_require_reachable_host_listener() {
   local log_fn="$1" die_fn="$2"
   local findings probe_status=0
