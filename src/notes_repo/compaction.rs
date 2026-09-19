@@ -13,13 +13,12 @@
 //!
 //! ## Why writ decides this at all
 //!
-//! Git used to. Every `git commit` and `git fetch` spawned
-//! `git maintenance run --auto --detach`, which packed loose objects in the
-//! background. Writ suppresses that (see [`writ_core::git_env`]) because a
-//! detached writer in a repo writd owns is a second writer it never spawned,
-//! cannot wait for, and whose lifetime no writd operation bounds. Suppressing it
-//! left the repo growing forever, so the compaction it used to get for free is
-//! now writ's job to schedule deliberately.
+//! Writ suppresses git's own `git maintenance run --auto --detach`, which every
+//! `git commit` and `git fetch` would otherwise spawn (see
+//! [`writ_core::git_env`]): a detached writer in a repo writd owns is a second
+//! writer it never spawned, cannot wait for, and whose lifetime no writd
+//! operation bounds. Without it the repo would grow forever, so compaction is
+//! writ's job to schedule deliberately.
 //!
 //! ## Two axes, because writ has two shapes of repo
 //!

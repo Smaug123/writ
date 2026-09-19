@@ -676,11 +676,9 @@ fn signed_narinfo_rejects_mutated_signed_fields() {
 /// the fingerprint over an empty reference set. The broker must read the
 /// absent line as zero references and verify the signature.
 ///
-/// Regression for the nixpkgs refresh that shipped both zstd NARs and
-/// reference-less narinfos: the zstd half was fixed in #249, but the
-/// missing-`References` half kept surfacing to no-egress guests as a generic
-/// 502 "nix cache upstream failed" (audit label
-/// "missing upstream narinfo References").
+/// Reading it as a missing field instead surfaces to a no-egress guest as a
+/// generic 502 "nix cache upstream failed" (audit label
+/// "missing upstream narinfo References"), which says nothing about the cause.
 #[test]
 fn real_reference_free_cache_narinfo_parses_and_verifies() {
     const CACHE_NIXOS_ORG_KEY: &str =

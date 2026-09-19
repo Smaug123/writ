@@ -1006,12 +1006,6 @@ fn list_refs_under_prefix_surfaces_corruption_as_error() {
 // synthetic `PATH`, because the properties under test — "a wedged child is
 // killed at the deadline", "a flooding child is rejected rather than buffered" —
 // cannot be provoked from real git without an actual wedged filesystem.
-//
-// These are the protections `notes_repo` previously lacked entirely. It had a
-// spawn retry and no timeout; `clean_git` had a timeout and no spawn retry. Each
-// helper looked complete on its own, so a hung `git fetch` here hung a bailiff
-// workflow forever and a `git for-each-ref` over a corrupted ref namespace could
-// buffer without bound.
 
 /// Install an executable `git` in `dir` whose body is `body`, and return an
 /// `InheritedEnv` whose `PATH` finds it and nothing else.
@@ -2112,7 +2106,7 @@ fn a_failure_after_the_repack_buys_a_pause_like_any_other() {
     // next request measures *and* repacks again.
     //
     // This is the third distinct exit that has to record the same fact, which is
-    // why the recording no longer lives at the exits at all: the attempt cannot
+    // why the recording does not live at the exits at all: the attempt cannot
     // touch the gate, and its caller writes it in exactly one place.
     let tmp = TempDir::new().unwrap();
     let repo = NotesRepo::init_or_open(tmp.path().join("r")).unwrap();
@@ -2267,11 +2261,9 @@ fn the_compaction_argv_carries_no_pruning_aggression_or_lock_override() {
         "must be `gc`, not `maintenance`: only `gc` takes the gc.pid lock"
     );
 
-    // An earlier version of this test forbade `--prune` outright, on the
-    // reasoning that git's default grace was already what writ wanted. That was
-    // the bug: the default is overridable from `<repo>/config`, so inheriting it
-    // means writ's documented grace can be moved by a file writ does not write.
-    // What must hold is not "no prune flag" but "a prune date that is not now".
+    // What must hold is not "no prune flag" but "a prune date that is not now":
+    // git's default grace is overridable from `<repo>/config`, so inheriting it
+    // would let writ's documented grace be moved by a file writ does not write.
     let prune: Vec<&&str> = GC_ARGV
         .iter()
         .filter(|a| a.starts_with("--prune"))

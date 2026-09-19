@@ -1,6 +1,6 @@
 //! Compose a planned fast-forward push into the GitHub publish step.
 //!
-//! Takes the output of the slice-B1b planner ([`FastForwardPlan`]) and
+//! Takes the output of the planner ([`FastForwardPlan`]) and
 //! runs the two remaining steps of the staged-push pipeline against
 //! GitHub — as two functions, not one, split exactly where the
 //! consequences change:
@@ -21,13 +21,6 @@
 //! audit log in between — tightly bracketing the one step that can
 //! actually move a branch, rather than the whole pipeline. See
 //! [`crate::git_push_approve`].
-//!
-//! The [`FastForwardPlan::AlreadyAtExpected`] arm short-circuits the
-//! upload and the re-point: nothing new was pushed, so there is
-//! nothing to upload and no ref to move. It does *not* short-circuit
-//! the lease check — recording a noop as approved is still a claim
-//! that the branch is at the staged tip, so [`commit_prepared_promotion`]
-//! confirms that with one `GET` before the caller records it.
 //!
 //! App-identity commit signing is plumbed straight through to the
 //! walker: when `signing_key` is `Some(&key)`, every commit
@@ -449,16 +442,9 @@ pub enum ExecuteError {
 /// smallest TOCTOU window the GitHub REST API admits.
 ///
 /// The `AlreadyAtExpected` arm skips the pre-walk and post-walk checks
-/// because it uploads nothing — there is no bandwidth to save and no
-/// upload window to bracket. It does **not** skip the third check:
-/// [`commit_prepared_promotion`]'s `Noop` arm still issues the
-/// lease-verifying `GET` before the caller records the resolution.
-/// The noop makes no *mutating* call, but recording it as approved
-/// asserts `new_app_tip = tip` is the branch's state — an assertion
-/// that is false if a rival moved the branch away from `tip` after the
-/// receipt was staged, so it must be verified against GitHub, not
-/// assumed from the plan. Skipping it would let a noop record a branch
-/// state that never held.
+/// because it uploads nothing, but not the third: recording a noop as
+/// approved asserts the branch is at `tip`, which must be verified
+/// against GitHub, not assumed from the plan.
 ///
 /// `trailers` is forwarded to the walker untouched.
 ///
@@ -469,25 +455,6 @@ pub enum ExecuteError {
 /// walker that builds the canonical bytes and signs them. The
 /// AlreadyAtExpected arm uploads no commits, so the key is unused
 /// in that path.
-///
-/// ## Failure modes
-///
-/// * [`ExecuteError::LeaseLookup`] — the pre-walk `GET` failed. No
-///   upload attempted, no ref update issued.
-/// * [`ExecuteError::ExpectedHeadMoved`] — branch on GitHub no
-///   longer matches `expected_remote_head` at pre-walk check.
-///   No upload attempted.
-/// * [`ExecuteError::Replay`] — walker failure inside the upload
-///   loop. No ref update has been issued so the branch on GitHub
-///   is unchanged; the partial upload becomes unreferenced loose
-///   objects that GitHub eventually GC's.
-/// * [`ExecuteError::LeaseRecheckFailed`] — the post-walk `GET`
-///   failed. The walker uploaded `uploaded_tip` but the ref was
-///   not advanced because we could not re-verify the lease.
-/// * [`ExecuteError::ExpectedHeadMovedAfterReplay`] — the branch
-///   moved during the walker upload window. The walker uploaded
-///   `uploaded_tip` (now unreferenced on GitHub) but the ref was
-///   not advanced.
 // One past clippy's argument-count threshold: each arg is a distinct
 // concern (transport, repo, branch, lease tip, object source, plan,
 // trailers, signing key) and the natural caller has them as separate
@@ -553,29 +520,14 @@ pub async fn prepare_fast_forward_plan<S: GitObjectSource>(
 /// [`PreparedPromotion::RefUpdate`] then issues exactly one
 /// `PATCH /git/refs/heads/<branch>`, the only GitHub call in the whole
 /// promote pipeline that can move the branch.
-/// [`PreparedPromotion::Noop`] issues no mutation — but it is *not*
-/// free of the lease check: the branch already "should" point at the
-/// staged tip, and recording the noop as approved asserts exactly
-/// that, so committing it confirms the branch is still at `tip` and
-/// refuses (`FinalLeaseMoved`) if a rival moved it. Both arms can
-/// therefore fail with the same `FinalLease*` variants; only the
-/// RefUpdate arm can additionally fail past the PATCH.
+/// [`PreparedPromotion::Noop`] issues no mutation but still checks the
+/// lease, since recording it as approved asserts the branch is at
+/// `tip`; both arms can therefore fail with the `FinalLease*`
+/// variants, and only the RefUpdate arm can fail past the PATCH.
 ///
-/// The final GET is load-bearing, not paranoia. `update_ref` runs with
-/// `force=false`, but GitHub's fast-forward check only demands that the
-/// new tip *descend from the current head* — it is not a compare-and-
-/// swap against `expected_remote_head`. If another actor rewinds the
-/// branch to an ancestor after the post-walk check (the caller may
-/// spend arbitrary time between prepare and commit: reaping the object
-/// source, writing the `Uncertain` row), the PATCH would still succeed
-/// and silently publish against a baseline the approval never covered.
-/// (The noop arm has no PATCH, but the symmetric hazard is recording an
-/// approval whose asserted branch tip a rival has since replaced.)
-/// Rechecking *inside* commit pins the race window to a single
-/// GET→PATCH round-trip regardless of what the caller does in between;
-/// closing even that residue needs server-side CAS, which the REST API
-/// does not offer (GraphQL's `updateRefs` with `expectedHeadOid` is
-/// the eventual candidate).
+/// The final GET is load-bearing: see "Lease enforcement" on
+/// [`prepare_fast_forward_plan`] for why `force=false` is not a
+/// compare-and-swap and why the recheck sits inside commit.
 ///
 /// Failures split by proof: the `FinalLease*` variants of
 /// [`CommitError`] fire before any PATCH is sent (branch provably

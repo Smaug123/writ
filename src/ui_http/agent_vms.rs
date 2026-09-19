@@ -188,9 +188,9 @@ mod tests {
     /// The join projects the audit half onto the runtime half without
     /// crossing the two over.
     ///
-    /// Testable at all only because `build_row` now takes the
-    /// looked-up summary rather than the service: it previously needed
-    /// a live `AgentVmDaemon` to reach, so nothing exercised it.
+    /// Testable at all because `build_row` takes the looked-up summary rather
+    /// than the service: reaching it through a live `AgentVmDaemon` would put
+    /// it out of a unit test's reach.
     #[test]
     fn a_row_carries_both_halves_of_the_join() {
         let session_id = SessionId::new();

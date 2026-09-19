@@ -7,25 +7,9 @@
 //! either reaches its write, and both broker sessions — including the
 //! `WorkspaceWrite`-capable implementer run — proceed.
 //!
-//! # What changed in slice 2
-//!
-//! The predecessor of this module, `BailiffRepoGuard`, had three
-//! defects that `docs/plans/2026-07-26-bailiff-workflow-as-data.md`
-//! records in full:
-//!
-//! 1. **It locked the whole repo.** Two workflows on unrelated plans
-//!    serialised for the length of an LLM run. That was justified at
-//!    the time by "humans drive the CLI one command at a time", a
-//!    premise variant fan-out invalidates by construction.
-//! 2. **The cross-process half lived in the binary.** `bin/bailiff.rs`
-//!    took an `flock` named `bailiff-implement.lock`, so a library
-//!    caller — the long-running orchestrator this module's own
-//!    docstring cited as its reason to exist — got only the in-process
-//!    half, and even the CLI took it for `implement` alone.
-//! 3. **`decide` took no lock at all**, in or out of process.
-//!
-//! [`PlanGuard`] fixes all three: it is keyed per plan, it owns both
-//! halves, and all four mutating verbs acquire it.
+//! [`PlanGuard`] is keyed per plan, so unrelated plans do not serialise
+//! for the length of an LLM run; it excludes other processes as well as
+//! this one; and all four mutating verbs acquire it.
 //!
 //! # Why per-plan granularity is safe
 //!
@@ -50,33 +34,18 @@
 //! Exclusion is a single per-plan `flock`, acquired on a blocking
 //! thread and held for the workflow's lifetime.
 //!
-//! The first draft layered a per-plan async mutex *over* the flock —
-//! the mutex to make same-process callers queue, the flock to exclude
-//! other processes. That design needed a process-wide registry of
-//! mutexes keyed by `(repo, plan)`, lifetime bookkeeping to keep the
-//! registry from growing once per plan ever seen, and a field
-//! declaration order chosen so the two layers released in the reverse
-//! of their acquisition order. Two distinct bugs came out of that
-//! bookkeeping — an eviction sweep that could hand a fresh mutex to a
-//! caller while another still held the old one, and a release-ordering
-//! window that let a woken in-process waiter collide with a lockfile
-//! not yet released — and the tests caught both.
-//!
-//! None of it was necessary: an `flock` is associated with an *open
-//! file description*, not a process, so two `open` calls contend even
-//! inside one process. The kernel already provides exactly the
-//! queueing the mutex layer was built to add. One primitive, no
-//! registry, no ordering subtlety, and the same guarantee.
+//! No in-process mutex sits over the flock: an `flock` is associated
+//! with an *open file description*, not a process, so two `open` calls
+//! contend even inside one process, and the kernel provides the
+//! queueing a mutex layer would add. One primitive, no registry, no
+//! ordering subtlety.
 //!
 //! # Waiting, not failing — and not on a blocking thread
 //!
 //! `acquire` waits. A caller that finds a plan busy logs once and
 //! waits rather than erroring, because the holder is typically
 //! mid-LLM-run and "come back later" is not something a caller can act
-//! on any better than the kernel can. This matches the in-process
-//! semantics workflows always had (`Mutex::lock` waits) and extends
-//! them across processes, replacing the CLI-layer `try_lock` that
-//! failed fast for `implement` alone.
+//! on any better than the kernel can.
 //!
 //! It waits by **polling `try_lock` with async backoff**, not by
 //! parking a `spawn_blocking` worker on a blocking `flock`. The

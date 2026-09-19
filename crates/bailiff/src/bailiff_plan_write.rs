@@ -1,10 +1,6 @@
-//! Bailiff-side write helper that completes the slice-C handshake:
-//! fetch writ's signed envelope, verify it, and persist the stage's
-//! note at the plan's notes ref in bailiff's own bare repo.
-//!
-//! This is slice C2 of `docs/plans/2026-05-14-bailiff-split.md`. The
-//! data layer ([`crate::bailiff_plan_note`]) is slice C1; the CLI
-//! verb that drives this helper is slice C3.
+//! Bailiff-side write helper that completes the run handshake: fetch
+//! writ's signed envelope, verify it, and persist the stage's note at
+//! the plan's notes ref in bailiff's own bare repo.
 //!
 //! # Flow
 //!
@@ -25,7 +21,7 @@
 //! 4. Run [`verify_run_envelope`] under `allowed_signers`. This
 //!    rebinds the output bytes to the metadata digest and verifies
 //!    the SSHSIG under bailiff's keyring — the same end-to-end
-//!    check the slice-B5 round-trip pinned.
+//!    check the round-trip tests pin.
 //! 5. Build a [`PlanNote`] referencing `completed.output_oid` (the
 //!    writ-side seed OID — *not* the envelope blob; see the
 //!    `writ_output_oid` docstring in [`crate::bailiff_plan_note`])
@@ -34,8 +30,8 @@
 //!    Returns the bailiff-side target OID.
 //!
 //! Every failure mode is a tagged variant of [`WriteStageNoteError`]
-//! so the CLI verbs can react without parsing prose. Since slice 3b
-//! one function serves all three envelope-bearing stages; only the
+//! so the CLI verbs can react without parsing prose. One function
+//! serves all three envelope-bearing stages; only the
 //! decision note, which carries no envelope, has its own writer.
 
 use std::path::Path;
@@ -192,8 +188,7 @@ pub enum FetchVerifyError {
 }
 
 /// Write `decision_note` as the **decision** note for its plan under
-/// [`plan_notes_ref`]`(plan_id)` in bailiff's repo. Slice D1.3 of
-/// `docs/plans/2026-05-16-slice-d1-decide.md`.
+/// [`plan_notes_ref`]`(plan_id)` in bailiff's repo.
 ///
 /// Idempotent-by-error: if a decision note already exists for the
 /// plan, returns [`WriteDecisionNoteError::DecisionAlreadyRecorded`]
@@ -274,12 +269,8 @@ pub enum WriteDecisionNoteError {
 /// Fetch writ's signed envelope for `stage`'s run, verify it
 /// end-to-end, and attach the stage's note to bailiff's per-plan ref.
 ///
-/// One function for all three envelope-bearing stages. Before slice 3b
-/// this was `write_plan_note` / `write_review_note` /
-/// `write_implement_note` — three bodies that were byte-identical
-/// modulo the note type, the seed, and the noun in their error enums.
-///
-/// The stage varies exactly three things, and each is a projection of
+/// One function for all three envelope-bearing stages. The stage
+/// varies exactly three things, and each is a projection of
 /// [`AgentStage`] rather than a parameter a caller could get wrong:
 /// which note body is built, which seed it attaches at
 /// ([`StageNoteSlot::seed`]), and which noun the error names.
@@ -291,11 +282,6 @@ pub enum WriteDecisionNoteError {
 /// **Idempotent by error.** A second write for the same
 /// `(plan_id, stage)` returns
 /// [`WriteStageNoteError::AlreadyRecorded`] rather than overwriting.
-/// Before slice 3b the submission was the odd one out here: it called
-/// `write_note`, so its duplicate surfaced as a generic git failure
-/// where its siblings' surfaced as the typed conflict. Both refused;
-/// only one said why. Unreachable through the workflow either way,
-/// since slice 1 gates `Submit` to `Absent`.
 ///
 /// **No precondition on any other note's presence.** The write helper
 /// enforces one invariant — one note per `(plan, stage)`. Ordering is
@@ -422,8 +408,7 @@ fn stage_note_body(
 
 /// Tagged failure modes of [`write_stage_note`].
 ///
-/// One enum where slice 3a had three, each with the same four
-/// failures under a different noun. The stage travels *in* the
+/// The stage travels *in* the
 /// variants that need it, so an operator-facing message can still name
 /// the right artefact without a per-stage enum to hang it on.
 #[derive(Debug, Error)]
@@ -463,10 +448,6 @@ pub enum WriteStageNoteError {
 mod decision_tests;
 #[cfg(test)]
 mod end_to_end_tests;
-// `plan_tests` / `review_tests` / `implement_tests` collapsed into
-// `stage_tests` in slice 3b, along with the three write helpers they
-// covered. Every case there runs for all three stages, so the coverage
-// is strictly larger than the three modules it replaces.
 #[cfg(test)]
 mod stage_tests;
 #[cfg(test)]
@@ -580,12 +561,6 @@ mod spec {
         /// For any valid payload and any stage, a trusted-signer
         /// write succeeds and the bailiff-side note reads back with
         /// exactly the envelope fields writ signed.
-        ///
-        /// Ranges over `AgentStage::ALL` rather than a local `Verb`
-        /// enum. That enum was a *fourth* encoding of the three-stage
-        /// distinction, alongside the three note types, the three
-        /// writers, and the three error enums slice 3b collapsed —
-        /// found only because deleting the writers broke it.
         #[test]
         fn every_stage_round_trips_a_trusted_envelope(
             stage_index in 0usize..AgentStage::ALL.len(),
@@ -692,13 +667,6 @@ mod spec {
         /// **Every** stage's write is idempotent by error: the second
         /// write for a plan id is refused rather than silently
         /// overwriting the first.
-        ///
-        /// Was `review_and_implement_writes_are_idempotent`, over two
-        /// stages. The submission was excluded because it alone called
-        /// `write_note`, whose duplicate surfaced as a generic git
-        /// failure rather than the typed conflict. Slice 3b made all
-        /// three typed, so the property now holds for all three — and
-        /// its scope is the record of that delta.
         #[test]
         fn every_stage_write_is_idempotent_by_error(
             stage_index in 0usize..AgentStage::ALL.len(),

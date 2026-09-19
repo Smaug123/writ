@@ -679,6 +679,37 @@ fn receiver_before(text: &str, at: usize) -> Option<&str> {
     (!name.is_empty() && before[..=start].ends_with(|c: char| c != '.')).then_some(name)
 }
 
+/// The process environment is global, and a test binary is threaded.
+///
+/// `std::env::set_var` is `unsafe` in Rust 2024 for a reason that applies
+/// exactly here: libtest runs tests on threads of one process, so a test that
+/// mutates a variable changes what *every* concurrent test reads, and a getter
+/// running alongside a setter is undefined behaviour rather than a race for a
+/// stale value. A snapshot-and-restore wrapper narrows the window; it does not
+/// close it, and it does nothing at all for the variables it forgets to put
+/// back.
+///
+/// Code that needs to vary an environment-derived value should take it as an
+/// argument instead — `DefaultPath::resolve_from` exists for precisely this,
+/// and `src/cli/identity.rs` records the same decision for `$USER`.
+#[test]
+fn only_a_named_file_mutates_the_process_environment() {
+    const NEEDLES: &[&str] = &["env::set_var(", "env::remove_var("];
+    /// `clap` reads `Command::env` declarations straight from the process
+    /// environment when it builds help, so a test that a token's *value*
+    /// never reaches `--help` has no injection point: the value has to be in
+    /// the environment for the call under test to find it. The guard there
+    /// restores through `Drop`.
+    const ALLOWED: &[&str] = &["src/bin/writ-vm.rs"];
+    let hits = offenders(NEEDLES, ALLOWED);
+    assert!(
+        hits.is_empty(),
+        "these mutate the environment every concurrent test shares; take the \
+         value as an argument instead:\n{}",
+        hits.join("\n"),
+    );
+}
+
 /// The statement containing byte offset `at`, scanning back to the previous
 /// `;` or block boundary.
 fn statement_containing(text: &str, at: usize) -> Option<&str> {

@@ -643,12 +643,12 @@ mod tests {
         assert_eq!(entry.message.as_deref(), Some("staged for review"));
     }
 
-    /// Stage-0 audit-pair oracle applied to a *real current handler*: driving
+    /// The audit-pair oracle against a real handler: driving
     /// `handle_git_push_request` on its happy path must leave the
     /// `(git_push_request, git_push_outcome)` pair complete — the two-phase
-    /// request-row-before-effect, outcome-row-after discipline this handler wires
-    /// by hand. See `docs/plans/2026-07-18-brokered-effect-audit-enforcement.md`
-    /// §4; the oracle primitive lives in `writ-audit::effect_audit_oracle`.
+    /// request-row-before-effect, outcome-row-after discipline this handler
+    /// wires by hand. The oracle primitive lives in
+    /// `writ-audit::effect_audit_oracle`.
     #[tokio::test]
     async fn git_push_handler_satisfies_audit_pair_oracle() {
         let github = wiremock::MockServer::start().await;

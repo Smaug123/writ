@@ -53,12 +53,10 @@ use crate::vm_git::{GitBranchName, GitCloneRepo, GitObjectId};
 use crate::vm_git_bundle::GitSecretValue;
 
 /// Per-object size ceiling fed to [`CatFileObjectSource`] when reading
-/// staging-repo objects during the walker upload. 256 MiB matches every
-/// existing call site (walker integration tests, vm-push staging max
-/// object size); kept as a module-private constant for B1e.2b rather
-/// than threaded through [`PromoteRuntimeConfig`] because making it
-/// configurable is its own (small) future slice and the current 256 MiB
-/// ceiling is already what production code carries.
+/// staging-repo objects during the walker upload. 256 MiB, matching the
+/// walker integration tests and the vm-push staging max object size;
+/// module-private rather than a [`PromoteRuntimeConfig`] field because
+/// nothing needs to configure it.
 const STAGING_REPO_MAX_OBJECT_BYTES: u64 = 256 << 20;
 
 /// Outcome of a successful approve walk.
@@ -236,11 +234,10 @@ impl PreparedApprove {
 /// but a successful promote that returns Err to the operator would
 /// force the bailiff to retry against a branch that already moved.
 ///
-/// `signing_key` is required (B-track pins app-identity signing) and
-/// is forwarded as `Some(...)` to [`prepare_fast_forward_plan`]. The
-/// `Option` arm in the layer below is reserved for the
-/// `AlreadyAtExpected` short-circuit, where no commits are signed
-/// anyway, plus pre-B1d call sites that no longer exist in main.
+/// `signing_key` is required (app-identity signing is pinned) and is
+/// forwarded as `Some(...)` to [`prepare_fast_forward_plan`]; the
+/// `Option` in the layer below exists for the `AlreadyAtExpected`
+/// short-circuit, where no commits are signed.
 // Each argument is a distinct concern (runtime config / GitHub
 // access / repo identity / branch / lease anchor / bundle payload /
 // signing identity / trailer set / attempt id).

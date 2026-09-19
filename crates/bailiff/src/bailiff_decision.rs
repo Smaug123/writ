@@ -2,8 +2,6 @@
 //!
 //! Types in this module model the operator-driven accept/reject
 //! verdict bailiff records against a previously-submitted plan.
-//!
-//! See `docs/plans/2026-05-16-slice-d1-decide.md` for the slice plan.
 
 use std::fmt;
 use std::str::FromStr;
