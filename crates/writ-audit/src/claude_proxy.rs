@@ -8,9 +8,8 @@ use super::AuditLog;
 use super::proxy_table::{
     ProxyAuditDecision, ProxyAuditRoute, ProxyAuditTable, ProxyOutcomeRecord, ProxyRequestRecord,
 };
-// Every fallible member of this module is now test-only — the production write
-// path is the audit-pair guard, which lives in `effect_table`. So is the error
-// type's only use here.
+// The production write path is the audit-pair guard in `effect_table`; the
+// fallible members here are test-only.
 #[cfg(any(test, feature = "test-support"))]
 use super::AuditError;
 

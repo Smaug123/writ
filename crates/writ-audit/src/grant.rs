@@ -1620,9 +1620,8 @@ mod tests {
         .unwrap();
     }
 
-    /// A recorded audit row for an unknown session was previously
-    /// caught only by the FK; the request-row insert reports it explicitly so
-    /// the error is readable rather than leaking SQLite's message.
+    /// The request-row insert reports an unknown session explicitly, so the
+    /// error is readable rather than SQLite's foreign-key message.
     #[test]
     fn pre_mint_rejects_write_against_nonexistent_session() {
         let log = AuditLog::open_in_memory().unwrap();

@@ -14,11 +14,9 @@
 //! thin shims that nominate a descriptor and re-export the generic
 //! record types under the per-backend names.
 
-use rusqlite::{Connection, params};
-// `OptionalExtension` (`.optional()`) is now only used by the test-only read
-// helpers below; the session-open guard that used it moved to `validation`.
 #[cfg(any(test, feature = "test-support"))]
 use rusqlite::OptionalExtension;
+use rusqlite::{Connection, params};
 
 use super::validation::{check_session_open, labeled_invariant};
 use super::{AuditError, AuditLog};
