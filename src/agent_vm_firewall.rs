@@ -476,45 +476,6 @@ impl SessionFirewallSpec {
 }
 
 impl SessionFirewallInstall {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        session_id: SessionId,
-        pool: AgentNetworkPool,
-        ipv4: Ipv4Cidr,
-        ipv6: Option<Ipv6Cidr>,
-        broker_ports: BrokerPorts,
-        broker_port_range: BrokerPortRange,
-        broker_ipv4_host: Option<Ipv4Addr>,
-        interfaces: Vec<PfInterface>,
-    ) -> Result<Self, AgentVmConfigError> {
-        let network = claim_session_network(
-            pool,
-            ipv4,
-            ipv6,
-            &broker_ports,
-            broker_port_range,
-            broker_ipv4_host,
-        )?;
-        // With interfaces this is the attached anchor, whose IPv6 deny is the
-        // `Ipv4OnlyNoGuestIpv6` backstop: it blocks *all* IPv6 on the agent
-        // VM's bridge, so pairing it with an IPv6 firewall scope (dual-stack)
-        // would contradict that scope's IPv6 allow. The core makes the
-        // "backstop only when there is no legitimate guest IPv6" invariant a
-        // construction error rather than a silently self-cancelling ruleset.
-        let ruleset = if interfaces.is_empty() {
-            session_firewall_pf_ruleset(session_id, network, &broker_ports, broker_ipv4_host)
-        } else {
-            session_attached_pf_ruleset(
-                session_id,
-                network,
-                &broker_ports,
-                broker_ipv4_host,
-                &interfaces,
-            )?
-        };
-        Ok(Self { network, ruleset })
-    }
-
     pub fn network(&self) -> AgentFirewallNetwork {
         self.network
     }
@@ -1244,14 +1205,35 @@ mod tests {
         BrokerPorts::new([BrokerPort::new(65000).unwrap()]).unwrap()
     }
 
-    #[test]
-    fn install_description_rejects_port_outside_helper_range() {
-        let err = SessionFirewallInstall::new(
+    /// A resolved install for the tests below: the spec's validation, then
+    /// the attached anchor whenever interfaces were supplied (the deny is what
+    /// asks for them).
+    fn resolved_install(
+        ipv4: Ipv4Cidr,
+        ipv6: Option<Ipv6Cidr>,
+        broker_port_range: BrokerPortRange,
+        broker_ipv4_host: Option<Ipv4Addr>,
+        interfaces: Vec<PfInterface>,
+    ) -> Result<SessionFirewallInstall, AgentVmConfigError> {
+        let deny = (!interfaces.is_empty()).then_some(DenyGuestIpv6 { min_members: 1 });
+        let spec = SessionFirewallSpec::new(
             session_id(),
             pool(),
+            ipv4,
+            ipv6,
+            ports(),
+            broker_port_range,
+            broker_ipv4_host,
+            deny,
+        )?;
+        Ok(spec.resolved(&interfaces))
+    }
+
+    #[test]
+    fn install_description_rejects_port_outside_helper_range() {
+        let err = resolved_install(
             ipv4(),
             Some(ipv6()),
-            ports(),
             BrokerPortRange::new(49152, 64999).unwrap(),
             None,
             Vec::new(),
@@ -1269,12 +1251,9 @@ mod tests {
 
     #[test]
     fn install_description_rejects_subnet_outside_pool() {
-        let err = SessionFirewallInstall::new(
-            session_id(),
-            pool(),
+        let err = resolved_install(
             Ipv4Cidr::new(Ipv4Addr::new(192, 168, 253, 0), 24).unwrap(),
             Some(ipv6()),
-            ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             None,
             Vec::new(),
@@ -1288,12 +1267,9 @@ mod tests {
 
     #[test]
     fn install_accepts_a_broker_host_inside_an_ipv4_only_subnet() {
-        let install = SessionFirewallInstall::new(
-            session_id(),
-            pool(),
+        let install = resolved_install(
             ipv4(),
             None,
-            ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             Some(Ipv4Addr::new(192, 168, 252, 5)),
             Vec::new(),
@@ -1308,12 +1284,9 @@ mod tests {
 
     #[test]
     fn install_rejects_a_broker_host_outside_the_session_subnet() {
-        let err = SessionFirewallInstall::new(
-            session_id(),
-            pool(),
+        let err = resolved_install(
             ipv4(),
             None,
-            ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             Some(Ipv4Addr::new(10, 0, 0, 5)),
             Vec::new(),
@@ -1327,12 +1300,9 @@ mod tests {
 
     #[test]
     fn install_rejects_a_broker_host_with_a_dual_stack_scope() {
-        let err = SessionFirewallInstall::new(
-            session_id(),
-            pool(),
+        let err = resolved_install(
             ipv4(),
             Some(ipv6()),
-            ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             Some(Ipv4Addr::new(192, 168, 252, 5)),
             Vec::new(),
@@ -1346,12 +1316,9 @@ mod tests {
 
     #[test]
     fn install_with_interfaces_renders_the_attached_anchor_for_an_ipv4_only_scope() {
-        let install = SessionFirewallInstall::new(
-            session_id(),
-            pool(),
+        let install = resolved_install(
             ipv4(),
             None,
-            ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             None,
             vec![
@@ -1377,12 +1344,9 @@ mod tests {
 
     #[test]
     fn install_rejects_an_interface_deny_alongside_an_ipv6_scope() {
-        let err = SessionFirewallInstall::new(
-            session_id(),
-            pool(),
+        let err = resolved_install(
             ipv4(),
             Some(ipv6()),
-            ports(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             None,
             vec![PfInterface::new("bridge100").unwrap()],

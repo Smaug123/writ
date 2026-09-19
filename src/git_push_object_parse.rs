@@ -24,7 +24,6 @@
 use std::num::ParseIntError;
 
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use crate::git_push_walker::{StagingCommit, StagingTree, StagingTreeEntry};
 use crate::github_git_db::{CommitIdentity, TreeEntryKind};
@@ -246,41 +245,6 @@ pub(crate) fn parse_commit_object(bytes: &[u8]) -> Result<StagingCommit, ParseOb
         committer,
         message,
     })
-}
-
-/// Reverse of [`parse_commit_object`].
-///
-/// Emits headers in the order `tree`, then each `parent` in slot
-/// order, then `author`, then `committer`, then a blank line, then
-/// the message bytes verbatim. The output is the canonical git
-/// commit format git itself emits — no signature, no encoding
-/// directive — so `git hash-object -t commit --stdin` over these
-/// bytes returns the SHA git would assign to a commit holding this
-/// `StagingCommit`'s data.
-///
-/// Used by the dry-run orchestrator's hash-equivalence oracle in
-/// a follow-up slice; until then it is exercised exclusively by
-/// the parser round-trip property test.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn serialize_commit_object(commit: &StagingCommit) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"tree ");
-    out.extend_from_slice(commit.tree.as_str().as_bytes());
-    out.push(b'\n');
-    for parent in &commit.parents {
-        out.extend_from_slice(b"parent ");
-        out.extend_from_slice(parent.as_str().as_bytes());
-        out.push(b'\n');
-    }
-    out.extend_from_slice(b"author ");
-    out.extend_from_slice(serialize_identity(&commit.author).as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(b"committer ");
-    out.extend_from_slice(serialize_identity(&commit.committer).as_bytes());
-    out.push(b'\n');
-    out.push(b'\n');
-    out.extend_from_slice(commit.message.as_bytes());
-    out
 }
 
 /// Parse the raw bytes of a git tree object into a [`StagingTree`].
@@ -530,38 +494,6 @@ fn is_protected_alias_for(name: &str, literal: &str, short_prefix: &str) -> bool
     !digits.is_empty() && digits.iter().all(|b| b.is_ascii_digit())
 }
 
-/// Reverse of [`parse_tree_object`]. Emits each entry in the order
-/// supplied by the caller, using the canonical (leading-zero-stripped)
-/// mode for subtrees.
-///
-/// See the dead-code note on [`serialize_commit_object`].
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn serialize_tree_object(tree: &StagingTree) -> Vec<u8> {
-    let mut out = Vec::new();
-    for entry in &tree.entries {
-        out.extend_from_slice(canonical_tree_mode(entry.kind).as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(entry.path.as_bytes());
-        out.push(0);
-        out.extend_from_slice(&hex_decode(entry.sha.as_str()));
-    }
-    out
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn canonical_tree_mode(kind: TreeEntryKind) -> &'static str {
-    // Tree-object on-disk modes omit the leading zero for
-    // directories (40000), matching what `git hash-object` emits.
-    // Other modes carry their full 6 digits.
-    match kind {
-        TreeEntryKind::Blob => "100644",
-        TreeEntryKind::Executable => "100755",
-        TreeEntryKind::Symlink => "120000",
-        TreeEntryKind::Subtree => "40000",
-        TreeEntryKind::Submodule => "160000",
-    }
-}
-
 fn parse_tree_entry_kind(mode: &str) -> Result<TreeEntryKind, ParseObjectError> {
     // Each mode is the canonical, leading-zero-stripped form git
     // itself emits when writing a tree. The padded form `040000`
@@ -753,32 +685,6 @@ fn parse_two_ascii_digits(bytes: &[u8]) -> Option<u8> {
     Some((bytes[0] - b'0') * 10 + (bytes[1] - b'0'))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn serialize_identity(identity: &CommitIdentity) -> String {
-    // CommitIdentity guarantees the stored RFC3339 string round-trips
-    // through `time::OffsetDateTime::parse` — the constructor was the
-    // formatter that produced it. The `expect` here pins that
-    // invariant: a failure would mean someone removed the constructor's
-    // validation, not bad input.
-    let dt = OffsetDateTime::parse(identity.date_rfc3339(), &Rfc3339)
-        .expect("CommitIdentity stores RFC3339 produced by `time` itself");
-    let seconds = dt.unix_timestamp();
-    let offset_seconds = dt.offset().whole_seconds();
-    let sign = if offset_seconds < 0 { '-' } else { '+' };
-    let abs_seconds = offset_seconds.unsigned_abs();
-    let hours = abs_seconds / 3600;
-    let minutes = (abs_seconds % 3600) / 60;
-    format!(
-        "{} <{}> {} {}{:02}{:02}",
-        identity.name(),
-        identity.email(),
-        seconds,
-        sign,
-        hours,
-        minutes,
-    )
-}
-
 fn find_byte(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
     haystack[from..]
         .iter()
@@ -793,33 +699,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         write!(&mut s, "{byte:02x}").expect("writing into String never fails");
     }
     s
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn hex_decode(hex: &str) -> Vec<u8> {
-    debug_assert_eq!(hex.len() % 2, 0, "GitObjectId is always even-length hex");
-    let bytes = hex.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = hex_nibble(bytes[i]);
-        let lo = hex_nibble(bytes[i + 1]);
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    out
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn hex_nibble(byte: u8) -> u8 {
-    // GitObjectId validates hex on construction, so we only ever
-    // see ASCII hex bytes here.
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => panic!("GitObjectId invariant violated: non-hex byte {byte}"),
-    }
 }
 
 #[cfg(test)]
