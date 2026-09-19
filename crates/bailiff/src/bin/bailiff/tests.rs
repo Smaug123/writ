@@ -367,7 +367,7 @@ fn default_paths_track_xdg_data_home() {
     // comment above it could only ask the next reader to preserve.
     assert_eq!(
         WRIT_NOTES_REPO.resolve().unwrap(),
-        writ::config::default_notes_repo_path().unwrap(),
+        writ::config::default_paths::NOTES_REPO.resolve().unwrap(),
     );
     assert_eq!(
         WRIT_NOTES_REPO.resolve().unwrap(),
