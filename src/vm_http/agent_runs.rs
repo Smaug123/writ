@@ -730,7 +730,7 @@ mod tests {
                 .into_buffered();
         assert_eq!(retried.status, VmHttpStatus::Ok);
 
-        // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): the run's
+        // The audit-pair oracle (writ-audit::effect_audit_oracle): the run's
         // request row (seeded at launch) and the outcome row recorded by the
         // handler form a complete pair, joined on run_id.
         state

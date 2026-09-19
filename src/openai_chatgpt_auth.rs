@@ -37,7 +37,7 @@
 //!   true atomic compare-and-set (the [`SecretStore`] abstraction has
 //!   none, and the keyring backend could not provide one): a change
 //!   landing in the sub-instruction window between the guard's read and
-//!   its write can still be lost, but the window no longer spans the
+//!   its write can still be lost, but that window does not span the
 //!   refresh network round-trip.
 //!
 //! Concurrency: a single [`tokio::sync::Mutex`] serialises all access to

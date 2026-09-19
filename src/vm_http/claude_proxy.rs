@@ -632,7 +632,7 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].2, Some(200));
-        // Stage-0 audit-pair oracle (writ-audit::effect_audit_oracle): a proxied
+        // The audit-pair oracle (writ-audit::effect_audit_oracle): a proxied
         // request must leave a complete (request, outcome) pair.
         state.audit.assert_effect_audit_pairs_complete(
             "claude_proxy_request",

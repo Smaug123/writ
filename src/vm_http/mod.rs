@@ -1104,7 +1104,7 @@ where
     };
     // Classify once, before authentication: the same route decides the auth
     // scheme, the body limit, how a denial is recorded, and who handles the
-    // request. The four used to re-derive it from the target independently.
+    // request, so the four cannot disagree about what the target is.
     let route = VmHttpRoute::resolve(&request);
     let auth_scheme = route.auth_scheme();
     let dispatch: VmHttpDispatch =
