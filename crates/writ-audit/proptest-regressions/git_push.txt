@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6f6c883da73b253bb59f412b7d93c540cea0fed874a531b6f13ab786c4332683 # shrinks to script = Uncertain
+cc 261f51a4ba55862052e6b0464076e66a81b127284d47d574d4edfb12e5b83db8 # shrinks to script = ValidUnattempted { result: Staged, close_before_outcome: false }
