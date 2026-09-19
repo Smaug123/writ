@@ -44,16 +44,26 @@ pub use sha256_hex::{Sha256Hex, Sha256HexError};
 pub use signing::{SshKeyFingerprint, SshKeyFingerprintError, SshSignature, SshSignatureError};
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // --- Nominal IDs ------------------------------------------------------
 
+/// Define a nominal id: a `Copy` newtype over a UUID with `new` (a fresh
+/// v4), `from_uuid`/`as_uuid`, `Display`/`FromStr` in the canonical
+/// hyphenated form, and transparent serde. Each kind of id is its own
+/// type, so a run id cannot be passed where a session id is expected.
+///
+/// ```ignore
+/// writ_core::uuid_id!(
+///     /// Docs for the id.
+///     PlanId
+/// );
+/// ```
+#[macro_export]
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(Uuid);
+        #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name($crate::__uuid::Uuid);
 
         impl $name {
             // A `Default` impl would silently mint a fresh random UUID,
@@ -61,26 +71,43 @@ macro_rules! uuid_id {
             // generation explicit.
             #[allow(clippy::new_without_default)]
             pub fn new() -> Self {
-                Self(Uuid::new_v4())
+                Self($crate::__uuid::Uuid::new_v4())
             }
-            pub fn from_uuid(u: Uuid) -> Self {
+            pub fn from_uuid(u: $crate::__uuid::Uuid) -> Self {
                 Self(u)
             }
-            pub fn as_uuid(self) -> Uuid {
+            pub fn as_uuid(self) -> $crate::__uuid::Uuid {
                 self.0
             }
         }
 
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                ::std::fmt::Display::fmt(&self.0, f)
             }
         }
 
-        impl std::str::FromStr for $name {
-            type Err = uuid::Error;
+        impl ::std::str::FromStr for $name {
+            type Err = $crate::__uuid::Error;
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                Ok(Self(Uuid::parse_str(s)?))
+                Ok(Self($crate::__uuid::Uuid::parse_str(s)?))
+            }
+        }
+
+        impl $crate::__serde::Serialize for $name {
+            fn serialize<S: $crate::__serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error> {
+                $crate::__serde::Serialize::serialize(&self.0, serializer)
+            }
+        }
+
+        impl<'de> $crate::__serde::Deserialize<'de> for $name {
+            fn deserialize<D: $crate::__serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Self, D::Error> {
+                $crate::__serde::Deserialize::deserialize(deserializer).map(Self)
             }
         }
     };
@@ -373,12 +400,22 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    #[test]
-    fn id_roundtrips_through_string() {
-        let a = SessionId::new();
-        let s = a.to_string();
-        let back: SessionId = s.parse().unwrap();
-        assert_eq!(a, back);
+    proptest::proptest! {
+        /// The shape every `uuid_id!` type shares, checked on one of them:
+        /// `Display` is the canonical hyphenated form, which `FromStr`
+        /// and `Deserialize` both accept, and the wire form is that bare
+        /// string.
+        #[test]
+        fn uuid_id_roundtrips_through_string_and_wire(raw in proptest::prelude::any::<u128>()) {
+            let id = SessionId::from_uuid(uuid::Uuid::from_u128(raw));
+            let text = id.to_string();
+            proptest::prop_assert_eq!(&text, &id.as_uuid().hyphenated().to_string());
+            proptest::prop_assert_eq!(text.parse::<SessionId>().unwrap(), id);
+            let wire = serde_json::to_string(&id).unwrap();
+            proptest::prop_assert_eq!(&wire, &format!("{text:?}"));
+            proptest::prop_assert_eq!(serde_json::from_str::<SessionId>(&wire).unwrap(), id);
+            proptest::prop_assert_eq!(format!("{id:?}"), format!("SessionId({text})"));
+        }
     }
 
     #[test]

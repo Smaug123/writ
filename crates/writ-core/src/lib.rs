@@ -28,3 +28,5 @@ pub mod validated_string;
 
 #[doc(hidden)]
 pub use serde as __serde;
+#[doc(hidden)]
+pub use uuid as __uuid;

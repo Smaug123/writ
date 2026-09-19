@@ -45,6 +45,7 @@ pub mod cli;
 #[cfg(feature = "host")]
 pub mod config;
 pub use writ_core::core;
+pub use writ_core::uuid_id;
 #[cfg(feature = "host")]
 pub(crate) mod crash_point;
 #[cfg(all(test, feature = "host"))]
