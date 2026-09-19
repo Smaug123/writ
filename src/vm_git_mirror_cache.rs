@@ -277,7 +277,7 @@ impl MirrorCache {
         key: &MirrorCacheKey,
         src_mirror: &Path,
     ) -> std::io::Result<MirrorCacheInsertion> {
-        create_private_dir_all(&self.root)?;
+        writ_core::private_fs::create_dir_all_0700(&self.root)?;
         let entry = self.root.join(key.slug());
         // Fast path: a complete entry already backs this key. Keep it and leave
         // the caller's source for it to clean up.
@@ -288,7 +288,7 @@ impl MirrorCache {
         let staging = self
             .root
             .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4().simple()));
-        create_private_dir(&staging)?;
+        writ_core::private_fs::create_dir_0700(&staging)?;
         let staged_mirror = staging.join(MIRROR_DIR_NAME);
         if let Err(err) = std::fs::rename(src_mirror, &staged_mirror) {
             // A cross-device rename (cache root and clone work dir on different
@@ -487,27 +487,6 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
-}
-
-/// Create a directory (and any missing parents) restricted to the owner. The
-/// cache holds bare clones of possibly-private repositories, so other local
-/// users must not be able to traverse into it; the explicit `set_permissions`
-/// after creation defeats the process umask (which would otherwise commonly
-/// leave a world-traversable 0755 directory).
-fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
-/// Create a single new private directory, failing if it already exists.
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new().mode(0o700).create(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Recursively copy a directory tree — the cross-device fallback for staging a

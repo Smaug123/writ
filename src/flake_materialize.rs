@@ -89,9 +89,11 @@ pub async fn materialize_flake_tree(
             });
         }
     }
-    create_private_dir_all(scratch_root).map_err(|source| MaterializeError::Scratch {
-        path: scratch_root.to_path_buf(),
-        source,
+    writ_core::private_fs::create_dir_all_0700(scratch_root).map_err(|source| {
+        MaterializeError::Scratch {
+            path: scratch_root.to_path_buf(),
+            source,
+        }
     })?;
     // Allocate the destination ourselves so it cannot escape `scratch_root`.
     let dest = scratch_root.join(format!("flake-{}", uuid::Uuid::new_v4().simple()));
@@ -140,19 +142,6 @@ pub async fn materialize_flake_tree(
     }
 
     Ok(MaterializedFlake { path: dest })
-}
-
-/// Create a directory tree restricted to the owner; the checkout holds
-/// possibly-private repository content, so other local users must not be able
-/// to traverse into the scratch root. The explicit `set_permissions` defeats
-/// the process umask.
-fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(test)]

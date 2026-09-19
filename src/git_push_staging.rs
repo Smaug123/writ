@@ -23,7 +23,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use writ_core::byte_size::ByteSize;
 
@@ -117,7 +117,7 @@ impl GitPushStagingStore {
     /// `staged/` and `tmp/` subdirectories with 0o700 permissions if they
     /// do not already exist.
     pub fn open(root: PathBuf) -> io::Result<Self> {
-        create_private_dir(&root)?;
+        writ_core::private_fs::ensure_dir_0700(&root)?;
         // Durably commit `root`'s own directory entry (which the mkdir
         // above may have just created) by fsyncing its parent, so a
         // freshly-created store survives a power loss with `root` intact.
@@ -127,8 +127,8 @@ impl GitPushStagingStore {
         if let Some(parent) = root.parent() {
             fsync_dir(parent)?;
         }
-        create_private_dir(&root.join(STAGED_DIR))?;
-        create_private_dir(&root.join(TMP_DIR))?;
+        writ_core::private_fs::ensure_dir_0700(&root.join(STAGED_DIR))?;
+        writ_core::private_fs::ensure_dir_0700(&root.join(TMP_DIR))?;
         // Durably commit the `staged/` and `tmp/` directory entries so
         // recovery can rely on `staged/` being durably linked under
         // `root` (see `ensure_carrier_durable`).
@@ -173,7 +173,7 @@ impl GitPushStagingStore {
         // failure mode tells us whether we lost an idempotent race.
         let final_dir = self.staged_path(request_id);
         let scratch = self.scratch_path();
-        create_private_dir(&scratch)?;
+        writ_core::private_fs::ensure_dir_0700(&scratch)?;
         let outcome = self.populate_and_commit(&scratch, &final_dir, &entry_bytes, &bundle);
         match outcome {
             Ok(()) => Ok(receipt),
@@ -540,8 +540,8 @@ impl GitPushStagingStore {
         entry_bytes: &[u8],
         bundle: &[u8],
     ) -> Result<(), StagingError> {
-        write_private_file(&scratch.join(ENTRY_FILE), entry_bytes)?;
-        write_private_file(&scratch.join(BUNDLE_FILE), bundle)?;
+        writ_core::private_fs::write_new_0600(&scratch.join(ENTRY_FILE), entry_bytes)?;
+        writ_core::private_fs::write_new_0600(&scratch.join(BUNDLE_FILE), bundle)?;
         fsync_dir(scratch)?;
         fs::rename(scratch, final_dir)?;
         fsync_dir(&self.root.join(STAGED_DIR))?;
@@ -576,43 +576,6 @@ fn parse_request_id_from_dirname(name: &OsStr) -> Result<RequestId, StagingError
             name: as_str.to_string(),
             message: err.to_string(),
         })
-}
-
-fn create_private_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(false).mode(0o700);
-        match builder.create(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
-        }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        match fs::create_dir(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-}
-
-fn write_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(body)?;
-    file.sync_all()
 }
 
 fn fsync_dir(path: &Path) -> io::Result<()> {
@@ -946,9 +909,9 @@ mod tests {
         );
         let entry_bytes = serde_json::to_vec(&expected_receipt).unwrap();
         let final_dir = store.root().join(STAGED_DIR).join(request_id.to_string());
-        create_private_dir(&final_dir).unwrap();
-        write_private_file(&final_dir.join(ENTRY_FILE), &entry_bytes).unwrap();
-        write_private_file(&final_dir.join(BUNDLE_FILE), &bundle).unwrap();
+        writ_core::private_fs::ensure_dir_0700(&final_dir).unwrap();
+        writ_core::private_fs::write_new_0600(&final_dir.join(ENTRY_FILE), &entry_bytes).unwrap();
+        writ_core::private_fs::write_new_0600(&final_dir.join(BUNDLE_FILE), &bundle).unwrap();
 
         let receipt = store
             .stage(request_id, staged_at, metadata, bundle)

@@ -713,63 +713,22 @@ pub fn write_session_material(
     spec: &BrokerSessionSpec,
     bearer: &VmHttpBearerToken,
 ) -> std::io::Result<()> {
-    create_private_dir(staging_dir)?;
+    writ_core::private_fs::ensure_dir_0700(staging_dir)?;
     // Clear a stale readiness marker from a prior attempt before launch.
     match std::fs::remove_file(staging_dir.join(READY_FILE)) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    write_private_file(
+    writ_core::private_fs::write_0600(
         &staging_dir.join(SESSION_SPEC_FILE),
         spec.to_json().as_bytes(),
     )?;
-    write_private_file(
+    writ_core::private_fs::write_0600(
         &staging_dir.join(BEARER_TOKEN_FILE),
         bearer.as_str().as_bytes(),
     )?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    if dir.exists() {
-        // Enforce 0700 on a reused directory too (DirBuilder::mode only applies
-        // when creating), so a looser pre-existing dir can't expose material.
-        return std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    std::fs::DirBuilder::new().mode(0o700).create(dir)
-}
-
-#[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    if dir.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir(dir)
-}
-
-#[cfg(unix)]
-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `OpenOptions::mode` only applies when creating a new inode; on a retried
-    // launch `path` may already exist with looser perms, so force 0600
-    // explicitly. The bearer token must never be group/world-readable.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents)
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, contents)
 }
 
 /// The host-side, **non-secret** facts needed to bring up one session's broker
@@ -844,7 +803,7 @@ fn write_broker_staging(
     config_json: &str,
 ) -> std::io::Result<()> {
     write_session_material(staging_dir, spec, bearer)?;
-    write_private_file(&staging_dir.join(CONFIG_FILE), config_json.as_bytes())
+    writ_core::private_fs::write_0600(&staging_dir.join(CONFIG_FILE), config_json.as_bytes())
 }
 
 /// Best-effort removal of a per-session path, whether it is a directory tree or a
