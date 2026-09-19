@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::audit::ClaudeProxyAuditRoute;
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
+use crate::upstream_base_url::{UpstreamBaseUrl, UpstreamBaseUrlError};
 
 use super::proxy_common::{
     ClaudeBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader, ProxyStream,
@@ -32,7 +33,7 @@ pub(super) type VmHttpClaudeProxyService<S> = VmHttpProxyService<ClaudeBackend, 
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpClaudeProxyConfig {
-    upstream_base_url: reqwest::Url,
+    upstream_base_url: UpstreamBaseUrl,
     auth_secret: SecretKey,
     auth_kind: VmHttpClaudeProxyAuthKind,
     anthropic_version: reqwest::header::HeaderValue,
@@ -52,16 +53,8 @@ pub enum VmHttpClaudeProxyAuthKind {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum VmHttpClaudeProxyConfigError {
-    #[error("Claude proxy upstream URL must not be empty")]
-    EmptyUpstreamUrl,
-    #[error("Claude proxy upstream URL {raw:?} is invalid: {message}")]
-    InvalidUpstreamUrl { raw: String, message: String },
-    #[error("Claude proxy upstream URL {raw:?} uses unsupported scheme {scheme:?}")]
-    UnsupportedUpstreamScheme { raw: String, scheme: String },
-    #[error("Claude proxy upstream URL must not contain embedded credentials: {0:?}")]
-    UpstreamUrlHasCredentials(String),
-    #[error("Claude proxy upstream URL must not contain a query or fragment: {0:?}")]
-    UpstreamUrlHasQueryOrFragment(String),
+    #[error("Claude proxy upstream URL {0}")]
+    UpstreamUrl(#[from] UpstreamBaseUrlError),
     #[error("Claude proxy request timeout must be greater than zero")]
     EmptyTimeout,
     #[error("Claude proxy max request bytes must be greater than zero")]
@@ -137,11 +130,8 @@ impl VmHttpClaudeProxyConfig {
         max_request_bytes: ByteSize,
         max_response_bytes: ByteSize,
     ) -> Result<Self, VmHttpClaudeProxyConfigError> {
-        let raw = upstream_base_url.as_ref();
+        let upstream_base_url = UpstreamBaseUrl::parse(upstream_base_url)?;
         let raw_anthropic_version = anthropic_version.as_ref();
-        if raw.is_empty() {
-            return Err(VmHttpClaudeProxyConfigError::EmptyUpstreamUrl);
-        }
         if raw_anthropic_version.is_empty() {
             return Err(VmHttpClaudeProxyConfigError::EmptyAnthropicVersion);
         }
@@ -163,34 +153,8 @@ impl VmHttpClaudeProxyConfig {
         if max_response_bytes.is_zero() {
             return Err(VmHttpClaudeProxyConfigError::EmptyMaxResponseBytes);
         }
-        let mut url = reqwest::Url::parse(raw).map_err(|err| {
-            VmHttpClaudeProxyConfigError::InvalidUpstreamUrl {
-                raw: raw.to_string(),
-                message: err.to_string(),
-            }
-        })?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(VmHttpClaudeProxyConfigError::UnsupportedUpstreamScheme {
-                raw: raw.to_string(),
-                scheme: url.scheme().to_string(),
-            });
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(VmHttpClaudeProxyConfigError::UpstreamUrlHasCredentials(
-                raw.to_string(),
-            ));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(VmHttpClaudeProxyConfigError::UpstreamUrlHasQueryOrFragment(
-                raw.to_string(),
-            ));
-        }
-        if !url.path().ends_with('/') {
-            let path = format!("{}/", url.path());
-            url.set_path(&path);
-        }
         Ok(Self {
-            upstream_base_url: url,
+            upstream_base_url,
             auth_secret,
             auth_kind,
             anthropic_version,
@@ -200,7 +164,7 @@ impl VmHttpClaudeProxyConfig {
         })
     }
 
-    pub fn upstream_base_url(&self) -> &reqwest::Url {
+    pub fn upstream_base_url(&self) -> &UpstreamBaseUrl {
         &self.upstream_base_url
     }
 
@@ -226,7 +190,7 @@ impl VmHttpClaudeProxyConfig {
 }
 
 impl ProxyBackendConfig for VmHttpClaudeProxyConfig {
-    fn upstream_base_url(&self) -> &reqwest::Url {
+    fn upstream_base_url(&self) -> &UpstreamBaseUrl {
         &self.upstream_base_url
     }
 
@@ -577,6 +541,7 @@ mod tests {
         assert_eq!(
             config
                 .upstream_base_url()
+                .as_url()
                 .join("v1/messages")
                 .unwrap()
                 .as_str(),
@@ -585,6 +550,7 @@ mod tests {
         assert_eq!(
             config
                 .upstream_base_url()
+                .as_url()
                 .join("v1/messages/count_tokens")
                 .unwrap()
                 .as_str(),

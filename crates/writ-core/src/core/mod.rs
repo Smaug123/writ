@@ -18,9 +18,9 @@ mod signing;
 
 pub use agent_vm::{
     AgentFirewallNetwork, AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPort,
-    BrokerPortRange, BrokerPorts, IPV4_IFACE_DENY_LABEL, IPV6_IFACE_DENY_LABEL, IpFamily, Ipv4Cidr,
-    Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr, PfDenyRule, PfHost, PfInterface,
-    PfInterfaceDenyRule, PfRule, PfRuleset, render_pf, session_attached_pf_ruleset,
+    BrokerPortRange, BrokerPorts, CidrParseError, IPV4_IFACE_DENY_LABEL, IPV6_IFACE_DENY_LABEL,
+    IpFamily, Ipv4Cidr, Ipv6Cidr, PfAllowRule, PfAnchorName, PfCidr, PfDenyRule, PfHost,
+    PfInterface, PfInterfaceDenyRule, PfRule, PfRuleset, render_pf, session_attached_pf_ruleset,
     session_firewall_pf_ruleset, session_pf_ruleset,
 };
 pub use capability_set::CapabilitySet;

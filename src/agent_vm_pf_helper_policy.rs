@@ -27,13 +27,14 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
+use crate::core::{
+    AgentNetworkPool, AgentVmConfigError, BrokerPortRange, CidrParseError, Ipv4Cidr, Ipv6Cidr,
+};
 
 /// Where the privileged helper reads its policy. Fixed on purpose: a
 /// caller-chosen path would hand the bounds back to the caller.
@@ -154,11 +155,12 @@ pub enum PfHelperPolicyError {
          {PF_HELPER_POLICY_FORMAT_VERSION}"
     )]
     UnsupportedVersion { path: PathBuf, version: u16 },
-    #[error("PF helper policy file {path} field {field} is not a CIDR: {reason}")]
+    #[error("PF helper policy file {path} field {field} is not a CIDR: {source}")]
     InvalidCidr {
         path: PathBuf,
         field: &'static str,
-        reason: String,
+        #[source]
+        source: CidrParseError,
     },
     #[error("PF helper policy file {path} is not a valid policy: {source}")]
     Invalid {
@@ -216,15 +218,19 @@ impl PfHelperPolicy {
                 version: wire.version,
             });
         }
-        let cidr_err = |field, reason: String| PfHelperPolicyError::InvalidCidr {
+        let cidr_err = |field, source: CidrParseError| PfHelperPolicyError::InvalidCidr {
             path: path.to_path_buf(),
             field,
-            reason,
+            source,
         };
-        let ipv4_pool =
-            parse_ipv4_cidr(&wire.ipv4_pool).map_err(|reason| cidr_err("ipv4_pool", reason))?;
-        let ipv6_pool =
-            parse_ipv6_cidr(&wire.ipv6_pool).map_err(|reason| cidr_err("ipv6_pool", reason))?;
+        let ipv4_pool = wire
+            .ipv4_pool
+            .parse::<Ipv4Cidr>()
+            .map_err(|source| cidr_err("ipv4_pool", source))?;
+        let ipv6_pool = wire
+            .ipv6_pool
+            .parse::<Ipv6Cidr>()
+            .map_err(|source| cidr_err("ipv6_pool", source))?;
         let invalid = |source| PfHelperPolicyError::Invalid {
             path: path.to_path_buf(),
             source,
@@ -235,35 +241,6 @@ impl PfHelperPolicy {
                 .map_err(invalid)?,
         })
     }
-}
-
-/// Parse `a.b.c.d/n` into a validated CIDR (host bits must be zero).
-pub fn parse_ipv4_cidr(raw: &str) -> Result<Ipv4Cidr, String> {
-    let (addr, prefix) = split_cidr(raw)?;
-    let addr = addr
-        .parse::<Ipv4Addr>()
-        .map_err(|e| format!("invalid IPv4 address in {raw:?}: {e}"))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|e| format!("invalid prefix length in {raw:?}: {e}"))?;
-    Ipv4Cidr::new(addr, prefix).map_err(|e| e.to_string())
-}
-
-/// Parse `addr/n` into a validated IPv6 CIDR (host bits must be zero).
-pub fn parse_ipv6_cidr(raw: &str) -> Result<Ipv6Cidr, String> {
-    let (addr, prefix) = split_cidr(raw)?;
-    let addr = addr
-        .parse::<Ipv6Addr>()
-        .map_err(|e| format!("invalid IPv6 address in {raw:?}: {e}"))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|e| format!("invalid prefix length in {raw:?}: {e}"))?;
-    Ipv6Cidr::new(addr, prefix).map_err(|e| e.to_string())
-}
-
-fn split_cidr(raw: &str) -> Result<(&str, &str), String> {
-    raw.split_once('/')
-        .ok_or_else(|| format!("CIDR value must contain '/', got {raw:?}"))
 }
 
 /// Mode bits that let anyone but the owner write: group or world.
@@ -485,6 +462,7 @@ mod tests {
     use super::*;
     use crate::agent_vm_firewall::{SessionFirewallRemoval, SessionFirewallSpec};
     use crate::core::{BrokerPort, BrokerPorts, SessionId};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn arb_ipv4_base_in(
         range_base: Ipv4Addr,
@@ -542,8 +520,8 @@ mod tests {
     fn policy() -> PfHelperPolicy {
         PfHelperPolicy::new(
             AgentNetworkPool::new(
-                parse_ipv4_cidr("10.200.0.0/16").unwrap(),
-                parse_ipv6_cidr("fd00:7772:6974::/48").unwrap(),
+                "10.200.0.0/16".parse().unwrap(),
+                "fd00:7772:6974::/48".parse().unwrap(),
             )
             .unwrap(),
             BrokerPortRange::new(49152, 65535).unwrap(),

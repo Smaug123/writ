@@ -35,7 +35,7 @@ use crate::agent_vm_firewall::{
     PassTranslationRule, PfInstallPhase, PfPreflightReport, SessionAnchorPlacement,
     SessionFirewallReport,
 };
-use crate::agent_vm_pf_helper_policy::{PfHelperPolicy, parse_ipv4_cidr, parse_ipv6_cidr};
+use crate::agent_vm_pf_helper_policy::PfHelperPolicy;
 use crate::core::{
     AgentNetworkPool, BrokerPortRange, PfAnchorName, PfCounterKey, PfCounterSnapshot, PfCounters,
     PfInterface, SessionId,
@@ -331,8 +331,8 @@ impl PfHelperPreflightDoc {
                 };
                 use PfHelperProtocolParseError::Malformed;
                 let pool = AgentNetworkPool::new(
-                    parse_ipv4_cidr(&wire.policy.ipv4_pool).map_err(|_| Malformed)?,
-                    parse_ipv6_cidr(&wire.policy.ipv6_pool).map_err(|_| Malformed)?,
+                    wire.policy.ipv4_pool.parse().map_err(|_| Malformed)?,
+                    wire.policy.ipv6_pool.parse().map_err(|_| Malformed)?,
                 )
                 .map_err(|_| Malformed)?;
                 let broker_port_range =
@@ -981,8 +981,8 @@ mod tests {
     fn test_policy() -> PfHelperPolicy {
         PfHelperPolicy::new(
             AgentNetworkPool::new(
-                parse_ipv4_cidr("10.200.0.0/16").unwrap(),
-                parse_ipv6_cidr("fd00:7772:6974::/48").unwrap(),
+                "10.200.0.0/16".parse().unwrap(),
+                "fd00:7772:6974::/48".parse().unwrap(),
             )
             .unwrap(),
             BrokerPortRange::new(49152, 65535).unwrap(),

@@ -2,6 +2,7 @@
 //! unsafe-shape rejections its constructor enforces.
 
 use super::*;
+use crate::upstream_base_url::UpstreamBaseUrlError;
 
 #[test]
 fn nix_cache_config_normalizes_base_urls_and_rejects_unsafe_shapes() {
@@ -18,7 +19,9 @@ fn nix_cache_config_normalizes_base_urls_and_rejects_unsafe_shapes() {
 
     assert_eq!(
         VmHttpNixCacheConfig::new("", ByteSize::kib(1), ByteSize::from_bytes(2048)),
-        Err(VmHttpNixCacheConfigError::EmptyUpstreamUrl)
+        Err(VmHttpNixCacheConfigError::UpstreamUrl(
+            UpstreamBaseUrlError::Empty
+        ))
     );
     assert_eq!(
         VmHttpNixCacheConfig::new(
@@ -42,7 +45,9 @@ fn nix_cache_config_normalizes_base_urls_and_rejects_unsafe_shapes() {
             ByteSize::kib(1),
             ByteSize::from_bytes(2048)
         ),
-        Err(VmHttpNixCacheConfigError::UnsupportedUpstreamScheme { .. })
+        Err(VmHttpNixCacheConfigError::UpstreamUrl(
+            UpstreamBaseUrlError::UnsupportedScheme { .. }
+        ))
     ));
     assert!(matches!(
         VmHttpNixCacheConfig::new(
@@ -50,7 +55,9 @@ fn nix_cache_config_normalizes_base_urls_and_rejects_unsafe_shapes() {
             ByteSize::kib(1),
             ByteSize::from_bytes(2048)
         ),
-        Err(VmHttpNixCacheConfigError::UpstreamUrlHasCredentials(_))
+        Err(VmHttpNixCacheConfigError::UpstreamUrl(
+            UpstreamBaseUrlError::HasCredentials(_)
+        ))
     ));
     assert!(matches!(
         VmHttpNixCacheConfig::new(
@@ -58,6 +65,8 @@ fn nix_cache_config_normalizes_base_urls_and_rejects_unsafe_shapes() {
             ByteSize::kib(1),
             ByteSize::from_bytes(2048)
         ),
-        Err(VmHttpNixCacheConfigError::UpstreamUrlHasQueryOrFragment(_))
+        Err(VmHttpNixCacheConfigError::UpstreamUrl(
+            UpstreamBaseUrlError::HasQueryOrFragment(_)
+        ))
     ));
 }

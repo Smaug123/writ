@@ -118,6 +118,8 @@ pub use writ_vm_client as vm_client;
 #[cfg(any(feature = "host", feature = "vm-client"))]
 pub use writ_vm_git as vm_git;
 #[cfg(feature = "host")]
+pub mod upstream_base_url;
+#[cfg(feature = "host")]
 pub mod vm_git_bundle;
 #[cfg(feature = "host")]
 pub mod vm_git_mirror_cache;

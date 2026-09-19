@@ -3,7 +3,6 @@
 //! The runner owns lifecycle ordering around Apple `container`; privileged PF
 //! changes still go through `writ-agent-vm-pf-helper`.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -358,8 +357,8 @@ struct ParsedSession {
 
 fn parse_session(args: &SessionArgs) -> Result<ParsedSession, Box<dyn std::error::Error>> {
     let session_id = parse_session_id(&args.session_id)?;
-    let ipv4_pool = parse_ipv4_cidr(&args.ipv4_pool)?;
-    let ipv6_pool = parse_ipv6_cidr(&args.ipv6_pool)?;
+    let ipv4_pool = args.ipv4_pool.parse::<Ipv4Cidr>()?;
+    let ipv6_pool = args.ipv6_pool.parse::<Ipv6Cidr>()?;
     Ok(ParsedSession {
         session_id,
         pool: AgentNetworkPool::new(ipv4_pool, ipv6_pool)?,
@@ -369,27 +368,6 @@ fn parse_session(args: &SessionArgs) -> Result<ParsedSession, Box<dyn std::error
 fn parse_session_id(raw: &str) -> Result<SessionId, Box<dyn std::error::Error>> {
     raw.parse()
         .map_err(|e| format!("invalid session ID: {e}").into())
-}
-
-fn parse_ipv4_cidr(raw: &str) -> Result<Ipv4Cidr, Box<dyn std::error::Error>> {
-    let (addr, prefix) = split_cidr(raw)?;
-    Ok(Ipv4Cidr::new(
-        addr.parse::<Ipv4Addr>()?,
-        prefix.parse::<u8>()?,
-    )?)
-}
-
-fn parse_ipv6_cidr(raw: &str) -> Result<Ipv6Cidr, Box<dyn std::error::Error>> {
-    let (addr, prefix) = split_cidr(raw)?;
-    Ok(Ipv6Cidr::new(
-        addr.parse::<Ipv6Addr>()?,
-        prefix.parse::<u8>()?,
-    )?)
-}
-
-fn split_cidr(raw: &str) -> Result<(&str, &str), Box<dyn std::error::Error>> {
-    raw.split_once('/')
-        .ok_or_else(|| format!("CIDR value must contain '/', got {raw:?}").into())
 }
 
 /// The invocations a `managed-stop` will run, for `--dry-run`. The agent VM /
