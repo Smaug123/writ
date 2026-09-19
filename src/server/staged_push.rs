@@ -390,67 +390,25 @@ const APPROVE_MINT_TTL_SECONDS: i64 = GITHUB_INSTALLATION_TOKEN_MAX_SECONDS;
 /// in-memory mutex — is the load-bearing piece that gates reject and
 /// the only durable state approve mutates outside of GitHub.
 ///
-/// Flow:
-///
-///   1. Validate `operator` (non-empty, bounded) before any IO so a
-///      caller cannot probe broker state via a malformed identity field.
-///   2. Check the three configured-state slots (`staging_store`,
-///      `promote_runtime`, `signing_key`) so a not-configured broker
-///      returns a precise diagnosis rather than dead-ending later.
-///   3. Load the staging entry atomically (receipt + bundle bytes); a
-///      missing entry surfaces as `UnknownStagedPush`.
-///   4. Read the joined audit view via [`AuditLog::get_git_push`]:
-///        * **Early short-circuit** on a prior resolution row — no
-///          attempt is started and no credential is wasted.
-///        * Refuse if no `Staged` outcome row exists (the staging dir
-///          and the audit log have drifted apart — operator must
-///          investigate).
-///        * Refuse a branch-creation push (no `expected_remote_head`):
-///          the walker needs a lease anchor a fresh branch does not
-///          have. Documented gap; failing closed is the right shape.
-///   5. Look up the originating session for `agent_kind`. The session
-///      is by definition closed by now; `get_session` reads it just the
-///      same.
-///   6. `start_approve_attempt`: insert `Started` row. The DAO refuses
-///      if any attempt is `Started`/`Uncertain` or
-///      `Resolved(PostPatchFailure)` — those are the
-///      reject-blocking states and would also block a fresh approve.
-///   7. Mint a one-shot installation token. On failure: transition the
-///      attempt to `Resolved(PrePatchFailure)` (no mint to capture).
-///   8. `record_attempt_mint`: persist the burned credential's identity
-///      in the append-only mint ledger *before* anything uses it, so a
-///      crash anywhere in the prepare phase cannot lose which credential
-///      was issued. On failure: `Resolved(PrePatchFailure)` capturing
-///      the mint on the resolved row directly.
-///   9. Run [`prepare_approve`] against the staging entry — staging
-///      fetch, unbundle, plan, and every object upload — with the
-///      attempt row still `Started`. None of that can move the branch,
-///      so a crash here is auto-recovered by boot reconcile (which
-///      copies the ledger mint onto the row it resolves). On a returned
-///      error: `Resolved(PrePatchFailure)` capturing the mint — every
-///      [`RunApproveError`] is pre-PATCH by construction.
-///  10. `mark_attempt_uncertain`: capture the mint context inline on
-///      the attempt row. **This is the TX that commits the broker to
-///      "the PATCH may exist on GitHub"** — reject is refused from this
-///      point until the attempt resolves. It yields the
-///      [`crate::audit::UncertainAttempt`] witness, the only key that
-///      opens [`crate::git_push_approve::PreparedApprove::commit`].
-///  11. `PreparedApprove::commit` re-verifies the lease one last time
-///      and issues the single branch-moving `PATCH`. Its error type
-///      splits by proof: the `FinalLease*` variants fire before the
-///      `PATCH` is sent (branch provably untouched →
-///      `Resolved(PrePatchFailure)`, push stays retryable), and
-///      `CommitError::UpdateRef` proves a `PATCH` reached GitHub
-///      without a confirmed response →
-///      `complete_attempt_post_patch_failure` (quarantines the push).
-///  12. On success: `complete_attempt_succeeded` atomically transitions
-///      the attempt to `Resolved(Succeeded)` *and* writes the
-///      `git_push_resolution(decision='approved')` row in a single
-///      SQLite transaction (the resolution-INSERT trigger sees the
-///      attempt already at `succeeded` and lets the row through).
-///  13. Staging-dir delete is best-effort after the joint TX; failures
-///      are logged. A stale dir surfaces in `promote list` for manual
-///      cleanup.
+/// The pre-attempt checks (operator shape, the three configured-state
+/// slots, the staging entry, the joined audit view's prior resolution /
+/// `Staged` outcome / lease anchor) refuse before any attempt row exists.
+/// The attempt is `Started` through the mint, the ledger write
+/// (`record_attempt_mint`, so a crash cannot lose which credential was
+/// issued) and [`prepare_approve`]; every failure there resolves it
+/// `PrePatchFailure`, and a crash is auto-recovered by boot reconcile.
+/// `mark_attempt_uncertain` is the transaction that commits the broker to
+/// "the PATCH may exist on GitHub": reject is refused from that point
+/// until the attempt resolves, and it yields the
+/// [`crate::audit::UncertainAttempt`] witness that alone opens
+/// [`crate::git_push_approve::PreparedApprove::commit`]. That commit's
+/// error type splits by proof: the `FinalLease*` variants fire before the
+/// `PATCH` (branch untouched, `PrePatchFailure`, push retryable), while
+/// `CommitError::UpdateRef` proves a `PATCH` reached GitHub without a
+/// confirmed response (`PostPatchFailure`, push quarantined). Success
+/// writes `Resolved(Succeeded)` and the `approved` resolution row in one
+/// SQLite transaction; the staging-dir delete afterwards is best-effort,
+/// and a stale dir surfaces in `promote list`.
 ///
 /// The token's `api_base` is plumbed straight through from
 /// [`crate::github::MintedToken::into_promote_pieces`] — using a
@@ -901,12 +859,9 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
         &bundle_tip,
         &bundle_bytes,
         signing_key,
-        // Trailers are an open follow-up: the design pins a per-approve
-        // trailer set (operator id, original commit sha) but the policy
-        // hasn't been ratified yet, so the slice ships with no trailers
-        // and the bundle's commits are replayed verbatim. The empty
-        // slice is identical in shape to what the prepare_approve unit
-        // tests pass.
+        // No trailers: the design pins a per-approve trailer set (operator
+        // id, original commit sha) but the policy is not ratified, so the
+        // bundle's commits are replayed verbatim.
         &[],
         attempt_id,
     )
@@ -918,9 +873,9 @@ async fn execute_started_attempt<S: SecretStore + Send + Sync + 'static>(
             prepared
         }
         Err(err) => {
-            // Every `RunApproveError` is pre-PATCH by construction —
-            // the type cannot express a PATCH failure, which is why the
-            // classification is no longer a match on variants. The
+            // Every `RunApproveError` is pre-PATCH by construction: the
+            // type cannot express a PATCH failure, so there is nothing to
+            // classify by variant. The
             // attempt is still `Started`, so the mint context is
             // captured on the resolved row (the ledger row written
             // above holds the same mint; the schema trigger checks the

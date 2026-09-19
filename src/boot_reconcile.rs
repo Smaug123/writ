@@ -1126,8 +1126,7 @@ mod tests {
     /// A persistent torn sibling (a carrier whose `entry.json` was
     /// removed, as an interrupted `delete` would leave) must not block
     /// recovery of a healthy orphan sitting next to it — and must never
-    /// itself be recovered. Regression test for the all-or-nothing
-    /// `list()` the sweep originally used.
+    /// itself be recovered.
     #[test]
     fn corrupt_sibling_does_not_block_recovery_of_a_valid_orphan() {
         let (log, session_id) = open_log_with_session();

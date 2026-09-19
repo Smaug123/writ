@@ -3,29 +3,27 @@
 //! Every path writ derives from the environment is *data* here — one
 //! [`DefaultPath`] per location, naming the XDG variable that owns it, the two
 //! suffixes, and how to override it — and [`DefaultPath::resolve_from`] is the
-//! single function that turns one into a path. Before this, the same six-line
-//! `if let Some(dir) = var_os(..)` block was copy-pasted once per location
-//! across three crates, and the copies had drifted.
+//! single function that turns one into a path.
 //!
 //! # Why this refuses rather than guessing
 //!
-//! The pasted version had two holes, both of which produced a *working* writd
-//! rather than a failure, which is why neither was noticed:
+//! Joining an environment variable's value raw has two holes, both of which
+//! produce a *working* writd rather than a failure:
 //!
 //! - `var_os` returns `Some("")` for an exported-but-empty `XDG_DATA_HOME` — a
 //!   real thing to find in a container or a stripped-down CI environment — and
 //!   `PathBuf::from("").join("writ/audit/audit.db")` is the *relative*
 //!   `writ/audit/audit.db`, resolved against whatever directory writd happened
 //!   to be started in. `unwrap_or_else` does not fire on `Some("")` either, so
-//!   the `HOME` fallback had the identical hole one level down.
-//! - An unset `HOME` fell back to `/tmp`, putting the audit database, the
+//!   a `HOME` fallback has the identical hole one level down.
+//! - A `/tmp` fallback for an unset `HOME` puts the audit database, the
 //!   signed-envelope repo, the secret store, and the daemon socket in a
 //!   world-writable sticky directory.
 //!
 //! The second is the one that matters, and it is not hypothetical on writ's
 //! primary platform: macOS sets no `XDG_RUNTIME_DIR`, so *every* macOS install
-//! already takes the `HOME` branch for the socket and the UI bearer file — one
-//! unset variable away from `/tmp`.
+//! takes the `HOME` branch for the socket and the UI bearer file — one unset
+//! variable away from `/tmp`.
 //!
 //! Two of those locations are worse than "durable state in a shared
 //! directory":
@@ -62,12 +60,12 @@
 //! clear refusal naming the variable and the config key beats a forked
 //! history.
 //!
-//! # What the pre-table resolvers did, for anyone migrating
+//! # What earlier versions did, for anyone migrating
 //!
 //! A refusal never tells an operator where their existing state *is*, because
 //! that varied per location and a confidently wrong answer would send them
-//! away from their own audit log. It is recorded here instead. Under the nine
-//! hand-written resolvers this replaces:
+//! away from their own audit log. It is recorded here instead. Under earlier
+//! versions:
 //!
 //! - **Seven** (config file, audit DB, legacy audit DB, notes repo, secret
 //!   store, socket, UI bearer) joined the variable's value raw. An empty
@@ -439,9 +437,7 @@ pub const AGENT_VM_STATE_DIR: DefaultPath = DefaultPath {
 ///
 /// Exists so the properties can quantify over *all* of them: a location added
 /// without being listed here is a location no property covers, and that is a
-/// gap someone has to notice rather than a test that fails. Keeping that claim
-/// true is why the bespoke resolver that used to live in
-/// `agent_vm_lifecycle::state_store` was folded in rather than left beside it.
+/// gap someone has to notice rather than a test that fails.
 ///
 /// Consumers outside this crate — `bailiff` has its own repo — declare their
 /// own [`DefaultPath`] and resolve it with the same code; they are not in this
