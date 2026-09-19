@@ -1,7 +1,8 @@
 //! Pure orchestrator for promoting an approved staged push.
 //!
-//! The B1e.2c handler is responsible for the audit/mint ceremony around an
-//! `ApproveStagedPush` RPC: validate the operator, look up the staged entry,
+//! The `approve_staged_push` handler in `server::staged_push` is responsible
+//! for the audit/mint ceremony around an `ApproveStagedPush` RPC: validate
+//! the operator, look up the staged entry,
 //! mint a credential under the grant-log discipline, write the resolution
 //! row, and delete the staging directory. This module does the part in
 //! between — given an already-minted GitHub installation token and the
@@ -27,11 +28,7 @@
 //! [`PromoteRuntimeConfig`] plus the GitHub API base; nothing here touches
 //! the audit log, the secret store, or the staging store. Failures bubble
 //! up as [`RunApproveError`] so the handler can decide how to record them
-//! in the audit log — see B1e.2c.
-//!
-//! The slice that wires this into the broker's `approve_staged_push`
-//! handler is B1e.2c; until that lands the broker stub still returns the
-//! slice-B1e.1 placeholder error.
+//! in the audit log.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -453,7 +450,7 @@ pub async fn prepare_approve_with_staging_repo(
 /// orchestrator runs cleanup explicitly on its own (success or error)
 /// so failures can be logged. Tests construct this directly via the
 /// `#[cfg(test)]`-only `from_path_for_test` constructor against a
-/// pre-populated repo so they can drive `run_approve_with_staging_repo`
+/// pre-populated repo so they can drive `prepare_approve_with_staging_repo`
 /// without the fetch.
 #[derive(Debug)]
 pub struct StagingRepo {
@@ -466,7 +463,7 @@ impl StagingRepo {
     }
 
     /// Wrap a caller-prepared bare repo path. Only used by tests of
-    /// `run_approve_with_staging_repo`; production code goes through
+    /// `prepare_approve_with_staging_repo`; production code goes through
     /// [`prepare_staging_repo`].
     #[cfg(test)]
     pub(crate) fn from_path_for_test(path: PathBuf) -> Self {

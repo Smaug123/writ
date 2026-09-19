@@ -1281,6 +1281,8 @@ mod shared_helper_tests {
         )
     }
 
+    const CANONICAL_TABLE: &[&str] = &["Retry-After", "X-Request-Id", "Openai-Version"];
+
     proptest! {
         /// The forwarded list is exactly the allowlisted input headers in
         /// order, each at most once, with a duplicate refused rather than
@@ -1317,20 +1319,18 @@ mod shared_helper_tests {
         /// back in its canonical spelling; anything else is dropped.
         #[test]
         fn canonical_header_name_is_case_insensitive_over_its_table(
-            index in 0usize..3,
+            canonical in prop::sample::select(CANONICAL_TABLE),
             upper in prop::collection::vec(any::<bool>(), 24),
             other in "[a-z-]{1,16}",
         ) {
-            const TABLE: &[&str] = &["Retry-After", "X-Request-Id", "Openai-Version"];
-            let canonical = TABLE[index];
             let spelled: String = canonical
                 .chars()
                 .zip(upper)
                 .map(|(c, up)| if up { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() })
                 .collect();
-            prop_assert_eq!(canonical_header_name(&spelled, TABLE), Some(canonical));
-            prop_assume!(!TABLE.iter().any(|t| t.eq_ignore_ascii_case(&other)));
-            prop_assert_eq!(canonical_header_name(&other, TABLE), None);
+            prop_assert_eq!(canonical_header_name(&spelled, CANONICAL_TABLE), Some(canonical));
+            prop_assume!(!CANONICAL_TABLE.iter().any(|t| t.eq_ignore_ascii_case(&other)));
+            prop_assert_eq!(canonical_header_name(&other, CANONICAL_TABLE), None);
         }
     }
 }

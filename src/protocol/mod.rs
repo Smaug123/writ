@@ -252,12 +252,6 @@ pub enum ClientMessage {
     /// broker is not the source of authentication and trusts whatever
     /// the local-socket peer asserts (the socket itself is the trust
     /// boundary).
-    ///
-    /// Slice B1e.1 lands the request type only. Dispatch returns
-    /// [`ServerMessage::Error`] until slice B1e.2 wires up the real
-    /// mint + replay + signing + audit pipeline; this matches the
-    /// same wire-first / handler-second split slice A1 used for
-    /// [`ClientMessage::RunAgent`].
     ApproveStagedPush {
         request_id: RequestId,
         operator: String,
@@ -319,14 +313,14 @@ pub enum ClientMessage {
     /// `docs/plans/2026-05-14-bailiff-split.md`.
     ///
     /// `session_id` binds the run to an audit session the caller
-    /// previously opened with [`ClientMessage::OpenSession`]. When
-    /// `Some`, writ validates the session exists and is still open
-    /// before spawning, and stamps the same id into the signed
-    /// metadata so a verifier can correlate the envelope back to the
-    /// workflow session. When `None` (legacy / standalone use), writ
-    /// mints a fresh id for the signed metadata alone — no audit
-    /// session row is created, and the id is unreachable except via
-    /// the signed envelope.
+    /// previously opened with [`ClientMessage::OpenSession`]. The
+    /// host-spawn arm requires it: writ checks the session exists and
+    /// is still open before spawning, records the run against it, and
+    /// stamps the same id into the signed metadata so a verifier can
+    /// correlate the envelope back to the workflow session. A request
+    /// carrying a workspace bootstrap goes to the VM arm instead, which
+    /// refuses a caller-supplied `session_id`: the agent VM opens its
+    /// own session, and that id is what the signed metadata carries.
     RunAgent {
         /// Prompt delivered verbatim to the spawned agent's stdin.
         /// Writ forwards the bytes but does not store, persist, or
@@ -539,10 +533,6 @@ pub enum ServerMessage {
     /// `output_oid` is the OID of the envelope blob writ wrote, so
     /// bailiff can attach the signed note at the requested ref
     /// without re-resolving the object.
-    ///
-    /// Slice A2 lands the wire shape; the dispatch path still
-    /// short-circuits to [`ServerMessage::Error`] until slice B
-    /// implements the spawner + signer.
     RunAgentCompleted {
         output_oid: GitObjectId,
         signed_metadata: SignedRunMetadata,

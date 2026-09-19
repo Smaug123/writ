@@ -6,39 +6,16 @@
 //! through, and the resulting hole is invisible at the call site because the code
 //! there looks careful.
 //!
-//! This module exists because that is exactly what happened, in two distinct
-//! ways. First, the recipe was written out longhand at eight call sites and they
-//! drifted: one used `GIT_CONFIG_SYSTEM=/dev/null` where the others used
-//! `GIT_CONFIG_NOSYSTEM=1`, and three omitted `GIT_CONFIG_COUNT=0`. Second, the
-//! recipe was *documented* as covering `GIT_CONFIG_PARAMETERS` via
-//! `GIT_CONFIG_COUNT=0`, and it did not; see that entry below. Nothing about
-//! either mistake read as wrong.
+//! The recipe must be sufficient on its own: production callers also call
+//! `env_clear`, but "safe because every caller does something else too" is not
+//! a property worth relying on, and the test helpers layer the recipe over an
+//! inherited environment.
 //!
-//! Scope of that second mistake, precisely: every *production* caller
-//! (`clean_git`, `notes_repo`, `git_push_objects_cat_file`, `flake_provision`)
-//! also calls `env_clear`, which removes `GIT_CONFIG_PARAMETERS` whether or not
-//! the recipe names it, so none of them was ever exposed. What was exposed was
-//! the test helpers, which layer the recipe over an inherited environment — so a
-//! developer or CI machine with `GIT_CONFIG_PARAMETERS` set could have had it
-//! reach the test gits. Naming the variable here therefore fixes real test
-//! hermeticity and is defence in depth for production, rather than closing a live
-//! hole in the broker. The recipe should be sufficient on its own regardless:
-//! "it happens to be safe because every current caller also does something else"
-//! is not a property worth relying on.
-//!
-//! It lives in `writ-core` rather than beside its main consumer so that the host
-//! daemon, the guest client, and every crate's test helpers can all derive from
-//! the same constant. A recipe that some crates cannot reach is a recipe those
-//! crates will re-type.
-//!
-//! Being *reachable* turned out not to be the same as being *reached*. When this
-//! module was introduced, the sentence above described the guest client as a
-//! consumer while `writ-vm-client`'s four git runners applied no recipe at all —
-//! and every duplication guard passed, because none of them asks whether a given
-//! git spawn is hardened; they ask whether the recipe is spelled out twice. That
-//! is what `a_git_named_helper_must_apply_the_recipe_to_its_own_command` in
-//! `tests/shared_hardening_helpers.rs` now checks, and its doc comment is honest
-//! about remaining a backstop: the durable form of this invariant is a
+//! It lives in `writ-core` so that the host daemon, the guest client, and every
+//! crate's test helpers derive from the same constant, and
+//! `a_git_named_helper_must_apply_the_recipe_to_its_own_command` in
+//! `tests/shared_hardening_helpers.rs` checks that each git-named helper applies
+//! it. That guard is a backstop: the durable form of the invariant is a
 //! construction boundary, where a runnable git `Command` cannot be obtained
 //! without the recipe having been applied.
 //!
@@ -62,11 +39,9 @@
 //!   independently of `GIT_CONFIG_COUNT`, so zeroing the count does **not**
 //!   neutralise it: with `GIT_CONFIG_COUNT=0` set, an inherited
 //!   `GIT_CONFIG_PARAMETERS="'core.pager=INJECTED'"` still reaches git
-//!   (verified against git 2.x). A comment in this codebase claimed otherwise
-//!   for some time, which is exactly why it is now a listed entry rather than
-//!   an assumption. Empty parses as "no parameters"; unsetting would also work,
-//!   but an explicit empty value survives being merged into an env a caller
-//!   builds up in any order.
+//!   (verified against git 2.x). Empty parses as "no parameters"; unsetting
+//!   would also work, but an explicit empty value survives being merged into an
+//!   env a caller builds up in any order.
 //!
 //! And one variable that must be *removed* rather than set
 //! ([`GIT_CONFIG_REMOVE_ENV`]):

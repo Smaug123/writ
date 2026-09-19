@@ -374,7 +374,7 @@ impl AuditLog {
         self.with_conn_mut(|c| insert_git_push_outcome_row(c, r))
     }
 
-    /// Persist an operator decision on a staged push. The v13 schema's
+    /// Persist an operator decision on a staged push. The schema's
     /// `BEFORE INSERT` trigger requires `git_push_outcome.result = 'staged'`
     /// for this request id, and the table's primary key prevents a
     /// second decision being recorded — both constraints surface as

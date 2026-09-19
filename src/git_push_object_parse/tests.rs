@@ -1075,16 +1075,6 @@ fn arb_staging_commit() -> impl Strategy<Value = StagingCommit> {
         )
 }
 
-fn arb_tree_entry_kind() -> impl Strategy<Value = TreeEntryKind> {
-    prop_oneof![
-        Just(TreeEntryKind::Blob),
-        Just(TreeEntryKind::Executable),
-        Just(TreeEntryKind::Symlink),
-        Just(TreeEntryKind::Subtree),
-        Just(TreeEntryKind::Submodule),
-    ]
-}
-
 fn arb_tree_path() -> impl Strategy<Value = String> {
     // Path bytes exclude '\0' (entry terminator), SP (mode/path
     // separator), and '/' (rejected by the parser because the
@@ -1118,7 +1108,11 @@ fn arb_tree_path() -> impl Strategy<Value = String> {
 }
 
 fn arb_staging_tree_entry() -> impl Strategy<Value = StagingTreeEntry> {
-    (arb_tree_path(), arb_tree_entry_kind(), arb_object_id())
+    (
+        arb_tree_path(),
+        prop::sample::select(TreeEntryKind::ALL.to_vec()),
+        arb_object_id(),
+    )
         .prop_map(|(path, kind, sha)| StagingTreeEntry { path, kind, sha })
 }
 
