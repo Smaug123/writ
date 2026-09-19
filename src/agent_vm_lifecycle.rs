@@ -1137,6 +1137,15 @@ impl AgentVmToolPaths {
     pub fn container(&self) -> &Path {
         &self.container
     }
+
+    /// The privileged PF helper, always invoked through [`Self::sudo`].
+    pub fn pf_helper(&self) -> &Path {
+        &self.pf_helper
+    }
+
+    pub fn sudo(&self) -> &Path {
+        &self.sudo
+    }
 }
 
 impl AgentVmStartInvocation {

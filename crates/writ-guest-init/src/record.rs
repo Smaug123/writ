@@ -33,15 +33,57 @@ pub const RECORD_PREFIX: &str = "writ-agent-vm-guest-init";
 
 /// The isolation ABI version a correct initializer stamps on its
 /// `security-ready` record. Bumped only when the host/guest contract changes;
-/// it is the same notion as the image's `org.writ.agent-vm.isolation-abi`
-/// label (Stage B3), which is held equal to this.
+/// it is the same notion as the image's [`ISOLATION_ABI_LABEL`] label
+/// (Stage B3), which is held equal to this.
 pub const ISOLATION_ABI_VERSION: u32 = parse_abi_version_file(ISOLATION_ABI_VERSION_FILE);
+
+/// The OCI image label whose value is the image's declared
+/// [`ISOLATION_ABI_VERSION`].
+///
+/// Self-asserted, so it is a *compatibility* signal and not an identity: any
+/// image can carry it, and the host pins identity with the image's resolved
+/// manifest digest instead. The host reads this label out of `container
+/// inspect` as one of the facts the `ipv4_only_locked_v1` profile's admission
+/// is conditional on.
+pub const ISOLATION_ABI_LABEL: &str = trim_one_newline(ISOLATION_ABI_LABEL_FILE);
 
 /// The one place the ABI version is written down: a text file the official
 /// image's Nix build reads for its `org.writ.agent-vm.isolation-abi` label,
 /// and this crate reads at compile time. One source, so the label the image
 /// carries and the number the initializer announces cannot disagree.
 const ISOLATION_ABI_VERSION_FILE: &str = include_str!("../isolation-abi-version");
+
+/// The one place the label's spelling is written down, read at compile time by
+/// this crate and at evaluation time by the official image's Nix build. One
+/// source, so the label the image stamps and the label the host looks for
+/// cannot disagree; a disagreement would refuse a correct image.
+const ISOLATION_ABI_LABEL_FILE: &str = include_str!("../isolation-abi-label");
+
+/// Strip the file's single trailing newline at compile time, rejecting
+/// anything that is not one non-empty line of printable ASCII. A malformed
+/// file is a build error, not a runtime surprise.
+const fn trim_one_newline(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    assert!(
+        !bytes.is_empty() && bytes[bytes.len() - 1] == b'\n',
+        "isolation-abi-label must end in exactly one newline"
+    );
+    let len = bytes.len() - 1;
+    assert!(len > 0, "isolation-abi-label is empty");
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        assert!(
+            b > 0x20 && b < 0x7f,
+            "isolation-abi-label must be one line of printable, space-free ASCII"
+        );
+        i += 1;
+    }
+    // `split_at` is const; the slice is ASCII by the loop above, so the split
+    // is on a UTF-8 boundary.
+    let (head, _) = text.split_at(len);
+    head
+}
 
 /// Parse the version file at compile time: ASCII digits, no leading zero, one
 /// trailing newline, nothing else. A malformed file is a build error, not a

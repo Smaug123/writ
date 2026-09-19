@@ -36,6 +36,7 @@ host = [
     "dep:rusqlite",
     "dep:ssh-key",
     "dep:subtle",
+    "dep:writ-guest-init",
     "dep:writ-vm-git",
     "dep:xz2",
     "dep:zstd",
@@ -88,6 +89,11 @@ writ-vm-client = { path = "crates/writ-vm-client", optional = true }
 # The audit log, re-exported as `writ::audit` under the host feature.
 writ-audit = { path = "crates/writ-audit", optional = true }
 writ-vm-git = { path = "crates/writ-vm-git", optional = true }
+# The guest-side handoff, as data. The host reads its constants (the image's
+# isolation-ABI label and version, the locked capability argv) when deciding
+# whether a `ipv4_only_locked_v1` session may start, and will read its records
+# when one does. Pure, so it costs a host build nothing but the compile.
+writ-guest-init = { path = "crates/writ-guest-init", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

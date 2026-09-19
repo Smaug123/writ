@@ -1,0 +1,58 @@
+[
+  {
+    "configuration" : {
+      "creationDate" : "0001-01-01T00:00:00Z",
+      "descriptor" : {
+        "digest" : "sha256:43e3ddf5916cc8580ccdda597a4cf9bf067a91fbfac0f1043943a68366cd32b9",
+        "mediaType" : "application/vnd.oci.image.index.v1+json",
+        "size" : 439
+      },
+      "name" : "writ-agent-vm-guest:latest"
+    },
+    "id" : "43e3ddf5916cc8580ccdda597a4cf9bf067a91fbfac0f1043943a68366cd32b9",
+    "variants" : [
+      {
+        "config" : {
+          "architecture" : "arm64",
+          "config" : {
+            "Cmd" : [
+              "/bin/sh"
+            ],
+            "Env" : [
+              "PATH=/bin",
+              "HOME=/root",
+              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt",
+              "GIT_SSL_CAINFO=/etc/ssl/certs/ca-bundle.crt",
+              "NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt",
+              "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=true",
+              "IS_SANDBOX=1"
+            ],
+            "Labels" : {
+              "org.writ.agent-vm.isolation-abi" : "1"
+            },
+            "WorkingDir" : "/"
+          },
+          "created" : "0001-01-01T00:00:00Z",
+          "history" : [
+            {
+              "created_by" : "nix2container"
+            }
+          ],
+          "os" : "linux",
+          "rootfs" : {
+            "diff_ids" : [
+              "sha256:11495acf09d79391b921516a7f9b4198a66969d8a196b90a2b57ac007994c005"
+            ],
+            "type" : "layers"
+          }
+        },
+        "digest" : "sha256:d89fed3c1baf5296826e3065bb69786c807627062b1a042adad771c7b4da3078",
+        "platform" : {
+          "architecture" : "arm64",
+          "os" : "linux"
+        },
+        "size" : 367106358
+      }
+    ]
+  }
+]

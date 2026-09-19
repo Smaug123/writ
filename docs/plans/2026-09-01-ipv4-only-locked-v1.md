@@ -333,6 +333,61 @@ the three parsers from the stage-1 branch; do not salvage
   still passes unchanged: `admit` did not change, so `locked_v1` is refused
   before any probe runs.
 
+**Landed, with five notes.**
+
+The probes run through `process_supervisor::run_supervised`, not a bare
+`tokio::time::timeout` over a captured child: the privileged probes are `sudo`
+wrapping the helper wrapping `pfctl`, so a deadline that killed only the
+direct child would leave a wedged `pfctl` holding the captured pipe open and
+accumulating with every refused start. The group kill cannot reach the *root*
+half of that chain (an unprivileged daemon's `kill(2)` on a root process is
+`EPERM`), so the stated guarantee is the weaker one: the daemon stops waiting,
+reports the fact unreadable, and does not admit, possibly leaving a wedged
+root helper behind. A test of its own drives a probe that *forks* the hang and
+waits on it rather than `exec`ing it, reads the descendant's pid while the
+probe is still running (so a slow shell delays the test instead of failing it)
+and asserts the pid is gone afterwards; it fails against the
+direct-child-only version.
+
+Being the first caller to spawn through `sudo` also exposed a latent flaw in
+the shared supervisor: its timeout and cap-rejection arms tolerate `EPERM`
+from `killpg` as "the group is already empty", then reap the leader with an
+*unbounded* `wait`. That reasoning holds for a child the daemon could have
+signalled and fails for one that raised its own privilege — the call would
+then block forever, which is the one thing the whole-call deadline exists to
+rule out. The reap is now bounded by a grace period and abandoned after it, so
+the worst case is `timeout + POST_KILL_REAP_GRACE`. A test reproduces the
+state portably, without root, by having the child leave the process group the
+supervisor made for it: the kill then reports success against a live child,
+exactly as `EPERM` does. It hangs against the unbounded version.
+
+The gatherer is a free `gather_locked_v1_evidence(&LockedV1ProbePlan)` rather
+than a method on the daemon, and the plan is built by
+`LockedV1ProbePlan::for_host(tools, image)` from exactly what the daemon
+config already holds. Nothing on `AgentVmDaemon` calls it: a daemon method
+with no caller would be dead weight until E2 wires the locked start path.
+
+The evidence is six flat observations rather than five, because the label and
+the digest come from one `container inspect` run but fail separately: a label
+value that is not a decimal version leaves the digest perfectly readable. The
+gatherer maps a document it cannot parse at all onto both facts unreadable, so
+the plan's `{label} × {digest}` grid is still swept in full.
+
+The allowlist is read as a trie keyed (CLI, macOS build, image digest), so a
+refusal names the level at which the observed platform left it: "this CLI is
+in no record" and "this proven CLI was never proven with that image" are
+different sentences, and the sweep asserts every refusal names a fact that is
+genuinely wrong in that cell rather than merely refusing.
+
+Two things were made single-source on the way past. `PfPreflightUnclean` is
+now the one definition of "this report does not permit an install", which
+`PfPreflightReport::require_clean` converts into the operator-facing
+`PfctlError`, so the install precheck and the admission evidence cannot
+disagree about the same report. And the ABI label's *spelling* joins its value
+in `crates/writ-guest-init` (`isolation-abi-label`, read by both the crate and
+`flake.nix`), because a host looking for a label the image does not stamp
+would refuse a correct image.
+
 ---
 
 ## Stage E1: Lifecycle phases and state schema v3

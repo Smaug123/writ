@@ -904,28 +904,81 @@ pub struct PfPreflightReport {
     pub pass_translation_rules: Vec<PassTranslationRule>,
 }
 
+/// Why a [`PfPreflightReport`] does not permit an install.
+///
+/// The one definition of "not clean", so the install precheck
+/// ([`PfPreflightReport::require_clean`]) and the locked profile's admission
+/// evidence cannot disagree about what the same report means. The operator
+/// wording lives in [`PfctlError`], which this converts into; nothing here
+/// restates it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PfPreflightUnclean {
+    /// PF is not enabled, so no rule of any anchor is consulted.
+    PfDisabled,
+    /// The session anchor is not loaded at all.
+    SessionAnchorAbsent,
+    /// The session anchor is loaded, but these earlier main-ruleset lines
+    /// could pass a packet before it is consulted.
+    SessionAnchorPreceded(Vec<String>),
+    /// These translation rules carry PF's `pass` modifier, which bypasses the
+    /// filter stage from any anchor and any position.
+    PassTranslationRules(Vec<PassTranslationRule>),
+}
+
+impl From<PfPreflightUnclean> for PfctlError {
+    fn from(unclean: PfPreflightUnclean) -> Self {
+        match unclean {
+            PfPreflightUnclean::PfDisabled => PfctlError::PfDisabled,
+            PfPreflightUnclean::SessionAnchorAbsent => {
+                PfctlError::MissingBootstrapAnchor(SESSION_BOOTSTRAP_ANCHOR)
+            }
+            PfPreflightUnclean::SessionAnchorPreceded(lines) => {
+                PfctlError::BootstrapAnchorNotFirst(lines)
+            }
+            PfPreflightUnclean::PassTranslationRules(rules) => {
+                PfctlError::PassTranslationRules(rules)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PfPreflightUnclean {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", PfctlError::from(self.clone()))
+    }
+}
+
 impl PfPreflightReport {
-    /// `Ok` iff an install's precheck would pass: PF enabled, the session
-    /// anchor present and first, and no `pass` translation rule loaded.
-    pub fn require_clean(&self) -> Result<(), PfctlError> {
+    /// The first reason this report does not permit an install, or `None` if
+    /// it does: PF enabled, the session anchor present and first, and no
+    /// `pass` translation rule loaded.
+    pub fn unclean(&self) -> Option<PfPreflightUnclean> {
         if !self.pf_enabled {
-            return Err(PfctlError::PfDisabled);
+            return Some(PfPreflightUnclean::PfDisabled);
         }
         match &self.session_anchor {
             SessionAnchorPlacement::First => {}
             SessionAnchorPlacement::Preceded(lines) => {
-                return Err(PfctlError::BootstrapAnchorNotFirst(lines.clone()));
+                return Some(PfPreflightUnclean::SessionAnchorPreceded(lines.clone()));
             }
             SessionAnchorPlacement::Absent => {
-                return Err(PfctlError::MissingBootstrapAnchor(SESSION_BOOTSTRAP_ANCHOR));
+                return Some(PfPreflightUnclean::SessionAnchorAbsent);
             }
         }
         if !self.pass_translation_rules.is_empty() {
-            return Err(PfctlError::PassTranslationRules(
+            return Some(PfPreflightUnclean::PassTranslationRules(
                 self.pass_translation_rules.clone(),
             ));
         }
-        Ok(())
+        None
+    }
+
+    /// `Ok` iff [`Self::unclean`] finds no reason to refuse.
+    pub fn require_clean(&self) -> Result<(), PfctlError> {
+        match self.unclean() {
+            None => Ok(()),
+            Some(unclean) => Err(unclean.into()),
+        }
     }
 }
 

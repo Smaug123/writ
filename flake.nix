@@ -203,10 +203,20 @@
           };
         });
 
-      # The guest isolation ABI the official image advertises, read from the
-      # same file `crates/writ-guest-init` compiles its `ISOLATION_ABI_VERSION`
-      # from, so the label and the initializer's ready record cannot disagree.
-      isolationAbiLabel = "org.writ.agent-vm.isolation-abi";
+      # The guest isolation ABI the official image advertises. Both the label's
+      # spelling and its value are read from the same files
+      # `crates/writ-guest-init` compiles `ISOLATION_ABI_LABEL` and
+      # `ISOLATION_ABI_VERSION` from, so the label the image stamps, the label
+      # the host's locked-profile admission looks for, and the number the
+      # initializer's ready record announces cannot disagree.
+      isolationAbiLabel =
+        let
+          raw = builtins.readFile ./crates/writ-guest-init/isolation-abi-label;
+          trimmed = lib.removeSuffix "\n" raw;
+        in
+        if builtins.match "[!-~]+" trimmed == null || trimmed + "\n" != raw
+        then throw "crates/writ-guest-init/isolation-abi-label must be one printable ASCII line and a newline, got ${builtins.toJSON raw}"
+        else trimmed;
       isolationAbiVersion =
         let
           raw = builtins.readFile ./crates/writ-guest-init/isolation-abi-version;
