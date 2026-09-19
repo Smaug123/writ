@@ -1549,8 +1549,8 @@ to `writ_core::git_env` (§5.1)).
 
 **Primitives.** `StagedEntry`/`GitPushStagingStore` (`git_push_staging.rs`);
 parsed `StagingCommit`/`StagingTree` + `ParseObjectError`
-(`git_push_object_parse.rs`); plan types `FastForwardPlan`,
-`BranchCreationPlan`, `ShaMap` (`git_push_walker.rs`); the object-source
+(`git_push_object_parse.rs`); plan types `FastForwardPlan`, `ShaMap`
+(`git_push_walker.rs`); the object-source
 abstraction `trait GitObjectSource` with production `CatFileObjectSource`
 (`git_push_objects_cat_file.rs`).
 

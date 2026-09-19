@@ -391,79 +391,6 @@ fn recorded_decision(
     Ok(serde_json::from_str::<PolicyDecision>(&decision_json)?)
 }
 
-/// Half-pair writers, for testing the mint DAO's own invariants.
-///
-/// **There is no production caller.** The only way to write these rows in a
-/// shipped build is [`AuditLog::begin_effect`] with [`HostMintAuditTable`],
-/// which hands back a guard that must be discharged with one of the three
-/// [`HostMintOutcome`] endings — that is what makes the mint's pair complete by
-/// construction rather than by the shell remembering to append an outcome.
-///
-/// They exist because the invariants below (scope authorisation, grant/decision
-/// agreement, the TTL-divergence ceiling, "no mint failure for a Deny") are
-/// properties of *one row*, and asserting them through the guard's sequencing
-/// would test the sequencing over again at every one. `#[cfg(test)]` rather
-/// than merely private, so a future production caller is a compile error rather
-/// than a review question.
-#[cfg(test)]
-impl AuditLog {
-    /// Persist a request and its policy decision, in its own transaction.
-    ///
-    /// The session-open check lives inside the same transaction as the INSERT.
-    /// Without it, a client could CloseSession and then see audit rows land
-    /// after the session's own `closed_at` — which would silently strip
-    /// `closed_at` of its meaning as an activity-window bound. The existing FK
-    /// covers "session exists"; it cannot express "session is open". The
-    /// BEFORE-INSERT trigger on `request` is braces to this belt.
-    pub(crate) fn record_pre_mint(&self, r: &PreMintRecord<'_>) -> Result<(), AuditError> {
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            crate::validation::check_session_open(&tx, r.session_id)?;
-            insert_pre_mint_row(&tx, r)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
-    /// Append the grant produced by a successful mint. The matching
-    /// request row must already have been persisted via
-    /// [`AuditLog::record_pre_mint`]; the FK on `grant_log.request_id`
-    /// enforces this at the DB layer.
-    ///
-    /// The session may have been closed between `record_pre_mint` and
-    /// this call (a CloseSession can land during the mint's `await`);
-    /// that is *not* an error. The authority to mint was established at
-    /// pre-mint time, so the resulting grant is still a legitimate
-    /// audit row even if the session has since gone quiet on paper.
-    pub(crate) fn record_grant(&self, grant: &CredentialGrant) -> Result<(), AuditError> {
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            insert_grant_row(&tx, grant)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
-    /// Append a backend mint failure for a previously pre-minted request.
-    /// Like [`AuditLog::record_grant`], this is permitted even if the
-    /// session has since been closed: the request was accepted while the
-    /// session was open, and the failure is the honest outcome of that
-    /// acceptance.
-    pub(crate) fn record_mint_failure(
-        &self,
-        request_id: RequestId,
-        failed_at: UnixMillis,
-        error: &str,
-    ) -> Result<(), AuditError> {
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            insert_mint_failure_row(&tx, request_id, failed_at, error)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-}
-
 impl AuditLog {
     pub fn list_grants_for_session(
         &self,
@@ -670,7 +597,8 @@ pub(super) fn grant_from_row(
 mod tests {
     use super::*;
     use crate::test_support::{
-        pre_mint, sample_repo, sample_request, sample_scope, sample_session,
+        pre_mint, record_grant, record_mint_failure, sample_repo, sample_request, sample_scope,
+        sample_session,
     };
     use writ_core::core::{
         GitHubAccess, GitHubGrantedScope, GitHubPermissions, GitHubRequest, MetadataAccess,
@@ -709,7 +637,7 @@ mod tests {
             UnixMillis::from_millis(1_700_000_100),
         )
         .unwrap();
-        log.record_grant(&grant).unwrap();
+        record_grant(&log, &grant).unwrap();
 
         let grants = log.list_grants_for_session(s.session_id).unwrap();
         assert_eq!(grants, vec![grant.clone()]);
@@ -739,15 +667,18 @@ mod tests {
             UnixMillis::from_millis(1_700_000_100),
         )
         .unwrap();
-        log.record_grant(&CredentialGrant {
-            jti: Jti::new(),
-            request_id,
-            session_id: s.session_id,
-            github_app_id: Some(42),
-            scope,
-            issued_at: UnixMillis::from_millis(1_700_000_100),
-            expires_at: UnixMillis::from_millis(1_700_000_400),
-        })
+        record_grant(
+            &log,
+            &CredentialGrant {
+                jti: Jti::new(),
+                request_id,
+                session_id: s.session_id,
+                github_app_id: Some(42),
+                scope,
+                issued_at: UnixMillis::from_millis(1_700_000_100),
+                expires_at: UnixMillis::from_millis(1_700_000_400),
+            },
+        )
         .unwrap();
 
         // The recorded grant authorises the exact request it was minted from.
@@ -807,7 +738,7 @@ mod tests {
             expires_at: UnixMillis::from_millis(1_700_000_400),
         };
 
-        let err = log.record_grant(&grant).unwrap_err();
+        let err = record_grant(&log, &grant).unwrap_err();
         assert!(
             matches!(err, AuditError::Invariant("grant.github_app_id is missing")),
             "got: {err:?}"
@@ -815,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn record_pre_mint_for_deny_writes_no_grant() {
+    fn pre_mint_for_deny_writes_no_grant() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -875,11 +806,11 @@ mod tests {
             issued_at: UnixMillis::from_millis(1),
             expires_at: UnixMillis::from_millis(2),
         };
-        let err = log.record_grant(&bogus_grant).unwrap_err();
+        let err = record_grant(&log, &bogus_grant).unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)));
     }
 
-    /// `record_grant` depends on a prior `record_pre_mint` (FK enforces
+    /// `record_grant` depends on a prior `pre_mint` (FK enforces
     /// it at the DB layer too, but the app-layer check produces a
     /// readable error rather than a generic FK violation).
     #[test]
@@ -896,7 +827,7 @@ mod tests {
             issued_at: UnixMillis::from_millis(1),
             expires_at: UnixMillis::from_millis(2),
         };
-        let err = log.record_grant(&grant).unwrap_err();
+        let err = record_grant(&log, &grant).unwrap_err();
         assert!(
             matches!(err, AuditError::Invariant(_)),
             "expected Invariant, got: {err:?}"
@@ -907,8 +838,7 @@ mod tests {
     #[test]
     fn record_mint_failure_without_pre_mint_is_rejected() {
         let log = AuditLog::open_in_memory().unwrap();
-        let err = log
-            .record_mint_failure(RequestId::new(), UnixMillis::from_millis(1), "boom")
+        let err = record_mint_failure(&log, RequestId::new(), UnixMillis::from_millis(1), "boom")
             .unwrap_err();
         assert!(
             matches!(err, AuditError::Invariant(_)),
@@ -947,7 +877,7 @@ mod tests {
                 UnixMillis::from_millis(at),
             )
             .unwrap();
-            log.record_grant(&grant).unwrap();
+            record_grant(&log, &grant).unwrap();
             grant
         };
 
@@ -1005,7 +935,7 @@ mod tests {
                 UnixMillis::from_millis(5_000),
             )
             .unwrap();
-            log.record_grant(&grant).unwrap();
+            record_grant(&log, &grant).unwrap();
             grant
         };
 
@@ -1069,7 +999,7 @@ mod tests {
             expires_at: UnixMillis::from_millis(2_000),
         };
 
-        let err = log.record_grant(&grant).unwrap_err();
+        let err = record_grant(&log, &grant).unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
     }
 
@@ -1112,7 +1042,7 @@ mod tests {
             expires_at: UnixMillis::from_millis(3_600_000),
         };
 
-        let err = log.record_grant(&grant).unwrap_err();
+        let err = record_grant(&log, &grant).unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
     }
 
@@ -1153,7 +1083,7 @@ mod tests {
             expires_at: UnixMillis::from_millis(100),
         };
 
-        let err = log.record_grant(&grant).unwrap_err();
+        let err = record_grant(&log, &grant).unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
     }
 
@@ -1196,7 +1126,7 @@ mod tests {
             expires_at: UnixMillis::from_millis(lifetime_millis),
         };
 
-        log.record_grant(&grant).unwrap();
+        record_grant(&log, &grant).unwrap();
     }
 
     #[test]
@@ -1221,7 +1151,8 @@ mod tests {
         )
         .unwrap();
 
-        log.record_mint_failure(
+        record_mint_failure(
+            &log,
             request_id,
             UnixMillis::from_millis(1_700_000_105),
             "GitHub returned 422: repository not installed",
@@ -1286,14 +1217,14 @@ mod tests {
 
             let (first, second) = if grant_first {
                 (
-                    log.record_grant(&grant),
-                    log.record_mint_failure(request_id, UnixMillis::from_millis(10), "boom"),
+                    record_grant(&log, &grant),
+                    record_mint_failure(&log, request_id, UnixMillis::from_millis(10), "boom"),
                 )
             } else {
                 (
-                    log.record_mint_failure(request_id, UnixMillis::from_millis(10), "boom")
+                    record_mint_failure(&log, request_id, UnixMillis::from_millis(10), "boom")
                         .map(|_| ()),
-                    log.record_grant(&grant),
+                    record_grant(&log, &grant),
                 )
             };
             first.unwrap_or_else(|e| panic!("first insert should succeed: {e}"));
@@ -1308,10 +1239,10 @@ mod tests {
 
     /// If the caller accidentally pairs a `Metadata` request with a
     /// `Contents:write` grant decision, the pre-mint row would claim
-    /// authority the request never asked for. `record_pre_mint` rejects
+    /// authority the request never asked for. The request-row insert rejects
     /// the pairing before any row lands.
     #[test]
-    fn record_pre_mint_rejects_decision_scope_exceeding_request() {
+    fn pre_mint_rejects_decision_scope_exceeding_request() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1341,7 +1272,7 @@ mod tests {
     /// impossible output of the policy engine, so recording it would
     /// corrupt replay.
     #[test]
-    fn record_pre_mint_rejects_grant_decision_on_different_repo() {
+    fn pre_mint_rejects_grant_decision_on_different_repo() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1382,7 +1313,7 @@ mod tests {
     /// (request read, decision write) is not a possible policy output for
     /// a correctly-paired request. Reject.
     #[test]
-    fn record_pre_mint_rejects_decision_access_level_exceeding_request() {
+    fn pre_mint_rejects_decision_access_level_exceeding_request() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1433,13 +1364,13 @@ mod tests {
         )
         .unwrap();
 
-        let err = log
-            .record_mint_failure(
-                request_id,
-                UnixMillis::from_millis(1_700_000_110),
-                "should not exist",
-            )
-            .unwrap_err();
+        let err = record_mint_failure(
+            &log,
+            request_id,
+            UnixMillis::from_millis(1_700_000_110),
+            "should not exist",
+        )
+        .unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)));
     }
 
@@ -1538,20 +1469,19 @@ mod tests {
             UnixMillis::from_millis(0),
         )
         .unwrap();
-        let err = log
-            .record_mint_failure(request_id, UnixMillis::from_millis(5), "")
-            .unwrap_err();
+        let err =
+            record_mint_failure(&log, request_id, UnixMillis::from_millis(5), "").unwrap_err();
         assert!(matches!(err, AuditError::Invariant(_)), "got: {err:?}");
     }
 
     /// A closed session must not accumulate new pre-mint rows —
     /// otherwise its `closed_at` no longer bounds the session's activity
     /// window, which is the whole point of recording a close timestamp.
-    /// The check has to live inside `record_pre_mint`'s transaction
+    /// The check has to live inside the request-row insert's transaction
     /// (belt) and inside a DB trigger (braces); this exercise covers
     /// the belt.
     #[test]
-    fn record_pre_mint_rejects_write_against_closed_session() {
+    fn pre_mint_rejects_write_against_closed_session() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1581,7 +1511,7 @@ mod tests {
     /// Same rule applies to Deny rows: a closed session must not
     /// accumulate any new request rows at all, not just Grant ones.
     #[test]
-    fn record_pre_mint_rejects_deny_against_closed_session() {
+    fn pre_mint_rejects_deny_against_closed_session() {
         let log = AuditLog::open_in_memory().unwrap();
         let s = sample_session();
         log.open_session(&s).unwrap();
@@ -1607,7 +1537,7 @@ mod tests {
         );
     }
 
-    /// The core fix: a CloseSession that lands *after* `record_pre_mint`
+    /// The core fix: a CloseSession that lands *after* the request row
     /// commits but *before* the backend mint finishes must not prevent
     /// the broker from appending the resulting grant. The authority to
     /// mint was established when the pre-mint row committed; the grant
@@ -1647,7 +1577,7 @@ mod tests {
             issued_at: UnixMillis::from_millis(1_700_000_200),
             expires_at: UnixMillis::from_millis(1_700_000_500),
         };
-        log.record_grant(&grant).unwrap();
+        record_grant(&log, &grant).unwrap();
         assert_eq!(
             log.list_grants_for_session(s.session_id).unwrap(),
             vec![grant]
@@ -1681,7 +1611,8 @@ mod tests {
         log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_150))
             .unwrap();
 
-        log.record_mint_failure(
+        record_mint_failure(
+            &log,
             request_id,
             UnixMillis::from_millis(1_700_000_200),
             "GitHub 503",
@@ -1690,10 +1621,10 @@ mod tests {
     }
 
     /// A recorded audit row for an unknown session was previously
-    /// caught only by the FK; `record_pre_mint` reports it explicitly so
+    /// caught only by the FK; the request-row insert reports it explicitly so
     /// the error is readable rather than leaking SQLite's message.
     #[test]
-    fn record_pre_mint_rejects_write_against_nonexistent_session() {
+    fn pre_mint_rejects_write_against_nonexistent_session() {
         let log = AuditLog::open_in_memory().unwrap();
         let phantom = SessionId::new();
         let req = sample_request();
