@@ -79,6 +79,41 @@ pub struct VmHttpNixCacheService<S: SecretStore> {
     admitted_nars: Arc<Mutex<HashMap<NixCacheNarFileName, VmHttpNixCacheNarEntry>>>,
 }
 
+/// The one of the two methods the cache serves that a request carries; the
+/// route handler answers 405 to anything else before any fetch runs.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum NixCacheMethod {
+    Get,
+    Head,
+}
+
+impl NixCacheMethod {
+    fn parse(method: &str) -> Option<Self> {
+        match method {
+            "GET" => Some(Self::Get),
+            "HEAD" => Some(Self::Head),
+            _ => None,
+        }
+    }
+
+    fn as_reqwest(self) -> reqwest::Method {
+        match self {
+            Self::Get => reqwest::Method::GET,
+            Self::Head => reqwest::Method::HEAD,
+        }
+    }
+}
+
+/// An upstream reply the proxy goes on to read: [`open_upstream`] has
+/// already turned a transport failure, a 404 and any other status into the
+/// finished fetch, so `response` is a 200.
+///
+/// [`open_upstream`]: VmHttpNixCacheService::open_upstream
+struct UpstreamOk {
+    upstream_url: String,
+    response: reqwest::Response,
+}
+
 #[derive(Debug)]
 struct VmHttpNixCacheProxyFetch {
     response: VmHttpResponse,
@@ -173,7 +208,7 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
         .into();
     };
 
-    if !matches!(request.method.as_str(), "GET" | "HEAD") {
+    let Some(method) = NixCacheMethod::parse(&request.method) else {
         let response = VmHttpResponse::text(VmHttpStatus::MethodNotAllowed, "method not allowed");
         return record_nix_cache_local_response(
             Some(&service),
@@ -184,7 +219,7 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
             Some(&route),
         )
         .into();
-    }
+    };
 
     let request_id = RequestId::new();
     // The audit row is written coalesced with the outcome *after* the fetch (a
@@ -212,9 +247,7 @@ pub(super) async fn route_nix_cache_request<S: SecretStore>(
     // request came in; the request row is written together with its outcome in
     // one commit after the fetch (see `record_nix_cache_request_and_outcome`).
     let received_at = UnixMillis::now();
-    let fetch = service
-        .fetch_route(request.method.as_str(), view, &route)
-        .await;
+    let fetch = service.fetch_route(method, view, &route).await;
     if let Err(err) = record_nix_cache_request_and_outcome(
         &service,
         request_id,
@@ -348,7 +381,7 @@ fn nix_cache_audit_route(
 impl<S: SecretStore> VmHttpNixCacheService<S> {
     async fn fetch_route(
         &self,
-        method: &str,
+        method: NixCacheMethod,
         view: VmNixCacheView,
         route: &VmNixCacheRoute,
     ) -> VmHttpNixCacheProxyFetch {
@@ -398,67 +431,21 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
 
     async fn fetch_metadata(
         &self,
-        method: &str,
+        method: NixCacheMethod,
         route: &VmNixCacheRoute,
     ) -> VmHttpNixCacheProxyFetch {
-        let url = self.upstream_url(route);
-        let upstream_url = url.to_string();
-        let is_head = method == "HEAD";
-        let method = match method {
-            "GET" => reqwest::Method::GET,
-            "HEAD" => reqwest::Method::HEAD,
-            _ => unreachable!("caller filters Nix cache proxy methods"),
+        let UpstreamOk {
+            upstream_url,
+            response,
+        } = match self.open_upstream(method, route).await {
+            Ok(ok) => ok,
+            Err(fetch) => return fetch,
         };
-        let response = match self.client.request(method, url).send().await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!(
-                    upstream_url = %upstream_url,
-                    error = %crate::server::error_with_source_chain(&err),
-                    "vm http nix cache upstream request failed",
-                );
-                return upstream_failure(upstream_url, None, "upstream request failed");
-            }
-        };
-        let upstream_status = response.status();
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return VmHttpNixCacheProxyFetch {
-                upstream_url,
-                upstream_status: Some(404),
-                response_bytes: response.body.len() as u64,
-                error: None,
-                response,
-            };
-        }
-        if response.status() != reqwest::StatusCode::OK {
-            let status = response.status();
-            tracing::warn!(
-                upstream_url = %upstream_url,
-                upstream_status = status.as_u16(),
-                "vm http nix cache upstream returned unsupported status",
-            );
-            let response = VmHttpResponse::text(
-                VmHttpStatus::BadGateway,
-                "nix cache upstream returned unsupported status",
-            );
-            return VmHttpNixCacheProxyFetch {
-                upstream_url,
-                upstream_status: Some(status.as_u16()),
-                response_bytes: response.body.len() as u64,
-                error: Some("unsupported upstream status"),
-                response,
-            };
-        }
         let content_length = upstream_content_length(&response);
         if content_length.is_some_and(|len| len > self.config.max_metadata_bytes()) {
-            return upstream_failure(
-                upstream_url,
-                Some(upstream_status.as_u16()),
-                "upstream response too large",
-            );
+            return upstream_failure(upstream_url, Some(200), "upstream response too large");
         }
-        if is_head {
+        if method == NixCacheMethod::Head {
             let response = VmHttpResponse::text(VmHttpStatus::Ok, "")
                 .with_content_length(content_length.map(ByteSize::get));
             return VmHttpNixCacheProxyFetch {
@@ -470,20 +457,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             };
         }
         let body =
-            match read_upstream_body_bounded(response, self.config.max_metadata_bytes()).await {
+            match read_upstream_body(response, self.config.max_metadata_bytes(), &upstream_url)
+                .await
+            {
                 Ok(body) => body,
-                Err(err) => {
-                    tracing::warn!(
-                        upstream_url = %upstream_url,
-                        error = %err,
-                        "vm http nix cache upstream body read failed",
-                    );
-                    return upstream_failure(
-                        upstream_url,
-                        Some(upstream_status.as_u16()),
-                        err.audit_error_label(),
-                    );
-                }
+                Err(fetch) => return fetch,
             };
         if let VmNixCacheRoute::NarInfo { hash } = route {
             let narinfo = match parse_signed_narinfo_for_store_hash(
@@ -500,7 +478,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                     );
                     return upstream_failure(
                         upstream_url,
-                        Some(upstream_status.as_u16()),
+                        Some(200),
                         narinfo_audit_error_label(&err),
                     );
                 }
@@ -511,11 +489,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                     error = %err,
                     "vm http nix cache upstream narinfo admission failed",
                 );
-                return upstream_failure(
-                    upstream_url,
-                    Some(upstream_status.as_u16()),
-                    err.audit_error_label(),
-                );
+                return upstream_failure(upstream_url, Some(200), err.audit_error_label());
             }
         }
         let response_bytes = body.len() as u64;
@@ -537,7 +511,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
 
     async fn fetch_nar(
         &self,
-        method: &str,
+        method: NixCacheMethod,
         view: VmNixCacheView,
         route: &VmNixCacheRoute,
     ) -> VmHttpNixCacheProxyFetch {
@@ -572,54 +546,13 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 "upstream-admitted nar refused on pre-warm route",
             );
         }
-        let url = self.upstream_url(route);
-        let upstream_url = url.to_string();
-        let is_head = method == "HEAD";
-        let method = match method {
-            "GET" => reqwest::Method::GET,
-            "HEAD" => reqwest::Method::HEAD,
-            _ => unreachable!("caller filters Nix cache proxy methods"),
+        let UpstreamOk {
+            upstream_url,
+            response,
+        } = match self.open_upstream(method, route).await {
+            Ok(ok) => ok,
+            Err(fetch) => return fetch,
         };
-        let response = match self.client.request(method, url).send().await {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::warn!(
-                    upstream_url = %upstream_url,
-                    error = %crate::server::error_with_source_chain(&err),
-                    "vm http nix cache NAR upstream request failed",
-                );
-                return upstream_failure(upstream_url, None, "upstream request failed");
-            }
-        };
-        let upstream_status = response.status();
-        if upstream_status == reqwest::StatusCode::NOT_FOUND {
-            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
-            return VmHttpNixCacheProxyFetch {
-                upstream_url,
-                upstream_status: Some(404),
-                response_bytes: response.body.len() as u64,
-                error: None,
-                response,
-            };
-        }
-        if upstream_status != reqwest::StatusCode::OK {
-            tracing::warn!(
-                upstream_url = %upstream_url,
-                upstream_status = upstream_status.as_u16(),
-                "vm http nix cache NAR upstream returned unsupported status",
-            );
-            let response = VmHttpResponse::text(
-                VmHttpStatus::BadGateway,
-                "nix cache upstream returned unsupported status",
-            );
-            return VmHttpNixCacheProxyFetch {
-                upstream_url,
-                upstream_status: Some(upstream_status.as_u16()),
-                response_bytes: response.body.len() as u64,
-                error: Some("unsupported upstream status"),
-                response,
-            };
-        }
 
         let content_length = match validate_nar_content_length(
             upstream_content_length(&response),
@@ -627,15 +560,11 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         ) {
             Ok(content_length) => content_length,
             Err(error) => {
-                return upstream_failure(
-                    upstream_url,
-                    Some(upstream_status.as_u16()),
-                    error.audit_error_label(),
-                );
+                return upstream_failure(upstream_url, Some(200), error.audit_error_label());
             }
         };
 
-        if is_head {
+        if method == NixCacheMethod::Head {
             let response = VmHttpResponse {
                 status: VmHttpStatus::Ok,
                 content_type: "application/x-nix-nar",
@@ -653,27 +582,17 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
             };
         }
 
-        let body = match read_upstream_body_bounded(response, self.config.max_nar_bytes()).await {
-            Ok(body) => body,
-            Err(err) => {
-                tracing::warn!(
-                    upstream_url = %upstream_url,
-                    error = %err,
-                    "vm http nix cache NAR upstream body read failed",
-                );
-                return upstream_failure(
-                    upstream_url,
-                    Some(upstream_status.as_u16()),
-                    err.audit_error_label(),
-                );
-            }
-        };
+        let body =
+            match read_upstream_body(response, self.config.max_nar_bytes(), &upstream_url).await {
+                Ok(body) => body,
+                Err(fetch) => return fetch,
+            };
         if let Err(err) = validate_nar_body_length(ByteSize::of(body.len()), content_length) {
             let response =
                 VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
             return VmHttpNixCacheProxyFetch {
                 upstream_url,
-                upstream_status: Some(upstream_status.as_u16()),
+                upstream_status: Some(200),
                 response_bytes: body.len() as u64,
                 error: Some(err.audit_error_label()),
                 response,
@@ -695,7 +614,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                         VmHttpResponse::text(VmHttpStatus::BadGateway, "nix cache upstream failed");
                     return VmHttpNixCacheProxyFetch {
                         upstream_url,
-                        upstream_status: Some(upstream_status.as_u16()),
+                        upstream_status: Some(200),
                         response_bytes,
                         error: Some(err.audit_error_label()),
                         response,
@@ -761,7 +680,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
     /// the hash, so the caller proxies the upstream exactly as before.
     async fn try_serve_local_narinfo(
         &self,
-        method: &str,
+        method: NixCacheMethod,
         hash: &NixStoreHashPart,
     ) -> Option<VmHttpNixCacheProxyFetch> {
         for (dir_index, dir) in self.config.local_cache_dirs().iter().enumerate() {
@@ -808,7 +727,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 );
                 return Some(local_failure(local_url, err.audit_error_label()));
             }
-            if method == "HEAD" {
+            if method == NixCacheMethod::Head {
                 let content_length = bytes.len() as u64;
                 let response = VmHttpResponse::text(VmHttpStatus::Ok, "")
                     .with_content_length(Some(content_length));
@@ -863,9 +782,13 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
     /// the NAR rather than a broker 502. The compressed read stays bounded by
     /// `max_nar_bytes`, so response size is still capped. Upstream-admitted NARs
     /// (untrusted) are still fully verified — see [`Self::fetch_nar`].
-    async fn serve_local_nar(&self, method: &str, nar_path: &Path) -> VmHttpNixCacheProxyFetch {
+    async fn serve_local_nar(
+        &self,
+        method: NixCacheMethod,
+        nar_path: &Path,
+    ) -> VmHttpNixCacheProxyFetch {
         let local_url = local_file_url(nar_path);
-        if method == "HEAD" {
+        if method == NixCacheMethod::Head {
             // HEAD needs only the (bounded) length — never buffer a potentially
             // large NAR just to discard it.
             return match stat_local_cache_file(nar_path, self.config.max_nar_bytes()).await {
@@ -928,6 +851,67 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
                 headers: Vec::new(),
             },
         }
+    }
+
+    /// Send the upstream request for `route` and admit only a 200 for
+    /// reading. A transport failure, a 404 (relayed as-is) and any other
+    /// status (502, audited as unsupported) come back as the finished
+    /// fetch for the caller to return.
+    async fn open_upstream(
+        &self,
+        method: NixCacheMethod,
+        route: &VmNixCacheRoute,
+    ) -> Result<UpstreamOk, VmHttpNixCacheProxyFetch> {
+        let url = self.upstream_url(route);
+        let upstream_url = url.to_string();
+        let response = match self.client.request(method.as_reqwest(), url).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    upstream_url = %upstream_url,
+                    error = %crate::server::error_with_source_chain(&err),
+                    "vm http nix cache upstream request failed",
+                );
+                return Err(upstream_failure(
+                    upstream_url,
+                    None,
+                    "upstream request failed",
+                ));
+            }
+        };
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            let response = VmHttpResponse::text(VmHttpStatus::NotFound, "not found");
+            return Err(VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(404),
+                response_bytes: response.body.len() as u64,
+                error: None,
+                response,
+            });
+        }
+        if status != reqwest::StatusCode::OK {
+            tracing::warn!(
+                upstream_url = %upstream_url,
+                upstream_status = status.as_u16(),
+                "vm http nix cache upstream returned unsupported status",
+            );
+            let response = VmHttpResponse::text(
+                VmHttpStatus::BadGateway,
+                "nix cache upstream returned unsupported status",
+            );
+            return Err(VmHttpNixCacheProxyFetch {
+                upstream_url,
+                upstream_status: Some(status.as_u16()),
+                response_bytes: response.body.len() as u64,
+                error: Some("unsupported upstream status"),
+                response,
+            });
+        }
+        Ok(UpstreamOk {
+            upstream_url,
+            response,
+        })
     }
 
     fn upstream_url(&self, route: &VmNixCacheRoute) -> reqwest::Url {
@@ -1011,20 +995,32 @@ fn upstream_content_length(response: &reqwest::Response) -> Option<ByteSize> {
         .map(ByteSize::from_bytes)
 }
 
-async fn read_upstream_body_bounded(
+/// Read a 200 body up to `max` bytes, or the finished (502, audited)
+/// fetch when it cannot be read whole.
+async fn read_upstream_body(
     response: reqwest::Response,
     max: ByteSize,
-) -> Result<Vec<u8>, VmHttpNixCacheBodyReadError> {
-    super::proxy_common::read_upstream_body_bounded(response, max)
-        .await
-        .map_err(|err| match err {
-            ProxyUpstreamBodyError::Request { source, .. } => {
-                VmHttpNixCacheBodyReadError::Request(source)
-            }
-            ProxyUpstreamBodyError::ResponseTooLarge { max, .. } => {
-                VmHttpNixCacheBodyReadError::ResponseTooLarge { max }
-            }
-        })
+    upstream_url: &str,
+) -> Result<Vec<u8>, VmHttpNixCacheProxyFetch> {
+    let err = match super::proxy_common::read_upstream_body_bounded(response, max).await {
+        Ok(body) => return Ok(body),
+        Err(ProxyUpstreamBodyError::Request { source, .. }) => {
+            VmHttpNixCacheBodyReadError::Request(source)
+        }
+        Err(ProxyUpstreamBodyError::ResponseTooLarge { max, .. }) => {
+            VmHttpNixCacheBodyReadError::ResponseTooLarge { max }
+        }
+    };
+    tracing::warn!(
+        upstream_url = %upstream_url,
+        error = %err,
+        "vm http nix cache upstream body read failed",
+    );
+    Err(upstream_failure(
+        upstream_url.to_owned(),
+        Some(200),
+        err.audit_error_label(),
+    ))
 }
 
 impl VmHttpNixCacheBodyReadError {
@@ -1080,8 +1076,8 @@ fn is_servable_local_narinfo_name(name: &std::ffi::OsStr) -> bool {
 
 /// Synthesize the `nix-cache-info` response locally (no upstream round-trip).
 /// Audited with no upstream URL or status, since nothing was proxied.
-fn local_cache_info(method: &str) -> VmHttpNixCacheProxyFetch {
-    let response = if method == "HEAD" {
+fn local_cache_info(method: NixCacheMethod) -> VmHttpNixCacheProxyFetch {
+    let response = if method == NixCacheMethod::Head {
         VmHttpResponse::text(VmHttpStatus::Ok, "")
     } else {
         VmHttpResponse::text(VmHttpStatus::Ok, VM_NIX_CACHE_INFO_BODY)
