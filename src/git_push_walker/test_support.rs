@@ -5,13 +5,13 @@
 //! explicit imports add what the parent does not pull in.
 
 use super::*;
-pub(super) use crate::test_support::{required_tool, shell_quote_path, write_executable_script};
-use std::path::PathBuf;
-use std::process::Command;
+pub(super) use crate::test_support::{
+    commit_empty, commit_merge, init_test_repo, required_tool, rev_parse, run_git,
+    shell_quote_path, write_executable_script,
+};
 use std::str::FromStr;
 
 use crate::github_git_db::GitDataHttp;
-use writ_core::git_env::apply_clean_git_config;
 
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
@@ -97,111 +97,3 @@ pub(super) async fn mount_commit_create(
 /// 10s gives plenty of room on a saturated CI host without
 /// letting a wedged child hang the suite indefinitely.
 pub(super) const TEST_GIT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Spawn `git -C <repo> <args>` under the same hardened env the
-/// production planner uses, plus pinned author/committer
-/// identity and date so commit SHAs are deterministic across
-/// runs and machines. Asserts success; returns the full output
-/// for callers that need stdout (e.g. `rev-parse`).
-pub(super) fn run_git(git: &Path, repo: &Path, args: &[&str]) -> std::process::Output {
-    let output = writ_core::process_spawn::output(
-        apply_clean_git_config(Command::new(git).arg("-C").arg(repo).args(args).env_clear())
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-            .env("GIT_AUTHOR_DATE", "2024-01-15T10:30:45Z")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-            .env("GIT_COMMITTER_DATE", "2024-01-15T10:30:45Z")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
-    )
-    .unwrap_or_else(|err| panic!("spawning git {args:?} failed: {err}"));
-    assert!(
-        output.status.success(),
-        "git -C {} {args:?} failed with {}: stdout={:?} stderr={}",
-        repo.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    output
-}
-
-pub(super) fn rev_parse(git: &Path, repo: &Path, rev: &str) -> GitObjectId {
-    let out = run_git(git, repo, &["rev-parse", rev]);
-    let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
-    GitObjectId::new(sha).expect("rev-parse output must be a valid 40-hex SHA")
-}
-
-/// Fresh tempdir, `git init` inside it, no global config. Returns
-/// `(TempDir, repo_path)` — the caller must keep the TempDir
-/// alive for the test's duration (drop deletes the directory).
-pub(super) fn init_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().to_path_buf();
-    let git = required_tool("git");
-    let init = writ_core::process_spawn::output(
-        apply_clean_git_config(
-            Command::new(&git)
-                .args(["init", "--quiet"])
-                .arg(&repo)
-                .env_clear(),
-        )
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped()),
-    )
-    .unwrap();
-    assert!(
-        init.status.success(),
-        "git init failed: {}",
-        String::from_utf8_lossy(&init.stderr),
-    );
-    (dir, repo, git)
-}
-
-/// Create an empty commit on HEAD with the given message; return
-/// its SHA. With the pinned env in [`run_git`] the resulting SHA
-/// is deterministic across runs as long as parents are too.
-pub(super) fn commit_empty(git: &Path, repo: &Path, message: &str) -> GitObjectId {
-    run_git(
-        git,
-        repo,
-        &["commit", "--allow-empty", "--quiet", "-m", message],
-    );
-    rev_parse(git, repo, "HEAD")
-}
-
-/// Create a merge commit via `commit-tree` with explicit parents.
-/// Uses the tree of the first parent. Returns the merge SHA.
-pub(super) fn commit_merge(
-    git: &Path,
-    repo: &Path,
-    message: &str,
-    parents: &[&GitObjectId],
-) -> GitObjectId {
-    let tree_out = run_git(
-        git,
-        repo,
-        &["rev-parse", &format!("{}^{{tree}}", parents[0].as_str())],
-    );
-    let tree = String::from_utf8(tree_out.stdout)
-        .unwrap()
-        .trim()
-        .to_string();
-    let mut args: Vec<String> = vec![
-        "commit-tree".to_string(),
-        tree,
-        "-m".to_string(),
-        message.to_string(),
-    ];
-    for parent in parents {
-        args.push("-p".to_string());
-        args.push(parent.as_str().to_string());
-    }
-    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run_git(git, repo, &args_refs);
-    let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
-    GitObjectId::new(sha).unwrap()
-}

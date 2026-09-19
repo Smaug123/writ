@@ -8,6 +8,7 @@
 
 mod broker;
 mod fixtures;
+mod git;
 mod path;
 mod secret;
 
@@ -16,6 +17,7 @@ pub use broker::{
     github_app,
 };
 pub use fixtures::*;
+pub use git::{commit_empty, commit_merge, git_stdout, init_test_repo, rev_parse, run_git};
 pub use path::{
     find_in_path, required_tool, required_tool_any, shell_quote_path, shell_single_quote,
     write_executable_script,
