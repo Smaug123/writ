@@ -331,7 +331,11 @@ pub const CONFIG_FILE: DefaultPath = DefaultPath {
 };
 
 /// The SQLite audit database — writ's system of record, and the oracle its
-/// authorisation checks consult.
+/// authorisation checks consult. It lives in a dedicated `audit/` directory
+/// (not directly under `writ/`) because the broker VM mounts the DB's
+/// *parent directory* read-write; anything else in that directory would be
+/// exposed read-write inside the broker VM. See
+/// [`ensure_audit_dir_is_dedicated`](super::ensure_audit_dir_is_dedicated).
 pub const AUDIT_DB: DefaultPath = DefaultPath {
     what: "the audit database",
     override_hint: "the `audit_db` config key (or `writd --audit-db`)",
