@@ -62,7 +62,7 @@ use bailiff::bailiff_plan_state::{NotePresence, PlanState, allows};
 use bailiff::bailiff_plan_submit::{SubmitPlanError, SubmitPlanInputs, submit_plan};
 use bailiff::bailiff_stage::AgentStage;
 use writ::agent_run::{AgentPrompt, AgentRunId, sha256_hex};
-use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
+use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, SessionId, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::protocol::{ClientMessage, SignedRunMetadata};
 use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
@@ -168,8 +168,8 @@ fn build_writ_side(dir: &Path) -> WritSide {
         session_id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
             .parse::<SessionId>()
             .unwrap(),
-        prompt_sha256: Sha256Hex::try_new(sha256_hex(b"prompt")).unwrap(),
-        output_envelope_sha256: Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap(),
+        prompt_sha256: sha256_hex(b"prompt"),
+        output_envelope_sha256: sha256_hex(&output_bytes),
         capabilities: vec![CapabilitySet::WorkspaceRead { repo: repo_ref() }],
         exit_code: 0,
         completed_at: UnixMillis::from_millis(1_700_000_000_000),

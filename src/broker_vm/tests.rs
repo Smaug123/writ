@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::broker_session::read_bearer_token_file;
-use crate::core::Ipv4Cidr;
+use crate::core::{Ipv4Cidr, Sha256Hex};
 use std::net::Ipv4Addr;
 
 fn session_id() -> SessionId {
@@ -236,7 +236,7 @@ struct GuestContractRow {
 /// corpus below or in `ENDPOINT_MAP` — adding it there is the author's job, and
 /// what `ENDPOINT_MAP`'s own doc asks for. A new route *variant* is caught
 /// independently, by the route table's coverage oracle.
-fn guest_route_digest() -> String {
+fn guest_route_digest() -> Sha256Hex {
     let mut lines: Vec<String> = Vec::new();
     for (method, target, _) in crate::vm_http::route_table::tests::ENDPOINT_MAP {
         lines.push(resolved_line(method, target));
@@ -377,7 +377,7 @@ fn broker_contract_fingerprint_is_pinned() {
     );
     let current = &GUEST_CONTRACT_HISTORY[version - 1];
     assert_eq!(
-        guest_route_digest(),
+        guest_route_digest().as_str(),
         current.route_digest,
         "the guest-facing route surface changed. Append a row to GUEST_CONTRACT_HISTORY with \
          its new digest and the new broker protocol version, bump VM_HTTP_CONTRACT_VERSION (so \

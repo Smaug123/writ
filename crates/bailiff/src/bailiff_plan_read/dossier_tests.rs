@@ -15,7 +15,7 @@ use crate::bailiff_plan_write::{StageNoteTarget, write_stage_note};
 use crate::bailiff_stage::StageNoteSlot;
 use tempfile::TempDir;
 use writ::agent_run::{AgentRunId, sha256_hex};
-use writ::core::{CapabilitySet, RepoRef, SessionId, Sha256Hex, UnixMillis};
+use writ::core::{CapabilitySet, RepoRef, SessionId, UnixMillis};
 use writ::run_envelope::OutputEnvelope;
 use writ::run_verify::AllowedSigners;
 use writ::signing::WritSigningKey;
@@ -43,8 +43,8 @@ fn plant_run(
     let metadata = SignedRunMetadata {
         run_id: AgentRunId::new(),
         session_id: SessionId::new(),
-        prompt_sha256: Sha256Hex::try_new(sha256_hex(b"prompt")).unwrap(),
-        output_envelope_sha256: Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap(),
+        prompt_sha256: sha256_hex(b"prompt"),
+        output_envelope_sha256: sha256_hex(&output_bytes),
         capabilities: vec![CapabilitySet::WorkspaceRead {
             repo: RepoRef {
                 owner: "smaug123".into(),
@@ -320,8 +320,8 @@ fn a_truncated_plan_body_keeps_its_marker() {
     let metadata = SignedRunMetadata {
         run_id: AgentRunId::new(),
         session_id: SessionId::new(),
-        prompt_sha256: Sha256Hex::try_new(sha256_hex(b"prompt")).unwrap(),
-        output_envelope_sha256: Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap(),
+        prompt_sha256: sha256_hex(b"prompt"),
+        output_envelope_sha256: sha256_hex(&output_bytes),
         capabilities: Vec::new(),
         exit_code: 0,
         completed_at: UnixMillis::from_millis(1),

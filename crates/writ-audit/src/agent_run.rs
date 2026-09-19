@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use super::session::SqlAgentKind;
 use super::validation::{
     bool_to_sql_i64, labeled_invariant, path_to_sql_text, u64_to_sql_i64,
-    validate_agent_run_stream_path_text, validate_sha256_hex, validate_stream_summary,
+    validate_agent_run_stream_path_text, validate_stream_summary,
 };
 use super::{AuditError, AuditLog};
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use writ_agent_run::{
     AgentPromptSummary, AgentRunId, AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus,
     CorrelationId, RunPurpose,
 };
-use writ_core::core::{AgentKind, SessionId, SessionRecord, UnixMillis};
+use writ_core::core::{AgentKind, SessionId, SessionRecord, Sha256Hex, UnixMillis};
 
 /// What "the session's most recent run" means, as a SQL `ORDER BY`
 /// fragment, in the one place every reader of that notion shares.
@@ -106,7 +106,6 @@ pub struct AgentRunOutcomeAuditRecord {
 /// byte length is range-checked at insert time (it feeds a param), so it is not
 /// re-checked here.
 fn validate_agent_run_request(r: &AgentRunAuditRecord) -> Result<(), AuditError> {
-    validate_sha256_hex(&r.prompt.sha256_hex, "agent run prompt sha256")?;
     if r.prompt.redacted_preview.is_empty() {
         return Err(AuditError::Invariant(
             "agent run prompt redacted preview must not be empty",
@@ -139,7 +138,7 @@ fn insert_agent_run_request_row(
             r.requested_at.as_millis(),
             r.agent_kind.as_str(),
             u64_to_sql_i64(r.prompt.byte_len, "agent run prompt bytes")?,
-            &r.prompt.sha256_hex,
+            r.prompt.sha256_hex.as_str(),
             &r.prompt.redacted_preview,
             r.correlation_id.as_ref().map(CorrelationId::as_str),
             r.purpose.as_ref().map(RunPurpose::as_str),
@@ -181,12 +180,12 @@ fn insert_agent_run_outcome_row(
             r.outcome.exit_code,
             path_to_sql_text(&r.outcome.stdout.path, "stdout path")?,
             u64_to_sql_i64(r.outcome.stdout.byte_len, "stdout bytes")?,
-            &r.outcome.stdout.sha256_hex,
+            r.outcome.stdout.sha256_hex.as_str(),
             bool_to_sql_i64(r.outcome.stdout.truncated),
             bool_to_sql_i64(r.outcome.stdout.stopped_at_deadline),
             path_to_sql_text(&r.outcome.stderr.path, "stderr path")?,
             u64_to_sql_i64(r.outcome.stderr.byte_len, "stderr bytes")?,
-            &r.outcome.stderr.sha256_hex,
+            r.outcome.stderr.sha256_hex.as_str(),
             bool_to_sql_i64(r.outcome.stderr.truncated),
             bool_to_sql_i64(r.outcome.stderr.stopped_at_deadline),
         ],
@@ -648,7 +647,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<Result<AgentRunAuditRec
             .map_err(|_| AuditError::Invariant("agent run row: session_id not a uuid"))?;
         let prompt_bytes = u64::try_from(prompt_bytes)
             .map_err(|_| AuditError::Invariant("agent run prompt bytes is negative"))?;
-        validate_sha256_hex(&prompt_sha256, "agent run prompt sha256")?;
+        let prompt_sha256 = sha256_from_sql(prompt_sha256, "agent run prompt sha256")?;
         if prompt_redacted_preview.is_empty() {
             return Err(AuditError::Invariant(
                 "agent run prompt redacted preview is empty",
@@ -743,7 +742,7 @@ fn agent_run_stream_from_sql(
     validate_agent_run_stream_path_text(&path, label)?;
     let byte_len = u64::try_from(byte_len)
         .map_err(|_| labeled_invariant(label, "agent run stream bytes is negative"))?;
-    validate_sha256_hex(&sha256_hex, label)?;
+    let sha256_hex = sha256_from_sql(sha256_hex, label)?;
     let truncated = agent_run_stream_flag_from_sql(truncated, label, "truncated")?;
     let stopped_at_deadline =
         agent_run_stream_flag_from_sql(stopped_at_deadline, label, "stopped_at_deadline")?;
@@ -754,6 +753,10 @@ fn agent_run_stream_from_sql(
         truncated,
         stopped_at_deadline,
     })
+}
+
+fn sha256_from_sql(text: String, label: &'static str) -> Result<Sha256Hex, AuditError> {
+    Sha256Hex::try_new(text).map_err(|_| labeled_invariant(label, "sha256 hex digest is invalid"))
 }
 
 /// Read one of a stream summary's boolean columns.
@@ -987,30 +990,6 @@ mod tests {
         log.open_session(&s).unwrap();
 
         let err = log
-            .record_agent_run(&AgentRunAuditRecord {
-                run_id: AgentRunId::new(),
-                session_id: s.session_id,
-                requested_at: UnixMillis::from_millis(1_700_000_100),
-                agent_kind: AgentKind::Claude,
-                prompt: AgentPromptSummary {
-                    byte_len: 1,
-                    sha256_hex: "not sha256".to_string(),
-                    redacted_preview: "<redacted>".to_string(),
-                },
-                correlation_id: None,
-                purpose: None,
-            })
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            AuditError::LabeledInvariant {
-                label: "agent run prompt sha256",
-                message: "sha256 hex digest is invalid",
-            }
-        ));
-
-        let err = log
             .record_agent_run_outcome(&AgentRunOutcomeAuditRecord {
                 completed_at: UnixMillis::from_millis(1_700_000_200),
                 outcome: AgentRunOutcome {
@@ -1111,7 +1090,7 @@ mod tests {
                         run_id.as_uuid().to_string(),
                         s.session_id.as_uuid().to_string(),
                         1_700_000_100i64,
-                        writ_agent_run::sha256_hex(b"x"),
+                        writ_agent_run::sha256_hex(b"x").as_str(),
                         "bad space",
                     ],
                 )
@@ -1134,7 +1113,7 @@ mod tests {
                         AgentRunId::new().as_uuid().to_string(),
                         s.session_id.as_uuid().to_string(),
                         1_700_000_101i64,
-                        writ_agent_run::sha256_hex(b"y"),
+                        writ_agent_run::sha256_hex(b"y").as_str(),
                         too_long,
                     ],
                 )
@@ -1234,7 +1213,7 @@ mod tests {
                         AgentRunId::new().as_uuid().to_string(),
                         s.session_id.as_uuid().to_string(),
                         1_700_000_100i64,
-                        writ_agent_run::sha256_hex(b"x"),
+                        writ_agent_run::sha256_hex(b"x").as_str(),
                         value,
                     ],
                 )

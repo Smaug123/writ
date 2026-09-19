@@ -8,7 +8,7 @@
 
 use tempfile::TempDir;
 use writ::agent_run::{AgentRunId, sha256_hex};
-use writ::core::{CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, UnixMillis};
+use writ::core::{CapabilitySet, NotesRef, RepoRef, SessionId, UnixMillis};
 use writ::notes_repo::NotesRepo;
 use writ::protocol::SignedRunMetadata;
 use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
@@ -61,8 +61,8 @@ pub(crate) fn signed_envelope(
         stderr_truncated_at: None,
     };
     let output_bytes = output.to_bytes();
-    let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
-    let prompt_sha = Sha256Hex::try_new(sha256_hex(prompt)).unwrap();
+    let output_sha = sha256_hex(&output_bytes);
+    let prompt_sha = sha256_hex(prompt);
     let metadata = SignedRunMetadata {
         run_id: AgentRunId::new(),
         session_id: SessionId::new(),

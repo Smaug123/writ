@@ -19,9 +19,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const SHA256_HEX_LEN: usize = 64;
 
-/// A SHA-256 digest as 64 lowercase hex characters. Constructed only
-/// via [`Sha256Hex::try_new`] (or its `FromStr` / `Deserialize`
-/// equivalents).
+/// A SHA-256 digest as 64 lowercase hex characters. Text from the wire
+/// enters via [`Sha256Hex::try_new`] (or its `FromStr` / `Deserialize`
+/// equivalents); a digest this process computed enters via
+/// [`Sha256Hex::from_digest`], which cannot fail.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Sha256Hex(String);
 
@@ -38,6 +39,19 @@ impl Sha256Hex {
             return Err(Sha256HexError::NonLowercaseHex);
         }
         Ok(Self(s))
+    }
+
+    /// The canonical rendering of a raw 32-byte digest. Infallible by
+    /// construction, so hashing code never round-trips through `try_new`
+    /// and an `expect` to say what the type already guarantees.
+    pub fn from_digest(digest: &[u8; 32]) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(SHA256_HEX_LEN);
+        for byte in digest {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Self(out)
     }
 
     pub fn as_str(&self) -> &str {
@@ -131,6 +145,18 @@ mod tests {
         let mut s = sample().to_string();
         s.replace_range(0..1, "g");
         assert_eq!(Sha256Hex::try_new(s), Err(Sha256HexError::NonLowercaseHex));
+    }
+
+    proptest::proptest! {
+        /// `from_digest` renders exactly what `try_new` accepts, agreeing
+        /// with the standard library's own lowercase-hex formatting.
+        #[test]
+        fn from_digest_is_the_canonical_rendering(digest in proptest::array::uniform32(0u8..)) {
+            let rendered = Sha256Hex::from_digest(&digest);
+            let reference: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            proptest::prop_assert_eq!(rendered.as_str(), reference.as_str());
+            proptest::prop_assert_eq!(Sha256Hex::try_new(rendered.as_str()), Ok(rendered));
+        }
     }
 
     #[test]

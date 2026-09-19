@@ -596,8 +596,7 @@ pub(super) async fn run_agent<S: SecretStore + Send + Sync + 'static>(
     }
 
     let prompt_summary = prompt.summary();
-    let prompt_sha256 = Sha256Hex::try_new(prompt_summary.sha256_hex.clone())
-        .expect("AgentPrompt::summary hashes via sha256_hex");
+    let prompt_sha256 = prompt_summary.sha256_hex.clone();
 
     // Two-phase, request row first: the row commits before the child starts,
     // so a run interrupted by a crash is visible as an unpaired request rather
@@ -907,9 +906,7 @@ async fn run_agent_in_vm<S: SecretStore + Send + Sync + 'static>(
     // would exhaust the bound and then wait forever for the slot it is itself
     // blocking.
     let prompt_bytes = prompt.as_bytes().to_vec();
-    let prompt_sha256_str = sha256_hex(&prompt_bytes);
-    let prompt_sha256 = Sha256Hex::try_new(prompt_sha256_str)
-        .expect("sha256_hex returns canonical 64-lowercase-hex output");
+    let prompt_sha256 = sha256_hex(&prompt_bytes);
 
     let started = match agent_vm
         .start_agent_run_session(

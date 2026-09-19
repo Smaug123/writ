@@ -35,12 +35,15 @@ const COMPARED_FIELDS: &[ComparedField] = &[
     ComparedField::OutputEnvelope,
 ];
 
-fn sha256_hex_strategy() -> impl Strategy<Value = String> {
+fn sha256_hex_strategy() -> impl Strategy<Value = Sha256Hex> {
     proptest::collection::vec(
         proptest::sample::select(b"0123456789abcdef".to_vec()),
         64..=64,
     )
-    .prop_map(|bytes| String::from_utf8(bytes).expect("hex digits are ASCII"))
+    .prop_map(|bytes| {
+        Sha256Hex::try_new(String::from_utf8(bytes).expect("hex digits are ASCII"))
+            .expect("64 lowercase hex digits")
+    })
 }
 
 /// An audited run and the signed metadata a *truthful* note about it carries.
@@ -77,7 +80,7 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
                 let run_id = AgentRunId::new();
                 let session_id = SessionId::new();
                 let completed_at = UnixMillis::from_millis(completed_ms);
-                let stream = |sha: String, name: &str| AgentRunStreamSummary {
+                let stream = |sha: Sha256Hex, name: &str| AgentRunStreamSummary {
                     path: std::path::PathBuf::from(format!("/logs/{run_id}/{name}.log")),
                     byte_len: 0,
                     sha256_hex: sha,
@@ -115,9 +118,8 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
                 let signed = SignedRunMetadata {
                     run_id,
                     session_id,
-                    prompt_sha256: Sha256Hex::try_new(prompt_sha).expect("64 hex digits"),
-                    output_envelope_sha256: Sha256Hex::try_new(envelope_sha.clone())
-                        .expect("64 hex digits"),
+                    prompt_sha256: prompt_sha,
+                    output_envelope_sha256: envelope_sha.clone(),
                     capabilities: Vec::new(),
                     exit_code,
                     completed_at,
@@ -126,8 +128,7 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
                 let audited = AuditedRun {
                     request,
                     outcome,
-                    output_envelope_sha256: Sha256Hex::try_new(envelope_sha)
-                        .expect("64 hex digits"),
+                    output_envelope_sha256: envelope_sha,
                 };
                 (signed, audited)
             },

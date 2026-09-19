@@ -1173,7 +1173,7 @@ mod end_to_end_tests {
         );
         assert_eq!(completed.signed_metadata.exit_code, 0);
         assert_eq!(
-            completed.signed_metadata.prompt_sha256.as_str(),
+            completed.signed_metadata.prompt_sha256,
             sha256_hex(prompt_text.as_bytes())
         );
 
@@ -1290,7 +1290,7 @@ mod end_to_end_tests {
         .expect("large-prompt RunAgent must succeed");
         assert_eq!(completed.signed_metadata.exit_code, 0);
         assert_eq!(
-            completed.signed_metadata.prompt_sha256.as_str(),
+            completed.signed_metadata.prompt_sha256,
             sha256_hex(big.as_bytes())
         );
 

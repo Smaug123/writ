@@ -715,14 +715,14 @@ mod tests {
             std::path::PathBuf::from("/runs/out.log")
         );
         assert_eq!(row.outcome.stdout.byte_len, 11);
-        assert_eq!(row.outcome.stdout.sha256_hex, "b".repeat(64));
+        assert_eq!(row.outcome.stdout.sha256_hex.as_str(), "b".repeat(64));
         assert!(row.outcome.stdout.truncated);
         assert_eq!(
             row.outcome.stderr.path,
             std::path::PathBuf::from("/runs/err.log")
         );
         assert_eq!(row.outcome.stderr.byte_len, 22);
-        assert_eq!(row.outcome.stderr.sha256_hex, "c".repeat(64));
+        assert_eq!(row.outcome.stderr.sha256_hex.as_str(), "c".repeat(64));
         assert!(!row.outcome.stderr.truncated);
 
         // The point of the rebuild: 'timed_out' is now storable, and the

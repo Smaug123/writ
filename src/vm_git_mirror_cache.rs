@@ -108,7 +108,7 @@ impl MirrorCacheKey {
         // canonical owner/name never contains one.
         let material = format!("{}\n{}", repo.canonicalise(), rev.as_str());
         Self {
-            slug: sha256_hex(material.as_bytes()),
+            slug: sha256_hex(material.as_bytes()).to_string(),
         }
     }
 
