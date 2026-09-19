@@ -829,10 +829,10 @@ fn start_agent_run(
         ServerMessage::AgentRunAccepted { session_id, run_id } => {
             println!("session_id={session_id}");
             println!("run_id={run_id}");
-            // Deliberately said out loud. The two ids above used to mean "this
-            // is running"; they now mean "this is writd's to start, and yours
-            // to stop". A caller that looked them up immediately and found
-            // nothing would otherwise read that as a failure.
+            // Said out loud because the two ids above mean "this is writd's
+            // to start, and yours to stop", not "this is running": a caller
+            // that looked them up immediately and found nothing would
+            // otherwise read that as a failure.
             println!("accepted: queued to start; stop it with `writ agent-vm stop {session_id}`");
             Ok(())
         }

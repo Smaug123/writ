@@ -724,8 +724,8 @@ async fn canonicalize_path(
 /// time, when the paths need not exist yet, and against freshly-canonicalised
 /// paths at run time, when a symlink could otherwise have aliased the bundle
 /// somewhere else since. Those two differ only in the *evidence* they are given;
-/// having them differ in the question as well is what previously let the checks
-/// drift out of step, with no reader able to tell whether they still agreed.
+/// having them differ in the question as well would let the checks drift out of
+/// step, with no reader able to tell whether they still agreed.
 struct BundleBoundary<'a> {
     work_dir: &'a Path,
     mirror_dir: &'a Path,

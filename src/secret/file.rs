@@ -189,10 +189,9 @@ mod tests {
         assert_eq!(s.get(&key("a")).unwrap().as_deref(), Some("second"));
     }
 
-    /// Regression: an earlier version used `{key}.tmp` as the mid-write
-    /// filename, so writing key "foo" would clobber the already-stored
-    /// "foo.tmp" key. Temp paths are now UUID-suffixed and `.`-prefixed,
-    /// which cannot collide with any valid `SecretKey`.
+    /// Temp paths are UUID-suffixed and `.`-prefixed, which cannot collide
+    /// with any valid `SecretKey`: writing key "foo" must not clobber a
+    /// stored "foo.tmp" key.
     #[test]
     fn put_does_not_clobber_key_ending_in_dot_tmp() {
         let (_tmp, s) = store();
@@ -293,9 +292,7 @@ mod tests {
         assert!(matches!(err, SecretError::UnsafePermissions { .. }));
     }
 
-    /// Regression: `open` previously only checked the mode bits and not
-    /// `is_dir`, so a permission-safe *file* at the base path would have
-    /// been happily accepted as a store root.
+    /// A permission-safe *file* at the base path is not a store root.
     #[test]
     fn open_rejects_file_that_is_not_a_directory() {
         let parent = TempDir::new().unwrap();

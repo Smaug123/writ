@@ -190,9 +190,7 @@ pub fn read_implement_note(
 /// happily refilled the hole — leaving two live notes nobody had
 /// reconciled. That is the "silently truncated" failure this function
 /// exists to avoid, so it does not sample; it looks everywhere it
-/// could be wrong. (A first version probed one slot past the miss,
-/// which catches a gap of width one and no more. Codex review caught
-/// it, correctly.)
+/// could be wrong.
 ///
 /// A gap can only come from manual repo surgery — bailiff only ever
 /// writes at the first free index — and is refused rather than
@@ -461,9 +459,8 @@ pub enum SummarizePlanError {
 /// into the same `None` because both mean "bailiff's local view does
 /// not have an envelope at this OID."
 ///
-/// The note body is the JSON-encoded envelope itself (per slice B's
-/// "envelope in note body, not a separate blob" decision), so this
-/// helper decodes straight into [`SignedRunEnvelope`]. Used by
+/// The note body is the JSON-encoded envelope itself, so this helper
+/// decodes straight into [`SignedRunEnvelope`]. Used by
 /// [`read_full_plan`] to pair each signed bailiff note with its
 /// envelope before verification.
 pub fn read_writ_envelope_at_oid(

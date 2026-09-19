@@ -102,7 +102,7 @@ pub struct DaemonConfig {
     /// `Option` rather than a `serde` default because the default is derived
     /// from the environment and can *fail* — an environment with no usable
     /// base directory has nowhere to put a secret store, and inventing one
-    /// under `/tmp` is what this deliberately no longer does. A `serde`
+    /// under `/tmp` is what this refuses to do. A `serde`
     /// default must be infallible, so the resolution moves out of
     /// deserialization and into the boot path, where the failure can be
     /// reported alongside every other config error.
@@ -279,11 +279,9 @@ impl UiHttpConfig {
 /// 3. uses [`Self::spawn_command`] + [`Self::spawn_args`] as the child
 ///    binary every `RunAgent` invocation drives.
 ///
-/// **KNOWN GAP — per-`AgentKind` spawn dispatch.** [`Self::spawn_command`]
-/// today is a *single* binary for the whole daemon. Slice C's only
-/// agent kind is the planner so this suffices, but slice D (review,
-/// likely a different agent kind) will need per-kind selection. The
-/// follow-up reshapes both this struct and
+/// **Known gap — per-`AgentKind` spawn dispatch.** [`Self::spawn_command`]
+/// is a *single* binary for the whole daemon, so the host arm serves one
+/// agent kind; per-kind selection would reshape both this struct and
 /// [`crate::server::RunAgentSpawnConfig`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

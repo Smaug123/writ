@@ -152,8 +152,8 @@ async fn the_lock_spans_awaits_between_blocking_sections() {
 /// This is the whole exclusion mechanism, probed the way another
 /// process would probe it. That the probe also fails from *inside*
 /// this process is the point: `flock` binds to an open file
-/// description rather than a process, which is why the in-process
-/// mutex layer the first draft wrapped around it was redundant.
+/// description rather than a process, so no in-process mutex layer is
+/// needed.
 #[tokio::test]
 async fn the_lockfile_excludes_every_other_holder_per_plan() {
     let tmp = TempDir::new().unwrap();

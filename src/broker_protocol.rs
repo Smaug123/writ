@@ -5,8 +5,8 @@
 //! `writd` are the *same* binary built from the *same* source tree, and are only
 //! ever meant to be built together. When they diverge — most commonly a rebuilt
 //! host against a stale image — the broker can reject a CLI flag the host now
-//! passes, or otherwise misread the host's material, and the only symptom used to
-//! be an opaque 180s readiness timeout.
+//! passes, or otherwise misread the host's material, and without a handshake
+//! the only symptom is an opaque readiness timeout.
 //!
 //! This module gives the broker a way to *report* its protocol version to the
 //! host: the broker stamps [`BROKER_PROTOCOL_VERSION`] into its ready file (a

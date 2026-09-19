@@ -2,7 +2,6 @@
 //! stage: a stage the transition relation forbids performs zero writ
 //! RPCs.
 //!
-//! Slice 3 of `docs/plans/2026-07-26-bailiff-workflow-as-data.md`.
 //! `rpc_trace_baseline.rs` pins this for three states — one refusal per
 //! workflow — because a fixture records one scenario. This file sweeps
 //! the whole 3 × 7 grid.
@@ -71,8 +70,8 @@ use common::*;
 /// [`PlanState::Corrupt`], which is *defined* as "a note set no legal
 /// sequence produces" and so has no canonical presence to return. One
 /// concrete unreachable set stands in: a verdict with no submission
-/// beneath it, which is the anomaly `plan decide` could manufacture in
-/// a single command before slice 1 gated it.
+/// beneath it, which is the anomaly an ungated `plan decide` would
+/// manufacture.
 fn presence_for(state: PlanState) -> NotePresence {
     state.presence().unwrap_or(NotePresence {
         ref_exists: true,
@@ -329,14 +328,12 @@ async fn a_forbidden_stage_emits_no_rpcs_and_an_allowed_one_emits_some() {
         PlanState::ALL.len() * AgentStage::ALL.len()
     );
     // Four legal (stage, state) pairs: submit from `absent`, review
-    // from `submitted`, implement from `accepted` — and, since slice 4,
-    // **implement from `implemented`**, because fan-out is N
-    // implementer runs on one accepted plan. That fourth pair crossing
-    // from the forbidden half to the permitted half is slice 4's
-    // behaviour delta, written here as a number so it cannot be
-    // absorbed silently: this file derives both halves from `allows`,
-    // so without the count a widened relation would just quietly move
-    // cases across.
+    // from `submitted`, implement from `accepted`, and **implement from
+    // `implemented`**, because fan-out is N implementer runs on one
+    // accepted plan. Written as a number so a change cannot be absorbed
+    // silently: this file derives both halves from `allows`, so without
+    // the count a widened relation would just quietly move cases
+    // across.
     assert_eq!(permitted, 4, "the permitted half of the grid changed");
     assert_eq!(forbidden, PlanState::ALL.len() * AgentStage::ALL.len() - 4);
 }

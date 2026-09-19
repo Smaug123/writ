@@ -1540,9 +1540,8 @@ mod tests {
     /// Cap we hold `agent_message` to across every variant — both the
     /// fixed labels we hand-pick and the full `Display` we pass through
     /// for variants whose payload is intrinsically bounded. Tight enough
-    /// that an unbounded payload (HTTP body, repo vec, or — the case
-    /// codex review flagged — a 64 KiB client-supplied repo owner)
-    /// sneaking in would trip the test.
+    /// that an unbounded payload (HTTP body, repo vec, or a 64 KiB
+    /// client-supplied repo owner) sneaking in would trip the test.
     const AGENT_MESSAGE_CAP: usize = 256;
 
     /// One representative of every `MintError` variant. Each carries a
@@ -1674,8 +1673,8 @@ mod tests {
 
     #[test]
     fn agent_message_drops_client_supplied_repo_for_repo_not_in_installation() {
-        // Regression for codex review finding: a Read/Metadata request
-        // is granted by policy without consulting the writable allowlist,
+        // A Read/Metadata request is granted by policy without
+        // consulting the writable allowlist,
         // so a client can submit an arbitrary `RepoRef` whose
         // owner/name strings are bounded only by `MAX_LINE_BYTES`
         // (64 KiB). When that owner does not match the configured
@@ -1792,10 +1791,9 @@ mod tests {
         );
     }
 
-    /// A typo on `api_base` (e.g. `apiBase`) used to be silently ignored,
-    /// causing a GHE-Server-targeted deployment to mint installation tokens
-    /// against public GitHub instead. `deny_unknown_fields` forces a hard
-    /// failure at config load time.
+    /// A typo on `api_base` (e.g. `apiBase`) must fail at config load time:
+    /// silently ignoring it would make a GHE-Server-targeted deployment mint
+    /// installation tokens against public GitHub instead.
     #[test]
     fn github_app_config_rejects_unknown_field() {
         let json = r#"{

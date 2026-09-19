@@ -19,8 +19,8 @@
 //!   validated here.
 //! - The session must already be open in the shared audit DB; this process
 //!   never opens or closes sessions.
-//! - This first slice serves the clone/nix-cache/proxy surface only: no
-//!   agent-run dispatch route and no git-push staging route (both deferred).
+//! - The broker serves the clone/nix-cache/proxy surface only: no agent-run
+//!   dispatch route and no git-push staging route.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -313,8 +313,8 @@ async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunEr
 
     // The vm_http git-clone path reuses the broker's promote runtime config; the
     // remaining BrokerState fields are the host-daemon-only surfaces (notes repo,
-    // signing key, run-agent dispatch, push staging) which this first broker
-    // slice does not serve.
+    // signing key, run-agent dispatch, push staging) which the broker does not
+    // serve.
     let promote_runtime = Some(Arc::new(
         vm_http_config.git_clone().to_promote_runtime_config(),
     ));

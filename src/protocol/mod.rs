@@ -51,9 +51,9 @@ pub use views::{
 /// by reasoning that sounds conservative. `skip_serializing_if` narrows the
 /// window to callers who set the field; it does not close it.
 ///
-/// So: if the bytes on the wire can differ, bump. Renaming `AgentRunStarted` to
-/// `AgentRunAccepted`, as #21 did, is the obvious case; adding an optional field
-/// to `RunAgent` is the non-obvious one, and it counts too.
+/// So: if the bytes on the wire can differ, bump. Renaming a variant is the
+/// obvious case; adding an optional field to `RunAgent` is the non-obvious
+/// one, and it counts too.
 ///
 /// ## What this buys, stated exactly
 ///
@@ -64,14 +64,13 @@ pub use views::{
 ///
 /// The skew it exists for is operational rather than contractual: leaving a
 /// daemon running across an upgrade is an ordinary thing to do on a dev
-/// machine. Before this, the two directions failed differently and one failed
-/// silently:
+/// machine. Without the handshake the two directions fail differently and one
+/// fails silently:
 ///
-/// * **Old client, new daemon.** The request still decoded, so the daemon
-///   *acted* — and then wrote a reply variant the client could not parse. A
-///   `StartAgentRun` booted a VM the caller never learned the name of,
-///   recoverable only through `writ agent-vm list`. This is the case the
-///   handshake actually fixes: the daemon now refuses a connection that
+/// * **Old client, new daemon.** The request still decodes, so the daemon
+///   *acts*, and then writes a reply variant the client cannot parse: a
+///   `StartAgentRun` boots a VM the caller never learns the name of. This is
+///   the case the handshake fixes: the daemon refuses a connection that
 ///   declares no version, before dispatching.
 /// * **New client, old daemon.** The old daemon cannot parse `Hello` at all
 ///   (an unknown `type` tag is a deserialization error) and answers
@@ -80,16 +79,9 @@ pub use views::{
 ///   request behind the `Hello`: an old daemon processes lines in order, so a
 ///   pipelined request would be dispatched by the very daemon that just
 ///   refused the handshake. One extra round trip on a Unix socket is the price
-///   of that, and it is not a price worth haggling over.
+///   of that.
 ///
-/// ## The honest limit
-///
-/// This protects the *next* breaking change, not the one already shipped. An
-/// old `writ` binary does not send a `Hello` and never will; what changes is
-/// that it is now refused cleanly instead of being served half an operation.
-///
-/// Version 1 is the first that says its own number. There is no version 0: a
-/// connection that declares nothing is not "version 0", it is a client that
+/// There is no version 0: a connection that declares nothing is a client that
 /// predates the handshake, and the broker says exactly that.
 ///
 /// This is the third versioned boundary in writ, alongside
