@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::bailiff_decision::{Decider, Decision};
-use writ::core::{NotesRef, NotesRefError, SshSignature, UnixMillis};
+use writ::core::{NotesRef, SshSignature, UnixMillis};
 use writ::protocol::SignedRunMetadata;
 use writ::vm_git::GitObjectId;
 
@@ -554,18 +554,6 @@ stage_note! {
     ImplementNoteParseError,
     "ImplementNote serialises to JSON without IO; cannot fail",
     "implement-note body is not valid canonical JSON: {0}",
-}
-
-/// Reasons [`plan_notes_ref`] would fail to construct a
-/// `NotesRef`. None are reachable for any caller using
-/// [`PlanId::new`] / [`PlanId::from_str`] — the type means we only
-/// ever feed validated UUIDs through — but the error type exists so
-/// a future schema change (e.g. allowing operator-chosen ids) has a
-/// place to surface validation failures.
-#[derive(Debug, thiserror::Error)]
-pub enum PlanNotesRefError {
-    #[error("invalid notes ref: {0}")]
-    InvalidRef(#[from] NotesRefError),
 }
 
 #[cfg(test)]
