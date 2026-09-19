@@ -23,3 +23,7 @@ pub mod private_fs;
 pub mod process_group;
 pub mod process_spawn;
 pub mod telemetry;
+pub mod validated_string;
+
+#[doc(hidden)]
+pub use serde as __serde;

@@ -15,32 +15,33 @@
 //! exactly one case prevents accidental "valid signature, mismatched
 //! casing" comparisons.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
 const SHA256_HEX_LEN: usize = 64;
 
-/// A SHA-256 digest as 64 lowercase hex characters. Text from the wire
-/// enters via [`Sha256Hex::try_new`] (or its `FromStr` / `Deserialize`
-/// equivalents); a digest this process computed enters via
-/// [`Sha256Hex::from_digest`], which cannot fail.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Sha256Hex(String);
+crate::validated_string! {
+    /// A SHA-256 digest as 64 lowercase hex characters. Text from the wire
+    /// enters via [`Sha256Hex::try_new`] (or its `FromStr` / `Deserialize`
+    /// equivalents); a digest this process computed enters via
+    /// [`Sha256Hex::from_digest`], which cannot fail.
+    pub struct Sha256Hex;
+    error = Sha256HexError;
+    constructor = try_new;
+    validate = validate_sha256_hex;
+}
+
+fn validate_sha256_hex(s: &str) -> Result<(), Sha256HexError> {
+    if s.len() != SHA256_HEX_LEN {
+        return Err(Sha256HexError::WrongLength {
+            got: s.len(),
+            expected: SHA256_HEX_LEN,
+        });
+    }
+    if !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Sha256HexError::NonLowercaseHex);
+    }
+    Ok(())
+}
 
 impl Sha256Hex {
-    pub fn try_new(s: impl Into<String>) -> Result<Self, Sha256HexError> {
-        let s = s.into();
-        if s.len() != SHA256_HEX_LEN {
-            return Err(Sha256HexError::WrongLength {
-                got: s.len(),
-                expected: SHA256_HEX_LEN,
-            });
-        }
-        if !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(Sha256HexError::NonLowercaseHex);
-        }
-        Ok(Self(s))
-    }
-
     /// The canonical rendering of a raw 32-byte digest. Infallible by
     /// construction, so hashing code never round-trips through `try_new`
     /// and an `expect` to say what the type already guarantees.
@@ -52,36 +53,6 @@ impl Sha256Hex {
             out.push(HEX[(byte & 0x0f) as usize] as char);
         }
         Self(out)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for Sha256Hex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::str::FromStr for Sha256Hex {
-    type Err = Sha256HexError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::try_new(s)
-    }
-}
-
-impl Serialize for Sha256Hex {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Sha256Hex {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        Self::try_new(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -96,7 +67,7 @@ pub enum Sha256HexError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
+    use proptest::prelude::*;
 
     fn sample() -> &'static str {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -147,6 +118,17 @@ mod tests {
         assert_eq!(Sha256Hex::try_new(s), Err(Sha256HexError::NonLowercaseHex));
     }
 
+    fn candidates() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[0-9a-f]{64}",
+            "[0-9a-fA-F]{62,66}",
+            "[0-9a-g]{64}",
+            ".{0,70}",
+        ]
+    }
+
+    crate::validated_string_laws!(Sha256Hex, try_new, validate_sha256_hex, candidates());
+
     proptest::proptest! {
         /// `from_digest` renders exactly what `try_new` accepts, agreeing
         /// with the standard library's own lowercase-hex formatting.
@@ -157,37 +139,5 @@ mod tests {
             proptest::prop_assert_eq!(rendered.as_str(), reference.as_str());
             proptest::prop_assert_eq!(Sha256Hex::try_new(rendered.as_str()), Ok(rendered));
         }
-    }
-
-    #[test]
-    fn from_str_uses_try_new() {
-        assert_eq!(Sha256Hex::from_str(sample()).unwrap().as_str(), sample());
-        assert!(Sha256Hex::from_str("nope").is_err());
-    }
-
-    #[test]
-    fn serialises_as_bare_string() {
-        let h = Sha256Hex::try_new(sample()).unwrap();
-        let j = serde_json::to_string(&h).unwrap();
-        assert_eq!(j, format!("\"{}\"", sample()));
-    }
-
-    #[test]
-    fn deserialises_through_try_new() {
-        let j = format!("\"{}\"", sample());
-        let back: Sha256Hex = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.as_str(), sample());
-    }
-
-    /// Wire payloads carrying a malformed digest must be rejected at
-    /// parse time, with an error message a human operator can act on.
-    #[test]
-    fn deserialise_rejects_invalid_with_descriptive_error() {
-        let err = serde_json::from_str::<Sha256Hex>(r#""not-a-hash""#).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("64") || msg.contains("hex"),
-            "expected descriptive error, got: {msg}"
-        );
     }
 }
