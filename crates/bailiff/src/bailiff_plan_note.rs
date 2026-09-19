@@ -519,6 +519,7 @@ stage_note! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use writ::agent_run::AgentRunId;
     use writ::core::SessionId;
     use writ::core::{CapabilitySet, RepoRef, Sha256Hex, SshKeyFingerprint, UnixMillis};
@@ -1390,30 +1391,32 @@ mod tests {
         assert_eq!(review.canonical_bytes(), implement.canonical_bytes());
     }
 
-    /// Attempt zero's seed is *byte-identical* to the pre-slice-4
-    /// implement seed, for every plan id.
-    ///
-    /// Checked against a reference implementation — the exact
-    /// expression the function had before it took an attempt — rather
-    /// than against the function itself, because the whole point is
-    /// that the two agree. Every implement note already in an
-    /// operator's repo is attached at these bytes; if attempt zero
-    /// moved, all of them would be orphaned, and no test that asked
-    /// the new function where they live could notice.
-    #[test]
-    fn attempt_zero_keeps_the_pre_slice_4_seed() {
-        /// `plan_implement_seed_blob_bytes` as it stood before slice 4.
-        fn pre_slice_4_seed(plan_id: PlanId) -> Vec<u8> {
-            format!("{plan_id}::implement").into_bytes()
-        }
-        for _ in 0..64 {
-            let plan_id = PlanId::new();
-            assert_eq!(
+    fn arb_plan_id() -> impl Strategy<Value = PlanId> {
+        any::<u128>().prop_map(|bits| PlanId::from_uuid(uuid::Uuid::from_u128(bits)))
+    }
+
+    proptest! {
+        /// Attempt zero's seed is *byte-identical* to the pre-slice-4
+        /// implement seed, for every plan id.
+        ///
+        /// Checked against a reference implementation — the exact
+        /// expression the function had before it took an attempt — rather
+        /// than against the function itself, because the whole point is
+        /// that the two agree. Every implement note already in an
+        /// operator's repo is attached at these bytes; if attempt zero
+        /// moved, all of them would be orphaned, and no test that asked
+        /// the new function where they live could notice.
+        #[test]
+        fn attempt_zero_keeps_the_pre_slice_4_seed(plan_id in arb_plan_id()) {
+            /// `plan_implement_seed_blob_bytes` as it stood before slice 4.
+            fn pre_slice_4_seed(plan_id: PlanId) -> Vec<u8> {
+                format!("{plan_id}::implement").into_bytes()
+            }
+            prop_assert_eq!(
                 plan_implement_seed_blob_bytes(plan_id, ImplementAttempt::FIRST),
                 pre_slice_4_seed(plan_id),
             );
         }
-    }
 
     /// Every seed a plan can produce is distinct from every other,
     /// across all four families and all attempts.
@@ -1424,10 +1427,8 @@ mod tests {
     /// so the risk is no longer just "two suffixes collide" but "an
     /// indexed suffix collides with a fixed one" — `::implement::1`
     /// against some future `::implement::retry`, say.
-    #[test]
-    fn every_seed_a_plan_can_produce_is_distinct() {
-        for _ in 0..8 {
-            let plan_id = PlanId::new();
+        #[test]
+        fn every_seed_a_plan_can_produce_is_distinct(plan_id in arb_plan_id()) {
             let mut seeds = vec![
                 plan_submission_seed_blob_bytes(plan_id),
                 plan_decision_seed_blob_bytes(plan_id),
@@ -1439,7 +1440,7 @@ mod tests {
             let total = seeds.len();
             seeds.sort();
             seeds.dedup();
-            assert_eq!(total, seeds.len(), "two seeds for plan {plan_id} collide");
+            prop_assert_eq!(total, seeds.len(), "two seeds for plan {} collide", plan_id);
         }
     }
 

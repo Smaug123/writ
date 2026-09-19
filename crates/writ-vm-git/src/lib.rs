@@ -1,8 +1,8 @@
 //! VM-facing Git wire types.
 //!
-//! This module validates the request/response shapes used between the guest
+//! This crate validates the request/response shapes used between the guest
 //! CLI and the host broker. Host-side bundle planning and execution live in
-//! host-only modules behind the `host` feature.
+//! the root crate's `vm_git_*` modules, behind its `host` feature.
 //!
 //! [`RepoRef`] is the repo-wide "owner/name" shape. [`GitCloneRepo`] layers
 //! GitHub-specific owner/name syntax on top because this endpoint always
@@ -232,8 +232,7 @@ pub const VM_OPENAI_PROXY_PREFIX: &str = "/openai";
 ///
 /// Lives beside the prefixes, and in a crate both the guest binary and the host
 /// broker depend on, so the host's route table can be tested against the very
-/// string the guest is configured with. That the two agreed was previously
-/// nobody's job to check.
+/// string the guest is configured with.
 pub fn anthropic_proxy_base_url(broker_url: &str) -> String {
     join_broker_path(broker_url, VM_ANTHROPIC_PROXY_PREFIX)
 }
@@ -572,6 +571,11 @@ pub enum WorkspaceWarmMode {
     Sources,
     #[default]
     DevShell,
+}
+
+impl WorkspaceWarmMode {
+    /// Every mode, for tests that range over all of them.
+    pub const ALL: [Self; 3] = [Self::None, Self::Sources, Self::DevShell];
 }
 
 pub fn default_workspace_destination(repo: &GitCloneRepo) -> PathBuf {

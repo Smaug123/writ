@@ -734,6 +734,17 @@ mod tests {
         assert_eq!(PfHelperProtocolDoc::current().version(), 2);
     }
 
+    /// The canonical version object with one byte-level liberty each: a
+    /// space after a colon, reordered keys, leading whitespace, an extra key.
+    const NON_CANONICAL_SPELLINGS: [fn(u16) -> String; 4] = [
+        |version| format!(r#"{{"protocol": "{PF_HELPER_PROTOCOL_NAME}","version":{version}}}"#),
+        |version| format!(r#"{{"version":{version},"protocol":"{PF_HELPER_PROTOCOL_NAME}"}}"#),
+        |version| format!(r#" {{"protocol":"{PF_HELPER_PROTOCOL_NAME}","version":{version}}}"#),
+        |version| {
+            format!(r#"{{"protocol":"{PF_HELPER_PROTOCOL_NAME}","version":{version},"extra":1}}"#)
+        },
+    ];
+
     proptest! {
         #[test]
         fn render_is_one_bounded_line(version in any::<u16>()) {
@@ -813,16 +824,11 @@ mod tests {
         #[test]
         fn a_non_canonical_spelling_of_a_valid_object_is_malformed(
             version in any::<u16>(),
-            variant in 0u8..4,
+            spelling in prop::sample::select(NON_CANONICAL_SPELLINGS.to_vec()),
         ) {
             // Same JSON value, different bytes: the parser is exact, not
             // semantic, so the helper cannot drift into a looser format.
-            let input = match variant {
-                0 => format!(r#"{{"protocol": "{PF_HELPER_PROTOCOL_NAME}","version":{version}}}"#),
-                1 => format!(r#"{{"version":{version},"protocol":"{PF_HELPER_PROTOCOL_NAME}"}}"#),
-                2 => format!(r#" {{"protocol":"{PF_HELPER_PROTOCOL_NAME}","version":{version}}}"#),
-                _ => format!(r#"{{"protocol":"{PF_HELPER_PROTOCOL_NAME}","version":{version},"extra":1}}"#),
-            };
+            let input = spelling(version);
             prop_assert_eq!(
                 PfHelperProtocolDoc::parse(&input),
                 Err(PfHelperProtocolParseError::Malformed),

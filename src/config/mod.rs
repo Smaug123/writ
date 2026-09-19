@@ -137,12 +137,10 @@ pub struct DaemonConfig {
     /// holding that run's captured `stdout.log` and `stderr.log`. Defaults to
     /// [`default_agent_run_log_root`].
     ///
-    /// **Today's writer is the VM `RunAgent` arm only**: it materialises the
-    /// streams the guest uploads into `<root>/<run-id>/`. The host-spawn arm
-    /// keeps its child's output in memory and writes no files, so a host-only
-    /// daemon creates this root and leaves it empty. That arm records no audit
-    /// rows either; giving it the pair is the follow-up this key is
-    /// preparation for, and needs on-disk paths to point the rows at.
+    /// Both `RunAgent` arms write here: the VM arm materialises the streams
+    /// the guest uploads into `<root>/<run-id>/`, and the host-spawn arm
+    /// captures its child's output there directly. Each records the run's
+    /// audit pair with these paths for the rows to point at.
     ///
     /// It is top-level rather than under `agent_vm` because neither section
     /// can own it: `ClientMessage::StartAgentRun` reaches the VM arm with no

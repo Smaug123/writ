@@ -57,12 +57,10 @@ pub(super) const SCHEMA_VERSION: i32 = 11;
 pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
-        // Renamed from "0001_initial" in slice G5: the v1 SQL was
-        // squashed in place to drop plan-era tables and columns, so
-        // a pre-G5 DB that records the bare "0001_initial" name now
-        // has an incompatible on-disk shape. The `_v2` suffix makes
-        // `verify_schema_history` reject those DBs at version 1
-        // instead of resuming forward over a non-squashed base.
+        // `_v2`: a DB that records the bare "0001_initial" name has the
+        // pre-squash on-disk shape (plan-era tables and columns), so
+        // `verify_schema_history` rejects it at version 1 instead of
+        // resuming forward over a base the later migrations do not fit.
         name: "0001_initial_v2",
         sql: include_str!("migrations/0001_initial_v2.sql"),
     },
@@ -420,8 +418,8 @@ mod tests {
             assert!(tables.contains(expected), "missing table: {expected}");
         }
 
-        // Plan lifecycle tables were removed in slice G: bailiff owns
-        // plan storage as git notes; the audit log no longer mirrors it.
+        // Bailiff owns plan storage as git notes; the audit log does not
+        // mirror it.
         for forbidden in [
             "plan",
             "plan_decision",
@@ -882,25 +880,17 @@ mod tests {
         }
     }
 
-    /// A pre-G5 DB stopped at version 1 recorded the unsuffixed
-    /// `0001_initial` name. Post-G5 the v1 migration was squashed in
-    /// place and renamed `0001_initial_v2`, so the same recorded name
-    /// now signals "DB is at the pre-squash v1 shape (plan tables
-    /// present, `agent_run.stage`/`read_plan_id` still there)" rather
-    /// than the new squashed shape. Refusing to open is required:
-    /// blindly applying the renumbered 0002-0004 migrations over a
-    /// pre-squash v1 base would leave the DB in a hybrid half-squashed
-    /// state.
+    /// A DB that recorded the unsuffixed `0001_initial` name at version 1
+    /// has the pre-squash v1 shape (plan tables present,
+    /// `agent_run.stage`/`read_plan_id` still there). Applying the 0002+
+    /// migrations over it would leave a hybrid, so opening it is refused.
     #[test]
     fn open_rejects_pre_squash_v1_history() {
         let db = NamedTempFile::new().unwrap();
         {
-            // We have to write the row manually rather than execute
-            // pre-G5 SQL: the squash drops the old plan tables, so
-            // simulating the *exact* old-v1 shape would require an
-            // archived copy of the old 0001_initial.sql. The name
-            // mismatch alone is what catches this on a real upgrade,
-            // and that's what's under test.
+            // The row is written by hand: the name mismatch alone is
+            // what catches this on a real upgrade, and that is what is
+            // under test.
             let conn = Connection::open(db.path()).unwrap();
             ensure_schema_version_table(&conn).unwrap();
             conn.execute(

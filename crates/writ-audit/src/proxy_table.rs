@@ -14,11 +14,9 @@
 //! thin shims that nominate a descriptor and re-export the generic
 //! record types under the per-backend names.
 
-use rusqlite::{Connection, params};
-// `OptionalExtension` (`.optional()`) is now only used by the test-only read
-// helpers below; the session-open guard that used it moved to `validation`.
 #[cfg(any(test, feature = "test-support"))]
 use rusqlite::OptionalExtension;
+use rusqlite::{Connection, params};
 
 use super::validation::{check_session_open, labeled_invariant};
 use super::{AuditError, AuditLog};
@@ -366,6 +364,10 @@ mod tests {
     enum TestRoute {
         A,
         B,
+    }
+
+    impl TestRoute {
+        const ALL: [Self; 2] = [Self::A, Self::B];
     }
 
     impl ProxyAuditRoute for TestRoute {
@@ -860,7 +862,7 @@ END;
             // through parameterised queries.
             method in "[\\x01-\\x7e]{1,16}",
             target in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
-            route_is_a in any::<bool>(),
+            route in proptest::sample::select(TestRoute::ALL.to_vec()),
             deny_reason in proptest::option::of("[\\x01-\\x7e]{1,80}"),
             http_status in 100u16..=599,
             upstream_status in proptest::option::of(100u16..=599),
@@ -874,7 +876,6 @@ END;
             log.open_session(&s).unwrap();
             let request_id = RequestId::new();
 
-            let route = if route_is_a { TestRoute::A } else { TestRoute::B };
             let decision = match &deny_reason {
                 None => ProxyAuditDecision::Allow,
                 Some(reason) => ProxyAuditDecision::Deny { reason: reason.clone() },

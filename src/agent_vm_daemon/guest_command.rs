@@ -556,11 +556,7 @@ mod spec {
         #[test]
         fn workspace_bootstrap_wrapper_preserves_guest_command_argv(
             guest_command in prop::collection::vec(any::<String>(), 1..16),
-            warm in prop_oneof![
-                Just(WorkspaceWarmMode::None),
-                Just(WorkspaceWarmMode::Sources),
-                Just(WorkspaceWarmMode::DevShell),
-            ],
+            warm in prop::sample::select(WorkspaceWarmMode::ALL.to_vec()),
         ) {
             let workspace = AgentVmWorkspaceBootstrap {
                 repo: "owner/repo".parse().unwrap(),

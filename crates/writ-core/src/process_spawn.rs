@@ -33,29 +33,22 @@
 //!   clears as concurrent children exit, but a *sustained* fork-pressure peak
 //!   lasts far longer than the `ETXTBSY` window, so it is given seconds.
 //!
-//! One *classification* is the point; one *deadline* is not. These helpers
-//! previously coexisted with a second, `notes_repo`-local retry loop that
-//! recognised exactly the resource errnos and *not* `ETXTBSY`, while this module
-//! recognised `ETXTBSY` and *not* the resource errnos — so each caller was flaky
-//! under precisely the pressure the other had been hardened against. Merging them
-//! onto a single 2s deadline then over-waited the `ETXTBSY` path, which
-//! poll-loop callers pay per spawn; hence one classifier, two bounds.
+//! One classifier, two bounds: a shared deadline would either over-wait the
+//! `ETXTBSY` path, which poll-loop callers pay per spawn, or under-wait a
+//! fork-pressure peak.
 //!
-//! Anything that spawns a child goes through here — and that is checked, not
-//! merely asked for: `every_child_spawn_goes_through_the_retrying_primitive` in
+//! Anything that spawns a child goes through here, and that is checked:
+//! `every_child_spawn_goes_through_the_retrying_primitive` in
 //! `tests/shared_hardening_helpers.rs` fails on a `.spawn()`/`.status()`/
 //! `.output()` chained onto a bare `Command`, and on any such terminator at all
-//! in a file that builds one. The sentence used to be an aspiration while 37
-//! call sites — including the fixture spawn that had already failed CI on
-//! `ETXTBSY` — quietly disagreed with it. What the guard still cannot see is a
-//! file that never *constructs* a `Command` but receives one and spawns it;
-//! nothing does that today.
+//! in a file that builds one. What the guard cannot see is a file that never
+//! *constructs* a `Command` but receives one and spawns it; nothing does that
+//! today.
 //!
-//! One migration note for callers: [`output`] does **not** inherit
-//! `Command::output`'s stdio defaults. It leaves stdin/stdout/stderr inherited,
-//! where `Command::output` quietly sets stdin to null and pipes both outputs. A
-//! site that read `output.stdout` and was switched over without configuring
-//! stdio would collect nothing and print to the terminal instead.
+//! [`output`] does **not** inherit `Command::output`'s stdio defaults. It
+//! leaves stdin/stdout/stderr inherited, where `Command::output` sets stdin to
+//! null and pipes both outputs. A site that reads `output.stdout` without
+//! configuring stdio collects nothing and prints to the terminal instead.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -256,25 +249,10 @@ fn wait_collecting_with(
                 (stdout, stderr, status)
             }
             Err((_refusal, returned_stderr)) => {
-                // Refused past the deadline — and retrying cannot always fix this
-                // one, because the causes are circular: `RLIMIT_NPROC` counts
-                // threads *and* processes against one UID, so our own live child
-                // holds the slot `pthread_create` wants, and nothing frees it
-                // until we collect. Reporting the refusal would mean calling a
-                // command that *ran*, with whatever side effects it had, a spawn
-                // failure.
-                //
-                // So give the pipes back and let `Child::wait_with_output` do it:
-                // std drains both with `poll` on this thread, needing no thread at
-                // all. That is the collector `Command::output` uses — exactly what
-                // the migrated call sites had before — so the fallback cannot be
-                // worse for them than not having migrated at all.
-                //
-                // The one thing given up is this function's stronger promise:
-                // `wait_with_output` returns on a *pipe read* error without
-                // waiting, so in that compound case (thread exhaustion *and* a
-                // failing pipe) the child may outlive the call. Preferred to the
-                // alternative, which loses a command that already happened.
+                // Refused past the deadline. Give the pipes back and let
+                // `Child::wait_with_output` drain both with `poll` on this
+                // thread; the doc on `wait_collecting` says why the retry cannot
+                // always win and what this fallback gives up.
                 child.stdout = stdout_pipe;
                 child.stderr = returned_stderr;
                 return child.wait_with_output();
@@ -401,9 +379,7 @@ mod tests {
 
     /// The whole all-or-nothing class is retryable, not just `ETXTBSY`. Each of
     /// these means the spawn was *refused* — the child never ran — so a retry
-    /// re-runs nothing. Two callers previously each recognised a disjoint subset
-    /// (`process_spawn` only `ETXTBSY`; `notes_repo` only the resource errnos),
-    /// so each was flaky under exactly the pressure the other guarded against.
+    /// re-runs nothing.
     #[test]
     fn every_all_or_nothing_spawn_refusal_is_retryable() {
         for errno in [
@@ -473,8 +449,8 @@ mod tests {
     }
 
     /// The resource deadline must be generous enough for a *sustained*
-    /// fork-pressure peak: `notes_repo` chose 2s after observing that a 500ms
-    /// ceiling still flaked, and unifying the retry must not regress that caller.
+    /// fork-pressure peak: a 500ms ceiling was observed to flake under one; 2s
+    /// was not.
     #[test]
     fn resource_deadline_covers_sustained_fork_pressure() {
         assert!(
@@ -489,8 +465,7 @@ mod tests {
     /// The `ETXTBSY` window is microseconds, and callers that spawn in a poll loop
     /// pay this bound per attempt on their fast-fail path — `broker_vm_runner`'s
     /// readiness poll asserts it fast-fails inside 5s. Raising this to match the
-    /// resource deadline (which a first cut of the unification did) buys nothing
-    /// and turns that budget into a flake.
+    /// resource deadline buys nothing and turns that budget into a flake.
     #[test]
     fn text_busy_deadline_stays_short_for_latency_sensitive_pollers() {
         assert!(
@@ -582,18 +557,9 @@ mod tests {
     }
 
     /// A command that *ran* is never reported as a spawn failure just because no
-    /// reader thread could be had.
-    ///
-    /// Retrying is not enough on its own here, and the reason is circular:
-    /// `RLIMIT_NPROC` counts threads and processes against the same UID, so when
-    /// the child itself takes the last slot, no amount of waiting frees the one
-    /// `pthread_create` wants — nothing will, until the child is collected, which
-    /// is the very thing blocked. Left there, a `git commit` that had already
-    /// written its object would come back as `EAGAIN`.
-    ///
-    /// So a persistent refusal falls back to `Child::wait_with_output`, which
-    /// drains both pipes with `poll` on this thread. This asserts the whole of
-    /// that: both streams arrive intact, and the exit status with them.
+    /// reader thread could be had: a persistent refusal falls back to
+    /// `Child::wait_with_output` (see `wait_collecting`), and both streams arrive
+    /// intact with the exit status.
     #[test]
     fn a_command_that_ran_is_collected_even_when_no_thread_can_be_had() {
         let mut command = std::process::Command::new("sh");
