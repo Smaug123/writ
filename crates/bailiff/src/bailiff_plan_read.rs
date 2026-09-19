@@ -1007,15 +1007,11 @@ mod dossier_tests;
 #[cfg(test)]
 mod full_plan_tests;
 #[cfg(test)]
-mod implement_tests;
-#[cfg(test)]
 mod list_tests;
-#[cfg(test)]
-mod plan_tests;
 #[cfg(test)]
 mod read_plan_body_tests;
 #[cfg(test)]
-mod review_tests;
+mod stage_read_tests;
 #[cfg(test)]
 mod test_support;
 

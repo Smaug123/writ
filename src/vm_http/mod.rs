@@ -384,6 +384,8 @@ impl VmHttpRequest {
 }
 
 impl<S: SecretStore + Send + Sync + 'static> VmHttpServices<S> {
+    /// No service routed: the accept loop alone, for tests of the transport.
+    #[cfg(test)]
     fn none() -> Self {
         Self {
             git_clone: None,
@@ -439,62 +441,32 @@ impl VmHttpRuntimeConfig {
         git_push_staging_root: impl Into<PathBuf>,
         git_push_body_limits: VmGitPushBodyLimits,
     ) -> Self {
-        Self::new_with_claude_proxy(
-            bind_addr,
-            broker_port_range,
-            git_clone,
-            nix_cache,
-            None,
-            git_push_staging_root,
-            git_push_body_limits,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_claude_proxy(
-        bind_addr: Ipv4Addr,
-        broker_port_range: BrokerPortRange,
-        git_clone: VmHttpGitCloneConfig,
-        nix_cache: VmHttpNixCacheConfig,
-        claude_proxy: Option<VmHttpClaudeProxyConfig>,
-        git_push_staging_root: impl Into<PathBuf>,
-        git_push_body_limits: VmGitPushBodyLimits,
-    ) -> Self {
-        Self::new_with_proxies(
-            bind_addr,
-            broker_port_range,
-            git_clone,
-            nix_cache,
-            claude_proxy,
-            None,
-            git_push_staging_root,
-            git_push_body_limits,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_proxies(
-        bind_addr: Ipv4Addr,
-        broker_port_range: BrokerPortRange,
-        git_clone: VmHttpGitCloneConfig,
-        nix_cache: VmHttpNixCacheConfig,
-        claude_proxy: Option<VmHttpClaudeProxyConfig>,
-        openai_proxy: Option<VmHttpOpenAiProxyConfig>,
-        git_push_staging_root: impl Into<PathBuf>,
-        git_push_body_limits: VmGitPushBodyLimits,
-    ) -> Self {
         Self {
             bind_addr,
             broker_port_range,
             git_clone,
             nix_cache,
-            claude_proxy,
-            openai_proxy,
+            claude_proxy: None,
+            openai_proxy: None,
             git_push_staging_root: git_push_staging_root.into(),
             git_push_body_limits,
             flake_provision: None,
             nix_prewarm_cache_dir: None,
         }
+    }
+
+    /// Enable the Claude proxy with the given config. `None` (the default)
+    /// leaves the Anthropic endpoints unrouted.
+    pub fn with_claude_proxy(mut self, claude_proxy: Option<VmHttpClaudeProxyConfig>) -> Self {
+        self.claude_proxy = claude_proxy;
+        self
+    }
+
+    /// Enable the OpenAI proxy with the given config. `None` (the default)
+    /// leaves the OpenAI endpoints unrouted.
+    pub fn with_openai_proxy(mut self, openai_proxy: Option<VmHttpOpenAiProxyConfig>) -> Self {
+        self.openai_proxy = openai_proxy;
+        self
     }
 
     /// Enable flake-input provisioning with the given config. `None` (the
@@ -703,16 +675,6 @@ pub async fn bind_vm_http_listener(
 /// Lifecycle code should install PF rules for [`PreparedVmHttpSession::broker_port`],
 /// pass [`PreparedVmHttpSession::bearer_token`] to the guest, and only then
 /// call [`PreparedVmHttpSession::spawn`].
-pub async fn prepare_vm_http_session<S: SecretStore + Send + Sync + 'static>(
-    state: Arc<BrokerState<S>>,
-    config: &VmHttpRuntimeConfig,
-    session_id: SessionId,
-    source_ipv4: Ipv4Cidr,
-) -> Result<PreparedVmHttpSession<S>, VmHttpRuntimeError> {
-    prepare_vm_http_session_with_agent_runs(state, config, session_id, source_ipv4, None, None)
-        .await
-}
-
 pub async fn prepare_vm_http_session_with_agent_runs<S: SecretStore + Send + Sync + 'static>(
     state: Arc<BrokerState<S>>,
     config: &VmHttpRuntimeConfig,
@@ -788,27 +750,6 @@ pub fn prepare_vm_http_session_on_listener<S: SecretStore + Send + Sync + 'stati
         git_push,
         flake_provision,
     })
-}
-
-pub async fn run_vm_http(listener: TcpListener, session: VmHttpSession) -> std::io::Result<()> {
-    // No external shutdown signal: callers that choose this convenience
-    // wrapper stop it by aborting the owning task.
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    run_vm_http_until_shutdown(listener, session, shutdown_rx).await
-}
-
-pub async fn run_vm_http_until_shutdown(
-    listener: TcpListener,
-    session: VmHttpSession,
-    shutdown: watch::Receiver<bool>,
-) -> std::io::Result<()> {
-    run_vm_http_runtime_until_shutdown::<Box<dyn SecretStore>>(
-        listener,
-        session,
-        VmHttpServices::none(),
-        shutdown,
-    )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]
