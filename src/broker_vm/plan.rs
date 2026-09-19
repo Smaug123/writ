@@ -212,15 +212,4 @@ impl BrokerVmPlan {
     pub fn internal_network(&self) -> &str {
         &self.internal_network
     }
-
-    /// Idempotent teardown: force-remove the broker VM, then remove its egress
-    /// network, then the **shared internal network** the broker arm created.
-    ///
-    /// The internal network is removed last and must run only after the *agent*
-    /// VM has already been stopped (the daemon's vm-arm orchestration stops the
-    /// agent VM before tearing the broker down) — otherwise the network is still
-    /// in use. The agent VM's own stop plan removes the agent VM only.
-    pub fn stop_invocations(&self) -> Vec<ProcessInvocation> {
-        broker_vm_removal_invocations(&self.container_tool, &self.names, &self.internal_network)
-    }
 }

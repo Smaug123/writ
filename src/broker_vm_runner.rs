@@ -118,7 +118,8 @@ pub enum BrokerVmLaunchError {
 /// broker's address on `plan.internal_network()`.
 ///
 /// On any error the networks and broker VM may be partially created; the caller
-/// is responsible for [`teardown_broker_vm`].
+/// is responsible for tearing them down (the daemon's cleanup runs
+/// [`crate::broker_vm::broker_vm_removal_invocations`]).
 pub async fn launch_broker_vm(
     plan: &BrokerVmPlan,
     ready_file: &Path,
@@ -165,22 +166,6 @@ pub async fn launch_broker_vm(
         .map_err(BrokerVmLaunchError::Inspect)?;
     parse_broker_ipv4_on_network(&json, plan.internal_network())
         .map_err(BrokerVmLaunchError::AddressDiscovery)
-}
-
-/// Best-effort teardown of a broker VM and its egress network. Runs every stop
-/// invocation regardless of earlier failures (so a stuck VM removal can't strand
-/// the network) and returns the messages of any that failed, for the caller to
-/// log. An empty vec means a clean teardown.
-pub async fn teardown_broker_vm(plan: &BrokerVmPlan) -> Vec<String> {
-    let mut failures = Vec::new();
-    for invocation in plan.stop_invocations() {
-        match tokio::task::spawn_blocking(move || invocation.run()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => failures.push(err.to_string()),
-            Err(join) => failures.push(format!("broker VM teardown worker task failed: {join}")),
-        }
-    }
-    failures
 }
 
 /// Wait for the broker to publish `ready_file`, but fail fast if the broker VM
@@ -1028,37 +1013,5 @@ exit 0
         .expect("launch must not hang")
         .expect("a broker that becomes ready during a slow inspect must be detected");
         assert_eq!(ip, Ipv4Addr::new(192, 168, 252, 3));
-    }
-
-    #[tokio::test]
-    async fn teardown_removes_the_vm_then_both_networks() {
-        let dir = tempfile::tempdir().unwrap();
-        let args_log = dir.path().join("args.log");
-        let tool = write_fake_container(dir.path(), &args_log, "192.168.252.3");
-        let plan = plan_with_tool(&tool, dir.path());
-
-        let failures = teardown_broker_vm(&plan).await;
-        assert!(failures.is_empty(), "clean teardown expected: {failures:?}");
-
-        let log = std::fs::read_to_string(&args_log).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        let rm = lines
-            .iter()
-            .position(|l| l.starts_with("rm -f writ-broker-vm-"))
-            .expect("vm removed");
-        let egress_rm = lines
-            .iter()
-            .position(|l| l.starts_with("network rm writ-broker-egress-"))
-            .expect("egress network removed");
-        let internal_rm = lines
-            .iter()
-            .position(|l| l.starts_with(&format!("network rm {INTERNAL_NET}")))
-            .expect("shared internal network removed");
-        // VM first, then egress, then the shared internal network (which is only
-        // free once the agent VM has also been stopped by the orchestrator).
-        assert!(
-            rm < egress_rm && egress_rm < internal_rm,
-            "unexpected teardown order: {lines:?}"
-        );
     }
 }

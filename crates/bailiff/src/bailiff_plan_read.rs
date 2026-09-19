@@ -40,14 +40,9 @@ use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use writ::run_verify::{AllowedSigners, VerifyError, verify_run_envelope};
 use writ::vm_git::GitObjectId;
 
-// The read-projection types these helpers return now live in
-// `bailiff_plan_view` so presentation code can depend on the types
-// without depending on this reader. Re-exported here so the read
-// functions, their tests, and the `bailiff` binary keep resolving
-// them via `crate::bailiff_plan_read::…`.
-pub(crate) use crate::bailiff_plan_view::SignedBailiffNote;
-pub use crate::bailiff_plan_view::{
-    BailiffPlanSummary, DecisionSummary, PlanFullView, SubmissionSummary, VerifiedSection,
+use crate::bailiff_plan_view::{
+    BailiffPlanSummary, DecisionSummary, PlanFullView, SignedBailiffNote, SubmissionSummary,
+    VerifiedSection,
 };
 
 /// Bailiff's local copy of writ's per-run signed-output notes ref.

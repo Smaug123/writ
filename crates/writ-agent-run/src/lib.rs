@@ -6,6 +6,12 @@
 //! are captured as private files with bounded retained bytes and metadata that
 //! can be audited without storing the stream bodies in SQLite.
 
+#[cfg(not(unix))]
+compile_error!(
+    "writ-agent-run is Unix-only: the process runner relies on process groups, \
+     waitid(2) and poll(2) to bound an agent's lifetime"
+);
+
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -1016,9 +1022,7 @@ mod process_runner {
         // Shared with both capture threads and armed after the group sweep
         // below. Until then it is empty, which means "drain for as long as it
         // takes" — correct while the agent is legitimately still writing.
-        #[cfg(unix)]
         let drain_deadline = std::sync::Arc::new(DrainDeadline::default());
-        #[cfg(unix)]
         let stdout_thread = spawn_capture_thread(
             "stdout",
             stdout,
@@ -1026,7 +1030,6 @@ mod process_runner {
             max_stdout,
             std::sync::Arc::clone(&drain_deadline),
         )?;
-        #[cfg(unix)]
         let stderr_thread = spawn_capture_thread(
             "stderr",
             stderr,
@@ -1034,12 +1037,6 @@ mod process_runner {
             max_stderr,
             std::sync::Arc::clone(&drain_deadline),
         )?;
-        #[cfg(not(unix))]
-        let stdout_thread =
-            spawn_capture_thread("stdout", stdout, stdout_path.clone(), max_stdout)?;
-        #[cfg(not(unix))]
-        let stderr_thread =
-            spawn_capture_thread("stderr", stderr, stderr_path.clone(), max_stderr)?;
 
         let stdin = child
             .as_mut()
@@ -1098,7 +1095,6 @@ mod process_runner {
         //
         // After the sweep rather than before it, because before it a stream
         // still open is the ordinary case.
-        #[cfg(unix)]
         drain_deadline.set(std::time::Instant::now() + DRAIN_GRACE);
 
         // The sweep above is the last thing that needs the group addressable, so
@@ -1232,7 +1228,6 @@ mod process_runner {
         /// **Disarms the guard on `ECHILD`**, for the reason [`Self::has_exited`]
         /// gives: that error is the one that means the pid is *gone*, so a
         /// `Drop` that went on to kill it would be signalling a stranger.
-        #[cfg(unix)]
         fn wait_without_reaping(&mut self) -> Result<AgentExit, AgentProcessRunError> {
             let pid = agent_pid(self.as_mut())?;
             match writ_core::process_group::wait_for_pid_without_reaping(pid) {
@@ -1249,22 +1244,6 @@ mod process_runner {
             }
         }
 
-        /// Off Unix there is no way to wait without consuming the status — and
-        /// no process group to keep addressable either, since the sweep there
-        /// reaches the one process through the `Child` itself. Reaping here is
-        /// both unavoidable and harmless.
-        #[cfg(not(unix))]
-        fn wait_without_reaping(&mut self) -> Result<AgentExit, AgentProcessRunError> {
-            let mut child = self
-                .0
-                .take()
-                .expect("the guard is disarmed only by a wait or a reap");
-            child
-                .wait()
-                .map(AgentExit::Reaped)
-                .map_err(AgentProcessRunError::Wait)
-        }
-
         /// Reap the agent and say how the run ended.
         ///
         /// Three outcomes, and which one it is turns on who ended the process:
@@ -1279,8 +1258,6 @@ mod process_runner {
         ///   failure it is rather than attributed to a deadline writ enforced.
         fn reap(mut self, exit: AgentExit) -> Result<AgentRunEnd, AgentProcessRunError> {
             let (status, killed_by_writ) = match exit {
-                #[cfg(not(unix))]
-                AgentExit::Reaped(status) => (status, false),
                 AgentExit::Observed { killed_by_writ } => {
                     let mut child = self
                         .0
@@ -1343,24 +1320,16 @@ mod process_runner {
 
     /// How the agent's lifetime ended, before its status has been collected.
     ///
-    /// On Unix there is only `Observed`: every run sweeps its process group once
-    /// the agent is gone, and that is safe only while the leader is still
-    /// unreaped, so no path here may reap early. `killed_by_writ` is what later
-    /// separates a deadline from an agent's own ending.
+    /// Every run sweeps its process group once the agent is gone, and that is
+    /// safe only while the leader is still unreaped, so no path here may reap
+    /// early. `killed_by_writ` is what later separates a deadline from an
+    /// agent's own ending.
     #[derive(Debug)]
     enum AgentExit {
-        /// Reaped by the wait itself, because the platform offers no way to
-        /// observe an exit without consuming it. Off Unix that costs nothing:
-        /// there are no process groups to keep addressable.
-        #[cfg(not(unix))]
-        Reaped(std::process::ExitStatus),
-        Observed {
-            killed_by_writ: bool,
-        },
+        Observed { killed_by_writ: bool },
     }
 
     /// Is this the error that means the pid no longer exists to be waited on?
-    #[cfg(unix)]
     fn is_no_such_child(err: &AgentProcessRunError) -> bool {
         let AgentProcessRunError::Wait(err) = err else {
             return false;
@@ -1368,29 +1337,14 @@ mod process_runner {
         err.raw_os_error() == Some(libc::ECHILD)
     }
 
-    #[cfg(not(unix))]
-    fn is_no_such_child(_err: &AgentProcessRunError) -> bool {
-        false
-    }
-
     /// Did this status describe a process killed by `SIGKILL`?
-    ///
-    /// `false` off Unix, where there are no signals to distinguish and a
-    /// code-less status is as much as the platform says.
-    #[cfg(unix)]
     fn died_by_sigkill(status: std::process::ExitStatus) -> bool {
         use std::os::unix::process::ExitStatusExt;
         status.signal() == Some(libc::SIGKILL)
     }
 
-    #[cfg(not(unix))]
-    fn died_by_sigkill(_status: std::process::ExitStatus) -> bool {
-        true
-    }
-
     /// Observe a child's exit without consuming its status, so the pid — and
     /// with it the process group id — stays claimed.
-    #[cfg(unix)]
     fn has_exited_without_reaping(child: &mut Child) -> Result<bool, AgentProcessRunError> {
         let pid = agent_pid(child)?;
         writ_core::process_group::pid_has_exited_without_reaping(pid)
@@ -1404,7 +1358,6 @@ mod process_runner {
     /// `kill(2)` reads it as a process group. Unreachable for a child of this
     /// process on any real platform, which is why it is an error rather than a
     /// case with behaviour.
-    #[cfg(unix)]
     fn agent_pid(child: &Child) -> Result<libc::pid_t, AgentProcessRunError> {
         writ_core::process_group::process_group_id(child.id()).ok_or_else(|| {
             AgentProcessRunError::Wait(std::io::Error::other(format!(
@@ -1412,17 +1365,6 @@ mod process_runner {
                 child.id()
             )))
         })
-    }
-
-    /// Off Unix there is no way to observe an exit without consuming it, and no
-    /// process group to protect by trying; `try_wait` is the whole of what the
-    /// platform offers.
-    #[cfg(not(unix))]
-    fn has_exited_without_reaping(child: &mut Child) -> Result<bool, AgentProcessRunError> {
-        child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(AgentProcessRunError::Wait)
     }
 
     impl Drop for ChildGuard {
@@ -1447,7 +1389,6 @@ mod process_runner {
     /// unwind past the running agent. The guard would still reap it — that is
     /// what the guard is for — but a daemon that reports "cannot start a
     /// capture thread" is far easier to act on than one whose handler panicked.
-    #[cfg(unix)]
     fn spawn_capture_thread<R: Read + Send + 'static + std::os::fd::AsRawFd>(
         stream: &'static str,
         reader: R,
@@ -1472,25 +1413,6 @@ mod process_runner {
             .map_err(|source| AgentProcessRunError::StreamThreadSpawn { stream, source })
     }
 
-    /// Off Unix there are no process groups to escape from and no `poll(2)` to
-    /// bound the drain with, so the capture is the plain blocking one and the
-    /// shared deadline has nothing to tell it.
-    #[cfg(not(unix))]
-    fn spawn_capture_thread<R: Read + Send + 'static>(
-        stream: &'static str,
-        reader: R,
-        path: PathBuf,
-        max_capture_bytes: u64,
-    ) -> Result<
-        thread::JoinHandle<Result<AgentRunStreamCapture, AgentProcessRunError>>,
-        AgentProcessRunError,
-    > {
-        thread::Builder::new()
-            .name(format!("writ-agent-{stream}"))
-            .spawn(move || capture_stream(reader, path, max_capture_bytes))
-            .map_err(|source| AgentProcessRunError::StreamThreadSpawn { stream, source })
-    }
-
     /// How long a capture keeps draining after the run's process group has been
     /// swept, before concluding that whatever still holds the write end is not
     /// going to let go.
@@ -1508,12 +1430,10 @@ mod process_runner {
     /// a second but whose deadline was an hour away waited the full hour before
     /// giving up on an escaped descendant — and would give an *unbounded* run no
     /// bound at all, when it is exactly as vulnerable.
-    #[cfg(unix)]
     const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// How long a capture waits in one `poll(2)` before re-reading the shared
     /// deadline. Bounds how late it can notice a stop, nothing more.
-    #[cfg(unix)]
     const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
     /// How much a capture may still read *after* its deadline has passed.
@@ -1533,7 +1453,6 @@ mod process_runner {
     /// post-deadline drain finite. A stream that hits it is by definition still
     /// being written to, so it is recorded as stopped at the deadline, which is
     /// exactly what it is.
-    #[cfg(unix)]
     pub(super) const DRAIN_POST_DEADLINE_ALLOWANCE: u64 = 1024 * 1024;
 
     /// When the capture threads should stop draining, set once by the thread
@@ -1543,11 +1462,9 @@ mod process_runner {
     /// instant that matters is not known until the sweep happens, and the
     /// threads are necessarily already running by then — they are what keeps the
     /// agent from blocking on a full pipe.
-    #[cfg(unix)]
     #[derive(Debug, Default)]
     pub(super) struct DrainDeadline(std::sync::Mutex<Option<std::time::Instant>>);
 
-    #[cfg(unix)]
     impl DrainDeadline {
         fn get(&self) -> Option<std::time::Instant> {
             *self.0.lock().expect("drain deadline mutex poisoned")
@@ -1575,7 +1492,6 @@ mod process_runner {
     /// recorded, so the `byte_len` and `sha256_hex` in the audit row would
     /// describe something still growing. Here the file is closed and synced
     /// before the summary is built, so the row stays true of it forever.
-    #[cfg(unix)]
     pub(super) fn capture_stream_to_deadline<R: Read + std::os::fd::AsRawFd>(
         mut reader: R,
         path: PathBuf,
@@ -1705,7 +1621,6 @@ mod process_runner {
     /// between writes. A regular file never reports it — there is no writer to
     /// hang up — so this answers `false` there and the caller falls back to
     /// probing for EOF, which a file gives immediately.
-    #[cfg(unix)]
     fn hangup(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
         let mut pollfd = libc::pollfd {
             fd,
@@ -1727,7 +1642,6 @@ mod process_runner {
 
     /// Wait for `fd` to be readable, for at most `timeout`. `Ok(false)` is "not
     /// readable yet", which includes being interrupted by a signal.
-    #[cfg(unix)]
     fn wait_readable(
         fd: std::os::fd::RawFd,
         timeout: std::time::Duration,
@@ -1753,7 +1667,6 @@ mod process_runner {
     }
 
     /// Put `fd` in non-blocking mode, preserving whatever else was set on it.
-    #[cfg(unix)]
     fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
@@ -1820,19 +1733,13 @@ mod process_runner {
     /// terminal signal sent to writd's group no longer reaches agents. For a
     /// daemon whose children outlive interactive sessions that is the behaviour
     /// we want anyway.
-    #[cfg(unix)]
     fn put_in_own_process_group(command: &mut Command) {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
 
-    #[cfg(not(unix))]
-    fn put_in_own_process_group(_command: &mut Command) {}
-
-    /// Signal the agent's whole process group.
-    ///
-    /// Returns whether the group was signalled; on anything but Unix there are
-    /// no process groups here and the caller falls back to the one process.
+    /// Signal the agent's whole process group. Returns whether it was
+    /// signalled.
     ///
     /// Delegates to `writ_core::process_group`, which is the codebase's single
     /// definition of this — the errno cases it tolerates and the reason it is
@@ -1851,17 +1758,11 @@ mod process_runner {
     /// descendant is most likely to be mid-`fork` and so to be missed — measured
     /// at 32 escapes in 80 runs with a single kill. See
     /// [`writ_core::process_group::sweep_process_group`].
-    #[cfg(unix)]
     fn kill_agent_process_group(pid: u32) -> bool {
         let Some(pgid) = writ_core::process_group::process_group_id(pid) else {
             return false;
         };
         writ_core::process_group::sweep_process_group(pgid, true).is_ok()
-    }
-
-    #[cfg(not(unix))]
-    fn kill_agent_process_group(_pid: u32) -> bool {
-        false
     }
 
     /// Start the thread that feeds the agent its prompt.
@@ -1936,10 +1837,9 @@ mod process_runner {
     /// `pub(super)` so the crate's tests can drive it over an in-memory reader.
     /// Its contract is about bytes, not processes; pinning it through a shell
     /// script would mostly test the script.
-    /// Used by the non-Unix capture path, and by the crate's tests to pin the
-    /// byte-level contract over an in-memory reader. On Unix the production
-    /// drain is [`capture_stream_to_deadline`].
-    #[cfg(any(not(unix), test))]
+    /// Used by the crate's tests to pin the byte-level contract over an
+    /// in-memory reader; the production drain is [`capture_stream_to_deadline`].
+    #[cfg(test)]
     pub(super) fn capture_stream<R: Read>(
         mut reader: R,
         path: PathBuf,
@@ -2073,60 +1973,36 @@ mod process_runner {
     }
 
     fn create_private_dir(path: &Path) -> Result<(), AgentProcessRunError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder
-                .create(path)
-                .map_err(|source| AgentProcessRunError::LogDir {
-                    operation: "create",
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-            // DirBuilderExt::mode is still subject to umask, so enforce the
-            // runtime invariant after creation.
-            set_private_dir_permissions(path)?;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            fs::create_dir_all(path).map_err(|source| AgentProcessRunError::LogDir {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .map_err(|source| AgentProcessRunError::LogDir {
                 operation: "create",
                 path: path.to_path_buf(),
                 source,
-            })
-        }
+            })?;
+        // DirBuilderExt::mode is still subject to umask, so enforce the
+        // runtime invariant after creation.
+        set_private_dir_permissions(path)
     }
 
     fn set_private_dir_permissions(path: &Path) -> Result<(), AgentProcessRunError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-                AgentProcessRunError::LogDir {
-                    operation: "set permissions on",
-                    path: path.to_path_buf(),
-                    source,
-                }
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Ok(())
-        }
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            AgentProcessRunError::LogDir {
+                operation: "set permissions on",
+                path: path.to_path_buf(),
+                source,
+            }
+        })
     }
 
     fn create_private_file(path: &Path) -> Result<File, AgentProcessRunError> {
+        use std::os::unix::fs::OpenOptionsExt;
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        options.write(true).create_new(true).mode(0o600);
         options
             .open(path)
             .map_err(|source| AgentProcessRunError::StreamFile {
@@ -2909,33 +2785,30 @@ mod tests {
         assert_eq!(outcome.stderr.full_byte_len, "fake stderr\n".len() as u64);
         assert!(!outcome.stdout.truncated());
         assert!(!outcome.stderr.truncated());
-        #[cfg(unix)]
-        {
-            assert_eq!(
-                fs::metadata(dir.path().join("logs"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-            assert_eq!(
-                fs::metadata(dir.path().join("logs").join(run_id.to_string()))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-            assert_eq!(
-                fs::metadata(outcome.stdout.path)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
+        assert_eq!(
+            fs::metadata(dir.path().join("logs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(dir.path().join("logs").join(run_id.to_string()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(outcome.stdout.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[cfg(feature = "host")]

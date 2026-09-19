@@ -50,7 +50,7 @@
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 
-use crate::core::{SshKeyFingerprint, SshKeyFingerprintError, SshSignature, SshSignatureError};
+use crate::core::{SshKeyFingerprint, SshSignature, SshSignatureError};
 use crate::secret::{SecretError, SecretKey, SecretStore};
 
 /// SSHSIG namespace bound into every writ-produced signature. Distinct
@@ -336,8 +336,6 @@ pub enum WritSigningKeyError {
     Encode(ssh_key::Error),
     #[error("ssh-key produced an SSHSIG that fails our wire validation: {0}")]
     Newtype(SshSignatureError),
-    #[error("ssh-key produced a fingerprint that fails our wire validation: {0}")]
-    Fingerprint(SshKeyFingerprintError),
 }
 
 #[derive(Debug, thiserror::Error)]
