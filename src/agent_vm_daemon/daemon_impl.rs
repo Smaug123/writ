@@ -1,13 +1,12 @@
 //! The `AgentVmDaemon` method surface: session start/stop/reconcile
 //! orchestration and its network-health, broker-VM, and cleanup helpers.
 //!
-//! This is one inherent `impl AgentVmDaemon` block, split out of
-//! `agent_vm_daemon.rs` to keep the daemon's runtime-config/report types and
-//! free functions legible separately. The struct itself and everything the
-//! methods reference (config/report types, the `choose_subnet_index` and
-//! `*_url_for_broker_url` free functions, the guest_command/materialize/
-//! run_outcome submodules) stay in the parent module and are reached via
-//! `super`. Behaviour is unchanged.
+//! This is one inherent `impl AgentVmDaemon` block, separate from the daemon's
+//! runtime-config/report types and free functions so each is legible on its
+//! own. The struct itself and everything the methods reference (config/report
+//! types, the `choose_subnet_index` and `*_url_for_broker_url` free functions,
+//! the guest_command/materialize/run_outcome submodules) live in the parent
+//! module and are reached via `super`.
 
 use super::*;
 
@@ -75,7 +74,7 @@ impl AgentVmDaemon {
     ///
     /// For tests. The map is an implementation detail with no operator meaning,
     /// but "does a refused start leave one behind" is not observable any other
-    /// way, and the answer used to be yes.
+    /// way.
     #[cfg(test)]
     pub(crate) async fn session_lock_count(&self) -> usize {
         self.session_locks.lock().await.len()
@@ -220,11 +219,11 @@ impl AgentVmDaemon {
         // rejection for the daemon's lifetime.
         //
         // Answers this request already has come first, before it can be made to
-        // wait for one it does not. Both were previously discovered *after* the
-        // slot was acquired, so at capacity a request whose fate was already
-        // decided — a malformed workspace destination, or an agent run under a
-        // broker placement that cannot serve one — would queue behind other
-        // people's agents before being told what was wrong with it.
+        // wait for one it does not. Discovered *after* the slot was acquired,
+        // they would instead put a request whose fate is already decided — a
+        // malformed workspace destination, or an agent run under a broker
+        // placement that cannot serve one — behind other people's agents at
+        // capacity, before telling it what was wrong with it.
         //
         // Recomputed rather than threaded onward: the checks are cheap and pure,
         // and a second call cannot disagree with the first.
@@ -271,11 +270,10 @@ impl AgentVmDaemon {
     /// of "this run did not complete", plus an error-level log line.
     ///
     /// Waits for a slot however long it takes. There is no per-caller budget
-    /// because there is no longer a caller with a deadline: the socket client
-    /// has already been answered, and `RunAgent`'s VM arm holds its connection
-    /// for the whole run by design. What a queued run can no longer do is
-    /// outlive the operator's patience unnoticed — it is stoppable by name from
-    /// the moment it is accepted.
+    /// because there is no caller with a deadline: the socket client has already
+    /// been answered, and `RunAgent`'s VM arm holds its connection for the whole
+    /// run by design. A queued run cannot outlive the operator's patience
+    /// unnoticed — it is stoppable by name from the moment it is accepted.
     ///
     /// "Stoppable" reaches exactly as far as the queue. Past the claim below
     /// this holds the session lock through `start_session_after_audit_opened`,
@@ -761,9 +759,9 @@ impl AgentVmDaemon {
     ) -> Result<(), AgentVmDaemonError> {
         // The whole release+wait dance shares one budget: `timeout`. Every
         // `container exec` runs under the *remaining* budget so a wedged guest
-        // exec cannot outlast it (the elapsed check used to sit only *after*
-        // the exec returned, so a hung exec never reached it). The guest is
-        // treated as compromised, so this bound is authority-side, not advisory.
+        // exec cannot outlast it: an elapsed check only *after* the exec
+        // returned would never be reached by a hung one. The guest is treated
+        // as compromised, so this bound is authority-side, not advisory.
         let start = Instant::now();
 
         let remaining = timeout.saturating_sub(start.elapsed());
@@ -1135,10 +1133,10 @@ impl AgentVmDaemon {
         Ok(guest_env)
     }
 
-    // Eight now, because a VM run's concurrency slot has to travel with the
-    // session rather than live in a caller's scope. Splitting the parameter list
-    // into a struct would move the same fields behind a name without making any
-    // of them optional.
+    // Eight arguments, because a VM run's concurrency slot has to travel with
+    // the session rather than live in a caller's scope. Splitting the parameter
+    // list into a struct would move the same fields behind a name without
+    // making any of them optional.
     /// `pub(super)` so that the tests of what a VM-placement session *is* can
     /// still reach it: new ones are refused at [`Self::start_session`] while
     /// nothing confines IPv6 between guests there, which puts this machinery

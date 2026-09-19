@@ -1893,11 +1893,10 @@ fn state_with_one_run_slot(audit: AuditLog) -> Arc<BrokerState<InMemorySecretSto
 /// nothing at all, with no error to explain why.
 ///
 /// The failure has to happen after acquisition to prove anything, which is a
-/// sharper requirement than it looks. This test previously used the
-/// broker-placement rejection — until that check moved *ahead* of the acquire to
-/// stop refusals queueing, at which point the test passed without a permit ever
-/// being taken and was asserting nothing. So it now fails inside VM startup,
-/// which is downstream of the slot.
+/// sharper requirement than it looks: every *refusal* is checked ahead of the
+/// acquire, so driving one would pass without a permit ever being taken and
+/// assert nothing. This fails inside VM startup, which is downstream of the
+/// slot.
 #[tokio::test]
 async fn a_failed_agent_run_start_returns_its_slot() {
     let dir = tempfile::tempdir().unwrap();

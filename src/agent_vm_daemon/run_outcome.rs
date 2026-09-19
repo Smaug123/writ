@@ -10,7 +10,7 @@ use crate::agent_run::AgentRunId;
 /// Errors returned by [`wait_for_agent_run_outcome`].
 ///
 /// `Timeout` carries the elapsed deadline rather than a free-form
-/// message so the synchronous `RunAgent` dispatch arm (slice VM2b) can
+/// message so the synchronous `RunAgent` dispatch arm can
 /// format a stable operator-facing message and verifiers can assert on
 /// the structured fields. `Audit` propagates the underlying audit
 /// failure verbatim — a poll that surfaces an audit error is almost
@@ -30,7 +30,7 @@ pub enum WaitForAgentRunOutcomeError {
 /// Poll the audit log for `run_id`'s outcome row until it appears, the
 /// audit lookup fails, or `timeout` elapses. The wait helper does not
 /// drive the VM's lifecycle — it is a one-shot read-side primitive for
-/// the synchronous-wait shape that slice VM2b's `RunAgent` dispatch
+/// the synchronous-wait shape the `RunAgent` dispatch
 /// arm needs (the guest POSTs `/v1/agent-runs/<id>/outcome`, which
 /// writes the row from `route_agent_run_outcome_request`; this helper
 /// observes that write).

@@ -386,8 +386,8 @@ fn vm_placement_start_failure_rolls_back_the_agent_vm_and_pf_not_the_network() {
 fn host_placement_start_tears_down_a_network_that_create_left_behind_on_failure() {
     // A `container network create` that registers the network and *then* exits
     // nonzero must not orphan it: managed start must tear the network down even
-    // though the create command reported failure. Regression for the "failed
-    // commands are assumed to have left no residue" gap — the teardown is
+    // though the create command reported failure: a failed command cannot be
+    // assumed to have left no residue. The teardown is
     // idempotent and absence-based, so tearing down a maybe-created resource is
     // always safe, and leaving it stranded would let a reused subnet collide with
     // an orphaned network after the recovery record is dropped.
