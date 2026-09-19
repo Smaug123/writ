@@ -12,6 +12,10 @@ Requires:
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, cargo or nix, and an Alpine image usable by Apple container
+  - a python3 that the macOS Application Firewall allows incoming connections
+    to: this proof's broker is `python3 -m http.server`, and a blocked
+    interpreter fails only for the guest. The proof preflights this before it
+    builds anything and prints the one command that fixes it.
 
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
@@ -41,6 +45,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/host-listener-preflight.sh
+source "${ROOT_DIR}/scripts/lib/host-listener-preflight.sh"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/writ-pf-proof.XXXXXX")"
 IMAGE="${WRIT_PROVE_IMAGE:-alpine:latest}"
 IPV4_CIDR="${WRIT_PROVE_IPV4_CIDR:-192.168.252.0/24}"
@@ -369,6 +376,12 @@ require_cmd curl
 require_cmd python3
 require_cmd sudo
 require_cmd uuidgen
+
+# Cheapest gate first: this proof stands a host listener up and expects a guest
+# VM to reach it. A host socket filter that blocks that listener is invisible to
+# every loopback check here, so test it now rather than after a VM boot.
+writ_require_reachable_host_listener log die
+
 choose_cargo
 
 mkdir -p "$BROKER_DIR" "$FORBIDDEN_DIR"
