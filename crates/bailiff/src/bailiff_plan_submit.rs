@@ -90,10 +90,8 @@ pub struct SubmitPlanInputs {
     /// session row; informational only.
     pub session_label: Option<String>,
     /// Optional coarse agent identity. Writ uses it for GitHub-App
-    /// selection on credential mints; with a `WorkspaceRead`-only
-    /// capability set today the field is unused, but is plumbed so
-    /// slice D/E reviewer/implementer runs (which mint GitHub
-    /// credentials) can pass it without a downstream refactor.
+    /// selection on credential mints; the planner's `WorkspaceRead`-only
+    /// capability set never mints, so here it is informational.
     pub session_agent_kind: Option<AgentKind>,
     /// Optional model identifier (e.g. `"claude-opus-4-7"`). Stored
     /// on writ's audit session row alongside `agent_kind`.
@@ -153,11 +151,8 @@ pub async fn submit_plan(
     allowed_signers: AllowedSigners,
     inputs: SubmitPlanInputs,
 ) -> Result<SubmitPlanOutcome, SubmitPlanError> {
-    // Pre-RPC gate. `submit` had none before slice 1: it opened a
-    // session and ran the planner immediately, so submitting against
-    // an id that already had a plan note burned a full agent run
-    // before `write_plan_note` refused the duplicate. `Submit` is
-    // legal only from `Absent`, so that now costs nothing.
+    // Pre-RPC gate: `Submit` is legal only from `Absent`, so a duplicate
+    // plan id costs no agent run.
     let plan_id = inputs.plan_id;
     let mut guard =
         open_plan_stage(bailiff_repo, plan_id, AgentStage::Submit.precondition()).await?;
@@ -496,15 +491,9 @@ mod end_to_end_tests {
         broker_task.stop().await;
     }
 
-    /// Behaviour delta (slice 1): re-submitting against a plan id
-    /// that already has notes is refused *before* the planner runs.
-    ///
-    /// `submit_plan` previously had no pre-RPC gate at all — it
-    /// opened a session and ran the planner immediately, so a
-    /// repeated `--plan-id` burned a full agent run before
-    /// `write_plan_note`'s idempotency check refused the duplicate.
-    /// `Submit` is legal only from `Absent`, so the same mistake is
-    /// now free. Witnessed against writ's audit log: the second call
+    /// Re-submitting against a plan id that already has notes is
+    /// refused *before* the planner runs: `Submit` is legal only from
+    /// `Absent`. Witnessed against writ's audit log: the second call
     /// leaves no new session row.
     #[tokio::test]
     async fn submit_plan_refuses_a_duplicate_plan_id_before_running_the_planner() {

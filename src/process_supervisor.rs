@@ -670,6 +670,7 @@ pub(crate) fn run_supervised_blocking_probed(
         stderr_buf,
         child_exited,
         retained_captures,
+        stdin_undelivered,
         stdin_write_error,
         stdout_read_error,
     } = match outcome {
@@ -717,17 +718,12 @@ pub(crate) fn run_supervised_blocking_probed(
                 });
             }
             let born_dead_signature = matches_born_dead_signature(pid_absent, &status);
-            // A born-dead child may be retried by the caller, and its `EPIPE` on
-            // stdin is a symptom of that rather than a delivery failure — so the
-            // held error is discarded in exactly that case and surfaced in every
-            // other.
-            if !born_dead_signature && let Some((written, source)) = stdin_write_error {
-                return Err(SupervisorError::StdinWrite {
-                    written,
-                    total: stdin_input.map_or(0, |b| b.len()),
-                    source,
-                });
-            }
+            settle_stdin_delivery(
+                stdin_input.map_or(0, |b| b.len()),
+                stdin_undelivered,
+                stdin_write_error,
+                born_dead_signature,
+            )?;
             // A failed stdout read means the capture is a prefix, not an answer.
             if let Some(err) = stdout_read_error {
                 return Err(SupervisorError::CaptureRead(err));
@@ -744,6 +740,44 @@ pub(crate) fn run_supervised_blocking_probed(
         }),
         ChildExitObservation::TimedOut => Ok(SupervisedOutcome::TimedOut),
     }
+}
+
+/// The verdict on stdin delivery for a child that exited.
+///
+/// A born-dead child is retried whole by the caller, so nothing about its
+/// stdin is a delivery failure: its `EPIPE` is a symptom of the phantom kill,
+/// and the held error is discarded in exactly that case. In every other case a
+/// write error is surfaced as [`SupervisorError::StdinWrite`], and so are bytes
+/// still in hand with no error: a child that exits between one successful
+/// write and the next attempt (which would have failed) has not read them, and
+/// `git hash-object --stdin` exiting 0 at that point names a truncated body.
+fn settle_stdin_delivery(
+    total: usize,
+    undelivered: usize,
+    write_error: Option<(usize, std::io::Error)>,
+    born_dead_signature: bool,
+) -> Result<(), SupervisorError> {
+    if born_dead_signature {
+        return Ok(());
+    }
+    if let Some((written, source)) = write_error {
+        return Err(SupervisorError::StdinWrite {
+            written,
+            total,
+            source,
+        });
+    }
+    if undelivered > 0 {
+        return Err(SupervisorError::StdinWrite {
+            written: total - undelivered,
+            total,
+            source: std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the child exited before the rest of its stdin was written",
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// The event loop of [`run_supervised_blocking`], factored out so its caller can
@@ -912,6 +946,7 @@ fn supervise_blocking_child(
         stderr_buf,
         child_exited,
         retained_captures: (stdout_pipe, stderr_pipe),
+        stdin_undelivered: stdin_remaining.len(),
         stdin_write_error,
         stdout_read_error,
     })
@@ -937,7 +972,11 @@ struct BlockingRunState {
         Option<std::process::ChildStdout>,
         Option<std::process::ChildStderr>,
     ),
-    /// Set when stdin was not fully delivered; settled by the caller, because a
+    /// Bytes of stdin never handed to the kernel. Non-zero without a write
+    /// error when the child exited between a successful write and the next
+    /// attempt, which would have failed.
+    stdin_undelivered: usize,
+    /// Set when a stdin write failed; settled by the caller, because a
     /// born-dead child shows up here first and must be retried, not reported.
     stdin_write_error: Option<(usize, std::io::Error)>,
     /// Set when reading captured stdout failed, which invalidates the capture.
@@ -2251,6 +2290,41 @@ mod blocking_tests {
             "a drain that reads until the pipe runs dry starves the deadline              check; took {:?}",
             started.elapsed()
         );
+    }
+
+    proptest::proptest! {
+        /// Exiting counts as delivered only when every stdin byte reached the
+        /// kernel: a write error or bytes still in hand are a `StdinWrite`
+        /// naming what was written, unless the child was born dead, in which
+        /// case the caller retries the whole run and nothing is reported.
+        #[test]
+        fn stdin_is_settled_as_delivered_iff_nothing_remains(
+            total in 0usize..1 << 20,
+            delivered_frac in 0.0f64..=1.0,
+            errored in proptest::bool::ANY,
+            born_dead in proptest::bool::ANY,
+        ) {
+            let delivered = ((total as f64) * delivered_frac) as usize;
+            // The loop drops the rest on a write error, so an error and an
+            // undelivered tail are never both present.
+            let (undelivered, write_error) = if errored {
+                (0, Some((delivered, std::io::Error::other("EPIPE"))))
+            } else {
+                (total - delivered, None)
+            };
+            match settle_stdin_delivery(total, undelivered, write_error, born_dead) {
+                Ok(()) => proptest::prop_assert!(
+                    born_dead || (delivered == total && !errored),
+                    "{delivered} of {total} delivered, errored={errored}, reported as delivered"
+                ),
+                Err(SupervisorError::StdinWrite { written, total: reported, .. }) => {
+                    proptest::prop_assert!(!born_dead);
+                    proptest::prop_assert_eq!(reported, total);
+                    proptest::prop_assert_eq!(written, delivered);
+                }
+                Err(other) => proptest::prop_assert!(false, "unexpected {other:?}"),
+            }
+        }
     }
 
     /// A child that exits without reading its stdin must not be reported as a

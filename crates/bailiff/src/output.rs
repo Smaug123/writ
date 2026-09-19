@@ -279,9 +279,8 @@ pub fn write_bailiff_plan_show(out: &mut dyn Write, view: &PlanFullView) -> std:
     writeln!(out)?;
     writeln!(out, "-- review --")?;
     write_signed_section(out, view.review.as_ref())?;
-    // One section per implementer attempt. A plan may carry several
-    // since slice 4 made `implement` repeatable, and this is the read
-    // path where that becomes visible; a plan with none still prints a
+    // One section per implementer attempt. A plan may carry several,
+    // since `implement` is repeatable; a plan with none still prints a
     // single `verification=<none>` section, so the shape an operator
     // (or a script) sees for the common case is unchanged.
     if view.implement.is_empty() {
@@ -1118,11 +1117,8 @@ mod tests {
             );
         }
 
-        /// Regression for a Codex P2 finding: when only the signature
-        /// differs (metadata byte-equal) the previous formatter
-        /// emitted two byte-identical metadata projections with no
-        /// hint as to what diverged. The `signature_sha256` /
-        /// `note_signature_sha256` lines must hash the two
+        /// When only the signature differs (metadata byte-equal), the
+        /// `signature_sha256` / `note_signature_sha256` lines must hash the two
         /// signatures separately so the operator sees the
         /// divergence at a glance — full PEM-armoured signatures
         /// would flood the page, but a digest pin is enough to
@@ -1130,7 +1126,7 @@ mod tests {
         #[test]
         fn show_signature_only_mismatch_renders_distinct_signature_digests() {
             // Note and envelope share metadata but carry distinct
-            // signature bodies — the case Codex called out.
+            // signature bodies.
             let envelope_signature = sample_signature();
             let note_signature = SshSignature::try_new(
                 "-----BEGIN SSH SIGNATURE-----\ndifferentbase64==\n-----END SSH SIGNATURE-----"
