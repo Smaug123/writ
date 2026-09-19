@@ -201,7 +201,7 @@ fn legal_stages_except_implement_never_repeat_from_the_state_they_produce() {
             if !stage.legal_predecessors().contains(&state) {
                 continue;
             }
-            // `Implement` is deliberately exempt since slice 4 — see
+            // `Implement` is deliberately exempt — see
             // `implement_is_the_one_repeatable_stage`, which pins that
             // it is the *only* exemption.
             if stage == PlanStage::Implement {
@@ -228,12 +228,10 @@ fn corrupt_denies_every_stage() {
     assert_eq!(PlanState::Corrupt.presence(), None);
 }
 
-/// The three tightenings from the plan's behaviour-change table, named
-/// one per delta so a reviewer sees each refusal asserted directly
-/// rather than inferred from a quantified property.
+/// Three refusals asserted directly rather than inferred from a
+/// quantified property.
 #[test]
-fn decide_now_requires_a_review() {
-    // `decide` used to read no precondition whatsoever.
+fn decide_requires_a_review() {
     assert!(allows(PlanState::Absent, PlanStage::Decide).is_err());
     assert!(allows(PlanState::Submitted, PlanStage::Decide).is_err());
     assert!(allows(PlanState::Reviewed, PlanStage::Decide).is_ok());
@@ -250,14 +248,13 @@ fn review_precedes_the_decision() {
 }
 
 #[test]
-fn implement_now_requires_an_accepted_verdict() {
+fn implement_requires_an_accepted_verdict() {
     assert!(allows(PlanState::Submitted, PlanStage::Implement).is_err());
     assert!(allows(PlanState::Reviewed, PlanStage::Implement).is_err());
     assert!(allows(PlanState::Rejected, PlanStage::Implement).is_err());
     assert!(allows(PlanState::Accepted, PlanStage::Implement).is_ok());
-    // Slice 4: legal from `Implemented` too. The old duplicate gate
-    // was a consequence of the relation until fan-out made repeating
-    // this stage the point — see `implement_is_the_one_repeatable_stage`.
+    // Legal from `Implemented` too: fan-out repeats this stage — see
+    // `implement_is_the_one_repeatable_stage`.
     assert!(allows(PlanState::Implemented, PlanStage::Implement).is_ok());
 }
 
@@ -299,8 +296,8 @@ fn next_stage_follows_the_chain_and_stops_at_terminals() {
     assert_eq!(PlanState::Reviewed.next_stage(), Some(PlanStage::Decide));
     assert_eq!(PlanState::Accepted.next_stage(), Some(PlanStage::Implement));
     assert_eq!(PlanState::Rejected.next_stage(), None);
-    // `Implemented` stopped being terminal in slice 4: another
-    // implementer attempt may always run, which is what fan-out is.
+    // `Implemented` is not terminal: another implementer attempt may
+    // always run, which is what fan-out is.
     // This is not "the plan is unfinished" — it is "more variants are
     // available", and no error message consults it, because every
     // stage illegal from `Implemented` is one the plan has already
@@ -449,7 +446,7 @@ fn rank_is_defined_for_every_state_on_the_progression() {
             };
             for outcome in [Decision::Accepted, Decision::Rejected] {
                 let next = derive_state(&write_note(presence, stage, outcome));
-                // Slice 4 introduced exactly one self-loop: a repeated
+                // There is exactly one self-loop: a repeated
                 // implementer attempt stays `Implemented`. Named as a
                 // pair rather than waved through as "implement is
                 // special", so any *other* move that stops advancing

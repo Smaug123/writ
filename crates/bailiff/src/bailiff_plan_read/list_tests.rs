@@ -1,4 +1,4 @@
-//! Tests for [`list_plan_ids`] and [`summarize_plan`] — slice F2's
+//! Tests for [`list_plan_ids`] and [`summarize_plan`] — the
 //! aggregate read primitives. The helpers compose over the existing
 //! `read_*_note` siblings (already covered by their own modules) so
 //! these tests focus on:
@@ -419,8 +419,3 @@ fn summarize_plan_projects_implemented_at_when_implemented() {
     );
     assert_eq!(summary.state(), PlanState::Implemented);
 }
-
-// The `PlanState::as_str` pinning test moved to
-// `bailiff_plan_state::tests::state_and_stage_strings_are_stable` in
-// slice 1: the strings are a property of the enum, not of the reader
-// that happens to produce one.

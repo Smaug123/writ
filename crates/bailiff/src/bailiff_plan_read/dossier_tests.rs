@@ -298,8 +298,7 @@ fn non_utf8_output_survives_verbatim() {
 /// reads it. The dossier shows rather than refuses — but it must not
 /// show a prefix labelled as though it were the whole thing, which is
 /// the one way this section can mislead while every signature checks
-/// out. The marker was dropped for the plan body while being carried
-/// for attempts, one line apart, until Codex review caught it.
+/// out.
 #[test]
 fn a_truncated_plan_body_keeps_its_marker() {
     let tmp = TempDir::new().unwrap();
