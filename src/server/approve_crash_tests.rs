@@ -16,7 +16,6 @@
 //! double-crash and torn-residue stretch tests (Stage 6) reuse its
 //! recovery helpers.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::test_support::{InMemorySecretStore, open_session};
@@ -27,16 +26,12 @@ use crate::core::RepoRef;
 use crate::crash_point::{CrashOutcome, CrashPlan, run_until_crash};
 use crate::fake_github::FakeGitHub;
 use crate::fake_origin::{FakeOrigin, ORIGIN_NAME, ORIGIN_OWNER};
-use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-use crate::policy::PolicyConfig;
-use crate::secret::SecretKey;
 use crate::signing::WritSigningKey;
-use crate::test_support::find_in_path;
+use crate::test_support::{broker_state, find_in_path, github_app};
 use crate::vm_git::{GitBranchName, GitCloneRepo, VmGitPushMetadata};
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 
 use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
-use crate::test_support::RSA_TEST_1_PEM as RSA_TEST_PEM;
 const INSTALLATION_ID: u64 = 999;
 pub(super) const WORLD_BRANCH: &str = "main";
 pub(super) const OPERATOR: &str = "alice";
@@ -206,41 +201,18 @@ fn build_state(
     )
     .expect("promote runtime config");
 
-    let pk = SecretKey::new("gh-app-pk").unwrap();
     let secrets = InMemorySecretStore::default();
-    secrets.put(&pk, RSA_TEST_PEM).unwrap();
-    let mut apps = BTreeMap::new();
-    apps.insert(
-        AgentKind::Claude,
-        GitHubAppConfig {
-            app_id: 42,
-            installation_id: INSTALLATION_ID,
-            installation_owner: ORIGIN_OWNER.into(),
-            private_key_secret: pk,
-            api_base: github.uri(),
-        },
-    );
-
-    Arc::new(BrokerState {
-        audit: Arc::new(AuditLog::open(audit_path).expect("file-backed audit DB opens")),
-        minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
-        secrets,
-        policy: PolicyConfig {
-            writable_repos: writable_repos.to_vec(),
-            default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: Some(Arc::new(
-            GitPushStagingStore::open(staging_path.to_path_buf()).expect("staging store opens"),
-        )),
-        notes_repo: None,
-        signing_key: Some(WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap()),
-        run_agent_spawn: None,
-        agent_run_slots: Default::default(),
-        promote_runtime: Some(Arc::new(promote_runtime)),
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    })
+    let mut apps = github_app(&secrets, AgentKind::Claude, &github.uri(), ORIGIN_OWNER);
+    apps.get_mut(&AgentKind::Claude).unwrap().installation_id = INSTALLATION_ID;
+    let mut state = broker_state(secrets, apps);
+    state.audit = Arc::new(AuditLog::open(audit_path).expect("file-backed audit DB opens"));
+    state.policy.writable_repos = writable_repos.to_vec();
+    state.staging_store = Some(Arc::new(
+        GitPushStagingStore::open(staging_path.to_path_buf()).expect("staging store opens"),
+    ));
+    state.signing_key = Some(WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap());
+    state.promote_runtime = Some(Arc::new(promote_runtime));
+    Arc::new(state)
 }
 
 /// Stage-4 oracle, part 1: the whole pipeline — real staging fetch

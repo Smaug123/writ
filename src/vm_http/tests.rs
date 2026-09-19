@@ -6,6 +6,7 @@
 //! reached via `super`.
 
 use crate::test_support::InMemorySecretStore;
+use crate::test_support::{broker_state, github_app};
 pub(super) use crate::test_support::{required_tool, shell_quote_path};
 use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::fs::PermissionsExt;
@@ -18,16 +19,12 @@ use wiremock::MockServer;
 
 use super::*;
 use crate::agent_run::AgentRunId;
-use crate::audit::AuditLog;
 use crate::core::{AgentKind, Ipv6Cidr, SessionRecord, TtlSeconds, UnixMillis};
-use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-use crate::policy::PolicyConfig;
 use crate::secret::SecretKey;
 use crate::vm_git::GUEST_IMAGE_REBUILD_COMMAND;
 use crate::vm_git::VM_GIT_CLONE_PATH;
 use crate::vm_git::{BROKER_IMAGE_REBUILD_COMMAND, VM_FLAKE_PROVISION_PATH, VM_GIT_PUSH_PATH};
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
-use std::collections::BTreeMap;
 
 /// The per-step timeout every clone test hands the service. No test asserts on
 /// it: the fake `git` is a shell script that returns at once, and the tests
@@ -61,8 +58,6 @@ pub(super) fn services_with_claude_proxy(
     }
 }
 
-use crate::test_support::RSA_TEST_1_PEM as TEST_PRIV;
-
 pub(super) fn session_for_subnet(ipv4: Ipv4Cidr) -> VmHttpSession {
     VmHttpSession::new(
         "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
@@ -90,41 +85,12 @@ pub(super) fn make_broker_state_with_extra_secrets(
     server: &MockServer,
     extra_secrets: Vec<(SecretKey, &str)>,
 ) -> Arc<BrokerState<Box<dyn SecretStore>>> {
-    let pk = SecretKey::new("gh-app-pk").unwrap();
     let store = InMemorySecretStore::default();
-    store.put(&pk, TEST_PRIV).unwrap();
     for (key, value) in extra_secrets {
         store.put(&key, value).unwrap();
     }
-    let mut apps = BTreeMap::new();
-    apps.insert(
-        AgentKind::Claude,
-        GitHubAppConfig {
-            app_id: 42,
-            installation_id: 999,
-            installation_owner: "o".into(),
-            private_key_secret: pk,
-            api_base: server.uri(),
-        },
-    );
-    Arc::new(BrokerState {
-        audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-        minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
-        secrets: Box::new(store) as Box<dyn SecretStore>,
-        policy: PolicyConfig {
-            writable_repos: vec![],
-            default_ttl: TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: None,
-        notes_repo: None,
-        signing_key: None,
-        run_agent_spawn: None,
-        agent_run_slots: Default::default(),
-        promote_runtime: None,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    })
+    let apps = github_app(&store, AgentKind::Claude, &server.uri(), "o");
+    Arc::new(broker_state(Box::new(store) as Box<dyn SecretStore>, apps))
 }
 
 pub(super) fn open_audit_session(state: &BrokerState<Box<dyn SecretStore>>, session_id: SessionId) {

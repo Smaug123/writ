@@ -6,13 +6,14 @@
 //! not pull in. Helpers are `pub(super)` so the sibling `*_tests`
 //! modules can reach them.
 
-pub(super) use crate::test_support::{InMemorySecretStore, find_in_path, required_tool_any};
+pub(super) use crate::test_support::{
+    InMemorySecretStore, broker_state, claude_broker_state, find_in_path, required_tool_any,
+};
 use std::path::PathBuf;
 
 use super::*;
 use crate::core::{AgentKind, RepoRef};
-use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
-use crate::policy::PolicyConfig;
+use crate::github::GitHubAppConfig;
 use crate::secret::{SecretKey, SecretStore};
 use std::collections::BTreeMap;
 use wiremock::MockServer;
@@ -27,39 +28,9 @@ pub(super) fn make_state(
     writable: Vec<RepoRef>,
     owner: &str,
 ) -> Arc<BrokerState<InMemorySecretStore>> {
-    let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemorySecretStore::default();
-    store.put(&pk, TEST_PRIV).unwrap();
-    let mut apps = BTreeMap::new();
-    apps.insert(
-        AgentKind::Claude,
-        GitHubAppConfig {
-            app_id: 42,
-            installation_id: 999,
-            installation_owner: owner.into(),
-            private_key_secret: pk,
-            api_base: server.uri(),
-        },
-    );
-    let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-    Arc::new(BrokerState {
-        audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-        minter,
-        secrets: store,
-        policy: PolicyConfig {
-            writable_repos: writable,
-            default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: None,
-        notes_repo: None,
-        signing_key: None,
-        run_agent_spawn: None,
-        agent_run_slots: Default::default(),
-        promote_runtime: None,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    })
+    let mut state = claude_broker_state(&server.uri(), owner);
+    state.policy.writable_repos = writable;
+    Arc::new(state)
 }
 
 pub(super) fn make_agent_registry_state(
@@ -97,25 +68,7 @@ pub(super) fn make_agent_registry_state_for_agents(
         };
         apps.insert(*agent, config);
     }
-    let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-    Arc::new(BrokerState {
-        audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-        minter,
-        secrets: store,
-        policy: PolicyConfig {
-            writable_repos: Vec::new(),
-            default_ttl: crate::core::TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: None,
-        notes_repo: None,
-        signing_key: None,
-        run_agent_spawn: None,
-        agent_run_slots: Default::default(),
-        promote_runtime: None,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    })
+    Arc::new(broker_state(store, apps))
 }
 
 /// A `BrokerState` with the whole `RunAgent` triple wired up, ready for a

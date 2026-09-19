@@ -9,11 +9,9 @@
 //! namespace, notes write, fetch refspec, envelope/reply
 //! agreement, plan-note serialisation — fails this test rather
 //! than getting caught by a downstream consumer.
-use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
-use writ::test_support::{InMemorySecretStore, find_in_path};
+use writ::test_support::{SpawnedBroker, cat_run_agent_spawn, claude_broker_state};
 
 use tokio::sync::Mutex as AsyncMutex;
 use wiremock::MockServer;
@@ -23,22 +21,14 @@ use crate::bailiff_plan_note::{
     ImplementAttempt, ImplementNote, PlanId, PlanNote, ReviewNote, plan_notes_ref,
 };
 use writ::agent_run::AgentPrompt;
-use writ::audit::AuditLog;
-use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
-use writ::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+use writ::core::{AgentKind, CapabilitySet, NotesRef, RepoRef};
 use writ::notes_repo::NotesRepo;
-use writ::policy::PolicyConfig;
 use writ::run_verify::AllowedSigners;
-use writ::secret::{SecretKey, SecretStore};
-use writ::server::{
-    BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
-};
 use writ::signing::WritSigningKey;
 use writ::writ_client::{RunAgentRequest, WritClient};
 
 use writ::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
 use writ::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
-use writ::test_support::RSA_TEST_1_PEM as TEST_PRIV;
 
 #[tokio::test]
 async fn write_plan_note_completes_after_real_broker_round_trip() {
@@ -47,58 +37,14 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
     let bailiff_repo_handle = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
     let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-    let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
-
     let github_server = MockServer::start().await;
-    let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemorySecretStore::default();
-    store.put(&pk, TEST_PRIV).unwrap();
-    let mut apps = BTreeMap::new();
-    apps.insert(
-        AgentKind::Claude,
-        GitHubAppConfig {
-            app_id: 42,
-            installation_id: 999,
-            installation_owner: "o".into(),
-            private_key_secret: pk,
-            api_base: github_server.uri(),
-        },
-    );
-    let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-
-    let state = Arc::new(BrokerState {
-        audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-        minter,
-        secrets: store,
-        policy: PolicyConfig {
-            writable_repos: vec![],
-            default_ttl: TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: None,
-        notes_repo: Some(Arc::new(writ_repo)),
-        signing_key: Some(signing_key.clone()),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: cat,
-            args: Vec::new(),
-            agent_kind: writ::core::AgentKind::Claude,
-            log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
-            timeout: None,
-        }),
-        agent_run_slots: Default::default(),
-        promote_runtime: None,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    });
-
-    let socket_dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket_path = socket_dir.path().join("writ.sock");
-    let listener = prepare_broker_listener(&socket_path).await.unwrap();
-    let broker_state = Arc::clone(&state);
-    let broker_task = tokio::spawn(async move {
-        let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-    });
+    let mut state = claude_broker_state(&github_server.uri(), "o");
+    state.notes_repo = Some(Arc::new(writ_repo));
+    state.signing_key = Some(signing_key.clone());
+    state.run_agent_spawn = Some(cat_run_agent_spawn(tmp.path()));
+    let state = Arc::new(state);
+    let broker_task = SpawnedBroker::start(Arc::clone(&state)).await;
+    let socket_path = broker_task.socket_path.clone();
 
     // --- Client request (bailiff side) --------------------------
     let prompt_text = "noop\n";
@@ -187,8 +133,7 @@ async fn write_plan_note_completes_after_real_broker_round_trip() {
     assert_eq!(note.signed_metadata, completed.signed_metadata);
     assert_eq!(note.signature, completed.signature);
 
-    broker_task.abort();
-    let _ = broker_task.await;
+    broker_task.stop().await;
 }
 
 /// Full slice-D2 handshake against a real writ broker: bailiff
@@ -206,58 +151,14 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
     let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
     let bailiff_repo_handle = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
     let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-    let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
-
     let github_server = MockServer::start().await;
-    let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemorySecretStore::default();
-    store.put(&pk, TEST_PRIV).unwrap();
-    let mut apps = BTreeMap::new();
-    apps.insert(
-        AgentKind::Claude,
-        GitHubAppConfig {
-            app_id: 42,
-            installation_id: 999,
-            installation_owner: "o".into(),
-            private_key_secret: pk,
-            api_base: github_server.uri(),
-        },
-    );
-    let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-
-    let state = Arc::new(BrokerState {
-        audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-        minter,
-        secrets: store,
-        policy: PolicyConfig {
-            writable_repos: vec![],
-            default_ttl: TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: None,
-        notes_repo: Some(Arc::new(writ_repo)),
-        signing_key: Some(signing_key.clone()),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: cat,
-            args: Vec::new(),
-            agent_kind: writ::core::AgentKind::Claude,
-            log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
-            timeout: None,
-        }),
-        agent_run_slots: Default::default(),
-        promote_runtime: None,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    });
-
-    let socket_dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket_path = socket_dir.path().join("writ.sock");
-    let listener = prepare_broker_listener(&socket_path).await.unwrap();
-    let broker_state = Arc::clone(&state);
-    let broker_task = tokio::spawn(async move {
-        let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-    });
+    let mut state = claude_broker_state(&github_server.uri(), "o");
+    state.notes_repo = Some(Arc::new(writ_repo));
+    state.signing_key = Some(signing_key.clone());
+    state.run_agent_spawn = Some(cat_run_agent_spawn(tmp.path()));
+    let state = Arc::new(state);
+    let broker_task = SpawnedBroker::start(Arc::clone(&state)).await;
+    let socket_path = broker_task.socket_path.clone();
 
     // --- Client request (bailiff side) --------------------------
     let prompt_text = "reviewer-prompt + plan body\n";
@@ -342,8 +243,7 @@ async fn write_review_note_completes_after_real_broker_round_trip() {
     assert_eq!(note.signed_metadata, completed.signed_metadata);
     assert_eq!(note.signature, completed.signature);
 
-    broker_task.abort();
-    let _ = broker_task.await;
+    broker_task.stop().await;
 }
 
 /// Full slice-E handshake against a real writ broker: bailiff
@@ -362,58 +262,14 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
     let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
     let bailiff_repo_handle = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
     let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-    let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
-
     let github_server = MockServer::start().await;
-    let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemorySecretStore::default();
-    store.put(&pk, TEST_PRIV).unwrap();
-    let mut apps = BTreeMap::new();
-    apps.insert(
-        AgentKind::Claude,
-        GitHubAppConfig {
-            app_id: 42,
-            installation_id: 999,
-            installation_owner: "o".into(),
-            private_key_secret: pk,
-            api_base: github_server.uri(),
-        },
-    );
-    let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-
-    let state = Arc::new(BrokerState {
-        audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-        minter,
-        secrets: store,
-        policy: PolicyConfig {
-            writable_repos: vec![],
-            default_ttl: TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: None,
-        notes_repo: Some(Arc::new(writ_repo)),
-        signing_key: Some(signing_key.clone()),
-        run_agent_spawn: Some(RunAgentSpawnConfig {
-            command: cat,
-            args: Vec::new(),
-            agent_kind: writ::core::AgentKind::Claude,
-            log_root: writ::config::AgentRunLogRoot::check(tmp.path().join("agent-runs")).unwrap(),
-            timeout: None,
-        }),
-        agent_run_slots: Default::default(),
-        promote_runtime: None,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: writ::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    });
-
-    let socket_dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket_path = socket_dir.path().join("writ.sock");
-    let listener = prepare_broker_listener(&socket_path).await.unwrap();
-    let broker_state = Arc::clone(&state);
-    let broker_task = tokio::spawn(async move {
-        let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-    });
+    let mut state = claude_broker_state(&github_server.uri(), "o");
+    state.notes_repo = Some(Arc::new(writ_repo));
+    state.signing_key = Some(signing_key.clone());
+    state.run_agent_spawn = Some(cat_run_agent_spawn(tmp.path()));
+    let state = Arc::new(state);
+    let broker_task = SpawnedBroker::start(Arc::clone(&state)).await;
+    let socket_path = broker_task.socket_path.clone();
 
     // --- Client request (bailiff side) --------------------------
     let prompt_text = "implementer-prompt + plan body\n";
@@ -499,6 +355,5 @@ async fn write_implement_note_completes_after_real_broker_round_trip() {
     assert_eq!(note.signed_metadata, completed.signed_metadata);
     assert_eq!(note.signature, completed.signature);
 
-    broker_task.abort();
-    let _ = broker_task.await;
+    broker_task.stop().await;
 }
