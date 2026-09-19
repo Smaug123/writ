@@ -4,6 +4,7 @@
 //! file permissions.
 use super::test_support::*;
 use super::*;
+use crate::test_support::write_executable_script;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -21,16 +22,6 @@ fn start_process_error() -> StartFailure {
         args: "network create".into(),
         source: std::io::Error::from(std::io::ErrorKind::NotFound),
     })
-}
-
-#[cfg(unix)]
-fn write_executable_script(dir: &Path, name: &str, contents: &str) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(&path, contents).unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
 }
 
 #[test]

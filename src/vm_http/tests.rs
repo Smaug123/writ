@@ -5,7 +5,8 @@
 //! (`dispatch_vm_http_head`, `DispatchedTestResponse`) stay in `mod.rs` and are
 //! reached via `super`.
 
-use std::collections::HashMap;
+use crate::test_support::InMemorySecretStore;
+pub(super) use crate::test_support::{required_tool, shell_quote_path};
 use std::net::{Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
@@ -21,7 +22,7 @@ use crate::audit::AuditLog;
 use crate::core::{AgentKind, Ipv6Cidr, SessionRecord, TtlSeconds, UnixMillis};
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
 use crate::policy::PolicyConfig;
-use crate::secret::{SecretError, SecretKey};
+use crate::secret::SecretKey;
 use crate::vm_git::GUEST_IMAGE_REBUILD_COMMAND;
 use crate::vm_git::VM_GIT_CLONE_PATH;
 use crate::vm_git::{BROKER_IMAGE_REBUILD_COMMAND, VM_FLAKE_PROVISION_PATH, VM_GIT_PUSH_PATH};
@@ -60,29 +61,7 @@ pub(super) fn services_with_claude_proxy(
     }
 }
 
-#[derive(Default)]
-struct InMemStore(Mutex<HashMap<String, String>>);
-
-impl SecretStore for InMemStore {
-    fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-        Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-    }
-
-    fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(key.as_str().to_string(), value.to_string());
-        Ok(())
-    }
-
-    fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-        self.0.lock().unwrap().remove(key.as_str());
-        Ok(())
-    }
-}
-
-const TEST_PRIV: &str = include_str!("../../tests/fixtures/rsa_test_1.pem");
+use crate::test_support::RSA_TEST_1_PEM as TEST_PRIV;
 
 pub(super) fn session_for_subnet(ipv4: Ipv4Cidr) -> VmHttpSession {
     VmHttpSession::new(
@@ -112,7 +91,7 @@ pub(super) fn make_broker_state_with_extra_secrets(
     extra_secrets: Vec<(SecretKey, &str)>,
 ) -> Arc<BrokerState<Box<dyn SecretStore>>> {
     let pk = SecretKey::new("gh-app-pk").unwrap();
-    let store = InMemStore::default();
+    let store = InMemorySecretStore::default();
     store.put(&pk, TEST_PRIV).unwrap();
     for (key, value) in extra_secrets {
         store.put(&key, value).unwrap();
@@ -234,9 +213,9 @@ pub(super) fn write_fake_git(dir: &Path) -> PathBuf {
 
 pub(super) fn write_fake_git_with_bundle_epilogue(dir: &Path, bundle_epilogue: &str) -> PathBuf {
     let git = dir.join("fake-git.sh");
-    let log_path = shell_single_quote(&dir.join("fake-git.log"));
-    let shell = required_test_tool("sh");
-    let mkdir = shell_single_quote(&required_test_tool("mkdir"));
+    let log_path = shell_quote_path(&dir.join("fake-git.log"));
+    let shell = required_tool("sh");
+    let mkdir = shell_quote_path(&required_tool("mkdir"));
     let script = format!(
         r#"#!{shell}
 set -eu
@@ -290,35 +269,9 @@ esac
     git
 }
 
-pub(super) fn shell_single_quote(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    format!("'{}'", raw.replace('\'', "'\\''"))
-}
-
-pub(super) fn required_test_tool(name: &str) -> PathBuf {
-    let path = std::env::var_os("PATH")
-        .unwrap_or_else(|| panic!("PATH must contain {name} for vm_http tests"));
-    for dir in std::env::split_paths(&path) {
-        let candidate = if dir.is_absolute() {
-            dir.join(name)
-        } else {
-            std::env::current_dir().unwrap().join(dir).join(name)
-        };
-        match std::fs::metadata(&candidate) {
-            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
-                return candidate;
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => panic!("failed to inspect {}: {err}", candidate.display()),
-        }
-    }
-    panic!("required test tool {name} not found on PATH");
-}
-
 fn write_fake_askpass(dir: &Path) -> PathBuf {
     let askpass = dir.join("fake-askpass.sh");
-    let shell = required_test_tool("sh");
+    let shell = required_tool("sh");
     std::fs::write(&askpass, format!("#!{}\nexit 1\n", shell.display())).unwrap();
     std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
     askpass
@@ -1314,7 +1267,7 @@ async fn vm_http_server_exits_when_shutdown_signal_set() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires host Nix; proves real Nix netrc auth against the VM HTTP cache route"]
 async fn nix_cli_can_authenticate_to_vm_http_nix_cache_route_with_netrc() {
-    let _nix = required_test_tool("nix");
+    let _nix = required_tool("nix");
     let temp = tempfile::tempdir().unwrap();
     let netrc = temp.path().join("netrc");
     let token = token();
@@ -1579,7 +1532,7 @@ mod brokered_route_audit_oracle {
 
     impl AuditOracleBroker {
         async fn build() -> Self {
-            let git_program = required_test_tool("git");
+            let git_program = required_tool("git");
             let temp = tempfile::tempdir().unwrap();
 
             // Upstreams for the two model proxies. Plain JSON, so both responses

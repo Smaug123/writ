@@ -661,6 +661,7 @@ fn scan_cache(dir: &Path) -> std::io::Result<(u64, ByteSize)> {
 mod tests {
     use super::*;
     use crate::flake_fixtures::fake_nix_failing;
+    use crate::test_support::find_in_path;
 
     /// The audit outcome a performed run describes, as the DAO would see it.
     /// Every run must describe exactly one, and it must agree with the ordinary
@@ -697,15 +698,6 @@ mod tests {
         );
     }
 
-    /// Locate `nix` on PATH. Returns `None` (test skips) when nix is absent, so
-    /// the suite still runs on machines without nix; CI has nix.
-    fn nix_program() -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("nix"))
-            .find(|candidate| candidate.is_file())
-    }
-
     /// A no-input flake: the only network-free fixture, since the classifier
     /// (correctly) rejects local `path`/`file://` inputs. `nix flake archive`
     /// still copies the flake's own source path into the cache.
@@ -739,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn provisions_a_no_input_flake_and_describes_a_success_outcome() {
-        let Some(nix) = nix_program() else {
+        let Some(nix) = find_in_path("nix") else {
             eprintln!("skipping: nix not found on PATH");
             return;
         };
@@ -771,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_budget_archive_fails_closed_and_describes_a_failure_outcome() {
-        let Some(nix) = nix_program() else {
+        let Some(nix) = find_in_path("nix") else {
             eprintln!("skipping: nix not found on PATH");
             return;
         };
@@ -842,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn reprovisioning_merges_into_a_shared_cache_preserving_other_entries() {
-        let Some(nix) = nix_program() else {
+        let Some(nix) = find_in_path("nix") else {
             eprintln!("skipping: nix not found on PATH");
             return;
         };

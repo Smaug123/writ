@@ -358,10 +358,11 @@ mod end_to_end_tests {
     //!   `allowed_signers`, the plan-note write fails *and* the
     //!   session still closes — confirming the cleanup behaviour the
     //!   error docstrings promise.
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
+    use writ::test_support::{InMemorySecretStore, find_in_path};
 
     use wiremock::MockServer;
 
@@ -375,44 +376,17 @@ mod end_to_end_tests {
     use writ::notes_repo::NotesRepo;
     use writ::policy::PolicyConfig;
     use writ::run_verify::AllowedSigners;
-    use writ::secret::{SecretError, SecretKey, SecretStore};
+    use writ::secret::{SecretKey, SecretStore};
     use writ::server::{
         BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
     };
     use writ::signing::WritSigningKey;
     use writ::writ_client::WritClient;
 
-    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const OTHER_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing_other.key.pub");
-    const TEST_PRIV: &str = include_str!("../tests/fixtures/rsa_test_1.pem");
-
-    #[derive(Default)]
-    struct InMemStore(Mutex<HashMap<String, String>>);
-    impl SecretStore for InMemStore {
-        fn get(&self, key: &SecretKey) -> Result<Option<String>, SecretError> {
-            Ok(self.0.lock().unwrap().get(key.as_str()).cloned())
-        }
-        fn put(&self, key: &SecretKey, value: &str) -> Result<(), SecretError> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.as_str().to_string(), value.to_string());
-            Ok(())
-        }
-        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-            self.0.lock().unwrap().remove(key.as_str());
-            Ok(())
-        }
-    }
-
-    fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|p| p.join(name))
-                .find(|p| p.is_file())
-        })
-    }
+    use writ::test_support::ED25519_OTHER_PUB as OTHER_PUB;
+    use writ::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
+    use writ::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
+    use writ::test_support::RSA_TEST_1_PEM as TEST_PRIV;
 
     /// Build a broker, return (state, socket path, broker join
     /// handle, tempdir, writ repo path). Reused by the happy-path
@@ -421,7 +395,7 @@ mod end_to_end_tests {
         tmp: &tempfile::TempDir,
         signing_key: WritSigningKey,
     ) -> (
-        Arc<BrokerState<InMemStore>>,
+        Arc<BrokerState<InMemorySecretStore>>,
         std::path::PathBuf,
         tokio::task::JoinHandle<()>,
     ) {
@@ -429,7 +403,7 @@ mod end_to_end_tests {
         let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
         let github_server = MockServer::start().await;
         let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemStore::default();
+        let store = InMemorySecretStore::default();
         store.put(&pk, TEST_PRIV).unwrap();
         let mut apps = BTreeMap::new();
         apps.insert(
@@ -783,7 +757,7 @@ mod session_mismatch_tests {
     use writ::run_verify::AllowedSigners;
     use writ::vm_git::GitObjectId;
 
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
+    use writ::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
 
     /// One-shot stub: each accepted connection reads one
     /// [`ClientMessage`], records it, then writes the next queued

@@ -315,9 +315,9 @@ mod tests {
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
     use crate::signing::WritSigningKey;
 
-    const SIGNING_PEM: &str = include_str!("../tests/fixtures/ed25519_test_signing.key");
-    const SIGNING_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing.key.pub");
-    const OTHER_PUB: &str = include_str!("../tests/fixtures/ed25519_test_signing_other.key.pub");
+    use crate::test_support::ED25519_OTHER_PUB as OTHER_PUB;
+    use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
+    use crate::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
 
     /// Build a freshly-signed envelope under `signing_key`. The output
     /// envelope is empty and the metadata fields are filled with stable

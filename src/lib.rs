@@ -104,6 +104,8 @@ pub mod secret;
 pub mod server;
 #[cfg(feature = "host")]
 pub mod signing;
+#[cfg(all(feature = "host", any(test, feature = "test-support")))]
+pub mod test_support;
 pub use writ_core::telemetry;
 #[cfg(feature = "host")]
 pub mod ui_http;

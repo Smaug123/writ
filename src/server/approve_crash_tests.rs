@@ -19,23 +19,24 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::test_support::{InMemStore, open_session};
+use super::test_support::{InMemorySecretStore, open_session};
 use super::*;
 use crate::audit::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState, GitPushResolution};
 use crate::core::AgentKind;
 use crate::core::RepoRef;
 use crate::crash_point::{CrashOutcome, CrashPlan, run_until_crash};
 use crate::fake_github::FakeGitHub;
-use crate::fake_origin::{FakeOrigin, ORIGIN_NAME, ORIGIN_OWNER, maybe_git};
+use crate::fake_origin::{FakeOrigin, ORIGIN_NAME, ORIGIN_OWNER};
 use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
 use crate::policy::PolicyConfig;
 use crate::secret::SecretKey;
 use crate::signing::WritSigningKey;
+use crate::test_support::find_in_path;
 use crate::vm_git::{GitBranchName, GitCloneRepo, VmGitPushMetadata};
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 
-const RSA_TEST_PEM: &str = include_str!("../../tests/fixtures/rsa_test_1.pem");
-const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
+use crate::test_support::RSA_TEST_1_PEM as RSA_TEST_PEM;
 const INSTALLATION_ID: u64 = 999;
 pub(super) const WORLD_BRANCH: &str = "main";
 pub(super) const OPERATOR: &str = "alice";
@@ -43,7 +44,7 @@ pub(super) const OPERATOR: &str = "alice";
 /// The real broker wired to the fakes, with one staged push ready to
 /// approve. Fields are the handles the sweep's oracle needs.
 pub(super) struct ApproveWorld {
-    pub(super) state: Arc<BrokerState<InMemStore>>,
+    pub(super) state: Arc<BrokerState<InMemorySecretStore>>,
     pub(super) github: FakeGitHub,
     pub(super) origin: FakeOrigin,
     pub(super) request_id: RequestId,
@@ -171,7 +172,7 @@ impl ApproveWorld {
     /// stays alive in the world (as a crashed process's kernel
     /// resources would not, but its *disk* state is what matters and
     /// that is shared by path).
-    pub(super) fn rebooted_state(&self) -> Arc<BrokerState<InMemStore>> {
+    pub(super) fn rebooted_state(&self) -> Arc<BrokerState<InMemorySecretStore>> {
         build_state(
             &self.audit_path,
             &self.staging_path,
@@ -190,8 +191,8 @@ fn build_state(
     github: &FakeGitHub,
     origin: &FakeOrigin,
     writable_repos: &[RepoRef],
-) -> Arc<BrokerState<InMemStore>> {
-    let git = maybe_git().expect("callers hold a FakeOrigin, so git exists");
+) -> Arc<BrokerState<InMemorySecretStore>> {
+    let git = find_in_path("git").expect("callers hold a FakeOrigin, so git exists");
     let promote_runtime = crate::git_push_promote::PromoteRuntimeConfig::new(
         git,
         origin.clone_base_url(),
@@ -206,7 +207,7 @@ fn build_state(
     .expect("promote runtime config");
 
     let pk = SecretKey::new("gh-app-pk").unwrap();
-    let secrets = InMemStore::default();
+    let secrets = InMemorySecretStore::default();
     secrets.put(&pk, RSA_TEST_PEM).unwrap();
     let mut apps = BTreeMap::new();
     apps.insert(
@@ -844,7 +845,7 @@ async fn crash_sweep_reject_is_permitted_exactly_when_the_patch_provably_never_f
 fn double_crash_sampled_pairs_recover_to_one_approved_publish() {
     use proptest::test_runner::{Config, TestRunner};
 
-    if maybe_git().is_none() {
+    if find_in_path("git").is_none() {
         eprintln!("skipping: `git` not on PATH");
         return;
     }

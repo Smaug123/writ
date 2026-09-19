@@ -5,6 +5,7 @@
 //! explicit imports add what the parent does not pull in.
 
 use super::*;
+pub(super) use crate::test_support::{required_tool, shell_quote_path, write_executable_script};
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -97,22 +98,6 @@ pub(super) async fn mount_commit_create(
 /// letting a wedged child hang the suite indefinitely.
 pub(super) const TEST_GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(super) fn required_git() -> PathBuf {
-    let path = std::env::var_os("PATH")
-        .unwrap_or_else(|| panic!("PATH must contain `git` for walker tests"));
-    for dir in std::env::split_paths(&path) {
-        let candidate = if dir.is_absolute() {
-            dir.join("git")
-        } else {
-            std::env::current_dir().unwrap().join(dir).join("git")
-        };
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("`git` not found on PATH for walker tests");
-}
-
 /// Spawn `git -C <repo> <args>` under the same hardened env the
 /// production planner uses, plus pinned author/committer
 /// identity and date so commit SHAs are deterministic across
@@ -155,7 +140,7 @@ pub(super) fn rev_parse(git: &Path, repo: &Path, rev: &str) -> GitObjectId {
 pub(super) fn init_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().to_path_buf();
-    let git = required_git();
+    let git = required_tool("git");
     let init = writ_core::process_spawn::output(
         apply_clean_git_config(
             Command::new(&git)

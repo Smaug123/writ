@@ -57,7 +57,7 @@ fn outcome_for_streams(
     }
 }
 
-const TEST_SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+use crate::test_support::ED25519_SIGNING_PEM as TEST_SIGNING_PEM;
 
 /// The materializer reads stdout/stderr files written by the guest,
 /// hashes the envelope, signs the metadata, and returns a

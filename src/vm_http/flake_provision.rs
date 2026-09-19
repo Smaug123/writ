@@ -502,12 +502,12 @@ mod tests {
     use crate::audit::FlakeProvisionAuditOutcome;
     use crate::core::{Ipv4Cidr, RepoRef, UnixMillis};
     use crate::flake_fixtures::{
-        NO_INPUT_LOCK, SSH_INPUT_LOCK, fake_nix_archiving, fake_nix_failing,
-        flake_mirror_with_lock, tool_on_path,
+        NO_INPUT_LOCK, SSH_INPUT_LOCK, fake_nix_archiving, fake_nix_failing, flake_mirror_with_lock,
     };
     use crate::flake_lock::{FlakeLockError, FlakeProvisionBounds};
     use crate::flake_materialize::MaterializeError;
     use crate::secret::SecretStore;
+    use crate::test_support::find_in_path;
     use crate::vm_git::GitCloneRepo;
     use crate::vm_git_mirror_cache::MirrorCacheKey;
 
@@ -764,7 +764,7 @@ mod tests {
     /// the invariant this whole series exists to make structural.
     #[tokio::test]
     async fn provisioned_flake_records_a_complete_audit_pair() {
-        let Some(git_program) = tool_on_path("git") else {
+        let Some(git_program) = find_in_path("git") else {
             eprintln!("skipping: git must be on PATH");
             return;
         };
@@ -820,7 +820,7 @@ mod tests {
     /// effect is recorded, not dropped.
     #[tokio::test]
     async fn failed_provision_records_a_failure_outcome() {
-        let Some(git_program) = tool_on_path("git") else {
+        let Some(git_program) = find_in_path("git") else {
             eprintln!("skipping: git must be on PATH");
             return;
         };
@@ -865,7 +865,7 @@ mod tests {
     /// reject-before-begin path, with real git work having already happened.
     #[tokio::test]
     async fn unprovisionable_lock_is_refused_before_any_audit_row() {
-        let Some(git_program) = tool_on_path("git") else {
+        let Some(git_program) = find_in_path("git") else {
             eprintln!("skipping: git must be on PATH");
             return;
         };

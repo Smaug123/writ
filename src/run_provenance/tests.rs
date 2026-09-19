@@ -137,7 +137,7 @@ fn matching_pair() -> impl Strategy<Value = (SignedRunMetadata, AuditedRun)> {
 /// Any fingerprint; `cross_check` does not compare it (the shell verifies the
 /// signature instead), so its value is immaterial here.
 fn fingerprint() -> crate::core::SshKeyFingerprint {
-    const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+    use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
     crate::signing::WritSigningKey::from_openssh_pem(SIGNING_PEM)
         .expect("the fixture key parses")
         .fingerprint()

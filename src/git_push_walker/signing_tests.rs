@@ -12,14 +12,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Test fixture: parse the in-tree Ed25519 signing key so the
 /// walker tests can drive the `Some(&key)` path.
 fn load_test_signing_key() -> WritSigningKey {
-    const PRIVATE_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
+    use crate::test_support::ED25519_SIGNING_PEM as PRIVATE_PEM;
     WritSigningKey::from_openssh_pem(PRIVATE_PEM).expect("fixture key parses")
 }
 
 /// Test fixture: matching public key for verifying SSHSIG output
 /// the walker generated.
 fn load_test_public_key() -> ssh_key::PublicKey {
-    const PUBLIC_OPENSSH: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key.pub");
+    use crate::test_support::ED25519_SIGNING_PUB as PUBLIC_OPENSSH;
     ssh_key::PublicKey::from_openssh(PUBLIC_OPENSSH).expect("fixture public key parses")
 }
 

@@ -16,13 +16,10 @@ use writ::protocol::SignedRunMetadata;
 use writ::run_envelope::{OutputEnvelope, SignedRunEnvelope};
 use writ::signing::WritSigningKey;
 
-pub(super) const SIGNING_PEM: &str = include_str!("../../tests/fixtures/ed25519_test_signing.key");
-pub(super) const SIGNING_PUB: &str =
-    include_str!("../../tests/fixtures/ed25519_test_signing.key.pub");
-pub(super) const OTHER_PEM: &str =
-    include_str!("../../tests/fixtures/ed25519_test_signing_other.key");
-pub(super) const OTHER_PUB: &str =
-    include_str!("../../tests/fixtures/ed25519_test_signing_other.key.pub");
+pub(super) use writ::test_support::ED25519_OTHER_PEM as OTHER_PEM;
+pub(super) use writ::test_support::ED25519_OTHER_PUB as OTHER_PUB;
+pub(super) use writ::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
+pub(super) use writ::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
 
 /// Bailiff's local notes ref for writ's per-run signed-output notes.
 /// Spelled out as a literal here (rather than reusing the production

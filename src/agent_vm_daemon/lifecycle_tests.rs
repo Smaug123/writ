@@ -395,9 +395,9 @@ fn write_vm_broker_fake_tool(dir: &Path, args_log: &Path, env_log: &Path) -> std
          exit 0; fi\n\
          if [ \"$1\" = exec ]; then case \"${{5:-}}\" in *bootstrap-failed*) printf 'ok' ;; esac; fi\n\
          exit 0\n",
-        args_log = shell_quote(args_log),
-        env_log = shell_quote(env_log),
-        env_path = shell_quote(&dir.join("env-path.log")),
+        args_log = shell_quote_path(args_log),
+        env_log = shell_quote_path(env_log),
+        env_path = shell_quote_path(&dir.join("env-path.log")),
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -1897,7 +1897,7 @@ async fn workspace_bootstrap_wait_preserves_tail_of_large_failure() {
 
 /// A state whose agent-run bound is exactly one, so a single session exhausts it
 /// and the slot's whereabouts are unambiguous.
-fn state_with_one_run_slot(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
+fn state_with_one_run_slot(audit: AuditLog) -> Arc<BrokerState<InMemorySecretStore>> {
     let mut state = make_state_with_audit(audit);
     let inner = Arc::get_mut(&mut state).expect("fresh state Arc is unshared");
     inner.agent_run_slots = crate::server::AgentRunSlots::new(
@@ -2075,7 +2075,9 @@ async fn a_refused_agent_run_start_registers_no_session_lock() {
 /// Small on purpose. Both counts are then unambiguous — a third `enqueue` is
 /// refused — so a test can say "the cancelled run gave its admission back" and
 /// mean it, rather than observing a number 64 away from anything that matters.
-fn state_with_one_run_slot_and_one_queue_place(audit: AuditLog) -> Arc<BrokerState<InMemStore>> {
+fn state_with_one_run_slot_and_one_queue_place(
+    audit: AuditLog,
+) -> Arc<BrokerState<InMemorySecretStore>> {
     let mut state = make_state_with_audit(audit);
     let inner = Arc::get_mut(&mut state).expect("fresh state Arc is unshared");
     inner.agent_run_slots = crate::server::AgentRunSlots::new(
@@ -2489,8 +2491,8 @@ async fn dropping_an_accepted_run_gives_back_everything_it_took() {
 async fn a_dispatched_start_boots_a_vm_only_once_its_reply_is_begun() {
     async fn dispatch_a_start(
         daemon: &Arc<AgentVmDaemon>,
-        state: &Arc<BrokerState<InMemStore>>,
-    ) -> crate::server::Dispatched<InMemStore> {
+        state: &Arc<BrokerState<InMemorySecretStore>>,
+    ) -> crate::server::Dispatched<InMemorySecretStore> {
         crate::server::dispatch_message_with_agent_vm(
             crate::protocol::ClientMessage::StartAgentRun {
                 label: Some("deferred".into()),

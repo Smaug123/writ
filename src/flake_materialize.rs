@@ -159,17 +159,7 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
 mod tests {
 
     use super::*;
-
-    fn git_on_path() -> PathBuf {
-        let path = std::env::var_os("PATH").expect("PATH must be set for git tests");
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("git");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-        panic!("git must be on PATH for flake_materialize tests");
-    }
+    use crate::test_support::required_tool;
 
     fn git(program: &Path, args: &[&str], cwd: &Path) {
         crate::flake_fixtures::git(program, args, cwd)
@@ -209,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_checks_out_the_flake_then_cleans_up_on_drop() {
-        let git_program = git_on_path();
+        let git_program = required_tool("git");
         let tmp = tempfile::tempdir().unwrap();
         let (mirror, rev) = fixture_mirror(&git_program, tmp.path());
         let scratch = tmp.path().join("scratch");
@@ -244,7 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_tree_survives_mirror_deletion() {
-        let git_program = git_on_path();
+        let git_program = required_tool("git");
         let tmp = tempfile::tempdir().unwrap();
         let (mirror, rev) = fixture_mirror(&git_program, tmp.path());
         let scratch = tmp.path().join("scratch");
@@ -287,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn materialize_creates_an_owner_only_scratch_root() {
         use std::os::unix::fs::PermissionsExt;
-        let git_program = git_on_path();
+        let git_program = required_tool("git");
         let tmp = tempfile::tempdir().unwrap();
         let (mirror, rev) = fixture_mirror(&git_program, tmp.path());
         let scratch = tmp.path().join("nested/scratch");
@@ -308,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_rejects_a_relative_scratch_root() {
-        let git_program = git_on_path();
+        let git_program = required_tool("git");
         let tmp = tempfile::tempdir().unwrap();
         let (mirror, rev) = fixture_mirror(&git_program, tmp.path());
 
@@ -332,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_fails_for_an_unknown_rev() {
-        let git_program = git_on_path();
+        let git_program = required_tool("git");
         let tmp = tempfile::tempdir().unwrap();
         let (mirror, _rev) = fixture_mirror(&git_program, tmp.path());
         let scratch = tmp.path().join("scratch");

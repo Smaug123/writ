@@ -610,60 +610,6 @@ async fn fast_forward_plan_seeds_replay_commits_end_to_end() {
 
 // ----- subprocess-timeout probe -----
 
-/// Create an executable file at `dir/name` containing `body`,
-/// chmod 0o755. Returns the absolute path. Used to inject a
-/// shell-script stand-in for `git` into the planner so we can
-/// exercise failure paths (timeout) without a real git
-/// subprocess.
-fn write_executable_probe(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join(name);
-    let mut file = std::fs::File::create(&path).expect("probe file create");
-    file.write_all(body.as_bytes()).expect("probe body write");
-    drop(file);
-    let mut perms = std::fs::metadata(&path).expect("probe stat").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("probe chmod");
-    path
-}
-
-/// Locate an executable on the test runner's `PATH` without
-/// resolving symlinks. Mirrors `resolve_program_for_clean_env` but
-/// returns the caller-visible path so the basename survives into
-/// `argv[0]` after `execve` — required on Nix where coreutils is
-/// a multi-call binary dispatched by `basename(argv[0])`.
-fn locate_on_path(name: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH").expect("PATH must be set in tests");
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        match std::fs::metadata(&candidate) {
-            Ok(meta) if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 => {
-                return candidate;
-            }
-            _ => {}
-        }
-    }
-    panic!("required test tool {name} not found on PATH");
-}
-
-/// Shell-quote a path so it embeds safely inside a script body.
-fn shell_quote(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let mut quoted = String::with_capacity(raw.len() + 2);
-    quoted.push('\'');
-    for ch in raw.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
 /// When the rev-list subprocess does not exit before the
 /// configured timeout, the planner surfaces it as
 /// `Git("...timed out...")` rather than blocking the orchestrator
@@ -680,14 +626,14 @@ fn shell_quote(path: &Path) -> String {
 async fn fast_forward_plan_surfaces_timeout_when_subprocess_stalls() {
     let dir = tempfile::tempdir().unwrap();
     let staging = dir.path().to_path_buf();
-    let sleep_bin = locate_on_path("sleep");
+    let sleep_bin = required_tool("sleep");
     // argv layout under the planner: `-C <staging> <subcommand> ...`.
     // After `shift 2`, `$1` is the git subcommand.
     let script = format!(
         "#!/bin/sh\nshift 2\nif [ \"$1\" = rev-parse ]; then\n  echo false\n  exit 0\nfi\nexec {sleep} 5\n",
-        sleep = shell_quote(&sleep_bin),
+        sleep = shell_quote_path(&sleep_bin),
     );
-    let probe = write_executable_probe(dir.path(), "git-sleep", &script);
+    let probe = write_executable_script(dir.path(), "git-sleep", &script);
     let bundle_tip = sample_object_id('a');
     let expected = sample_object_id('b');
     let short_timeout = Duration::from_millis(150);
