@@ -7,29 +7,14 @@
 //! request-row insert, then the matching outcome-row insert — so no effect can be
 //! recorded with only one half of the pair.
 //!
-//! The public surface is exactly three operations, and every one writes *both
-//! halves or refuses*:
+//! The public surface is two operations, and each writes *both halves or
+//! refuses*:
 //! - [`AuditLog::begin_effect`] records the request row and returns a
 //!   [`RecordedRequest`] guard that must be discharged with
 //!   [`RecordedRequest::complete`] (the two-phase path: request row durable
 //!   before the effect, outcome row after);
 //! - [`AuditLog::record_effect_coalesced`] writes both rows in one transaction
 //!   (the authority-free single-fsync path, e.g. the Nix-cache serve).
-//!
-//! This is the storage half of the "complete by construction" work
-//! (`docs/plans/2026-07-18-brokered-effect-audit-enforcement.md`); the VM-HTTP
-//! driver that makes every effect handler flow through it is a later stage.
-
-// The two-phase guard (`begin_effect` / `RecordedRequest` / `complete`) and the
-// coalesced writer are now `pub`, consumed by the VM-HTTP `broker_effect` driver
-// in the `writ` crate. The `allow(dead_code)` stays: the flake-provision and
-// git-push `EffectAuditTable` markers are `pub(crate)` and, until their own
-// driver ports land, are only ever named as type arguments (never constructed),
-// which the dead-code pass flags as "never constructed". Exempting the trait
-// here exempts its impls' marker types, same as when the guard itself was
-// crate-internal.
-#![allow(dead_code)]
-
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -429,19 +414,30 @@ impl AuditLog {
         row: &T::RequestRow<'_>,
     ) -> Result<RecordedRequest<T>, AuditError> {
         let key = T::request_key(row);
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            check_session_open(&tx, T::session_id(row))?;
-            T::insert_request(&tx, row)?;
-            tx.commit()?;
-            Ok(())
-        })?;
+        self.record_effect_request::<T>(row)?;
         Ok(RecordedRequest {
             audit: Arc::clone(self),
             key,
             discharged: false,
             claim: None,
             _table: PhantomData,
+        })
+    }
+
+    /// The request half of [`begin_effect`](Self::begin_effect): the
+    /// session-open check and the request-row insert, in one committed
+    /// transaction. Private so the only production route to a request row is
+    /// the guard.
+    fn record_effect_request<T: EffectAuditTable>(
+        &self,
+        row: &T::RequestRow<'_>,
+    ) -> Result<(), AuditError> {
+        self.with_conn_mut(|c| {
+            let tx = c.transaction()?;
+            check_session_open(&tx, T::session_id(row))?;
+            T::insert_request(&tx, row)?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -575,6 +571,30 @@ impl AuditLog {
             tx.commit()?;
             Ok(())
         })
+    }
+}
+
+/// The guard's two halves, exposed to this crate's tests only.
+///
+/// Every production write goes through [`AuditLog::begin_effect`] +
+/// [`RecordedRequest::complete`] or [`AuditLog::record_effect_coalesced`]. Tests
+/// need the halves on their own for two things: seeding an *unpaired* row to
+/// prove the boot-time scan and the audit-pair oracle catch one, and asserting a
+/// single row's own invariants (a DAO's validation) without a guard in the way.
+#[cfg(test)]
+impl AuditLog {
+    pub(crate) fn seed_effect_request<T: EffectAuditTable>(
+        &self,
+        row: &T::RequestRow<'_>,
+    ) -> Result<(), AuditError> {
+        self.record_effect_request::<T>(row)
+    }
+
+    pub(crate) fn seed_effect_outcome<T: EffectAuditTable>(
+        &self,
+        row: &T::OutcomeRow<'_>,
+    ) -> Result<(), AuditError> {
+        self.record_effect_outcome::<T>(row)
     }
 }
 
