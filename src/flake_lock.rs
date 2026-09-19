@@ -44,11 +44,10 @@ use serde::Deserialize;
 /// rejected rather than parsed on a guess.
 const SUPPORTED_LOCK_VERSIONS: &[u64] = &[5, 6, 7];
 
-/// A parsed, structurally-valid `flake.lock`: its version and the classified
-/// transitive input graph (every node except the root).
+/// A parsed, structurally-valid `flake.lock` of a supported version: the
+/// classified transitive input graph (every node except the root).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlakeLock {
-    version: u64,
     inputs: Vec<FlakeLockInput>,
 }
 
@@ -229,11 +228,7 @@ impl FlakeLock {
             });
         }
 
-        Ok(Self { version, inputs })
-    }
-
-    pub fn version(&self) -> u64 {
-        self.version
+        Ok(Self { inputs })
     }
 
     pub fn inputs(&self) -> &[FlakeLockInput] {
@@ -601,12 +596,6 @@ impl FlakeProvisionPlan {
         self.bounds
     }
 
-    /// The `file://` substituter URL of the final cache (the published
-    /// destination the guest substitutes from).
-    pub fn cache_file_url(&self) -> String {
-        file_url(&self.cache_dir)
-    }
-
     /// The argv (excluding the program) for `nix flake archive`, targeting
     /// `archive_to` via `--to`.
     ///
@@ -716,7 +705,6 @@ mod tests {
             ],
         );
         let lock = parse_json(&value).unwrap();
-        assert_eq!(lock.version(), 7);
         assert_eq!(lock.input_count(), 3);
         for input in lock.inputs() {
             assert!(
@@ -1055,7 +1043,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.input_count(), 1);
-        assert_eq!(plan.cache_file_url(), "file:///cache/flake");
         // `--to` targets the supplied (staging) dir, not the final cache_dir.
         let args: Vec<String> = plan
             .nix_archive_args(Path::new("/stage/dir"))
@@ -1093,12 +1080,6 @@ mod tests {
             &lock,
         )
         .unwrap();
-        // A space-bearing parent (`Application Support`) must yield a valid,
-        // percent-encoded file URL nix can parse — not a raw space.
-        assert_eq!(
-            plan.cache_file_url(),
-            "file:///Users/x/Library/Application%20Support/cache"
-        );
         let to = plan
             .nix_archive_args(Path::new("/stage dir/cache"))
             .into_iter()

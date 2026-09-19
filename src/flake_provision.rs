@@ -212,7 +212,9 @@ impl PerformedFlakeProvision {
         }
     }
 
-    /// Collapse to the ordinary result, discarding the audit wording.
+    /// Test convenience: collapse to the ordinary result, discarding the
+    /// audit wording.
+    #[cfg(test)]
     pub fn into_result(self) -> Result<FlakeProvisionReport, FlakeProvisionError> {
         match self {
             Self::Provisioned(report) => Ok(report),

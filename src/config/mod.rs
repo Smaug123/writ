@@ -113,7 +113,7 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub socket_path: Option<PathBuf>,
     /// Override the default audit DB path. If absent, uses
-    /// `$XDG_DATA_HOME/writ/audit/audit.db` (see [`default_audit_db_path`]).
+    /// `$XDG_DATA_HOME/writ/audit/audit.db` (see [`default_paths::AUDIT_DB`]).
     /// The DB's directory is mounted read-write into the broker VM under
     /// `broker_placement = vm`, so it must hold nothing but the audit DB; see
     /// [`ensure_audit_dir_is_dedicated`].
@@ -226,7 +226,7 @@ pub struct UiHttpConfig {
     /// reworked threat model.
     pub bind: SocketAddr,
     /// Override the path the daemon writes the bearer file to.
-    /// Defaults to [`default_ui_http_bearer_path`].
+    /// Defaults to [`default_paths::UI_HTTP_BEARER`].
     #[serde(default)]
     pub bearer_path: Option<PathBuf>,
 }
@@ -266,14 +266,6 @@ impl UiHttpConfig {
     pub fn bearer_path_or_default(&self) -> Result<PathBuf, BaseDirError> {
         default_paths::UI_HTTP_BEARER.or_resolve(self.bearer_path.clone())
     }
-}
-
-/// Default location for the UI HTTP bearer file. Lives next to the
-/// Unix socket so the same `$XDG_RUNTIME_DIR/writ/` directory holds
-/// the runtime-secret material that consumers need to talk to the
-/// daemon.
-pub fn default_ui_http_bearer_path() -> Result<PathBuf, BaseDirError> {
-    default_paths::UI_HTTP_BEARER.resolve()
 }
 
 /// Configuration for the `RunAgent` dispatch path. Absent from
@@ -460,19 +452,6 @@ pub enum RunAgentBootError {
         #[source]
         source: SigningKeyStoreError,
     },
-}
-
-/// Default location for writ's bare notes repo. Sits alongside the
-/// audit DB under `$XDG_DATA_HOME/writ/` so a single backup of that
-/// directory captures both writ's audit log and its signed-run
-/// envelopes.
-///
-/// Bailiff fetches notes from this same location when the operator runs with
-/// stock defaults, and calls *this function* to find it rather than keeping its
-/// own copy of the convention — the two used to be independent functions kept
-/// in agreement by a comment.
-pub fn default_notes_repo_path() -> Result<PathBuf, BaseDirError> {
-    default_paths::NOTES_REPO.resolve()
 }
 
 #[derive(Debug, Deserialize)]
@@ -919,8 +898,8 @@ pub enum DaemonConfigError {
 ///
 /// Parse-don't-validate for the one config value that is threaded *through*
 /// the section validators rather than parsed by one of them. Without it,
-/// [`AgentVmDaemonConfig::to_runtime_config`] would take a bare `PathBuf` and
-/// a caller could hand it a relative path, producing an apparently-valid
+/// [`AgentVmDaemonPlan::materialize`] would take a bare `PathBuf` and a
+/// caller could hand it a relative path, producing an apparently-valid
 /// runtime config whose first agent-run outcome fails at upload time.
 ///
 /// Being checked is *not* being prepared: [`Self::prepare`] is the separate
@@ -1043,9 +1022,10 @@ pub enum AgentVmDaemonConfigError {
     LifecycleRuntime(#[from] AgentVmLifecycleRuntimeConfigError),
     #[error(transparent)]
     Runtime(#[from] AgentVmDaemonRuntimeConfigError),
-    /// The top-level `agent_run_log_root` is not an `agent_vm` key, but
-    /// [`AgentVmDaemonConfig::to_runtime_config`] prepares it, so its faults
-    /// have to be expressible in that method's report.
+    /// The top-level `agent_run_log_root` is not an `agent_vm` key, but the
+    /// test-only `AgentVmDaemonConfig::to_runtime_config` prepares it
+    /// alongside this section, so its faults have to be expressible in that
+    /// method's report.
     #[error(transparent)]
     AgentRunLogRoot(#[from] AgentRunLogRootError),
     #[error("agent VM config field {field} has invalid CIDR {value:?}: {message}")]
@@ -1057,23 +1037,12 @@ pub enum AgentVmDaemonConfigError {
 }
 
 impl AgentVmDaemonConfig {
-    /// Validate both subsections and build the runtime config.
-    ///
-    /// Equivalent to [`Self::check`] followed by
-    /// [`AgentVmDaemonPlan::materialize`], **plus** preparing
-    /// `agent_run_log_root`; a caller that also validates *sibling* config
-    /// sections should use those directly (as [`check_daemon_sections`] does),
-    /// so that this section creates nothing until those siblings have been
-    /// checked too.
-    ///
-    /// The log root is prepared here because a runtime config handed back from
-    /// this method is meant to be usable, and `AgentRunLogRoot` proves only
-    /// that the *path* is well-formed. Before the root moved to the top level
-    /// it was one of `vm_http`'s own, so `materialize` created it; dropping
-    /// that would leave a caller with a config whose first outcome upload
-    /// fails on a directory that was never there. It accumulates alongside the
-    /// section's own faults rather than gating them, for the same reason the
-    /// two effects are independent in `check_daemon_sections`.
+    /// Test convenience: [`Self::check`] followed by
+    /// [`AgentVmDaemonPlan::materialize`], plus preparing
+    /// `agent_run_log_root`, with the faults of all three accumulated. The
+    /// daemon goes through [`check_daemon_sections`] instead, so that this
+    /// section creates nothing until its sibling sections have been checked.
+    #[cfg(test)]
     pub fn to_runtime_config(
         &self,
         agent_run_log_root: AgentRunLogRoot,
@@ -2007,11 +1976,6 @@ pub fn default_secret_store_path() -> Result<PathBuf, BaseDirError> {
     default_paths::SECRET_STORE.resolve()
 }
 
-/// Default location for the SQLite audit database. The DB lives in a dedicated
-/// `audit/` directory (not directly under `writ/`) because the broker VM mounts
-/// the audit DB's *parent directory* read-write; anything else in that directory
-/// would be exposed read-write inside the broker VM. See
-/// [`ensure_audit_dir_is_dedicated`].
 /// Default root for per-run agent stdout/stderr logs. A sibling of the audit
 /// DB's directory rather than a child of the agent-VM work root: the streams
 /// outlive the run that produced them and are pointed at by audit rows, so
@@ -2019,10 +1983,6 @@ pub fn default_secret_store_path() -> Result<PathBuf, BaseDirError> {
 /// space.
 pub fn default_agent_run_log_root() -> Result<PathBuf, BaseDirError> {
     default_paths::AGENT_RUN_LOG_ROOT.resolve()
-}
-
-pub fn default_audit_db_path() -> Result<PathBuf, BaseDirError> {
-    default_paths::AUDIT_DB.resolve()
 }
 
 #[cfg(test)]

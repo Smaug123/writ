@@ -137,19 +137,6 @@ impl AgentStage {
             AgentStage::Implement => StageNoteSlot::Implement(ImplementAttempt::FIRST),
         }
     }
-
-    /// `Some` iff this stage's prompt splices in a plan body.
-    ///
-    /// `None` for [`AgentStage::Submit`], which *produces* the plan
-    /// body rather than consuming one: its prompt is the operator's
-    /// bytes verbatim.
-    pub const fn plan_body_stage(self) -> Option<PlanBodyStage> {
-        match self {
-            AgentStage::Submit => None,
-            AgentStage::Review => Some(PlanBodyStage::Review),
-            AgentStage::Implement => Some(PlanBodyStage::Implement),
-        }
-    }
 }
 
 /// The agent-run stages that *consume* the plan body a submit
@@ -257,8 +244,7 @@ impl PlanBodyStage {
         }
     }
 
-    /// The [`AgentStage`] this refines. The inverse of
-    /// [`AgentStage::plan_body_stage`] on its `Some` cases.
+    /// The [`AgentStage`] this refines.
     pub const fn stage(self) -> AgentStage {
         match self {
             PlanBodyStage::Review => AgentStage::Review,

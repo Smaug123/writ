@@ -266,11 +266,11 @@ pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotD
 }
 
 /// The pre-2026-07 default audit DB location, before it moved into a dedicated
-/// `audit/` directory (see [`super::default_audit_db_path`]). Retained only so the
+/// `audit/` directory (see [`AUDIT_DB`](super::default_paths::AUDIT_DB)). Retained only so the
 /// daemon can detect an un-migrated legacy database and refuse to boot rather
 /// than silently fork audit history; it is not a supported configuration target.
 /// Resolves the environment through the same [`DefaultPath`](super::DefaultPath) machinery as
-/// [`super::default_audit_db_path`]. The two are a pair: this one says where
+/// [`AUDIT_DB`](super::default_paths::AUDIT_DB). The two are a pair: this one says where
 /// the old database would be and that one says where the new one goes, so any
 /// divergence between them is a migration the guard fails to notice. Sharing
 /// one resolver is what keeps them from drifting — they were previously two
@@ -375,7 +375,7 @@ pub fn path_entry_present(path: &Path) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{default_audit_db_path, default_secret_store_path};
+    use crate::config::{default_paths, default_secret_store_path};
     use proptest::prelude::*;
 
     // `the_legacy_and_current_audit_defaults_share_a_base_directory` stood
@@ -575,7 +575,9 @@ mod tests {
         // dedicated dir, or it could never fire; the new default is that legacy
         // dir's `audit/` subdirectory.
         let legacy = legacy_default_audit_db_path().expect("the test env has HOME");
-        let current = default_audit_db_path().expect("the test env has HOME");
+        let current = default_paths::AUDIT_DB
+            .resolve()
+            .expect("the test env has HOME");
         assert_ne!(legacy, current);
         assert_eq!(
             current.parent().unwrap().parent().unwrap(),
@@ -588,7 +590,9 @@ mod tests {
         // Regression (P1): the broker VM read-write-mounts the audit DB's
         // directory, so the default secret store must not live inside it. Fails
         // on the pre-fix default (audit.db a sibling of secrets/ under writ/).
-        let audit_db = default_audit_db_path().expect("the test env has HOME");
+        let audit_db = default_paths::AUDIT_DB
+            .resolve()
+            .expect("the test env has HOME");
         let audit_dir = audit_db.parent().unwrap().to_path_buf();
         let secrets = default_secret_store_path().expect("the test env has HOME");
         assert!(
