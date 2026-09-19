@@ -148,11 +148,11 @@ const IPV4_ONLY_KERNEL_ARGV: [&str; 2] = ["--kernel-arg", "ipv6.disable=1"];
 ///
 /// The read-back uses `cat` command substitution, not `read`: BusyBox `read`
 /// (the guest image's `sh`) returns non-zero reading `/proc/sys` sysctls even
-/// when it correctly assigns the value, so the earlier `read … || state=` wiped
-/// the just-read `1` to empty and failed every start on Apple `container` 1.0.0.
-/// `$(cat …)` returns the value regardless of `read`'s exit quirk and strips the
-/// trailing newline, so a genuine `0`/empty (write did not take) still fails
-/// closed while a real `1` passes.
+/// when it correctly assigns the value, so a `read … || state=` would wipe the
+/// just-read `1` to empty and fail every start (observed on Apple `container`
+/// 1.0.0). `$(cat …)` returns the value regardless of `read`'s exit quirk and
+/// strips the trailing newline, so a genuine `0`/empty (write did not take)
+/// still fails closed while a real `1` passes.
 const GUEST_IPV6_ENFORCE_AND_PROBE_SCRIPT: &str = r#"set -e
 for scope in all default; do
   path="/proc/sys/net/ipv6/conf/$scope/disable_ipv6"

@@ -1,11 +1,10 @@
 //! The VM-HTTP route table: one classification of a guest request, consumed by
 //! every stage of the dispatch.
 //!
-//! Three functions used to switch on the same target string independently —
-//! auth-scheme selection, body-limit selection, and the routing if/else — and a
-//! fourth bespoke branch decided which auth *denials* were audited. A new
-//! capability had to touch all four, and nothing checked they agreed. Here the
-//! request is classified **once**, into a route that answers all four questions.
+//! One classification answers all four questions the dispatch asks — the auth
+//! scheme, the body limit, whether an auth denial is audited, and who handles
+//! the request — so a new capability is one variant rather than four
+//! independent switches on the same target string that nothing checks agree.
 //!
 //! The invariant this buys, and the reason the `Plain` set is closed:
 //!
@@ -25,18 +24,14 @@
 //!
 //! [`PlainRoute`] is deliberately a closed enum rather than an open extension
 //! point: an open one would let a future *effectful* endpoint be registered as
-//! plain and run IO outside a driver while a totality test still passed — which
-//! is the original discipline gap, reintroduced. `GitClone` sat in it for
-//! exactly that reason until the host mint became an `EffectAuditTable` of its
-//! own.
+//! plain and run IO outside a driver while a totality test still passed.
 //!
-//! This is a discriminated union interpreted by a `match`, not the
-//! `Box<dyn ErasedEffect>` the plan sketched. The registry entry is a
-//! *description* of a route, and the codebase's rule is data descriptions over
-//! behavioural abstractions: the variants are inspectable, the dispatcher's match
-//! is exhaustive, and adding a capability is a compile error until every site
-//! handles it. (The trait/driver split still applies where the plan intended it —
-//! to the heterogeneous *execution*, behind `BrokeredEffect`.)
+//! This is a discriminated union interpreted by a `match`, not a boxed erased
+//! effect. The registry entry is a *description* of a route, and the codebase's
+//! rule is data descriptions over behavioural abstractions: the variants are
+//! inspectable, the dispatcher's match is exhaustive, and adding a capability is
+//! a compile error until every site handles it. The trait/driver split applies
+//! to the heterogeneous *execution* instead, behind `BrokeredEffect`.
 
 use crate::agent_run::AgentRunId;
 use crate::secret::SecretStore;
@@ -368,10 +363,9 @@ impl VmHttpRoute {
     ///
     /// This is why the route is resolved *before* authentication: an auth denial
     /// on an audited route is itself an audited event (a guest hammering the
-    /// model proxies with a bad token is exactly what a reviewer wants to see),
-    /// and it is now the matched route that decides how to record it, rather
-    /// than a bespoke if/else beside the dispatcher that had to re-classify the
-    /// target a fourth time.
+    /// model proxies with a bad token is exactly what an operator wants to see),
+    /// and the matched route is what decides how to record it, rather than a
+    /// branch beside the dispatcher that re-classifies the target.
     ///
     /// Routes whose tables have no denial shape — and every [`PlainRoute`] —
     /// return the response unrecorded, exactly as before.

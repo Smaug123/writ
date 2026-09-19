@@ -624,8 +624,8 @@ const PF_COMMAND_STDOUT_CAP: usize = 1024 * 1024;
 /// supervisor drains both pipes from one non-blocking `poll(2)` loop, so no
 /// thread is involved and that window does not exist.
 ///
-/// Supervision also gets `pfctl` a timeout and a process-group kill, which it
-/// previously had neither of. `Stdio::null()` on stdin is deliberate: neither
+/// Supervision also gets `pfctl` a timeout and a process-group kill.
+/// `Stdio::null()` on stdin is deliberate: neither
 /// binary reads stdin here, and inheriting the parent's would let a misinvocation
 /// block on the terminal.
 ///
@@ -1411,9 +1411,9 @@ mod tests {
         ));
     }
 
-    /// The default macOS `pf.conf` with the writ anchor appended: the shape
-    /// every install had until now, and the one this check now refuses,
-    /// because `com.apple/*` is a filter anchor whose contents a
+    /// The default macOS `pf.conf` with the writ anchor appended — the shape an
+    /// install gets by following the obvious instructions, and the one this
+    /// check refuses, because `com.apple/*` is a filter anchor whose contents a
     /// main-ruleset readback cannot see.
     #[test]
     fn an_appended_session_anchor_is_preceded_by_apples() {
@@ -1688,10 +1688,10 @@ mod tests {
     /// A wedged `pfctl` is killed at the deadline rather than parking the
     /// privileged helper forever.
     ///
-    /// `pfctl` invocations previously had no timeout at all. Routing them through
-    /// the shared supervisor is what supplies one; this pins that it is actually
-    /// wired up, since a supervisor call with a generous timeout looks identical
-    /// to an unsupervised one until something hangs.
+    /// The timeout comes from routing `pfctl` through the shared supervisor;
+    /// this pins that it is actually wired up, since a supervisor call with a
+    /// generous timeout looks identical to an unsupervised one until something
+    /// hangs.
     #[test]
     fn a_wedged_pf_command_is_killed_at_the_deadline() {
         use std::os::unix::fs::PermissionsExt;

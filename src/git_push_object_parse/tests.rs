@@ -937,10 +937,10 @@ fn parse_identity_handles_empty_name() {
 #[test]
 fn parse_tz_offset_rejects_minutes_at_or_above_sixty() {
     // An attacker-controlled staging-repo commit could carry
-    // e.g. `+1260`, which used to be silently normalized to
-    // 13:00 — laundering a different commit timestamp through
-    // the parser. Now the MM field is rejected unless it lies
-    // in 00..=59.
+    // e.g. `+1260`, which a lenient parser would normalize to
+    // 13:00, laundering a different commit timestamp through
+    // the parser. The MM field is rejected unless it lies in
+    // 00..=59.
     let err = parse_tz_offset("+1260").expect_err("MM=60 must fail");
     assert!(
         matches!(err, ParseObjectError::MalformedIdentity(ref msg) if msg.contains("00..=59")),

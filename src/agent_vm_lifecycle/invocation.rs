@@ -7,8 +7,6 @@
 //! orchestration/cleanup code runs them; this module holds only the execution
 //! mechanics. The `ProcessInvocation` struct itself, its error type, and the
 //! `BoundedOutput`/`CapturedTail` result types live in the parent module.
-//! Extracted from `agent_vm_lifecycle.rs` to keep that file readable;
-//! behaviour is unchanged.
 
 use super::*;
 

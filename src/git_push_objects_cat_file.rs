@@ -207,9 +207,8 @@ impl CatFileObjectSource {
     /// `killpg`, which is the only way to avoid a pid-recycle race
     /// where the kernel could reuse the leader's pid for an
     /// unrelated process group between `wait()` and `killpg`. Both
-    /// steps come from `crate::process_supervisor` — this used to
-    /// be a private re-implementation of them, which is precisely
-    /// the kind of divergence that ordering subtlety cannot afford.
+    /// steps come from `crate::process_supervisor`; that ordering
+    /// subtlety cannot afford a second implementation.
     ///
     /// Cancellation safety: from the moment we take ownership of
     /// the child the source's outer [`Drop`] is disarmed (`inner`
@@ -714,8 +713,8 @@ mod tests {
             "got: {err:?}"
         );
 
-        // Regression for codex review P2: a type mismatch must
-        // drain the response payload so the next request is framed
+        // A type mismatch must drain the response payload so the
+        // next request is framed
         // against fresh bytes. Without the fix this read either
         // hangs, errors on a malformed header, or returns wrong
         // data.
@@ -757,8 +756,8 @@ mod tests {
 
     #[tokio::test]
     async fn cat_file_source_rejects_oversized_payload_and_poisons_source() {
-        // Regression for codex round-1 P1: when the staging repo is
-        // an untrusted bundle, the size field in a cat-file header
+        // When the staging repo is an untrusted bundle, the size
+        // field in a cat-file header
         // is attacker-controlled. Allocating `Vec::with_capacity`
         // for that size lets a small, valid-looking bundle declare
         // a multi-gigabyte object and OOM the broker. The
@@ -828,8 +827,8 @@ mod tests {
 
     #[tokio::test]
     async fn cat_file_source_times_out_a_wedged_read_and_poisons_source() {
-        // Regression for the Codex round-2 P1: `read_object_raw`'s pipe
-        // awaits are unbounded, so a `git cat-file --batch` child that
+        // Without a per-object deadline, `read_object_raw`'s pipe
+        // awaits would be unbounded, so a `git cat-file --batch` child that
         // accepts the request SHA but never writes a response parks the
         // caller — and, up the stack, an approve holding an active
         // grant — forever. `open`'s per-object `read_timeout` must bound
@@ -953,8 +952,8 @@ mod tests {
 
     #[tokio::test]
     async fn cat_file_source_drop_kills_process_group() {
-        // Regression for codex review P2: dropping the source must
-        // SIGKILL the *whole* process group, not just the leader pid.
+        // Dropping the source must SIGKILL the *whole* process group,
+        // not just the leader pid.
         // A wrapper script forks a long-lived sibling into the
         // shared pgid, records its pid, then sleeps so the leader
         // stays alive until Drop runs. If Drop only killed the
@@ -1011,8 +1010,8 @@ mod tests {
 
     #[tokio::test]
     async fn cat_file_source_close_cancellation_kills_process_group() {
-        // Regression for codex review P2: cancelling `close()` at
-        // its `child.wait().await` must still SIGKILL the whole
+        // Cancelling `close()` at its `child.wait().await` must
+        // still SIGKILL the whole
         // process group. The wrapper `exec sleep`s, so it never
         // observes the EOF that `close()` writes to its stdin —
         // the only way to cancel cleanup is to drop the future.
