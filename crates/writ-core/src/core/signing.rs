@@ -5,16 +5,12 @@
 //! Bailiff resolves the fingerprint to a public key via a config-driven
 //! SSH allowed-signers file (the same trust-anchor shape Git uses for
 //! commit-signature verification) and then validates the signature
-//! against the canonical bytes of `SignedRunMetadata`. See
-//! `docs/plans/2026-05-14-bailiff-split.md`.
+//! against the canonical bytes of `SignedRunMetadata`.
 //!
-//! v1 validation is intentionally narrow — enough to reject obvious
+//! Validation here is intentionally narrow — enough to reject obvious
 //! misuse at the wire (empty payloads, NUL bytes, missing format
-//! markers), not full cryptographic correctness. The authoritative
-//! gate is `ssh-keygen -Y verify` against the allowed-signers file,
-//! which slice B will wire up. The newtypes exist now so the wire
-//! shape is correct-by-construction in slice A2 before the verifier
-//! lands.
+//! markers), not cryptographic correctness. The authoritative gate is
+//! `ssh-keygen -Y verify` against the allowed-signers file.
 
 const FINGERPRINT_PREFIX: &str = "SHA256:";
 const SIGNATURE_BEGIN_MARKER: &str = "-----BEGIN SSH SIGNATURE-----";
@@ -95,7 +91,7 @@ fn validate_signature(s: &str) -> Result<(), SshSignatureError> {
     // The two markers alone — with no signature bytes between them
     // — would pass a naive `starts_with` + `ends_with` pair, then
     // hand bailiff a payload `ssh-keygen -Y verify` is guaranteed
-    // to reject. Catch it here so slice B's verifier never sees it.
+    // to reject. Catch it here so the verifier never sees it.
     if body.trim().is_empty() {
         return Err(SshSignatureError::EmptyBody);
     }
@@ -266,8 +262,8 @@ mod tests {
     /// A payload that is only the BEGIN and END markers — with no
     /// signature bytes between them — passes a naive starts_with /
     /// ends_with pair but is meaningless to a verifier. Catch it here
-    /// rather than handing slice B's `ssh-keygen -Y verify` something
-    /// guaranteed to fail.
+    /// rather than handing `ssh-keygen -Y verify` something guaranteed
+    /// to fail.
     #[test]
     fn signature_rejects_empty_body_between_markers() {
         let bad = format!("{SIGNATURE_BEGIN_MARKER}{SIGNATURE_END_MARKER}");
