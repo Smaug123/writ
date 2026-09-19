@@ -283,12 +283,10 @@ impl VmClientConfig {
     /// Begin a request to the broker, carrying both credentials this guest owes
     /// it: the session bearer token, and the contract version it speaks.
     ///
-    /// Every call site used to assemble these by hand, which made "does this
-    /// request declare everything it must?" a per-site question with seven
-    /// answers. The broker now *refuses* a request on one of its own routes that
-    /// omits [`VM_HTTP_CONTRACT_HEADER`], so a forgotten header is no longer a
-    /// missing check but a broken endpoint — hence one constructor, and no
-    /// public way to reach a bare [`Url`].
+    /// The broker refuses a request on one of its own routes that omits
+    /// [`VM_HTTP_CONTRACT_HEADER`], so a forgotten header is a broken endpoint,
+    /// not a missing check; hence one constructor, and no public way to reach a
+    /// bare [`Url`].
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         reqwest::Client::new()
             .request(method, self.endpoint(path))

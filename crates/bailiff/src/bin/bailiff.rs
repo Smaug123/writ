@@ -1,21 +1,18 @@
-//! `bailiff` — the workflow orchestrator that drives plan submission
-//! (and, in later slices, execute) on top of writ's `RunAgent` RPC.
-//! See `docs/plans/2026-05-14-bailiff-split.md`.
+//! `bailiff` — the workflow orchestrator that drives plan submission,
+//! review, decision, and implementation on top of writ's `RunAgent`
+//! RPC.
 //!
-//! Slice C3 introduces the first operator-facing verb,
-//! `bailiff plan submit`: open a writ session, run the planner agent,
-//! verify writ's signed envelope, and persist a
-//! [`bailiff::bailiff_plan_note::PlanNote`] in bailiff's own bare repo.
-//! The workflow itself lives in
-//! [`bailiff::bailiff_plan_submit::submit_plan`]; this binary is the
-//! thin CLI layer that resolves paths, parses flags, and prints the
-//! plan id on success. Slice D2.5 adds the parallel `bailiff plan
-//! review` verb, which reads the submission note, runs the reviewer
-//! agent through writ, and persists a
-//! [`bailiff::bailiff_plan_note::ReviewNote`]. The implement verb
-//! mirrors review but grants the implementer agent
-//! `WorkspaceWrite`, composes the operator's feature prompt with the
-//! verified plan body, and persists a
+//! The workflows live in the library; this binary is the thin CLI
+//! layer that resolves paths, parses flags, and prints the resulting
+//! id or OID. `bailiff plan submit` opens a writ session, runs the
+//! planner agent, verifies writ's signed envelope, and persists a
+//! [`bailiff::bailiff_plan_note::PlanNote`] in bailiff's own bare repo
+//! ([`bailiff::bailiff_plan_submit::submit_plan`]). `bailiff plan
+//! review` reads the submission note, runs the reviewer agent through
+//! writ, and persists a [`bailiff::bailiff_plan_note::ReviewNote`].
+//! `bailiff plan implement` mirrors review but grants the implementer
+//! agent `WorkspaceWrite`, composes the operator's feature prompt with
+//! the verified plan body, and persists an
 //! [`bailiff::bailiff_plan_note::ImplementNote`].
 //!
 //! Paths default to the same XDG convention `docs/design/broker.md`
@@ -159,11 +156,7 @@ enum PlanCmd {
     /// Exactly one of `--accept` / `--reject` is required.
     ///
     /// Legal only from `reviewed`: reviewer feedback is an input to
-    /// the verdict, so `bailiff plan review` runs first. D1.3
-    /// originally decoupled the decision write from any precondition,
-    /// which let this verb create a plan ref carrying a verdict for a
-    /// plan that was never submitted — a `corrupt` row in `bailiff
-    /// plan list`. The gate is now
+    /// the verdict, so `bailiff plan review` runs first. The gate is
     /// [`bailiff::bailiff_plan_state::allows`], the same relation
     /// every other verb consults.
     #[command(group(
@@ -189,8 +182,7 @@ enum PlanCmd {
         /// Defaults to `cli:$USER`; the verb fails if neither flag
         /// nor `$USER` is set. bailiff treats an unattributable
         /// verdict as an operator-config bug rather than silently
-        /// degrading audit value (writ's since-removed `plan decide`
-        /// verb used to fall back to `cli:unknown`).
+        /// degrading audit value.
         #[arg(long)]
         decider: Option<String>,
         /// Path to bailiff's bare git repo. Defaults to
@@ -327,9 +319,9 @@ enum PlanCmd {
     /// key=value block per plan separated by blank lines. Empty
     /// repo prints a single `no plans` line, exit 0.
     ///
-    /// Slice F's read-only verb. Verifies nothing — each row is
-    /// metadata pulled from bailiff's own notes; `bailiff plan show`
-    /// (slice F4) is where writ-side signature verification happens.
+    /// Read-only. Verifies nothing — each row is metadata pulled from
+    /// bailiff's own notes; `bailiff plan show` is where writ-side
+    /// signature verification happens.
     List {
         /// Path to bailiff's bare git repo. Defaults to
         /// `$XDG_DATA_HOME/bailiff/repo` (or
@@ -348,7 +340,7 @@ enum PlanCmd {
     /// "show what's on writ right now," they should re-run the
     /// relevant `submit*` verb to bring fresh envelopes across.
     ///
-    /// Slice F's per-plan read verb. Sections render in a fixed
+    /// Sections render in a fixed
     /// order — Plan / Decision / Review / Implement — each headed by
     /// its verification status; missing-because-not-yet-written
     /// sections render with an explicit `<none>` and a
@@ -698,9 +690,8 @@ async fn plan_review(
         // actionable shape `plan decide` uses for
         // `DecisionAlreadyRecorded`, so an operator who re-ran the
         // verb sees what to do next rather than a generic formatted
-        // error chain. Since slice 3b one `AlreadyRecorded` variant
-        // covers all three stages and names its own noun, so this arm
-        // no longer has to.
+        // error chain. One `AlreadyRecorded` variant covers all three
+        // stages and names its own noun.
         Err(SubmitReviewError::WriteReviewNote {
             session_id: _,
             source:
@@ -780,12 +771,10 @@ async fn plan_implement(
             println!("{}", outcome.implement_note_oid);
             Ok(())
         }
-        // The four hand-written pre-RPC gate messages that used to
-        // live here are gone. `IllegalTransition` renders its own —
-        // observed state, blocked stage, and the operator's next
-        // command, all derived from the transition relation — so it
-        // falls through to the passthrough arm below. That is the
-        // point of slice 1: the remedy text cannot drift from the
+        // `IllegalTransition` renders its own message — observed state,
+        // blocked stage, and the operator's next command, all derived
+        // from the transition relation — so it falls through to the
+        // passthrough arm below; the remedy text cannot drift from the
         // gate, because the gate generates it.
         //
         // Post-RPC variant of the idempotency invariant: the
@@ -888,7 +877,6 @@ fn writ_output_ref() -> NotesRef {
 /// Bailiff's own bare repo, declared with writ's [`DefaultPath`] vocabulary
 /// and resolved by writ's resolver — it is bailiff's path, so bailiff owns the
 /// declaration, but there is only one implementation of "where does this go".
-/// See `docs/plans/2026-05-14-bailiff-split.md` slice B4.
 const BAILIFF_REPO: DefaultPath = DefaultPath {
     what: "bailiff's notes repo",
     override_hint: "`--bailiff-repo`",
@@ -900,11 +888,9 @@ const BAILIFF_REPO: DefaultPath = DefaultPath {
 /// Where writd keeps the notes bailiff fetches from: writd's *own* entry,
 /// carrying bailiff's override advice.
 ///
-/// These used to be two independent resolvers kept in agreement by a comment
-/// saying they **must** agree — an invariant that holds until it doesn't, and
-/// whose failure is silent, since bailiff would fetch from an empty repo and
-/// report no notes rather than erroring. Reusing the entry makes agreement an
-/// identity rather than a coincidence worth testing. Only the override hint is
+/// Reusing writd's entry makes agreement an identity rather than an invariant
+/// to test: a divergence would be silent, since bailiff would fetch from an
+/// empty repo and report no notes rather than erroring. Only the override hint is
 /// replaced: an operator running `bailiff` cannot act on writd's
 /// `run_agent.notes_repo_path` config key.
 const WRIT_NOTES_REPO: DefaultPath =
@@ -924,26 +910,14 @@ async fn plan_decide(
 
     let repo = open_bailiff_repo(bailiff_repo_path).await?;
 
-    // Slice 2: `decide` takes the plan's lock like every other
-    // mutating verb. Before, it was the one mutator outside the
-    // single-writer invariant entirely — it opened its own repo handle
-    // inside `spawn_blocking` and never touched a guard — so its
-    // slice-1 gate and its write were not atomic against a concurrent
-    // process. `write_decision_note`'s `DecisionAlreadyRecorded`
-    // remains the backstop beneath both.
-    //
-    // Slice 3: the lock-then-gate pair is `open_plan_stage`, shared
-    // with the three agent-run workflows. `decide` is why that phase
-    // takes a `PlanStage` rather than an `AgentStage` — it is the one
-    // mutating verb that runs no agent, and the phase must still cover
-    // it or `decide` becomes the exception again.
-    //
-    // `decide` previously read no precondition at all, which is why it
-    // could write a verdict for a plan that was never submitted:
-    // `write_decision_note` creates the per-plan ref, `list_plan_ids`
-    // enumerates by ref existence, and the resulting row rendered as
-    // `corrupt` — the anomaly the display layer exists to *report*,
-    // manufactured by this verb in one command.
+    // `decide` takes the plan's lock and gate like every other mutating
+    // verb, through the `open_plan_stage` the three agent-run workflows
+    // share; it is the one mutating verb that runs no agent, which is
+    // why that phase takes a `PlanStage` rather than an `AgentStage`.
+    // `write_decision_note`'s `DecisionAlreadyRecorded` remains the
+    // backstop beneath the gate. Without the gate, a verdict for a plan
+    // that was never submitted would create the per-plan ref and render
+    // as `corrupt` in `bailiff plan list`.
     let mut guard = open_plan_stage(Arc::new(repo), plan_id, PlanStage::Decide)
         .await
         .map_err(|e| format!("{e}"))?;
@@ -1204,14 +1178,9 @@ fn resolve_decision_outcome(accept: bool, reject: bool) -> Decision {
 /// non-empty value.
 ///
 /// `user_env` is injected (not read from the live process) so tests
-/// don't have to mutate the global env — concurrent test execution
-/// in this binary used to race on `$USER`. Callers in `main()` pass
+/// don't have to mutate the global env, which concurrent tests would
+/// race on. Callers in `main()` pass
 /// `std::env::var("USER").ok().filter(|s| !s.is_empty())`.
-///
-/// Stricter than writ's since-removed `plan decide` verb, which fell
-/// back to `cli:unknown` — see `PlanCmd::Decide`'s docstring for the
-/// reasoning. The strictness is the bailiff-side default we want to
-/// keep.
 fn resolve_decider(
     flag: Option<String>,
     user_env: Option<String>,

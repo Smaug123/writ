@@ -1,4 +1,4 @@
-//! Slice-D2.4 workflow function that drives `bailiff plan review`:
+//! Workflow function that drives `bailiff plan review`:
 //! read the planner's submission note, fetch + verify the signed
 //! envelope it points to, decode the planner's stdout as the plan
 //! body, compose the reviewer's effective prompt, open a writ
@@ -8,11 +8,10 @@
 //!
 //! Sibling to [`crate::bailiff_plan_submit`]: the post-`OpenSession`
 //! contract is identical (close-on-error on every later failure). The
-//! novelty is the pre-RPC chain — bailiff is for the first time
-//! reading back one of its own writ-signed envelopes to compose a
-//! follow-up agent's prompt, and the byte-for-byte trip from
-//! `SignedRunEnvelope` → `OutputEnvelope` → UTF-8 stdout is new
-//! ground that every variant of [`ReadPlanBodyError`] guards.
+//! pre-RPC chain reads back one of bailiff's own writ-signed envelopes
+//! to compose the reviewer's prompt; every step of the trip from
+//! `SignedRunEnvelope` → `OutputEnvelope` → UTF-8 stdout has a variant
+//! of [`ReadPlanBodyError`].
 //!
 //! # Composition
 //!
@@ -149,10 +148,9 @@ pub async fn submit_review(
     allowed_signers: AllowedSigners,
     inputs: SubmitReviewInputs,
 ) -> Result<SubmitReviewOutcome, SubmitReviewError> {
-    // Before slice 1 this workflow gated on the submission note by
-    // hand; it now asks the shared relation. `Review` is legal from
-    // `Submitted` only — reviewer feedback is an input to the verdict,
-    // so a plan that already has one is past this stage.
+    // `Review` is legal from `Submitted` only: reviewer feedback is an
+    // input to the verdict, so a plan that already has one is past this
+    // stage.
     let plan_id = inputs.plan_id;
     let mut guard = open_plan_stage(
         bailiff_repo,
@@ -390,11 +388,6 @@ pub enum SubmitReviewError {
     },
 }
 
-// `compose_tests` moved to `crate::bailiff_stage::tests` in slice 3,
-// along with the composer it covered. The reviewer's framing is now
-// `PlanBodyStage::Review`, and its exact-concatenation and byte-cap
-// tests live beside the single definition.
-
 #[cfg(test)]
 mod end_to_end_tests {
     //! End-to-end against a real writ broker. Pattern mirrors
@@ -603,16 +596,8 @@ mod end_to_end_tests {
         broker_task.stop().await;
     }
 
-    /// Behaviour delta (slice 1): a plan that already carries a
-    /// verdict is past `review`, and the refusal says so rather than
-    /// pointing at a later stage.
-    ///
-    /// This replaces a test asserting that reviewing a *rejected* plan
-    /// is refused. Under the shipped order (`review` → `decide`) that
-    /// scenario cannot be built: reaching `rejected` requires a review
-    /// note, so the second call is a repeat rather than a first
-    /// review. The property worth keeping is that the repeat is
-    /// refused pre-RPC with actionable guidance.
+    /// A plan that already carries a verdict is past `review`, and the
+    /// refusal says so rather than pointing at a later stage.
     #[tokio::test]
     async fn submit_review_refuses_a_decided_plan_before_opening_a_session() {
         let tmp = tempfile::tempdir().unwrap();
@@ -762,21 +747,14 @@ mod end_to_end_tests {
     /// Second `submit_review` against an already-reviewed plan is
     /// refused *before any RPC*, and the first review note survives.
     ///
-    /// Before slice 1 this test asserted the weaker post-RPC
-    /// behaviour: the second reviewer agent ran, `write_review_note`
-    /// rejected the duplicate, and the assertion was that the wasted
-    /// session had at least been closed. The transition relation
-    /// subsumes that idempotency check — `Review` is illegal from
-    /// `Reviewed` — so the duplicate now costs no session and no
-    /// agent run at all, which is what this asserts instead.
+    /// `Review` is illegal from `Reviewed`, so the duplicate costs no
+    /// session and no agent run.
     ///
     /// `SubmitReviewError::WriteReviewNote { source:
-    /// ReviewAlreadyRecorded }` is consequently no longer reachable
-    /// in-process: the workflow-held [`PlanGuard`] means nothing
-    /// can attach a review note between this gate and the write. It
-    /// remains reachable across processes, which is exactly the hole
-    /// slice 2's per-plan flock closes; the write-side check stays as
-    /// the backstop for it.
+    /// ReviewAlreadyRecorded }` is consequently unreachable through the
+    /// workflow: the workflow-held [`PlanGuard`] means nothing, in this
+    /// process or another, can attach a review note between this gate
+    /// and the write. The write-side check stays as the backstop.
     #[tokio::test]
     async fn submit_review_refuses_a_duplicate_before_opening_a_session() {
         let tmp = tempfile::tempdir().unwrap();

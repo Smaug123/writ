@@ -66,9 +66,7 @@ fn the_body_consuming_stages_are_exactly_review_and_implement() {
 /// this one names the stage, which the fixture diff does not.
 ///
 /// The inequality is the load-bearing half: a reviewer prompt that
-/// framed the plan as approved would be a lie about an undecided plan,
-/// which is the mistake the plan doc records under "The stage order
-/// was wrong".
+/// framed the plan as approved would be a lie about an undecided plan.
 #[test]
 fn separators_are_the_pre_slice_3_bytes_and_differ_by_stage() {
     assert_eq!(
@@ -85,9 +83,7 @@ fn separators_are_the_pre_slice_3_bytes_and_differ_by_stage() {
     );
 }
 
-/// Moved from `bailiff_plan_review::compose_tests` when the composer
-/// it covered became a binding over [`splice_plan_body`]. The
-/// concatenation is exact — no trimming, no re-encoding, no extra
+/// The concatenation is exact — no trimming, no re-encoding, no extra
 /// newline — for the reviewer's framing.
 #[test]
 fn reviewer_separator_appears_verbatim_between_instructions_and_body() {
@@ -103,8 +99,7 @@ fn reviewer_separator_appears_verbatim_between_instructions_and_body() {
     );
 }
 
-/// Moved from `bailiff_plan_implement::compose_tests`, likewise. Kept
-/// distinct from the reviewer case above rather than parameterised:
+/// Kept distinct from the reviewer case above rather than parameterised:
 /// the two literal expectations are what pin that the *framings* did
 /// not swap, which a shared helper reading `stage.separator()` would
 /// not catch.
@@ -219,7 +214,7 @@ fn broker_request_threads_workspace_and_agent_identity() {
     assert_eq!(req.agent_model.as_deref(), Some("claude-opus-4-7"));
 }
 
-/// The mirror-image invariant, which had no test before slice 3: a run
+/// The mirror-image invariant: a run
 /// bound to a session bailiff owns must carry that id and *no*
 /// workspace bootstrap. A bootstrap here would silently reroute the
 /// run into the VM arm, which then rejects the request for carrying a

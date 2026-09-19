@@ -1,21 +1,6 @@
 //! The plan workflow's transition relation, in one place.
 //!
-//! Before this module, four sites each encoded their own answer to
-//! "may this stage run now?", and no two agreed:
-//!
-//! - `plan_decide` read no precondition at all, so `bailiff plan
-//!   decide` against an unsubmitted plan created the plan's ref and
-//!   produced a [`PlanState::Corrupt`] row — the anomaly the display
-//!   layer exists to *report*, manufactured by a sibling verb;
-//! - [`crate::bailiff_plan_review::submit_review`] gated on the
-//!   submission only, so a rejected plan reviewed happily;
-//! - [`crate::bailiff_plan_implement::submit_implement`] gated on
-//!   submission + `Accepted` + no prior implement, never reading the
-//!   review note at all;
-//! - `BailiffPlanSummary::state` derived a fourth relation for
-//!   display, preferring "the latest stage present in the data".
-//!
-//! Everything the workflow knows about legality now lives here:
+//! Everything the workflow knows about legality lives here:
 //! [`NotePresence`] is the observation, [`PlanState`] the position,
 //! [`PlanStage`] the event, [`derive_state`] the parse, and [`allows`] the
 //! relation. Call sites ask; they do not re-derive.
@@ -29,18 +14,13 @@
 //! walking the relation with a reference implementation that never
 //! consults [`PlanState::presence`].
 //!
-//! **The write-side `AlreadyRecorded` errors stay.** This machine
-//! subsumes all four of the old ad-hoc idempotency gates — `Decide` is
-//! illegal from `Accepted`/`Rejected`, `Review` from `Reviewed`,
-//! `Implement` from `Implemented` — but
+//! **The write-side `AlreadyRecorded` errors stay.** The relation makes
+//! `Decide` illegal from `Accepted`/`Rejected`, `Review` from
+//! `Reviewed`, and a repeated `Submit` from anything but `Absent`, but
 //! [`writ::notes_repo::NotesRepo::write_note_if_absent`] keeps refusing
 //! a second write at an occupied seed. That is the unkillable layer, in
-//! the same sense as the approve path's SQL triggers
-//! (`docs/plans/2026-07-25-approve-state-machine-as-a-type.md`): the
-//! repo should refuse a contradiction even if every Rust caller above
-//! it is wrong.
-//!
-//! See `docs/plans/2026-07-26-bailiff-workflow-as-data.md` slice 1.
+//! the same sense as the approve path's SQL triggers: the repo should
+//! refuse a contradiction even if every Rust caller above it is wrong.
 
 use crate::bailiff_decision::Decision;
 
@@ -52,9 +32,7 @@ use crate::bailiff_decision::Decision;
 /// because every property in this module quantifies over `ALL`, and an
 /// `ALL` missing a variant would silently weaken all of them at once.
 /// `crates/writ-audit/src/git_push/approve_attempt.rs` has a
-/// near-identical macro and records why (a reviewer found its
-/// hand-written predecessor's completeness test proved less than it
-/// claimed). The two are not shared: `bailiff` depends on `writ`, which
+/// near-identical macro. The two are not shared: `bailiff` depends on `writ`, which
 /// depends on `writ-audit`, so exporting one across that chain would
 /// leak an audit-crate internal to a product-layer crate to save
 /// twenty lines.
@@ -118,8 +96,7 @@ pub struct NotePresence {
     /// empty note set, but only the first is [`PlanState::Absent`];
     /// the second is an anomaly, and letting `submit` run against it
     /// would write into a ref whose existing contents nobody has
-    /// explained. Without this field the two collapse, which is the
-    /// regression `derive_state` shipped with until review caught it.
+    /// explained. Without this field the two collapse.
     pub ref_exists: bool,
     pub submission: bool,
     pub decision: Option<Decision>,
@@ -147,9 +124,7 @@ plan_enum! {
     /// terminal and `Corrupt` off to the side.
     ///
     /// Review precedes the decision because reviewer feedback is an
-    /// *input* to it: `docs/plans/2026-05-11-agent-plans.md` specifies
-    /// "the review → decide → execute cycle" and "reviewer feedback is
-    /// for the decision, not for execution", which is also why
+    /// *input* to it, not to execution, which is also why
     /// `submit_implement` deliberately keeps the review note out of
     /// the implementer's prompt.
     pub enum PlanState {
@@ -164,8 +139,7 @@ plan_enum! {
         /// A note set no legal stage sequence could have produced —
         /// for example a decision without a submission, or an
         /// implement note on a plan that was never reviewed. Reachable
-        /// only by manual repo surgery (or by a pre-slice-1 binary),
-        /// and denies every stage.
+        /// only by manual repo surgery, and denies every stage.
         Corrupt => "corrupt",
         /// Submission attached, awaiting review.
         Submitted => "submitted",
@@ -263,11 +237,9 @@ impl PlanStage {
     /// Every state from which this stage may run.
     ///
     /// Every stage but one has a single legal predecessor. `Implement`
-    /// has two, because slice 4 made it **repeatable**: fan-out is N
-    /// implementer runs on one accepted plan, so a plan that is already
-    /// `Implemented` may take another attempt. Slice 1 expressed this
-    /// as a set rather than a single state precisely so that change
-    /// would be one entry rather than a new shape.
+    /// has two, because it is **repeatable**: fan-out is N implementer
+    /// runs on one accepted plan, so a plan that is already
+    /// `Implemented` may take another attempt.
     ///
     /// That repeatability is the one place the workflow is not a chain,
     /// and it is why
@@ -333,8 +305,7 @@ pub fn allows(state: PlanState, stage: PlanStage) -> Result<(), IllegalTransitio
 /// enum alongside the `plan_id`, matching how every other bailiff
 /// error carries the id. The message names both the blocked stage's
 /// requirement and — via [`PlanState::next_stage`] — the operator's
-/// actual next command, so the four verbs no longer each hand-write
-/// their own remedy text.
+/// actual next command, so no verb hand-writes its own remedy text.
 /// `Display` is hand-written rather than `thiserror`-derived because
 /// the message is computed from the relation (the requirement list and
 /// the remedy are both looked up, not spelled out), and `#[error]`'s
@@ -368,10 +339,8 @@ impl std::fmt::Display for IllegalTransition {
                  inspect it with `bailiff plan show` before doing anything else",
             ),
             // Repeated command. Pointing at the *next* stage here would
-            // be actively misleading — running it cannot make this
-            // request legal — and this is where the per-verb
-            // "already recorded ... submit a fresh plan" messages the
-            // transition relation replaced used to say so.
+            // be actively misleading: running it cannot make this
+            // request legal.
             _ if self.stage.already_passed_from(self.state) => write!(
                 f,
                 "this plan is already past `{}`; bailiff does not re-run a stage — submit a \

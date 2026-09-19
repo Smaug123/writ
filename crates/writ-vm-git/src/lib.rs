@@ -232,8 +232,7 @@ pub const VM_OPENAI_PROXY_PREFIX: &str = "/openai";
 ///
 /// Lives beside the prefixes, and in a crate both the guest binary and the host
 /// broker depend on, so the host's route table can be tested against the very
-/// string the guest is configured with. That the two agreed was previously
-/// nobody's job to check.
+/// string the guest is configured with.
 pub fn anthropic_proxy_base_url(broker_url: &str) -> String {
     join_broker_path(broker_url, VM_ANTHROPIC_PROXY_PREFIX)
 }

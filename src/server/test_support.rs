@@ -188,11 +188,9 @@ pub(super) fn make_state_with_staging(
 /// [`PromoteRuntimeConfig`] (built against a fake git binary path
 /// and a per-test work_root under the same tempdir as staging) and
 /// a [`WritSigningKey`] (from the shared fixture). The fake git
-/// path is deliberately unused in slice B1e.2c — this slice never
-/// spawns git, it only proves the configured-state guards admit a
-/// well-formed request through to the load. B1e.2d/2e will swap in
-/// the system git for the integration tests that actually fetch
-/// and unbundle.
+/// path is never spawned: this state proves the configured-state
+/// guards admit a well-formed request through to the load, and the
+/// integration tests that fetch and unbundle use the system git.
 pub(super) fn make_state_with_approve_ready(
     server: &MockServer,
 ) -> (Arc<BrokerState<InMemorySecretStore>>, tempfile::TempDir) {
@@ -205,8 +203,7 @@ pub(super) fn make_state_with_approve_ready(
     let work_root = tmp.path().join("promote");
     std::fs::create_dir_all(&work_root).unwrap();
     let runtime = PromoteRuntimeConfig::new(
-        // Slice B1e.2c never spawns git; the fake path is fine
-        // and is replaced by `which git` in the follow-up slices.
+        // Never spawned; see the doc above.
         PathBuf::from("/nonexistent/bin/git"),
         GitCloneBaseUrl::github(),
         GitCredentialBoundary::new(

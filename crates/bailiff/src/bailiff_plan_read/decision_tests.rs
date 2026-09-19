@@ -1,4 +1,4 @@
-//! Tests for [`read_decision_note`] — the slice D1.4 read counterpart
+//! Tests for [`read_decision_note`] — the read counterpart
 //! to [`crate::bailiff_plan_write::write_decision_note`]. The
 //! load-bearing round-trip test drives the actual writer so a future
 //! refactor that drifts the writer's seed-OID derivation from the
