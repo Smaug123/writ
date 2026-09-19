@@ -1,5 +1,5 @@
 //! Tests for [`read_writ_envelope_at_oid`] and [`read_full_plan`] —
-//! slice F3's read-and-verify composition.
+//! the read-and-verify composition.
 //!
 //! Fixtures plant coherent writ runs (envelope + paired bailiff
 //! signed note pointing at the envelope's target OID) directly
@@ -554,8 +554,7 @@ fn read_full_plan_marks_section_when_metadata_tampered_post_sign() {
 /// match the envelope's — so the section must surface as
 /// `NoteEnvelopeMismatch`, never as `Verified`.
 ///
-/// This is the attack vector codex P1 surfaced: without the
-/// binding check, an operator who edits the bailiff plan note
+/// Without the binding check, an operator who edits the bailiff plan note
 /// (mutating `purpose`, or replacing `signed_metadata` with the
 /// metadata of a different run) could be shown the forged note
 /// next to a legitimate envelope's `Verified` status.
