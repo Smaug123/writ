@@ -30,6 +30,7 @@ use crate::core::{RequestId, SessionId, UnixMillis};
 use crate::openai_chatgpt_auth::ChatgptUpstreamHeaders;
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
+use crate::upstream_base_url::UpstreamBaseUrl;
 
 use super::broker_effect::{BrokeredEffect, EffectCompletion};
 use super::{
@@ -224,7 +225,7 @@ pub(super) trait ProxyAudit: 'static {
 /// refresh URL) via inherent methods; this trait only carries what the
 /// generic transport layer needs.
 pub(super) trait ProxyBackendConfig: Clone + Send + Sync + 'static {
-    fn upstream_base_url(&self) -> &reqwest::Url;
+    fn upstream_base_url(&self) -> &UpstreamBaseUrl;
     fn timeout(&self) -> std::time::Duration;
     fn max_response_bytes(&self) -> ByteSize;
 }
@@ -667,6 +668,7 @@ impl<B: ProxyBackend, S: SecretStore + Send + Sync + 'static> VmHttpProxyService
         Some(
             self.config
                 .upstream_base_url()
+                .as_url()
                 .join(&relative)
                 .expect("proxy backend route paths are URL-safe relative paths"),
         )

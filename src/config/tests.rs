@@ -7,6 +7,7 @@
 use super::*;
 use crate::core::AgentKind;
 use crate::github::GitHubAppRegistryConfigError;
+use crate::upstream_base_url::UpstreamBaseUrlError;
 
 const TEST_NIX_CACHE_PUBLIC_KEY: &str =
     "cache.example-1:IsGkyTbr2sed7tWowgiPcI0ZHhBAHoGQ7TyYRweyzwE=";
@@ -774,14 +775,16 @@ fn agent_vm_http_config_rejects_unsafe_git_clone_base_url() {
     assert!(matches!(
         sole_error(c.to_runtime_config()),
         AgentVmHttpConfigError::GitClone(
-            GitCloneBundlePlanError::UnsupportedGitCloneBaseUrlScheme { scheme, .. }
+            GitCloneBundlePlanError::GitCloneBaseUrl(UpstreamBaseUrlError::UnsupportedScheme { scheme, .. })
         ) if scheme == "ssh"
     ));
 
     c.git_clone_base_url = "https://user:token@github.com".into();
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::GitCloneBaseUrlHasCredentials(_))
+        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::GitCloneBaseUrl(
+            UpstreamBaseUrlError::HasCredentials(_)
+        ))
     ));
 }
 
@@ -846,9 +849,9 @@ fn agent_vm_http_config_rejects_invalid_nix_cache_url() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::NixCache(
-            VmHttpNixCacheConfigError::UnsupportedUpstreamScheme { .. }
-        )
+        AgentVmHttpConfigError::NixCache(VmHttpNixCacheConfigError::UpstreamUrl(
+            UpstreamBaseUrlError::UnsupportedScheme { .. }
+        ))
     ));
 }
 
@@ -904,9 +907,9 @@ fn agent_vm_http_config_rejects_invalid_claude_proxy_url() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::ClaudeProxy(
-            VmHttpClaudeProxyConfigError::UnsupportedUpstreamScheme { .. }
-        )
+        AgentVmHttpConfigError::ClaudeProxy(VmHttpClaudeProxyConfigError::UpstreamUrl(
+            UpstreamBaseUrlError::UnsupportedScheme { .. }
+        ))
     ));
 }
 

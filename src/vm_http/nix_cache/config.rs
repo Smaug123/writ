@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use writ_core::byte_size::ByteSize;
 
 use crate::nix_binary_cache::NixTrustedPublicKeys;
+use crate::upstream_base_url::{UpstreamBaseUrl, UpstreamBaseUrlError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpNixCacheConfig {
-    upstream_base_url: reqwest::Url,
+    upstream_base_url: UpstreamBaseUrl,
     max_metadata_bytes: ByteSize,
     max_nar_bytes: ByteSize,
     trusted_public_keys: NixTrustedPublicKeys,
@@ -28,16 +29,8 @@ pub struct VmHttpNixCacheConfig {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum VmHttpNixCacheConfigError {
-    #[error("Nix cache upstream URL must not be empty")]
-    EmptyUpstreamUrl,
-    #[error("Nix cache upstream URL {raw:?} is invalid: {message}")]
-    InvalidUpstreamUrl { raw: String, message: String },
-    #[error("Nix cache upstream URL {raw:?} uses unsupported scheme {scheme:?}")]
-    UnsupportedUpstreamScheme { raw: String, scheme: String },
-    #[error("Nix cache upstream URL must not contain embedded credentials: {0:?}")]
-    UpstreamUrlHasCredentials(String),
-    #[error("Nix cache upstream URL must not contain a query or fragment: {0:?}")]
-    UpstreamUrlHasQueryOrFragment(String),
+    #[error("Nix cache upstream URL {0}")]
+    UpstreamUrl(#[from] UpstreamBaseUrlError),
     #[error("Nix cache max metadata bytes must be greater than zero")]
     EmptyMaxMetadataBytes,
     #[error("Nix cache max NAR bytes must be greater than zero")]
@@ -64,44 +57,15 @@ impl VmHttpNixCacheConfig {
         max_nar_bytes: ByteSize,
         trusted_public_keys: NixTrustedPublicKeys,
     ) -> Result<Self, VmHttpNixCacheConfigError> {
-        let raw = upstream_base_url.as_ref();
-        if raw.is_empty() {
-            return Err(VmHttpNixCacheConfigError::EmptyUpstreamUrl);
-        }
+        let upstream_base_url = UpstreamBaseUrl::parse(upstream_base_url)?;
         if max_metadata_bytes.is_zero() {
             return Err(VmHttpNixCacheConfigError::EmptyMaxMetadataBytes);
         }
         if max_nar_bytes.is_zero() {
             return Err(VmHttpNixCacheConfigError::EmptyMaxNarBytes);
         }
-        let mut url = reqwest::Url::parse(raw).map_err(|err| {
-            VmHttpNixCacheConfigError::InvalidUpstreamUrl {
-                raw: raw.to_string(),
-                message: err.to_string(),
-            }
-        })?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(VmHttpNixCacheConfigError::UnsupportedUpstreamScheme {
-                raw: raw.to_string(),
-                scheme: url.scheme().to_string(),
-            });
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(VmHttpNixCacheConfigError::UpstreamUrlHasCredentials(
-                raw.to_string(),
-            ));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(VmHttpNixCacheConfigError::UpstreamUrlHasQueryOrFragment(
-                raw.to_string(),
-            ));
-        }
-        if !url.path().ends_with('/') {
-            let path = format!("{}/", url.path());
-            url.set_path(&path);
-        }
         Ok(Self {
-            upstream_base_url: url,
+            upstream_base_url,
             max_metadata_bytes,
             max_nar_bytes,
             trusted_public_keys,
@@ -133,7 +97,7 @@ impl VmHttpNixCacheConfig {
         self
     }
 
-    pub fn upstream_base_url(&self) -> &reqwest::Url {
+    pub fn upstream_base_url(&self) -> &UpstreamBaseUrl {
         &self.upstream_base_url
     }
 
