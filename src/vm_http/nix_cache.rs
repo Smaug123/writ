@@ -937,6 +937,7 @@ impl<S: SecretStore> VmHttpNixCacheService<S> {
         };
         self.config
             .upstream_base_url()
+            .as_url()
             .join(&path)
             .expect("Nix cache route paths are URL-safe relative paths")
     }
