@@ -30,6 +30,10 @@ cargo test
 cargo test -p writ --no-default-features --features vm-client --lib --bins
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features
 nix build .#packages.x86_64-linux.default   # the separate Nix-build CI job
+./scripts/test-proof-helpers.sh             # pure-bash helpers the prove-*.sh
+                                            # harnesses share; needs no Nix, so
+                                            # it is the first CI step and the
+                                            # cheapest gate to run locally
 ```
 
 The `cargo doc` gate is load-bearing and easy to forget: `build`, `test`, and

@@ -186,9 +186,35 @@ interpreter. This is the proof's positive-control broker only; production
   $dest` still reports "permitted".
 - End-to-end: with a **release** `writd` at `$dest` allowed, and the python
   broker allowed via the proof knob, `scripts/prove-agent-vm-lifecycle.sh`'s
-  broker-reach leg passes (no `WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG` waiver).
+  broker-reach leg passes (no `WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER` waiver).
   This is the first release-build green the proof has had since the symptom
   appeared, and it confirms the diagnosis end to end.
+
+**Verified on hardware 2026-09-19.** `scripts/prove-agent-vm-lifecycle.sh` ran
+green, exit 0, with no waiver: the broker-reach positive control passed, and so
+did every firewall, capability, and IPv6 leg. `writd` was the signed
+`~/.local/bin/writd` from Stage 1/2, allowed once by
+`scripts/allow-writd-firewall.sh`. Host placement is confirmed end to end, so
+`broker_placement = vm` stays parked. Note that this proof's broker is the
+python stand-in, so its green says nothing about `writd`'s own listener;
+`--getappblocked ~/.local/bin/writd` is the check for that, and it reports
+"permitted".
+
+Two deviations from the footnote above, both deliberate:
+
+1. `WRIT_PROVE_ALLOW_BROKER_BIN` was not built. A proof that allows its own
+   broker binary in the firewall for the duration of the run is self-permitting:
+   it would pass on exactly the hosts whose configuration it is supposed to
+   expose, and it would mutate host security state as a side effect of a test.
+   Instead the harnesses *detect* the condition and refuse to run, printing the
+   one `socketfilterfw --unblockapp` command for the interpreter they resolved;
+   allowing it stays a human decision, made once, visibly.
+2. That check is a preflight, not a post-mortem. It stands a listener up and
+   fetches from it over a real interface address before anything is built or
+   booted, so a blocked interpreter costs about 0.3s instead of a build, a sudo
+   prompt, a PF anchor, and a VM boot. See
+   `scripts/lib/host-listener-preflight.sh`, and
+   `scripts/test-proof-helpers.sh` for the classifier tests that go with it.
 
 ---
 

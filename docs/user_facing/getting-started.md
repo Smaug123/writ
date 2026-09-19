@@ -83,6 +83,16 @@ firewall. If you distribute `writ` to machines you do not administer, sign it
 with an Apple Developer ID and notarize it instead; the firewall then
 auto-allows it with no per-machine step.
 
+The `scripts/prove-*.sh` harnesses do not use `writd` for this: they stand a
+`python3 -m http.server` up as a stand-in broker, so the binary the firewall
+judges is whichever interpreter `python3` resolves to — on a nix host, a store
+path that gets its own entry, blocked by default, and a fresh one on every
+version bump. Those harnesses now probe for this before they build anything or
+boot a VM, and print the exact `socketfilterfw --unblockapp` command for the
+interpreter they resolved. Note that `/usr/bin/python3` is not a way around it:
+that path is Apple's `xcode_select` shim, which execs whatever `python3`
+`PATH` yields.
+
 ## 3. Store the private key
 
 The broker never reads the PEM file directly — it goes through a

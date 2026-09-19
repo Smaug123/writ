@@ -16,6 +16,10 @@ Requires:
     probe with wget and grades it on the host's PF deny counter; the released
     workload holds no CAP_NET_RAW, so a raw-socket tool such as busybox ping
     cannot be the sender)
+  - a python3 that the macOS Application Firewall allows incoming connections
+    to: this proof's broker is `python3 -m http.server`, and a blocked
+    interpreter fails only for the guest. The proof preflights this before it
+    builds anything and prints the one command that fixes it.
 
 Environment overrides:
   WRIT_PROVE_IMAGE       OCI image to run, default alpine:latest
@@ -24,11 +28,14 @@ Environment overrides:
   WRIT_PROVE_SUBNET_INDEX  session subnet index, default 252
   WRIT_PROVE_BROKER_PORT_MIN  minimum allowed broker port, default 49152
   WRIT_PROVE_BROKER_PORT_MAX  maximum allowed broker port, default 65535
-  WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1
+  WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1
                          carry on past a broker-reach failure whose evidence
-                         exactly matches the known macOS vmnet accept() defect
-                         (docs/vmnet-accept-bug-and-broker-vm-plan.md), so the
-                         firewall legs still run; the proof then exits 2
+                         says a host socket filter ate the request above PF
+                         (on macOS: the Application Firewall blocking the
+                         listener's binary), so the firewall legs still run;
+                         the proof then exits 2. This also downgrades the
+                         host-listener preflight to a warning, since that gate
+                         predicts exactly the failure being waived
 EOF
 }
 
@@ -40,6 +47,23 @@ die() {
   printf '[prove-lifecycle] error: %s\n' "$*" >&2
   dump_pf_diagnostics
   exit 1
+}
+
+# For failures before any PF anchor or VM exists. `die` dumps PF state through
+# sudo, which at that point would prompt for a password this script has not
+# asked for yet, to describe an anchor that was never installed.
+die_before_setup() {
+  printf '[prove-lifecycle] error: %s\n' "$*" >&2
+  exit 1
+}
+
+# Stands in for die_before_setup when WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1:
+# it returns instead of exiting, so the run carries on to the legs the waiver
+# exists to exercise. assert_broker_reachable then grades the failure for real and
+# forces the non-zero exit, so waiving the preflight cannot turn into a green run.
+warn_before_setup() {
+  printf '[prove-lifecycle] warning: %s\n' "$*" >&2
+  printf '[prove-lifecycle] warning: continuing because WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1; the proof will exit non-zero\n' >&2
 }
 
 # On failure, before anything is torn down: what PF did with the session's
@@ -72,6 +96,12 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/host-listener-preflight.sh
+source "${ROOT_DIR}/scripts/lib/host-listener-preflight.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/broker-reach-evidence.sh
+source "${ROOT_DIR}/scripts/lib/broker-reach-evidence.sh"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/writ-lifecycle-proof.XXXXXX")"
 IMAGE="${WRIT_PROVE_IMAGE:-alpine:latest}"
 IPV4_POOL="${WRIT_PROVE_IPV4_POOL:-192.168.0.0/16}"
@@ -466,34 +496,36 @@ pf_broker_pass_counters() {
 }
 
 # Broker reachability is the proof's positive control: the one connection the
-# anchor must pass. When it fails, the question is whether PF dropped it or
-# whether the bytes cleared PF and were lost above it. This proof's broker is
-# a host process with a blocking accept(), and on some macOS builds a host
-# accept() of a connection that originates from a container over vmnet hands
-# back a socket the kernel considers not connected (recv -> ENOTCONN), so the
-# request is ACKed by the kernel and never seen by the process. That defect is
-# root-caused, reduced to a pure-C repro, and documented in
-# docs/vmnet-accept-bug-and-broker-vm-plan.md; the product sidesteps it with
-# `broker_placement = vm`. It has been rediscovered from this leg's bare
-# timeout more than once, so on failure this assertion checks for its exact
-# signature, all four parts read on the host:
-#   1. the anchor's broker pass rule counted the guest's packets and created a
-#      state (PF passed the connection);
-#   2. no interface-scoped IPv4 deny counted a packet during the probe (PF did
-#      not drop it);
-#   3. the host holds a PF state for gateway:port <- guest whose TCP phase shows
-#      the handshake COMPLETED on BOTH endpoints (each side ESTABLISHED or a
-#      later graceful-close state, never a SYN_SENT/SYN_RCVD half-open and never
-#      a bare TIME_WAIT that a reset could leave — a broker that never SYN-ACKed,
-#      or answered a dead port with a reset, is a different failure, not waived);
-#   4. the broker logged the loopback control request but never one from the
-#      guest (the bytes reached the host kernel, not the listening process).
-# All four together name the vmnet accept() defect and exonerate the anchor;
-# anything else is reported as an ordinary failure for a human to read.
-# WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 lets the proof carry on past that
-# exact signature (and only that one), so the firewall legs that follow can
-# still be exercised on an affected host; the final summary then says the
-# positive control was waived, and the proof exits non-zero.
+# anchor must pass. When it fails, the question is where the request died, and
+# the answer decides who is at fault:
+#
+#   - PF counted it on a deny rule            -> the anchor is implicated
+#   - PF passed it and the listening process
+#     never saw it                            -> a socket filter above PF
+#   - anything else                            -> a human reads the evidence
+#
+# The middle case has been rediscovered from a bare timeout more than once. On
+# macOS it is the Application Firewall (`socketfilterfw`) blocking the
+# listener's binary: the kernel completes the handshake and ACKs the request,
+# then the filter detaches the socket before `accept()` returns it, so the
+# process never sees a byte while loopback — which the firewall exempts — keeps
+# working. It is not an Apple vmnet defect; see
+# docs/vmnet-accept-bug-and-broker-vm-plan.md, whose original root cause is
+# superseded by the correction at its head.
+#
+# Five things are read on the host to tell those cases apart: the anchor's pass
+# and deny counters, the PF state's TCP phases, which requests the listener
+# logged, and whether the listener itself reported a not-connected socket
+# (ENOTCONN) while serving the guest. That last witness is process-level proof
+# that accept() happened, which is why a state pair of TIME_WAIT:TIME_WAIT — all
+# a short graded probe may leave behind — no longer hides the diagnosis.
+# scripts/lib/broker-reach-evidence.sh does the classification as pure string
+# logic, and scripts/test-proof-helpers.sh tests it without hardware.
+#
+# WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1 lets the proof carry on past that
+# one signature, so the firewall legs that follow can still be exercised on an
+# affected host; the final summary then says the positive control was waived,
+# and the proof exits non-zero.
 BROKER_REACH_WAIVED=0
 assert_broker_reachable() {
   local label="VM can reach broker port through host-only gateway"
@@ -511,50 +543,71 @@ assert_broker_reachable() {
   local pass_packets=$(( ${pass_after% *} - ${pass_before% *} ))
   local pass_states="${pass_after#* }"
   local deny_packets=$(( deny_after - deny_before ))
-  local host_state handshake_complete=0
+  # pfctl prints the TCP state pair as `<src-state>:<dst-state>`, the last field
+  # on the tuple line.
+  local host_state state_pair=""
   host_state="$(sudo pfctl -ss 2>/dev/null \
     | grep -F "tcp ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}:" || true)"
-  # The defect's signature is that the handshake COMPLETED (the host ACKed the
-  # request) yet the process never read it — the original capture showed the
-  # state as ESTABLISHED:FIN_WAIT_2. pfctl prints the TCP state pair as the last
-  # field on the tuple line (`<src-state>:<dst-state>`); read BOTH endpoints.
-  # Waive only if neither endpoint is still pre-establishment
-  # (SYN_SENT/SYN_RCVD/CLOSED/NO_TRAFFIC — this rejects a half-open such as
-  # SYN_SENT:ESTABLISHED, or a SYN to a dead port) AND at least one endpoint is
-  # in a state reachable only after a completed 3-way handshake (ESTABLISHED or
-  # a graceful-close phase). TIME_WAIT is deliberately excluded from that set:
-  # a reset can leave a reset-adjacent state, so a bare TIME_WAIT:TIME_WAIT is
-  # treated as inconclusive rather than proof of completion.
-  local state_pair state_a state_b
-  state_pair="${host_state##* }"
-  state_a="${state_pair%%:*}"
-  state_b="${state_pair##*:}"
-  local pre_handshake_re='^(SYN_SENT|SYN_RCVD|CLOSED|NO_TRAFFIC)$'
-  local post_handshake_re='^(ESTABLISHED|FIN_WAIT_1|FIN_WAIT_2|CLOSING|CLOSE_WAIT|LAST_ACK)$'
-  if [[ -n "$host_state" ]] \
-    && ! [[ "$state_a" =~ $pre_handshake_re ]] \
-    && ! [[ "$state_b" =~ $pre_handshake_re ]] \
-    && { [[ "$state_a" =~ $post_handshake_re ]] || [[ "$state_b" =~ $post_handshake_re ]]; }; then
-    handshake_complete=1
+  if [[ -n "$host_state" ]]; then
+    state_pair="${host_state##* }"
   fi
-  local guest_logged=0 loopback_logged=0
-  grep -Fq "${GUEST_IPV4} - -" "${TMP_DIR}/broker.log" 2>/dev/null && guest_logged=1
-  grep -Fq "127.0.0.1 - -" "${TMP_DIR}/broker.log" 2>/dev/null && loopback_logged=1
+  local broker_log="${TMP_DIR}/broker.log"
+  local guest_logged=0 loopback_logged=0 listener_detached=0
+  grep -Fq "${GUEST_IPV4} - -" "$broker_log" 2>/dev/null && guest_logged=1
+  grep -Fq "127.0.0.1 - -" "$broker_log" 2>/dev/null && loopback_logged=1
+  # The witness has to be the guest's own traceback, not merely an ENOTCONN
+  # somewhere in the log and the guest's address somewhere else: this listener
+  # binds 0.0.0.0, so another peer can produce a traceback of its own, and
+  # borrowing it would waive a real guest failure.
+  if [[ -r "$broker_log" ]]; then
+    listener_detached="$(writ_listener_detached_for_peer "$GUEST_IPV4" <"$broker_log")"
+  fi
+  local phase
+  phase="$(writ_tcp_state_pair_phase "$state_pair")"
   log "broker-reach failure evidence:"
   log "  anchor broker pass rule: +${pass_packets} packet(s) during the probe, ${pass_states} live state(s)"
   log "  anchor IPv4 interface deny: +${deny_packets} packet(s) during the probe"
-  log "  host PF state for ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}: ${host_state:-none} (handshake complete=${handshake_complete})"
+  log "  host PF state for ${IPV4_GATEWAY}:${BROKER_PORT} <- ${GUEST_IPV4}: ${host_state:-none} (${phase})"
   log "  broker log: loopback request logged=${loopback_logged}, guest request logged=${guest_logged}"
-  if (( pass_packets > 0 && pass_states > 0 && deny_packets == 0 && loopback_logged == 1 && guest_logged == 0 && handshake_complete == 1 )); then
-    log "diagnosis: PF passed the guest's connection and dropped nothing; the host completed the handshake; the broker process never saw the request. This is the known macOS vmnet accept() defect (a host accept() of a vmnet-originated connection returns a not-connected socket), not a firewall drop. See docs/vmnet-accept-bug-and-broker-vm-plan.md. The session anchor is not implicated, and this host-placement leg cannot pass on an affected host; the product sidesteps it with broker_placement = vm."
-    if [[ "${WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG:-0}" == "1" ]]; then
-      BROKER_REACH_WAIVED=1
-      log "WAIVED: continuing past the positive control because WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1; the proof will exit non-zero"
-      return
-    fi
-    die "expected success: ${label} (known vmnet accept() defect, see diagnosis above; set WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 to exercise the remaining legs anyway)"
+  log "  broker listener reported ENOTCONN while serving the guest: ${listener_detached}"
+  # The listener's own log, in full. It is a handful of lines, and when a socket
+  # filter is at work the traceback in it names the cause outright — that was
+  # sitting unread in this file the first time this leg was diagnosed by hand.
+  local log_lines=0
+  if [[ -s "$broker_log" ]]; then
+    log_lines="$(grep -c '' "$broker_log")"
   fi
-  die "expected success: ${label}"
+  log "broker listener log (${broker_log}, ${log_lines} line(s)):"
+  if (( log_lines > 0 )); then
+    while IFS= read -r line; do
+      log "  ${line}"
+    done <"$broker_log"
+  else
+    log "  (empty)"
+  fi
+  local verdict
+  verdict="$(writ_classify_broker_reach_evidence "$pass_packets" "$pass_states" \
+    "$deny_packets" "$loopback_logged" "$guest_logged" "$state_pair" \
+    "$listener_detached")"
+  case "$verdict" in
+    pf-dropped)
+      log "diagnosis: an interface-scoped deny rule of the session anchor counted the guest's probe, so PF itself dropped it. The anchor, the pools it was rendered from, or the broker port is wrong. This is not a host socket filter."
+      die "expected success: ${label} (PF dropped it; see diagnosis above)"
+      ;;
+    listener-never-saw-request)
+      log "diagnosis: PF passed the guest's connection and dropped nothing, the handshake completed on the host, and the listening process never saw the request — a socket filter took it above PF. On macOS that is the Application Firewall blocking the listener's binary (loopback is exempt, which is why this proof's own loopback control request was logged). The session anchor is not implicated. This proof's preflight tests exactly this before booting a VM, so reaching here means the host changed under the run, or the guest's path differs from the interface the preflight used. Remedy: unblock the listener's binary with 'sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp <binary>' (scripts/allow-writd-firewall.sh does it for writd) and re-run. Background: docs/vmnet-accept-bug-and-broker-vm-plan.md, whose original vmnet root cause is superseded by the correction at its head."
+      if [[ "${WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER:-0}" == "1" ]]; then
+        BROKER_REACH_WAIVED=1
+        log "WAIVED: continuing past the positive control because WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1; the proof will exit non-zero"
+        return
+      fi
+      die "expected success: ${label} (a host socket filter blocked the listener; see diagnosis above; set WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1 to exercise the remaining legs anyway)"
+      ;;
+    *)
+      log "diagnosis: none. The evidence above matches no known signature, so read it rather than assuming a firewall: in particular, a pass rule that counted nothing means PF never saw the guest's packets at all, which points at the bridge or the guest's route."
+      die "expected success: ${label} (evidence above is inconclusive)"
+      ;;
+  esac
 }
 
 # The interface-scoped IPv4 deny is live on the guest's actual path: a TCP
@@ -677,6 +730,22 @@ require_cmd curl
 require_cmd python3
 require_cmd sudo
 require_cmd uuidgen
+
+# Cheapest gate first: this proof's broker is a host listener, and a host
+# socket filter that blocks it is invisible to every loopback check the harness
+# makes. Catch that here, in about a second, rather than after a build, a sudo
+# prompt, a PF anchor, and a VM boot.
+#
+# Under the waiver this must warn rather than exit. The waiver's whole purpose is
+# to exercise the remaining legs on a host whose listener is blocked, and a fatal
+# preflight would make it unreachable: the run would stop here, long before
+# assert_broker_reachable, which is where the waiver is implemented.
+if [[ "${WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER:-0}" == "1" ]]; then
+  writ_require_reachable_host_listener log warn_before_setup
+else
+  writ_require_reachable_host_listener log die_before_setup
+fi
+
 choose_cargo
 
 IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
@@ -816,7 +885,7 @@ assert_no_pf_state_for_guest
 cleanup
 trap - EXIT INT TERM
 if (( BROKER_REACH_WAIVED == 1 )); then
-  log "runner lifecycle proof INCOMPLETE for ${IPV4_CIDR}: the positive control (broker reachable) was waived under WRIT_PROVE_TOLERATE_VMNET_ACCEPT_BUG=1 because this host shows the known vmnet accept() defect (docs/vmnet-accept-bug-and-broker-vm-plan.md); every other leg passed: workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"
+  log "runner lifecycle proof INCOMPLETE for ${IPV4_CIDR}: the positive control (broker reachable) was waived under WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1 because a host socket filter blocked this proof's broker listener; every other leg passed: workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"
   exit 2
 fi
 log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"

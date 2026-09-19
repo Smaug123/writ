@@ -9,8 +9,14 @@
 > here. This was confirmed by allowing the pure‑C repro server in the firewall,
 > which made the repro pass, and by `socketfilterfw --listapps` showing the
 > release/nix `writd` (and the proof's nix‑built `python3`) as *Block* while the
-> debug `writd` and `/usr/bin/python3` were *Allow* — the debug‑vs‑release split
-> was a per‑binary firewall decision, not build timing. **Host placement works
+> debug `writd` was *Allow* — the debug‑vs‑release split was a per‑binary
+> firewall decision, not build timing. (`--listapps` also shows a *Allow* row
+> for `/usr/bin/python3`, which is a red herring: that path is Apple's
+> `xcode_select` tool shim, one of 78 hardlinks to the same file, and it execs
+> `$(xcode-select -p)/usr/bin/xcrun`, which resolves `python3` off `PATH`. On a
+> nix host the interpreter that ends up owning the socket is the nix one, and
+> the firewall judges *that* binary. Running the proofs as `/usr/bin/python3`
+> changes nothing.) **Host placement works
 > in a release build once `writd` is allowed.** The durable fix is a stable
 > code‑signing identity for `writd` plus a one‑time firewall allow; see
 > `docs/plans/2026-09-16-macos-firewall-stable-identity.md` and the macOS step
