@@ -1,6 +1,7 @@
 //! Shared test fixtures used by the audit submodules' inline tests.
 
-use super::{AuditError, AuditLog, PreMintRecord};
+use super::{AuditError, AuditLog, HostMintAuditTable, HostMintOutcome, PreMintRecord};
+use writ_core::core::CredentialGrant;
 use writ_core::core::{
     AgentKind, CapabilityRequest, GitHubAccess, GitHubGrantedScope, GitHubPermissions,
     GitHubRequest, GrantedScope, MetadataAccess, PolicyDecision, RepoRef, RequestId, SessionId,
@@ -43,8 +44,8 @@ pub(super) fn sample_scope() -> GrantedScope {
     })
 }
 
-/// Stash the request+decision row so subsequent `record_grant` or
-/// `record_mint_failure` calls have something to attach to.
+/// Write the mint's request row on its own, so a later [`record_grant`] or
+/// [`record_mint_failure`] has something to attach to.
 pub(super) fn pre_mint(
     log: &AuditLog,
     request_id: RequestId,
@@ -53,11 +54,30 @@ pub(super) fn pre_mint(
     decision: &PolicyDecision,
     received_at: UnixMillis,
 ) -> Result<(), AuditError> {
-    log.record_pre_mint(&PreMintRecord {
+    log.seed_effect_request::<HostMintAuditTable>(&PreMintRecord {
         request_id,
         session_id,
         received_at,
         request,
         decision,
+    })
+}
+
+/// Write the `Granted` ending of a mint on its own.
+pub(super) fn record_grant(log: &AuditLog, grant: &CredentialGrant) -> Result<(), AuditError> {
+    log.seed_effect_outcome::<HostMintAuditTable>(&HostMintOutcome::Granted(grant))
+}
+
+/// Write the `Failed` ending of a mint on its own.
+pub(super) fn record_mint_failure(
+    log: &AuditLog,
+    request_id: RequestId,
+    failed_at: UnixMillis,
+    error: &str,
+) -> Result<(), AuditError> {
+    log.seed_effect_outcome::<HostMintAuditTable>(&HostMintOutcome::Failed {
+        request_id,
+        failed_at,
+        error,
     })
 }

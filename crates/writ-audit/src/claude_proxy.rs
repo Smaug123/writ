@@ -63,33 +63,6 @@ pub type ClaudeProxyRequestRecord<'a> = ProxyRequestRecord<'a, ClaudeProxyAuditR
 pub type ClaudeProxyOutcomeRecord<'a> = ProxyOutcomeRecord<'a>;
 
 impl AuditLog {
-    /// Write *only* the request row of a VM Claude proxy pair.
-    ///
-    /// **Test-only, and deliberately so.** Every production write of this table
-    /// goes through the audit-pair guard — `begin_effect` + `complete` for an
-    /// upstream fetch, `record_effect_coalesced` for a locally-generated
-    /// response — so no handler can leave one half of the pair behind. What the
-    /// tests still need it for is the opposite: *seeding* an unpaired row, to
-    /// prove the boot sweep ([`crate::effect_scan`]) and the audit-pair oracle
-    /// ([`crate::effect_audit_oracle`]) actually catch one.
-    #[cfg(test)]
-    pub(crate) fn record_claude_proxy_request(
-        &self,
-        r: &ClaudeProxyRequestRecord<'_>,
-    ) -> Result<(), AuditError> {
-        self.record_proxy_request::<ClaudeProxyAuditTable>(r)
-    }
-
-    /// Write *only* the outcome row of a VM Claude proxy pair. Test-only, for
-    /// the same reason as [`AuditLog::record_claude_proxy_request`].
-    #[cfg(test)]
-    pub(crate) fn record_claude_proxy_outcome(
-        &self,
-        r: &ClaudeProxyOutcomeRecord<'_>,
-    ) -> Result<(), AuditError> {
-        self.record_proxy_outcome::<ClaudeProxyAuditTable>(r)
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn claude_proxy_outcome_for_test(
         &self,
@@ -122,7 +95,7 @@ mod tests {
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
 
-        log.record_claude_proxy_request(&ClaudeProxyRequestRecord {
+        log.seed_effect_request::<ClaudeProxyAuditTable>(&ClaudeProxyRequestRecord {
             request_id,
             session_id: s.session_id,
             received_at: UnixMillis::from_millis(1_700_000_200),
@@ -132,7 +105,7 @@ mod tests {
             decision: &ClaudeProxyAuditDecision::Allow,
         })
         .unwrap();
-        log.record_claude_proxy_outcome(&ClaudeProxyOutcomeRecord {
+        log.seed_effect_outcome::<ClaudeProxyAuditTable>(&ClaudeProxyOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_240),
             http_status: 200,
