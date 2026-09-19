@@ -261,9 +261,6 @@ fn write_ready_file_atomic(path: &Path, broker_port: BrokerPort) -> Result<(), B
     })
 }
 
-/// Validate all inputs and assemble the (not-yet-serving) vm_http session on its
-/// fixed listener. Splitting this from [`serve_broker`] keeps every fail-fast
-/// check testable without spawning a server or waiting on a signal.
 /// The fixed-listener session plus the egress dependencies the broker must be
 /// able to reach before it publishes readiness. Returned by [`prepare_broker`]
 /// so [`run_broker`] can gate readiness on egress without re-reading the config.
@@ -275,6 +272,9 @@ struct PreparedBroker {
     egress_probe_urls: Vec<String>,
 }
 
+/// Validate all inputs and assemble the (not-yet-serving) vm_http session on its
+/// fixed listener. Splitting this from [`serve_broker`] keeps every fail-fast
+/// check testable without spawning a server or waiting on a signal.
 async fn prepare_broker(args: &BrokerArgs) -> Result<PreparedBroker, BrokerRunError> {
     let config_json =
         std::fs::read_to_string(&args.config).map_err(|source| BrokerRunError::ConfigRead {

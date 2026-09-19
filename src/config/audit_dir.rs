@@ -101,32 +101,6 @@ fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
-/// Enforce that the audit DB's directory — the one the broker VM mounts
-/// read-write — contains only the audit database and its SQLite sidecars, so
-/// nothing else host-owned is reachable read-write inside the broker VM.
-///
-/// The *scanned* directory is the real form of what the broker actually mounts:
-/// [`crate::agent_vm_daemon`]'s `resolve_broker_audit_paths` mounts
-/// `absolute(audit_db).parent()`, so this canonicalises **that parent** (not the
-/// DB — the DB's own final symlink could resolve into a different directory than
-/// the one mounted). Case-insensitive collisions collapse to filesystem identity
-/// once the directory exists.
-///
-/// An allowed entry must be a **regular file** (a directory, symlink, or other
-/// object using a sidecar name is rejected), **singly linked** (no hard-link
-/// alias to an external inode), and either **the audit DB itself** — matched by
-/// filesystem identity, so a case-aliased config name like `AUDIT.DB` opening the
-/// on-disk `audit.db` still matches — or a `-{wal,shm,journal}` sidecar of the DB.
-/// Sidecar names are checked against both the configured basename and the DB
-/// entry's on-disk basename: SQLite names a sidecar after the path it was opened
-/// with, but on a case-insensitive filesystem an existing sidecar keeps its
-/// original spelling; both refer to the same file there and coincide on a
-/// case-sensitive filesystem, so accepting either widens nothing.
-///
-/// A not-yet-created directory is not a violation (nothing is mounted yet); a
-/// directory that cannot be read fails closed (`Io`). Callers gate this on
-/// `broker_placement == Vm` and open the audit DB first; it is authoritative at
-/// broker-VM mount time, when every lazily-written file already exists.
 /// Preflight, run **before** `AuditLog::open` under vm placement: if the audit
 /// DB path already exists it must be a plain regular file with a single hard
 /// link — not a symlink or multiply-linked file. `AuditLog::open` follows
@@ -156,6 +130,32 @@ pub fn ensure_audit_db_entry_is_regular_file(audit_db: &Path) -> Result<(), Audi
     Ok(())
 }
 
+/// Enforce that the audit DB's directory — the one the broker VM mounts
+/// read-write — contains only the audit database and its SQLite sidecars, so
+/// nothing else host-owned is reachable read-write inside the broker VM.
+///
+/// The *scanned* directory is the real form of what the broker actually mounts:
+/// [`crate::agent_vm_daemon`]'s `resolve_broker_audit_paths` mounts
+/// `absolute(audit_db).parent()`, so this canonicalises **that parent** (not the
+/// DB — the DB's own final symlink could resolve into a different directory than
+/// the one mounted). Case-insensitive collisions collapse to filesystem identity
+/// once the directory exists.
+///
+/// An allowed entry must be a **regular file** (a directory, symlink, or other
+/// object using a sidecar name is rejected), **singly linked** (no hard-link
+/// alias to an external inode), and either **the audit DB itself** — matched by
+/// filesystem identity, so a case-aliased config name like `AUDIT.DB` opening the
+/// on-disk `audit.db` still matches — or a `-{wal,shm,journal}` sidecar of the DB.
+/// Sidecar names are checked against both the configured basename and the DB
+/// entry's on-disk basename: SQLite names a sidecar after the path it was opened
+/// with, but on a case-insensitive filesystem an existing sidecar keeps its
+/// original spelling; both refer to the same file there and coincide on a
+/// case-sensitive filesystem, so accepting either widens nothing.
+///
+/// A not-yet-created directory is not a violation (nothing is mounted yet); a
+/// directory that cannot be read fails closed (`Io`). Callers gate this on
+/// `broker_placement == Vm` and open the audit DB first; it is authoritative at
+/// broker-VM mount time, when every lazily-written file already exists.
 pub fn ensure_audit_dir_is_dedicated(audit_db: &Path) -> Result<(), AuditDirNotDedicated> {
     let abs = std::path::absolute(audit_db).unwrap_or_else(|_| audit_db.to_path_buf());
     let Some(parent) = abs.parent() else {
