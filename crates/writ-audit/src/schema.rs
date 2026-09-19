@@ -269,9 +269,9 @@ fn now_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::AuditLog;
-    use crate::test_support::{pre_mint, sample_request, sample_session};
+    use crate::test_support::sample_session;
     use tempfile::NamedTempFile;
-    use writ_core::core::{Jti, PolicyDecision, RequestId, SessionId, UnixMillis};
+    use writ_core::core::{Jti, RequestId, SessionId, UnixMillis};
 
     #[test]
     fn fresh_open_is_at_current_schema_version() {
@@ -1248,31 +1248,5 @@ mod tests {
             let err = push_with_correlation(binding);
             assert!(err.to_string().contains("CHECK"), "got: {err}");
         }
-    }
-
-    /// A recorded audit row for an unknown session was previously
-    /// caught only by the FK; `record_pre_mint` reports it explicitly so
-    /// the error is readable rather than leaking SQLite's message.
-    #[test]
-    fn record_pre_mint_rejects_write_against_nonexistent_session() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let phantom = SessionId::new();
-        let req = sample_request();
-        let decision = PolicyDecision::Deny {
-            reason: "any".into(),
-        };
-        let err = pre_mint(
-            &log,
-            RequestId::new(),
-            phantom,
-            &req,
-            &decision,
-            UnixMillis::from_millis(1),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, AuditError::Invariant("session does not exist")),
-            "got: {err:?}"
-        );
     }
 }

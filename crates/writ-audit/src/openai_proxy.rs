@@ -61,27 +61,6 @@ pub type OpenAiProxyRequestRecord<'a> = ProxyRequestRecord<'a, OpenAiProxyAuditR
 pub type OpenAiProxyOutcomeRecord<'a> = ProxyOutcomeRecord<'a>;
 
 impl AuditLog {
-    /// Write *only* the request row of a VM OpenAI proxy pair. Test-only: see
-    /// [`AuditLog::record_claude_proxy_request`] for why the production paths
-    /// cannot reach an unpaired write.
-    #[cfg(test)]
-    pub(crate) fn record_openai_proxy_request(
-        &self,
-        r: &OpenAiProxyRequestRecord<'_>,
-    ) -> Result<(), AuditError> {
-        self.record_proxy_request::<OpenAiProxyAuditTable>(r)
-    }
-
-    /// Write *only* the outcome row of a VM OpenAI proxy pair. Test-only, for
-    /// the same reason as [`AuditLog::record_openai_proxy_request`].
-    #[cfg(test)]
-    pub(crate) fn record_openai_proxy_outcome(
-        &self,
-        r: &OpenAiProxyOutcomeRecord<'_>,
-    ) -> Result<(), AuditError> {
-        self.record_proxy_outcome::<OpenAiProxyAuditTable>(r)
-    }
-
     #[cfg(test)]
     pub(crate) fn openai_proxy_outcome_for_test(
         &self,
@@ -104,7 +83,7 @@ impl AuditLog {
 mod tests {
     use super::*;
     use crate::test_support::sample_session;
-    use writ_core::core::{RequestId, SessionId, UnixMillis};
+    use writ_core::core::{RequestId, UnixMillis};
 
     #[test]
     fn openai_proxy_request_then_outcome_roundtrips() {
@@ -113,7 +92,7 @@ mod tests {
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
 
-        log.record_openai_proxy_request(&OpenAiProxyRequestRecord {
+        log.seed_effect_request::<OpenAiProxyAuditTable>(&OpenAiProxyRequestRecord {
             request_id,
             session_id: s.session_id,
             received_at: UnixMillis::from_millis(1_700_000_300),
@@ -123,7 +102,7 @@ mod tests {
             decision: &OpenAiProxyAuditDecision::Allow,
         })
         .unwrap();
-        log.record_openai_proxy_outcome(&OpenAiProxyOutcomeRecord {
+        log.seed_effect_outcome::<OpenAiProxyAuditTable>(&OpenAiProxyOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_340),
             http_status: 200,
@@ -148,47 +127,6 @@ mod tests {
         assert_eq!(
             log.openai_proxy_outcome_for_test(request_id).unwrap(),
             Some((200, 256, None))
-        );
-    }
-
-    #[test]
-    fn openai_proxy_request_rejects_closed_or_missing_session() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
-            .unwrap();
-
-        let closed = log
-            .record_openai_proxy_request(&OpenAiProxyRequestRecord {
-                request_id: RequestId::new(),
-                session_id: s.session_id,
-                received_at: UnixMillis::from_millis(1_700_000_100),
-                method: "POST",
-                target: "/v1/responses",
-                route: OpenAiProxyAuditRoute::Responses,
-                decision: &OpenAiProxyAuditDecision::Allow,
-            })
-            .unwrap_err();
-        assert!(
-            matches!(closed, AuditError::Invariant("session is closed")),
-            "got: {closed:?}"
-        );
-
-        let missing = log
-            .record_openai_proxy_request(&OpenAiProxyRequestRecord {
-                request_id: RequestId::new(),
-                session_id: SessionId::new(),
-                received_at: UnixMillis::from_millis(1_700_000_100),
-                method: "POST",
-                target: "/v1/responses",
-                route: OpenAiProxyAuditRoute::Responses,
-                decision: &OpenAiProxyAuditDecision::Allow,
-            })
-            .unwrap_err();
-        assert!(
-            matches!(missing, AuditError::Invariant("session does not exist")),
-            "got: {missing:?}"
         );
     }
 }

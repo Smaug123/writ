@@ -1,16 +1,18 @@
-//! Example-based tests for `plan_fast_forward_via_rev_list` and the
-//! totality of the branch-creation-to-fast-forward error mapping.
+//! Example-based tests for `plan_fast_forward_via_rev_list`: its
+//! argv/parse primitives, the real-git end-to-end topology cases, and
+//! the subprocess-timeout guard.
 
 use super::test_fixture::InMemoryGitObjectSource;
 use super::test_support::*;
 use super::*;
 use serde_json::json;
+use std::path::PathBuf;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Same `Replay`-extraction helper as `expect_replay`, but for
-/// the fast-forward result enum. Keeps the per-test asserts focussed
-/// on shape rather than match scaffolding.
+/// Assert a planner result is `Replay` and return the inner
+/// `(commits, seed)`. Keeps the per-test asserts focussed on shape
+/// rather than match scaffolding.
 fn expect_replay_ff(plan: FastForwardPlan) -> (Vec<GitObjectId>, ShaMap) {
     match plan {
         FastForwardPlan::Replay { commits, seed } => (commits, seed),
@@ -19,6 +21,167 @@ fn expect_replay_ff(plan: FastForwardPlan) -> (Vec<GitObjectId>, ShaMap) {
         }
     }
 }
+
+// ----- pure helpers -----
+
+#[test]
+fn build_is_shallow_invocation_pins_argv_shape() {
+    let staging = PathBuf::from("/tmp/staging");
+    let git = PathBuf::from("/usr/bin/git");
+    let invocation = build_is_shallow_invocation(&staging, &git);
+    assert_eq!(invocation.program(), git.as_path());
+    assert_eq!(
+        invocation.display_args_lossy(),
+        vec![
+            "-C".to_string(),
+            "/tmp/staging".to_string(),
+            "rev-parse".to_string(),
+            "--is-shallow-repository".to_string(),
+        ],
+    );
+    assert!(invocation.required_secret_env().is_empty());
+    // Hardened env stays attached to the pre-flight check too —
+    // otherwise a malicious `core.fsmonitor` in a parent `.git`
+    // dir could fire.
+    let names: Vec<&str> = invocation.env().iter().map(|e| e.name()).collect();
+    assert!(names.contains(&"GIT_CONFIG_NOSYSTEM"));
+    assert!(names.contains(&"HOME"));
+}
+
+#[test]
+fn parse_is_shallow_output_recognises_true_and_false() {
+    assert!(parse_is_shallow_output(b"true\n").unwrap());
+    assert!(!parse_is_shallow_output(b"false\n").unwrap());
+    // Whitespace tolerance: git always emits a trailing newline,
+    // but defensive trim covers windows-CRLF too.
+    assert!(parse_is_shallow_output(b"  true  ").unwrap());
+    assert!(!parse_is_shallow_output(b"false\r\n").unwrap());
+}
+
+#[test]
+fn parse_is_shallow_output_rejects_unexpected_value() {
+    let err = parse_is_shallow_output(b"maybe\n").unwrap_err();
+    match err {
+        FastForwardPlanError::InvalidRevListOutput { line, .. } => {
+            assert_eq!(line, "maybe");
+        }
+        other => panic!("expected InvalidRevListOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn build_rev_list_boundary_invocation_pins_argv_shape() {
+    let staging = PathBuf::from("/tmp/staging");
+    let git = PathBuf::from("/usr/bin/git");
+    let bundle_tip = sample_object_id('a');
+    let baseline = sample_object_id('b');
+    let invocation = build_rev_list_boundary_invocation(&staging, &git, &bundle_tip, &baseline);
+    assert_eq!(invocation.program(), git.as_path());
+    assert_eq!(
+        invocation.display_args_lossy(),
+        vec![
+            "-C".to_string(),
+            "/tmp/staging".to_string(),
+            "rev-list".to_string(),
+            "--topo-order".to_string(),
+            "--reverse".to_string(),
+            "--boundary".to_string(),
+            format!("^{}", baseline.as_str()),
+            bundle_tip.as_str().to_string(),
+        ],
+    );
+    // Reading the staging repo never needs a credential — the
+    // App token is a GitHub-side thing, not a local-git thing.
+    assert!(invocation.required_secret_env().is_empty());
+    // Sanity-check the hardened-env wiring: the production
+    // helper must supply at least the `GIT_CONFIG_NOSYSTEM` and
+    // `HOME` entries. Spelling them out here catches regressions
+    // where someone swaps out `clean_git_config_env`.
+    let names: Vec<&str> = invocation.env().iter().map(|e| e.name()).collect();
+    assert!(names.contains(&"GIT_CONFIG_NOSYSTEM"));
+    assert!(names.contains(&"HOME"));
+}
+
+#[test]
+fn parse_rev_list_boundary_output_splits_interesting_and_boundary() {
+    let a = "a".repeat(40);
+    let b = "b".repeat(40);
+    let c = "c".repeat(40);
+    let stdout = format!("{a}\n{b}\n-{c}\n");
+    let (commits, boundaries) = parse_rev_list_boundary_output(stdout.as_bytes()).unwrap();
+    let commit_strs: Vec<&str> = commits.iter().map(GitObjectId::as_str).collect();
+    let boundary_strs: Vec<&str> = boundaries.iter().map(GitObjectId::as_str).collect();
+    assert_eq!(commit_strs, vec![a.as_str(), b.as_str()]);
+    assert_eq!(boundary_strs, vec![c.as_str()]);
+}
+
+#[test]
+fn parse_rev_list_boundary_output_accepts_empty_input() {
+    let (commits, boundaries) = parse_rev_list_boundary_output(b"").unwrap();
+    assert!(commits.is_empty());
+    assert!(boundaries.is_empty());
+}
+
+#[test]
+fn parse_rev_list_boundary_output_ignores_blank_lines() {
+    let sha = "a".repeat(40);
+    let stdout = format!("\n{sha}\n\n");
+    let (commits, _) = parse_rev_list_boundary_output(stdout.as_bytes()).unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].as_str(), sha);
+}
+
+#[test]
+fn parse_rev_list_boundary_output_rejects_short_sha() {
+    let err = parse_rev_list_boundary_output(b"abc\n").unwrap_err();
+    match err {
+        FastForwardPlanError::InvalidRevListOutput { line, .. } => {
+            assert_eq!(line, "abc");
+        }
+        other => panic!("expected InvalidRevListOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_rev_list_boundary_output_rejects_non_hex_sha() {
+    let bad = "z".repeat(40);
+    let err = parse_rev_list_boundary_output(bad.as_bytes()).unwrap_err();
+    assert!(
+        matches!(err, FastForwardPlanError::InvalidRevListOutput { .. }),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn parse_rev_list_boundary_output_preserves_dash_prefix_in_error_line() {
+    // The reported `line` includes the leading `-`, so a future
+    // debugger sees exactly what git emitted (boundary or not)
+    // rather than an unprefixed snippet that could be mistaken
+    // for an interesting commit.
+    let err = parse_rev_list_boundary_output(b"-abc\n").unwrap_err();
+    match err {
+        FastForwardPlanError::InvalidRevListOutput { line, .. } => {
+            assert_eq!(line, "-abc");
+        }
+        other => panic!("expected InvalidRevListOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_rev_list_boundary_output_rejects_non_utf8() {
+    let mut bytes = vec![b'a'; 40];
+    bytes.push(b'\n');
+    bytes.push(0xff);
+    let err = parse_rev_list_boundary_output(&bytes).unwrap_err();
+    match err {
+        FastForwardPlanError::InvalidRevListOutput { line, .. } => {
+            assert!(line.contains("non-utf8"), "got {line}");
+        }
+        other => panic!("expected InvalidRevListOutput, got {other:?}"),
+    }
+}
+
+// ----- real-git topology tests -----
 
 #[tokio::test]
 async fn fast_forward_plan_returns_single_commit_when_tip_is_child_of_expected_remote_head() {
@@ -349,9 +512,7 @@ async fn fast_forward_plan_surfaces_git_error_on_unknown_sha() {
 /// straight into `replay_commits` against a wiremock-backed
 /// GitHub Git Data client. Proves the boundary
 /// (= expected_remote_head) lands in the seed map in a shape that
-/// satisfies the walker's `UnmappedParent` guard, identical in
-/// structure to the branch-creation end-to-end test but with the
-/// fast-forward planner.
+/// satisfies the walker's `UnmappedParent` guard.
 #[tokio::test]
 async fn fast_forward_plan_seeds_replay_commits_end_to_end() {
     let (_dir, repo, git) = init_test_repo();
@@ -447,43 +608,106 @@ async fn fast_forward_plan_seeds_replay_commits_end_to_end() {
     assert_eq!(map.commit(&expected), Some(&expected));
 }
 
-/// `branch_creation_to_fast_forward` is total: every variant of
-/// the source enum maps to a sensible variant of the destination.
-/// Pin the mapping so a future refactor can't silently re-route
-/// (e.g. by changing a variant's name) without updating the
-/// adapter.
-#[test]
-fn branch_creation_to_fast_forward_is_total() {
-    assert_eq!(
-        branch_creation_to_fast_forward(BranchCreationPlanError::Git("boom".to_string())),
-        FastForwardPlanError::Git("boom".to_string()),
+// ----- subprocess-timeout probe -----
+
+/// Create an executable file at `dir/name` containing `body`,
+/// chmod 0o755. Returns the absolute path. Used to inject a
+/// shell-script stand-in for `git` into the planner so we can
+/// exercise failure paths (timeout) without a real git
+/// subprocess.
+fn write_executable_probe(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    let mut file = std::fs::File::create(&path).expect("probe file create");
+    file.write_all(body.as_bytes()).expect("probe body write");
+    drop(file);
+    let mut perms = std::fs::metadata(&path).expect("probe stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("probe chmod");
+    path
+}
+
+/// Locate an executable on the test runner's `PATH` without
+/// resolving symlinks. Mirrors `resolve_program_for_clean_env` but
+/// returns the caller-visible path so the basename survives into
+/// `argv[0]` after `execve` — required on Nix where coreutils is
+/// a multi-call binary dispatched by `basename(argv[0])`.
+fn locate_on_path(name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH").expect("PATH must be set in tests");
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 => {
+                return candidate;
+            }
+            _ => {}
+        }
+    }
+    panic!("required test tool {name} not found on PATH");
+}
+
+/// Shell-quote a path so it embeds safely inside a script body.
+fn shell_quote(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut quoted = String::with_capacity(raw.len() + 2);
+    quoted.push('\'');
+    for ch in raw.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// When the rev-list subprocess does not exit before the
+/// configured timeout, the planner surfaces it as
+/// `Git("...timed out...")` rather than blocking the orchestrator
+/// thread. The probe is a shell script standing in for `git` that
+/// answers the `rev-parse --is-shallow-repository` preflight
+/// cleanly (so the planner reaches `rev-list`) and then stalls.
+///
+/// `clean_git` strips `PATH` from the child, so the script cannot
+/// resolve `sleep` at exec time. We resolve it from the test
+/// runner's `PATH` (without canonicalising — coreutils is a
+/// multi-call binary on Nix) and embed the path directly so the
+/// stall survives in the cleared environment.
+#[tokio::test]
+async fn fast_forward_plan_surfaces_timeout_when_subprocess_stalls() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = dir.path().to_path_buf();
+    let sleep_bin = locate_on_path("sleep");
+    // argv layout under the planner: `-C <staging> <subcommand> ...`.
+    // After `shift 2`, `$1` is the git subcommand.
+    let script = format!(
+        "#!/bin/sh\nshift 2\nif [ \"$1\" = rev-parse ]; then\n  echo false\n  exit 0\nfi\nexec {sleep} 5\n",
+        sleep = shell_quote(&sleep_bin),
     );
-    assert_eq!(
-        branch_creation_to_fast_forward(BranchCreationPlanError::InvalidRevListOutput {
-            line: "bad".to_string(),
-            reason: "reason".to_string(),
-        }),
-        FastForwardPlanError::InvalidRevListOutput {
-            line: "bad".to_string(),
-            reason: "reason".to_string(),
-        },
-    );
-    assert_eq!(
-        branch_creation_to_fast_forward(BranchCreationPlanError::ShallowStagingRepo {
-            staging_repo: "/tmp/staging".to_string(),
-        }),
-        FastForwardPlanError::ShallowStagingRepo {
-            staging_repo: "/tmp/staging".to_string(),
-        },
-    );
-    assert_eq!(
-        branch_creation_to_fast_forward(BranchCreationPlanError::DisjointHistory {
-            default_head: "aaaa".to_string(),
-            bundle_tip: "bbbb".to_string(),
-        }),
-        FastForwardPlanError::DivergedHistory {
-            expected_remote_head: "aaaa".to_string(),
-            bundle_tip: "bbbb".to_string(),
-        },
-    );
+    let probe = write_executable_probe(dir.path(), "git-sleep", &script);
+    let bundle_tip = sample_object_id('a');
+    let expected = sample_object_id('b');
+    let short_timeout = Duration::from_millis(150);
+    let err = plan_fast_forward_via_rev_list(
+        &bundle_tip,
+        &expected,
+        &staging,
+        &probe,
+        short_timeout,
+        REV_LIST_STDOUT_BYTE_CAP,
+    )
+    .await
+    .expect_err("sleeping probe must time out");
+    match err {
+        FastForwardPlanError::Git(msg) => {
+            assert!(
+                msg.contains("timed out"),
+                "expected timeout indication in error, got: {msg}",
+            );
+        }
+        other => panic!("expected Git, got {other:?}"),
+    }
 }
