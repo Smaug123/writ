@@ -761,9 +761,11 @@ fn agent_vm_http_config_rejects_empty_git_program() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::EmptyPath {
-            field: "git_program"
-        })
+        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::PathShape(
+            PathShapeError::Empty {
+                field: "git_program"
+            }
+        ))
     ));
 }
 
@@ -795,12 +797,12 @@ fn agent_vm_http_config_rejects_relative_askpass_program() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::GitClone(
-            GitCloneBundlePlanError::RelativePath {
+        AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::PathShape(
+            PathShapeError::Relative {
                 field: "askpass_program",
                 path
             }
-        ) if path.as_os_str() == "askpass"
+        )) if path.as_os_str() == "askpass"
     ));
 }
 
@@ -811,12 +813,10 @@ fn agent_vm_http_config_rejects_relative_work_root() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::GitClone(
-            GitCloneBundlePlanError::RelativePath {
-                field: "work_root",
-                path
-            }
-        ) if path.as_os_str() == "relative"
+        AgentVmHttpConfigError::PathShape(PathShapeError::Relative {
+            field: "work_root",
+            path
+        }) if path.as_os_str() == "relative"
     ));
 }
 
@@ -1005,7 +1005,7 @@ fn daemon_config_rejects_relative_agent_run_log_root() {
             None,
             None,
         )),
-        DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Relative(path))
+        DaemonConfigError::AgentRunLogRoot(AgentRunLogRootError::Shape(PathShapeError::Relative { path, .. }))
             if path.as_os_str() == "agent-runs"
     ));
 }
@@ -1376,7 +1376,10 @@ fn agent_vm_http_config_rejects_relative_git_push_staging_root() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::RelativeGitPushStagingRoot(path)
+        AgentVmHttpConfigError::PathShape(PathShapeError::Relative {
+            field: "git push staging root",
+            path
+        })
             if path.as_os_str() == "git-push-staging"
     ));
 }
@@ -1419,7 +1422,10 @@ fn agent_vm_http_config_rejects_relative_flake_input_cache_dir() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::RelativeFlakeInputCacheDir(path)
+        AgentVmHttpConfigError::PathShape(PathShapeError::Relative {
+            field: "flake input cache dir",
+            path
+        })
             if path.as_os_str() == "flake-input-cache"
     ));
 }
@@ -1481,7 +1487,10 @@ fn agent_vm_http_config_rejects_relative_prewarm_cache_dir() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::RelativeNixPrewarmCacheDir(path)
+        AgentVmHttpConfigError::PathShape(PathShapeError::Relative {
+            field: "nix pre-warm cache dir",
+            path
+        })
             if path.as_os_str() == "nix-prewarm-cache"
     ));
 }
@@ -1615,7 +1624,10 @@ fn agent_vm_http_config_rejects_relative_flake_mirror_cache_dir() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::RelativeFlakeMirrorCacheDir(path)
+        AgentVmHttpConfigError::PathShape(PathShapeError::Relative {
+            field: "flake mirror cache dir",
+            path
+        })
             if path.as_os_str() == "flake-mirror-cache"
     ));
 }
@@ -1648,7 +1660,10 @@ fn agent_vm_http_config_rejects_relative_flake_materialize_scratch_dir() {
 
     assert!(matches!(
         sole_error(c.to_runtime_config()),
-        AgentVmHttpConfigError::RelativeFlakeMaterializeScratchDir(path)
+        AgentVmHttpConfigError::PathShape(PathShapeError::Relative {
+            field: "flake materialize scratch dir",
+            path
+        })
             if path.as_os_str() == "flake-materialize"
     ));
 }
@@ -2224,7 +2239,7 @@ fn a_relative_work_root_is_reported_once_and_creates_nothing() {
     assert!(
         errors.iter().any(|error| matches!(
             error,
-            AgentVmHttpConfigError::GitClone(GitCloneBundlePlanError::RelativePath {
+            AgentVmHttpConfigError::PathShape(PathShapeError::Relative {
                 field: "work_root",
                 ..
             })

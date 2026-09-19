@@ -11,6 +11,29 @@
 use super::*;
 
 impl GitDataClient {
+    /// A request to `{api_base}/repos/{owner}/{name}/{path}` carrying the
+    /// App token and the three headers every Git Data call sends. Callers
+    /// add a body, and a `small_call` timeout where the response is small.
+    fn request(
+        &self,
+        method: reqwest::Method,
+        repo: &RepoRef,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        let url = format!(
+            "{}/repos/{}/{}/{path}",
+            self.api_base.trim_end_matches('/'),
+            repo.owner,
+            repo.name,
+        );
+        self.http
+            .request(method, &url)
+            .bearer_auth(&self.token)
+            .header("Accept", ACCEPT_HEADER)
+            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
+            .header("User-Agent", USER_AGENT_HEADER)
+    }
+
     /// `api_base` is the GitHub REST API root *without* a trailing slash
     /// (e.g. `https://api.github.com`); the path segments for each
     /// endpoint are concatenated on. Tests pass a `wiremock` server URI
@@ -53,23 +76,12 @@ impl GitDataClient {
         repo: &RepoRef,
         content: &[u8],
     ) -> Result<GitObjectId, GitDataError> {
-        let url = format!(
-            "{}/repos/{}/{}/git/blobs",
-            self.api_base.trim_end_matches('/'),
-            repo.owner,
-            repo.name,
-        );
         let body = BlobCreateBody {
             content: BASE64_STANDARD.encode(content),
             encoding: "base64",
         };
         let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("Accept", ACCEPT_HEADER)
-            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
-            .header("User-Agent", USER_AGENT_HEADER)
+            .request(reqwest::Method::POST, repo, "git/blobs")
             // No `small_call` override here — deliberately. This is the
             // one request whose body can be huge (up to the staging
             // repo's 256 MiB per-object ceiling, base64-expanded), and
@@ -80,11 +92,7 @@ impl GitDataClient {
             .json(&body)
             .send()
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GitDataError::ApiError { status, body });
-        }
+        let response = into_success(response).await?;
         let parsed: BlobCreateResponse = response.json().await?;
         Ok(parsed.sha)
     }
@@ -107,12 +115,6 @@ impl GitDataClient {
         repo: &RepoRef,
         entries: &[TreeEntry],
     ) -> Result<GitObjectId, GitDataError> {
-        let url = format!(
-            "{}/repos/{}/{}/git/trees",
-            self.api_base.trim_end_matches('/'),
-            repo.owner,
-            repo.name,
-        );
         let body = TreeCreateBody {
             tree: entries
                 .iter()
@@ -125,24 +127,15 @@ impl GitDataClient {
                 .collect(),
         };
         let response = self
-            .http
-            .post(&url)
+            .request(reqwest::Method::POST, repo, "git/trees")
             // No `small_call` override: like `create_blob`, this is an
             // object upload whose body scales with repo content (one
             // wire entry per tree row), so it runs under the
             // client-level `total` ceiling.
-            .bearer_auth(&self.token)
-            .header("Accept", ACCEPT_HEADER)
-            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
-            .header("User-Agent", USER_AGENT_HEADER)
             .json(&body)
             .send()
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GitDataError::ApiError { status, body });
-        }
+        let response = into_success(response).await?;
         let parsed: TreeCreateResponse = response.json().await?;
         Ok(parsed.sha)
     }
@@ -190,12 +183,6 @@ impl GitDataClient {
         repo: &RepoRef,
         request: &CommitRequest<'_>,
     ) -> Result<GitObjectId, GitDataError> {
-        let url = format!(
-            "{}/repos/{}/{}/git/commits",
-            self.api_base.trim_end_matches('/'),
-            repo.owner,
-            repo.name,
-        );
         let body = CommitCreateBody {
             message: request.message,
             tree: request.tree,
@@ -205,25 +192,16 @@ impl GitDataClient {
             signature: request.signature,
         };
         let response = self
-            .http
-            .post(&url)
+            .request(reqwest::Method::POST, repo, "git/commits")
             // No `small_call` override: a commit object's body is
             // dominated by its message, which the staging repo admits
             // at up to its 256 MiB per-object ceiling and which is
             // forwarded here verbatim. Like the blob upload, this runs
             // under the client-level `total` ceiling.
-            .bearer_auth(&self.token)
-            .header("Accept", ACCEPT_HEADER)
-            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
-            .header("User-Agent", USER_AGENT_HEADER)
             .json(&body)
             .send()
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GitDataError::ApiError { status, body });
-        }
+        let response = into_success(response).await?;
         let parsed: CommitCreateResponse = response.json().await?;
         if request.signature.is_some() {
             match parsed.verification {
@@ -269,29 +247,16 @@ impl GitDataClient {
         repo: &RepoRef,
         branch: &GitBranchName,
     ) -> Result<GitObjectId, GitDataError> {
-        let encoded_branch = percent_encode_ref_segment(branch.as_str());
-        let url = format!(
-            "{}/repos/{}/{}/git/ref/heads/{}",
-            self.api_base.trim_end_matches('/'),
-            repo.owner,
-            repo.name,
-            encoded_branch,
+        let path = format!(
+            "git/ref/heads/{}",
+            percent_encode_ref_segment(branch.as_str())
         );
         let response = self
-            .http
-            .get(&url)
+            .request(reqwest::Method::GET, repo, &path)
             .timeout(self.small_call)
-            .bearer_auth(&self.token)
-            .header("Accept", ACCEPT_HEADER)
-            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
-            .header("User-Agent", USER_AGENT_HEADER)
             .send()
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GitDataError::ApiError { status, body });
-        }
+        let response = into_success(response).await?;
         let parsed: GetRefResponse = response.json().await?;
         if parsed.object.object_type != "commit" {
             return Err(GitDataError::UnexpectedRefObjectType {
@@ -331,34 +296,31 @@ impl GitDataClient {
         branch: &GitBranchName,
         new_head: &GitObjectId,
     ) -> Result<(), GitDataError> {
-        let encoded_branch = percent_encode_ref_segment(branch.as_str());
-        let url = format!(
-            "{}/repos/{}/{}/git/refs/heads/{}",
-            self.api_base.trim_end_matches('/'),
-            repo.owner,
-            repo.name,
-            encoded_branch,
+        let path = format!(
+            "git/refs/heads/{}",
+            percent_encode_ref_segment(branch.as_str())
         );
         let body = UpdateRefBody {
             sha: new_head,
             force: false,
         };
         let response = self
-            .http
-            .patch(&url)
+            .request(reqwest::Method::PATCH, repo, &path)
             .timeout(self.small_call)
-            .bearer_auth(&self.token)
-            .header("Accept", ACCEPT_HEADER)
-            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
-            .header("User-Agent", USER_AGENT_HEADER)
             .json(&body)
             .send()
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GitDataError::ApiError { status, body });
-        }
+        into_success(response).await?;
         Ok(())
     }
+}
+
+/// The response if GitHub answered 2xx, else the status and body it sent.
+async fn into_success(response: reqwest::Response) -> Result<reqwest::Response, GitDataError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(GitDataError::ApiError { status, body })
 }
