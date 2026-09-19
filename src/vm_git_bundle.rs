@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 use writ_core::byte_size::ByteSize;
+use writ_core::path_shape::{PathShapeError, require_absolute, require_non_empty};
 
 use crate::clean_git::{
     self, CleanGitEnv, CleanGitError, CleanGitInvocation, clean_git_config_env,
@@ -97,10 +98,8 @@ pub enum GitSecretValueError {
 pub enum GitCloneBundlePlanError {
     #[error("Git clone base URL {0}")]
     GitCloneBaseUrl(#[from] UpstreamBaseUrlError),
-    #[error("{field} path must not be empty")]
-    EmptyPath { field: &'static str },
-    #[error("{field} path must be absolute: {path}")]
-    RelativePath { field: &'static str, path: PathBuf },
+    #[error(transparent)]
+    PathShape(#[from] PathShapeError),
     #[error("bundle path must not be inside the mirror repository: {0}")]
     BundleInsideMirror(PathBuf),
     #[error(
@@ -220,7 +219,7 @@ impl GitCredentialBoundary {
         token_env: GitSecretEnvVar,
     ) -> Result<Self, GitCloneBundlePlanError> {
         let askpass_program = askpass_program.into();
-        require_absolute_path("askpass_program", &askpass_program)?;
+        require_absolute("askpass_program", &askpass_program)?;
         Ok(Self {
             askpass_program,
             token_env,
@@ -385,9 +384,9 @@ impl GitCloneBundlePlan {
         let git_program = git_program.into();
         let work_dir = work_dir.into();
         let bundle_path = bundle_path.into();
-        require_non_empty_path("git_program", &git_program)?;
-        require_absolute_path("work_dir", &work_dir)?;
-        require_absolute_path("bundle_path", &bundle_path)?;
+        require_non_empty("git_program", &git_program)?;
+        require_absolute("work_dir", &work_dir)?;
+        require_absolute("bundle_path", &bundle_path)?;
         if timeout.is_zero() {
             return Err(GitCloneBundlePlanError::ZeroTimeout);
         }
@@ -821,24 +820,6 @@ fn validate_secret_env_var(raw: &str) -> Result<(), GitSecretEnvVarError> {
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
         return Err(GitSecretEnvVarError::InvalidByte(raw.to_string()));
-    }
-    Ok(())
-}
-
-fn require_non_empty_path(field: &'static str, path: &Path) -> Result<(), GitCloneBundlePlanError> {
-    if path.as_os_str().is_empty() {
-        return Err(GitCloneBundlePlanError::EmptyPath { field });
-    }
-    Ok(())
-}
-
-fn require_absolute_path(field: &'static str, path: &Path) -> Result<(), GitCloneBundlePlanError> {
-    require_non_empty_path(field, path)?;
-    if !path.is_absolute() {
-        return Err(GitCloneBundlePlanError::RelativePath {
-            field,
-            path: path.to_path_buf(),
-        });
     }
     Ok(())
 }
@@ -1353,10 +1334,12 @@ exit 42
     fn plan_rejects_malformed_paths_and_limits() {
         assert_eq!(
             GitCredentialBoundary::new("relative-askpass", GitSecretEnvVar::new("TOKEN").unwrap()),
-            Err(GitCloneBundlePlanError::RelativePath {
-                field: "askpass_program",
-                path: PathBuf::from("relative-askpass"),
-            })
+            Err(GitCloneBundlePlanError::PathShape(
+                PathShapeError::Relative {
+                    field: "askpass_program",
+                    path: PathBuf::from("relative-askpass"),
+                }
+            ))
         );
 
         assert_eq!(
@@ -1369,10 +1352,12 @@ exit 42
                 Duration::from_secs(1),
                 ByteSize::from_bytes(1),
             ),
-            Err(GitCloneBundlePlanError::RelativePath {
-                field: "work_dir",
-                path: PathBuf::from("relative-work"),
-            })
+            Err(GitCloneBundlePlanError::PathShape(
+                PathShapeError::Relative {
+                    field: "work_dir",
+                    path: PathBuf::from("relative-work"),
+                }
+            ))
         );
 
         assert_eq!(
@@ -1385,10 +1370,12 @@ exit 42
                 Duration::from_secs(1),
                 ByteSize::from_bytes(1),
             ),
-            Err(GitCloneBundlePlanError::RelativePath {
-                field: "bundle_path",
-                path: PathBuf::from("relative.bundle"),
-            })
+            Err(GitCloneBundlePlanError::PathShape(
+                PathShapeError::Relative {
+                    field: "bundle_path",
+                    path: PathBuf::from("relative.bundle"),
+                }
+            ))
         );
 
         assert_eq!(
