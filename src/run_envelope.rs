@@ -180,12 +180,7 @@ mod tests {
         }
     }
 
-    fn sample_signature() -> SshSignature {
-        SshSignature::try_new(
-            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQ...\n-----END SSH SIGNATURE-----",
-        )
-        .unwrap()
-    }
+    use crate::test_support::sample_signature;
 
     #[test]
     fn round_trip_through_to_bytes_preserves_fields() {
