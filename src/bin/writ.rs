@@ -1146,9 +1146,8 @@ fn write_and_read_reply(
     deadline: std::time::Instant,
 ) -> Result<ServerMessage, Box<dyn std::error::Error>> {
     apply_remaining_budget(socket_path, stream, deadline)?;
-    let mut line = serde_json::to_string(msg)
+    let line = writ::protocol::framing::encode_frame(msg)
         .map_err(|e| format!("encoding request for writ daemon as JSON failed: {e}"))?;
-    line.push('\n');
 
     let mut w = stream;
     w.write_all(line.as_bytes()).map_err(|e| {

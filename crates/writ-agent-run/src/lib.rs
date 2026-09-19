@@ -14,7 +14,6 @@ compile_error!(
 
 use std::fmt;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -440,20 +439,24 @@ impl Default for Sha256Stream {
 
 // --- CorrelationId ----------------------------------------------------
 
-/// Opaque caller-supplied identifier tying related agent runs and git
-/// pushes together. Per the broker design (§"Correlation ID"), the
-/// broker validates only as a safe id — bounded length, restricted
-/// character class — and never interprets the contents. The upstream
-/// orchestrator (today: a human; later: a separate agent) decides
-/// what the id means.
-///
-/// Character class is `[A-Za-z0-9_-]` and length is
-/// [`MIN_CORRELATION_ID_BYTES`]..=[`MAX_CORRELATION_ID_BYTES`]. The
-/// class is deliberately narrow: no dots, slashes, or colons — that
-/// way a correlation id cannot pose as a path segment or scheme
-/// component if it ever leaks into a URL.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct CorrelationId(String);
+writ_core::validated_string! {
+    /// Opaque caller-supplied identifier tying related agent runs and git
+    /// pushes together. Per the broker design (§"Correlation ID"), the
+    /// broker validates only as a safe id — bounded length, restricted
+    /// character class — and never interprets the contents. The upstream
+    /// orchestrator (today: a human; later: a separate agent) decides
+    /// what the id means.
+    ///
+    /// Character class is `[A-Za-z0-9_-]` and length is
+    /// [`MIN_CORRELATION_ID_BYTES`]..=[`MAX_CORRELATION_ID_BYTES`]. The
+    /// class is deliberately narrow: no dots, slashes, or colons — that
+    /// way a correlation id cannot pose as a path segment or scheme
+    /// component if it ever leaks into a URL.
+    pub struct CorrelationId;
+    error = CorrelationIdError;
+    constructor = try_new;
+    validate = validate_correlation_id;
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CorrelationIdError {
@@ -467,103 +470,68 @@ pub enum CorrelationIdError {
     InvalidByte { at: usize, byte: u8 },
 }
 
-impl CorrelationId {
-    pub fn try_new(raw: impl Into<String>) -> Result<Self, CorrelationIdError> {
-        let raw = raw.into();
-        let len = raw.len();
-        if !(MIN_CORRELATION_ID_BYTES..=MAX_CORRELATION_ID_BYTES).contains(&len) {
-            return Err(CorrelationIdError::InvalidLength { got: len });
+fn validate_correlation_id(raw: &str) -> Result<(), CorrelationIdError> {
+    let len = raw.len();
+    if !(MIN_CORRELATION_ID_BYTES..=MAX_CORRELATION_ID_BYTES).contains(&len) {
+        return Err(CorrelationIdError::InvalidLength { got: len });
+    }
+    for (at, byte) in raw.bytes().enumerate() {
+        let ok = byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+        if !ok {
+            return Err(CorrelationIdError::InvalidByte { at, byte });
         }
-        for (at, byte) in raw.bytes().enumerate() {
-            let ok = byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
-            if !ok {
-                return Err(CorrelationIdError::InvalidByte { at, byte });
-            }
-        }
-        Ok(Self(raw))
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CorrelationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl fmt::Debug for CorrelationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CorrelationId({:?})", self.0)
-    }
-}
-
-impl FromStr for CorrelationId {
-    type Err = CorrelationIdError;
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::try_new(raw)
-    }
-}
-
-impl Serialize for CorrelationId {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for CorrelationId {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(d)?;
-        Self::try_new(raw).map_err(serde::de::Error::custom)
-    }
+    Ok(())
 }
 
 // --- RunPurpose -------------------------------------------------------
 
-/// Caller-supplied opaque tag saying what a run was *for*, recorded
-/// verbatim on the `agent_run` audit row. Writ never interprets the
-/// contents: the upstream orchestrator decides what a purpose means
-/// and matches on it by equality (bailiff writes `"plan-submit"`,
-/// `"review:plan-abc"`, and whatever an operator passes to
-/// `--purpose`).
-///
-/// Invariants:
-/// - [`MIN_RUN_PURPOSE_BYTES`]..=[`MAX_RUN_PURPOSE_BYTES`] bytes
-/// - every byte is printable ASCII, `0x20..=0x7e`
-/// - no leading or trailing space
-///
-/// The value is stored verbatim and never normalised — [`as_str`] returns
-/// the caller's bytes unchanged, because an audit row that silently
-/// differs from what the caller sent is not a record of what happened.
-///
-/// [`as_str`]: Self::as_str
-///
-/// # Why printable ASCII, when a purpose is prose
-///
-/// A purpose is a join key an orchestrator reconciles on, and it lands
-/// in an append-only log that can never be corrected. The hazard is
-/// therefore two purposes that are unequal as keys but identical on
-/// screen. Printable ASCII excludes, *by construction* rather than by
-/// blocklist, every invisible and control character that could produce
-/// one: NUL, CR/LF, ESC, the C1 range, zero-width spaces, and bidi
-/// overrides. An allow-Unicode class cannot get there — it would need a
-/// blocklist of format characters, which is wrong by default the moment
-/// Unicode gains a member, and it would still admit the confusables
-/// (Cyrillic `а` is an ordinary lowercase letter) that motivate it.
-///
-/// The cost is that a purpose must be written in Latin script. That is a
-/// loud parse-time rejection rather than a silent corruption, and the
-/// class is trivially widened later — every value valid today stays
-/// valid — whereas a log full of Unicode purposes could not be narrowed.
-///
-/// What this does *not* promise: that two purposes cannot render
-/// *similarly*. `l`/`1`/`I`, `O`/`0`, and runs of interior spaces all
-/// survive, deliberately — a quoted render distinguishes them, and they
-/// are a lesser hazard than a character with no glyph at all.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct RunPurpose(String);
+writ_core::validated_string! {
+    /// Caller-supplied opaque tag saying what a run was *for*, recorded
+    /// verbatim on the `agent_run` audit row. Writ never interprets the
+    /// contents: the upstream orchestrator decides what a purpose means
+    /// and matches on it by equality (bailiff writes `"plan-submit"`,
+    /// `"review:plan-abc"`, and whatever an operator passes to
+    /// `--purpose`).
+    ///
+    /// Invariants:
+    /// - [`MIN_RUN_PURPOSE_BYTES`]..=[`MAX_RUN_PURPOSE_BYTES`] bytes
+    /// - every byte is printable ASCII, `0x20..=0x7e`
+    /// - no leading or trailing space
+    ///
+    /// The value is stored verbatim and never normalised — [`as_str`] returns
+    /// the caller's bytes unchanged, because an audit row that silently
+    /// differs from what the caller sent is not a record of what happened.
+    ///
+    /// [`as_str`]: Self::as_str
+    ///
+    /// # Why printable ASCII, when a purpose is prose
+    ///
+    /// A purpose is a join key an orchestrator reconciles on, and it lands
+    /// in an append-only log that can never be corrected. The hazard is
+    /// therefore two purposes that are unequal as keys but identical on
+    /// screen. Printable ASCII excludes, *by construction* rather than by
+    /// blocklist, every invisible and control character that could produce
+    /// one: NUL, CR/LF, ESC, the C1 range, zero-width spaces, and bidi
+    /// overrides. An allow-Unicode class cannot get there — it would need a
+    /// blocklist of format characters, which is wrong by default the moment
+    /// Unicode gains a member, and it would still admit the confusables
+    /// (Cyrillic `а` is an ordinary lowercase letter) that motivate it.
+    ///
+    /// The cost is that a purpose must be written in Latin script. That is a
+    /// loud parse-time rejection rather than a silent corruption, and the
+    /// class is trivially widened later — every value valid today stays
+    /// valid — whereas a log full of Unicode purposes could not be narrowed.
+    ///
+    /// What this does *not* promise: that two purposes cannot render
+    /// *similarly*. `l`/`1`/`I`, `O`/`0`, and runs of interior spaces all
+    /// survive, deliberately — a quoted render distinguishes them, and they
+    /// are a lesser hazard than a character with no glyph at all.
+    pub struct RunPurpose;
+    error = RunPurposeError;
+    constructor = try_new;
+    validate = validate_run_purpose;
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RunPurposeError {
@@ -580,66 +548,27 @@ pub enum RunPurposeError {
     SurroundingSpace,
 }
 
-impl RunPurpose {
-    pub fn try_new(raw: impl Into<String>) -> Result<Self, RunPurposeError> {
-        let raw = raw.into();
-        let len = raw.len();
-        if len < MIN_RUN_PURPOSE_BYTES {
-            return Err(RunPurposeError::Empty);
+fn validate_run_purpose(raw: &str) -> Result<(), RunPurposeError> {
+    let len = raw.len();
+    if len < MIN_RUN_PURPOSE_BYTES {
+        return Err(RunPurposeError::Empty);
+    }
+    if len > MAX_RUN_PURPOSE_BYTES {
+        return Err(RunPurposeError::TooLong { got: len });
+    }
+    for (at, byte) in raw.bytes().enumerate() {
+        if !(0x20..=0x7e).contains(&byte) {
+            return Err(RunPurposeError::ForbiddenByte { at, byte });
         }
-        if len > MAX_RUN_PURPOSE_BYTES {
-            return Err(RunPurposeError::TooLong { got: len });
-        }
-        for (at, byte) in raw.bytes().enumerate() {
-            if !(0x20..=0x7e).contains(&byte) {
-                return Err(RunPurposeError::ForbiddenByte { at, byte });
-            }
-        }
-        // Checked after the byte scan, so the class violation is reported
-        // in preference to the shape one: a purpose containing a newline
-        // should be told about the newline. Space is the only whitespace
-        // the class admits, which is what makes this test exhaustive.
-        if raw.starts_with(' ') || raw.ends_with(' ') {
-            return Err(RunPurposeError::SurroundingSpace);
-        }
-        Ok(Self(raw))
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
+    // Checked after the byte scan, so the class violation is reported
+    // in preference to the shape one: a purpose containing a newline
+    // should be told about the newline. Space is the only whitespace
+    // the class admits, which is what makes this test exhaustive.
+    if raw.starts_with(' ') || raw.ends_with(' ') {
+        return Err(RunPurposeError::SurroundingSpace);
     }
-}
-
-impl fmt::Display for RunPurpose {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl fmt::Debug for RunPurpose {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RunPurpose({:?})", self.0)
-    }
-}
-
-impl FromStr for RunPurpose {
-    type Err = RunPurposeError;
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        Self::try_new(raw)
-    }
-}
-
-impl Serialize for RunPurpose {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for RunPurpose {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(d)?;
-        Self::try_new(raw).map_err(serde::de::Error::custom)
-    }
+    Ok(())
 }
 
 /// How long writ will let one agent run before killing it.
@@ -2626,16 +2555,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn correlation_id_serde_is_bare_string_and_roundtrips() {
-        let c = CorrelationId::try_new("plan-2026-05-11_42").unwrap();
-        let json = serde_json::to_string(&c).unwrap();
-        assert_eq!(json, r#""plan-2026-05-11_42""#);
-        let back: CorrelationId = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, c);
-        // invalid wire payloads are rejected on parse
-        assert!(serde_json::from_str::<CorrelationId>(r#""bad/id""#).is_err());
-        assert!(serde_json::from_str::<CorrelationId>(r#""""#).is_err());
+    fn correlation_id_candidate() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[A-Za-z0-9_-]{0,70}",
+            "[A-Za-z0-9_./:-]{0,20}",
+            Just("plan-2026-05-11_42".to_string()),
+            any::<String>(),
+        ]
+    }
+
+    mod correlation_id_laws {
+        use super::*;
+        writ_core::validated_string_laws!(
+            CorrelationId,
+            try_new,
+            validate_correlation_id,
+            correlation_id_candidate()
+        );
+    }
+
+    mod run_purpose_laws {
+        use super::*;
+        writ_core::validated_string_laws!(
+            RunPurpose,
+            try_new,
+            validate_run_purpose,
+            run_purpose_candidate()
+        );
     }
 
     #[cfg(feature = "host")]

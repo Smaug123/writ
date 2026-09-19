@@ -177,6 +177,50 @@ fn git_check_ref_format_branch_accepts(raw: &str) -> bool {
     .success()
 }
 
+mod clone_ref_laws {
+    use super::*;
+    writ_core::validated_string_laws!(
+        GitCloneRef,
+        new,
+        validate_git_ref,
+        prop_oneof![
+            git_ref_strategy(),
+            invalid_git_ref_strategy(),
+            any::<String>()
+        ]
+    );
+}
+
+mod branch_name_laws {
+    use super::*;
+    writ_core::validated_string_laws!(
+        GitBranchName,
+        new,
+        validate_git_branch_name,
+        prop_oneof![
+            git_branch_strategy(),
+            git_branch_oracle_candidate_strategy(),
+            invalid_git_branch_strategy(),
+            any::<String>()
+        ]
+    );
+}
+
+mod object_id_laws {
+    use super::*;
+    writ_core::validated_string_laws!(
+        GitObjectId,
+        new,
+        validate_git_object_id,
+        prop_oneof![
+            object_id_strategy(),
+            "[0-9a-fA-F]{38,42}",
+            "[0-9a-g]{40}",
+            any::<String>()
+        ]
+    );
+}
+
 proptest! {
     #[test]
     fn vm_clone_request_roundtrips_any_valid_generated_repo(

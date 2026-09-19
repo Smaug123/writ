@@ -6,12 +6,9 @@
 //! review attach, …) hang off the same client.
 //!
 //! Wire framing: one [`ClientMessage`] per line, one [`ServerMessage`]
-//! per line in reply. Reads are bounded by a per-line cap so a
-//! malformed broker can't make bailiff allocate without bound. The
-//! cap matches the broker-side `read_line_bounded` limit and is sized
-//! for the worst-case JSON expansion of a 1 MiB `AgentPrompt` (6:1
-//! when every byte is an ASCII control character that `serde_json`
-//! encodes as `\u00XX`).
+//! per line in reply, read and written through
+//! [`crate::protocol::framing`], whose per-line cap keeps a malformed
+//! broker from making bailiff allocate without bound.
 //!
 //! Errors are tagged so callers can react without string-matching: a
 //! transport failure is distinct from a writ-side [`ServerMessage::Error`],
@@ -25,22 +22,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::agent_run::AgentPrompt;
 use crate::core::{AgentKind, CapabilitySet, NotesRef, SessionId, SshSignature};
+use crate::protocol::framing::{MAX_LINE_BYTES, encode_frame, read_line_bounded};
 use crate::protocol::{ClientMessage, HOST_PROTOCOL_VERSION, ServerMessage, SignedRunMetadata};
 use crate::vm_git::{AgentVmWorkspaceBootstrap, GitObjectId};
-
-/// Matches the broker-side cap in `src/server.rs`. The largest legal
-/// reply is a `RunAgentCompleted` whose canonical metadata plus
-/// signed envelope reference fit in a few KiB, so the cap is set by
-/// the request side (the broker accepting a worst-case-escaped 1 MiB
-/// `AgentPrompt`). Both ends share a single ceiling so the framing
-/// contract stays symmetric. A peer that frames a single line larger
-/// than this is treated as broken.
-const MAX_LINE_BYTES: usize = 6 * crate::agent_run::MAX_AGENT_PROMPT_BYTES + 64 * 1024;
 
 /// What writ returned for a `RunAgent` request that ran to completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,9 +331,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
 {
-    let mut json =
-        serde_json::to_string(msg).map_err(|source| WritClientError::Serialize { source })?;
-    json.push('\n');
+    let json = encode_frame(msg).map_err(|source| WritClientError::Serialize { source })?;
     writer
         .write_all(json.as_bytes())
         .await
@@ -361,46 +348,6 @@ where
     serde_json::from_slice(&bytes).map_err(|e| WritClientError::ReadDecode { source: e })
 }
 
-/// Mirror of `server::read_line_bounded`. Duplicated rather than
-/// re-exported so the framing contract is documented at both ends of
-/// the wire; a divergence between the two would be a real protocol
-/// bug, not an import-path detail.
-async fn read_line_bounded<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max: usize,
-) -> io::Result<Option<Vec<u8>>> {
-    let mut buf = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(if buf.is_empty() { None } else { Some(buf) });
-        }
-        if let Some(i) = available.iter().position(|&b| b == b'\n') {
-            if buf.len() + i > max {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("reply line exceeds {max}-byte limit"),
-                ));
-            }
-            buf.extend_from_slice(&available[..i]);
-            reader.consume(i + 1);
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            return Ok(Some(buf));
-        }
-        let len = available.len();
-        if buf.len() + len > max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("reply line exceeds {max}-byte limit"),
-            ));
-        }
-        buf.extend_from_slice(available);
-        reader.consume(len);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Unit tests use [`UnixStream::pair`] to stand in for a real
@@ -411,9 +358,8 @@ mod tests {
     //! integration test only has to assert the end-to-end story.
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::{UnixListener, UnixStream};
+    use tokio::net::UnixListener;
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
@@ -422,6 +368,7 @@ mod tests {
     use crate::core::{
         AgentKind, NotesRef, RepoRef, SessionId, Sha256Hex, SshKeyFingerprint, UnixMillis,
     };
+    use crate::protocol::framing::write_frame;
     use crate::protocol::{ClientMessage, SignedRunMetadata};
     use crate::vm_git::{AgentVmWorkspaceBootstrap, GitCloneRepo, WorkspaceWarmMode};
 
@@ -520,9 +467,7 @@ mod tests {
                     {
                         req_clone.lock().await.push(msg);
                     }
-                    let mut json = serde_json::to_string(&reply).unwrap();
-                    json.push('\n');
-                    let _ = writer.write_all(json.as_bytes()).await;
+                    let _ = write_frame(&mut writer, &reply).await;
                     let _ = writer.shutdown().await;
                 }
             });
@@ -574,9 +519,7 @@ mod tests {
                         let reply = ServerMessage::Error {
                             message: "invalid request: unknown variant `hello`".into(),
                         };
-                        let mut json = serde_json::to_string(&reply).unwrap();
-                        json.push('\n');
-                        if writer.write_all(json.as_bytes()).await.is_err() {
+                        if write_frame(&mut writer, &reply).await.is_err() {
                             break;
                         }
                     }
@@ -1039,32 +982,6 @@ mod tests {
             matches!(err, WritClientError::ReadFraming { .. }),
             "expected ReadFraming, got {err:?}"
         );
-    }
-
-    /// `read_line_bounded` strips the trailing `\r` so callers can
-    /// match against bytes without worrying about CRLF.
-    #[tokio::test]
-    async fn read_line_bounded_strips_cr() {
-        let mut input = &b"hello\r\n"[..];
-        let line = read_line_bounded(&mut input, 64).await.unwrap().unwrap();
-        assert_eq!(&line, b"hello");
-    }
-
-    /// Stream-pair sanity check: a writer-side stream that closes
-    /// without writing yields `Ok(None)` from `read_line_bounded`,
-    /// matching the EOF semantics `WritClient` translates to
-    /// `ReadEof`.
-    #[tokio::test]
-    async fn read_line_bounded_returns_none_on_clean_eof_over_pair() {
-        let (a, b) = UnixStream::pair().unwrap();
-        drop(b);
-        let mut reader = BufReader::new(a);
-        // Short timeout so the test fails fast if EOF detection breaks.
-        let line = tokio::time::timeout(Duration::from_secs(2), read_line_bounded(&mut reader, 64))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(line.is_none());
     }
 }
 
