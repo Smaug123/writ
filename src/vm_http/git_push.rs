@@ -19,7 +19,9 @@ use crate::vm_git::{
     VmGitPushErrorResponse, VmGitPushMetadata, parse_vm_git_push_request_body,
 };
 
-use super::broker_effect::{BrokeredEffect, EffectCompletion, broker_effect};
+use super::broker_effect::{
+    BrokeredEffect, EffectCompletion, broker_effect, closed_session_response,
+};
 use super::{VmHttpDispatch, VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
 pub struct VmHttpGitPushService<S: SecretStore> {
@@ -339,21 +341,9 @@ impl<'a, S: SecretStore + Send + Sync + 'static> BrokeredEffect for GitPushEffec
     }
 
     fn begin_error_response(err: &AuditError) -> Option<VmHttpResponse> {
-        // A closed/unknown session is a clean client error, not an audit-write
-        // failure — return the domain response and skip the 500 + tracing event.
-        match err {
-            AuditError::Invariant("session does not exist") => Some(git_push_error_response(
-                VmHttpStatus::Unauthorized,
-                VmGitPushErrorCode::Denied,
-                "session is not active",
-            )),
-            AuditError::Invariant("session is closed") => Some(git_push_error_response(
-                VmHttpStatus::Gone,
-                VmGitPushErrorCode::Denied,
-                "session is closed",
-            )),
-            _ => None,
-        }
+        closed_session_response(err, |status, message| {
+            git_push_error_response(status, VmGitPushErrorCode::Denied, message)
+        })
     }
 
     fn audit_write_failure_response() -> VmHttpResponse {
