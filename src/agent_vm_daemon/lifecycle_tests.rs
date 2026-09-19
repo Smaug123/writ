@@ -555,13 +555,14 @@ async fn vm_broker_placement_advertises_prewarm_substituter_when_prewarm_dir_con
 
 #[tokio::test]
 async fn daemon_start_injects_vm_http_env_without_persisting_token_and_stop_cleans_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness {
+        dir,
+        args_log,
+        env_path_log,
+        env_log,
+        state_store,
+        daemon,
+    } = Harness::new();
     let state = make_state();
 
     let started = daemon
@@ -663,13 +664,7 @@ async fn daemon_start_injects_vm_http_env_without_persisting_token_and_stop_clea
 
 #[tokio::test]
 async fn daemon_stop_removes_the_broker_material_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness { dir, daemon, .. } = Harness::new();
     let state = make_state();
 
     let started = daemon
@@ -708,13 +703,12 @@ async fn daemon_stop_removes_the_broker_material_dir() {
 
 #[tokio::test]
 async fn daemon_stop_preserves_state_record_when_material_removal_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness {
+        dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     let state = make_state();
 
     let started = daemon
@@ -816,13 +810,9 @@ async fn daemon_start_advertises_prewarm_substituter_when_prewarm_dir_configured
 
 #[tokio::test]
 async fn daemon_stop_does_not_close_audit_session_when_vm_state_is_missing() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness {
+        dir: _dir, daemon, ..
+    } = Harness::new();
     let state = make_state();
     let session_id = SessionId::new();
     state
@@ -851,15 +841,14 @@ async fn daemon_stop_does_not_close_audit_session_when_vm_state_is_missing() {
 
 #[tokio::test]
 async fn daemon_start_failure_after_audit_open_closes_audit_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let Harness {
+        dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     occupy_subnet(&state_store, 252);
     occupy_subnet(&state_store, 253);
-    let daemon = AgentVmDaemon::new(config);
     let audit_db = dir.path().join("audit.db");
     let state = make_state_with_audit(AuditLog::open(&audit_db).unwrap());
 
@@ -1032,15 +1021,14 @@ async fn daemon_workspace_bootstrap_failure_removes_state_and_closes_audit_sessi
 
 #[tokio::test]
 async fn daemon_list_reports_persisted_session_without_runtime_as_detached() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let Harness {
+        dir: _dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     occupy_subnet(&state_store, 252);
     let state = state_store.load_all().unwrap().pop().unwrap();
-    let daemon = AgentVmDaemon::new(config);
 
     let sessions = daemon.list_sessions().await.unwrap();
 
@@ -1062,16 +1050,15 @@ async fn daemon_list_reports_persisted_session_without_runtime_as_detached() {
 /// appearing orphaned. `false` (no prior forwarder) must not attach anything.
 #[tokio::test]
 async fn reattach_broker_log_forwarder_marks_session_attached() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let Harness {
+        dir: _dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     occupy_subnet(&state_store, 252);
     let state = state_store.load_all().unwrap().pop().unwrap();
     let session_id = state.session_id();
-    let daemon = AgentVmDaemon::new(config);
 
     // No prior forwarder: nothing is attached (mirrors the detached case).
     daemon
@@ -1092,13 +1079,9 @@ async fn reattach_broker_log_forwarder_marks_session_attached() {
 
 #[tokio::test]
 async fn daemon_reconcile_on_empty_store_is_noop() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness {
+        dir: _dir, daemon, ..
+    } = Harness::new();
     let audit = Arc::new(AuditLog::open_in_memory().unwrap());
 
     let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
@@ -1110,12 +1093,12 @@ async fn daemon_reconcile_on_empty_store_is_noop() {
 
 #[tokio::test]
 async fn daemon_reconcile_cleans_persisted_state_and_closes_audit() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let Harness {
+        dir: _dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     occupy_subnet(&state_store, 252);
     let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
     let audit = Arc::new(AuditLog::open_in_memory().unwrap());
@@ -1129,7 +1112,6 @@ async fn daemon_reconcile_cleans_persisted_state_and_closes_audit() {
             closed_at: None,
         })
         .unwrap();
-    let daemon = AgentVmDaemon::new(config);
 
     let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
 
@@ -1142,15 +1124,14 @@ async fn daemon_reconcile_cleans_persisted_state_and_closes_audit() {
 
 #[tokio::test]
 async fn daemon_reconcile_is_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let Harness {
+        dir: _dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     occupy_subnet(&state_store, 252);
     let audit = Arc::new(AuditLog::open_in_memory().unwrap());
-    let daemon = AgentVmDaemon::new(config);
 
     let first = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
     assert_eq!(first.cleaned().len(), 1);
@@ -1163,12 +1144,12 @@ async fn daemon_reconcile_is_idempotent() {
 
 #[tokio::test]
 async fn daemon_reconcile_handles_multiple_sessions() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let Harness {
+        dir: _dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     occupy_subnet(&state_store, 252);
     occupy_subnet(&state_store, 253);
     let mut expected: Vec<SessionId> = state_store
@@ -1179,7 +1160,6 @@ async fn daemon_reconcile_handles_multiple_sessions() {
         .collect();
     expected.sort();
     let audit = Arc::new(AuditLog::open_in_memory().unwrap());
-    let daemon = AgentVmDaemon::new(config);
 
     let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
 
@@ -1300,13 +1280,12 @@ async fn daemon_reconcile_preserves_firewall_and_revokes_authority_when_vm_absen
 /// could otherwise let a stop skip authority revocation yet report success.
 #[tokio::test]
 async fn agent_vm_session_is_managed_classifies_load_outcomes() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness {
+        dir: _dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
 
     // Absent record → not a managed agent-VM session (an ordinary broker session).
     assert!(
@@ -1470,12 +1449,12 @@ async fn daemon_stop_revokes_authority_when_teardown_fails() {
 
 #[tokio::test]
 async fn daemon_reconcile_preserves_state_record_when_material_removal_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+    let Harness {
+        dir,
+        state_store,
+        daemon,
+        ..
+    } = Harness::new();
     occupy_subnet(&state_store, 252);
     let session_id = state_store.load_all().unwrap().pop().unwrap().session_id();
     let audit = Arc::new(AuditLog::open_in_memory().unwrap());
@@ -1489,7 +1468,6 @@ async fn daemon_reconcile_preserves_state_record_when_material_removal_fails() {
             closed_at: None,
         })
         .unwrap();
-    let daemon = AgentVmDaemon::new(config);
 
     // Wedge the material removal (see the stop-path test): a file where the
     // per-session material dir would be forces `remove_dir_all` to fail. Teardown
@@ -2109,13 +2087,12 @@ fn a_workspace() -> AgentVmWorkspaceBootstrap {
 /// would go on claiming it after a crash with nothing to close it.
 #[tokio::test]
 async fn accepting_an_agent_run_names_it_without_starting_anything() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness {
+        dir,
+        args_log,
+        daemon,
+        ..
+    } = Harness::new();
     let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
 
     let accepted = daemon
@@ -2173,13 +2150,13 @@ async fn accepting_an_agent_run_names_it_without_starting_anything() {
 /// weaker version of this test and hang this one.
 #[tokio::test]
 async fn stopping_an_accepted_run_before_it_starts_prevents_the_start() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = Arc::new(AgentVmDaemon::new(config));
+    let Harness {
+        dir,
+        args_log,
+        daemon,
+        ..
+    } = Harness::new();
+    let daemon = Arc::new(daemon);
     let state = state_with_one_run_slot_and_one_queue_place(
         AuditLog::open(dir.path().join("audit.db")).unwrap(),
     );
@@ -2328,13 +2305,13 @@ async fn a_started_agent_run_leaves_no_accepted_run_registration() {
 /// findable only by listing, stoppable only by an operator who thinks to look.
 #[tokio::test]
 async fn start_agent_run_answers_while_the_run_is_still_queued() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = Arc::new(AgentVmDaemon::new(config));
+    let Harness {
+        dir,
+        args_log,
+        daemon,
+        ..
+    } = Harness::new();
+    let daemon = Arc::new(daemon);
     let state = state_with_one_run_slot(AuditLog::open(dir.path().join("audit.db")).unwrap());
 
     let occupied = state
@@ -2421,13 +2398,7 @@ async fn start_agent_run_answers_while_the_run_is_still_queued() {
 /// request — would otherwise start leaking silently.
 #[tokio::test]
 async fn dropping_an_accepted_run_gives_back_everything_it_took() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-    let (config, _state_store) = daemon_config(dir.path(), &fake_tool);
-    let daemon = AgentVmDaemon::new(config);
+    let Harness { dir, daemon, .. } = Harness::new();
     let state = state_with_one_run_slot_and_one_queue_place(
         AuditLog::open(dir.path().join("audit.db")).unwrap(),
     );

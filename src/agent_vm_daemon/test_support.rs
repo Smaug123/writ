@@ -75,6 +75,41 @@ pub(super) fn write_fake_tool(
     path
 }
 
+/// What every lifecycle test starts from: a tempdir, the three logs the
+/// default fake `container` tool writes, and the daemon plus state store that
+/// [`daemon_config`] builds around that tool. Destructure the names a test
+/// uses; the tempdir, and the fixture with it, goes when the value does.
+pub(super) struct Harness {
+    pub(super) dir: tempfile::TempDir,
+    /// Every argv the fake tool was invoked with, one line each.
+    pub(super) args_log: PathBuf,
+    /// The `--env-file` path the fake `run` was handed.
+    pub(super) env_path_log: PathBuf,
+    /// That env file's contents.
+    pub(super) env_log: PathBuf,
+    pub(super) state_store: AgentVmSessionStateStore,
+    pub(super) daemon: AgentVmDaemon,
+}
+
+impl Harness {
+    pub(super) fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_path_log = dir.path().join("env-path.log");
+        let env_log = dir.path().join("env.log");
+        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+        let (config, state_store) = daemon_config(dir.path(), &fake_tool);
+        Self {
+            dir,
+            args_log,
+            env_path_log,
+            env_log,
+            state_store,
+            daemon: AgentVmDaemon::new(config),
+        }
+    }
+}
+
 /// Like [`write_fake_tool`] but never signals a bootstrap outcome — the
 /// inspect always reports "pending". Used to exercise the bootstrap wait's
 /// timeout path (the default tool now reports `ok`, since every start waits).
