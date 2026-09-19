@@ -21,7 +21,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::agent_vm_firewall::{PassTranslationRule, PfPreflightReport, SessionAnchorPlacement};
-use crate::agent_vm_pf_helper_policy::{PfHelperPolicy, parse_ipv4_cidr, parse_ipv6_cidr};
+use crate::agent_vm_pf_helper_policy::PfHelperPolicy;
 use crate::core::{AgentNetworkPool, BrokerPortRange};
 use crate::test_support::write_executable_script;
 
@@ -53,8 +53,8 @@ const OTHER_DIGEST: &str =
 fn test_policy() -> PfHelperPolicy {
     PfHelperPolicy::new(
         AgentNetworkPool::new(
-            parse_ipv4_cidr("10.200.0.0/16").unwrap(),
-            parse_ipv6_cidr("fd00:7772:6974::/48").unwrap(),
+            "10.200.0.0/16".parse().unwrap(),
+            "fd00:7772:6974::/48".parse().unwrap(),
         )
         .unwrap(),
         BrokerPortRange::new(49152, 65535).unwrap(),

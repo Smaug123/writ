@@ -1,6 +1,6 @@
 //! Daemon configuration loaded from a JSON file at startup.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,7 +16,9 @@ use crate::agent_vm_lifecycle::{
     AgentVmLifecycleConfigError, AgentVmResources, AgentVmSessionStateStore, AgentVmToolPaths,
     BrokerPlacement, ConfiguredIpv6Profile, ContainerImage, default_agent_vm_state_dir,
 };
-use crate::core::{AgentNetworkPool, AgentVmConfigError, BrokerPortRange, Ipv4Cidr, Ipv6Cidr};
+use crate::core::{
+    AgentNetworkPool, AgentVmConfigError, BrokerPortRange, CidrParseError, Ipv4Cidr, Ipv6Cidr,
+};
 use crate::flake_lock::{FlakeProvisionBounds, FlakeProvisionBoundsError};
 use crate::flake_provision_from_mirror::MirrorFlakeProvisionConfig;
 use crate::github::GitHubAppRegistryConfig;
@@ -1175,8 +1177,8 @@ impl AgentVmLifecycleConfig {
         &self,
     ) -> Result<AgentVmLifecycleRuntimeConfig, Errors<AgentVmDaemonConfigError>> {
         let mut errors = Accumulator::new();
-        let ipv4_pool = errors.record(parse_ipv4_cidr_config("ipv4_pool", &self.ipv4_pool));
-        let ipv6_pool = errors.record(parse_ipv6_cidr_config("ipv6_pool", &self.ipv6_pool));
+        let ipv4_pool = errors.record(parse_cidr_config::<Ipv4Cidr>("ipv4_pool", &self.ipv4_pool));
+        let ipv6_pool = errors.record(parse_cidr_config::<Ipv6Cidr>("ipv6_pool", &self.ipv6_pool));
         let pool = all_recorded!(ipv4_pool, ipv6_pool)
             .and_then(|(v4, v6)| errors.record_from(AgentNetworkPool::new(v4, v6)));
         let state_dir = match &self.state_dir {
@@ -2032,60 +2034,19 @@ pub fn default_vm_http_work_root() -> Result<PathBuf, BaseDirError> {
     default_paths::VM_HTTP_WORK_ROOT.resolve()
 }
 
-fn parse_ipv4_cidr_config(
+/// `addr/prefix` in either family, faulted against `field`. Shape faults
+/// (host bits, prefix range) are reported under the field too, rather than
+/// as a bare [`AgentVmConfigError`], so the operator learns which key.
+fn parse_cidr_config<T: std::str::FromStr<Err = CidrParseError>>(
     field: &'static str,
     raw: &str,
-) -> Result<Ipv4Cidr, AgentVmDaemonConfigError> {
-    let (addr, prefix) =
-        raw.split_once('/')
-            .ok_or_else(|| AgentVmDaemonConfigError::InvalidCidr {
-                field,
-                value: raw.to_string(),
-                message: "missing '/'".into(),
-            })?;
-    let addr = addr
-        .parse::<Ipv4Addr>()
+) -> Result<T, AgentVmDaemonConfigError> {
+    raw.parse::<T>()
         .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
             field,
             value: raw.to_string(),
             message: err.to_string(),
-        })?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
-            field,
-            value: raw.to_string(),
-            message: err.to_string(),
-        })?;
-    Ipv4Cidr::new(addr, prefix).map_err(AgentVmDaemonConfigError::from)
-}
-
-fn parse_ipv6_cidr_config(
-    field: &'static str,
-    raw: &str,
-) -> Result<Ipv6Cidr, AgentVmDaemonConfigError> {
-    let (addr, prefix) =
-        raw.split_once('/')
-            .ok_or_else(|| AgentVmDaemonConfigError::InvalidCidr {
-                field,
-                value: raw.to_string(),
-                message: "missing '/'".into(),
-            })?;
-    let addr = addr
-        .parse::<Ipv6Addr>()
-        .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
-            field,
-            value: raw.to_string(),
-            message: err.to_string(),
-        })?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|err| AgentVmDaemonConfigError::InvalidCidr {
-            field,
-            value: raw.to_string(),
-            message: err.to_string(),
-        })?;
-    Ipv6Cidr::new(addr, prefix).map_err(AgentVmDaemonConfigError::from)
+        })
 }
 
 impl DaemonConfig {

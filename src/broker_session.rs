@@ -12,7 +12,7 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use crate::core::{BrokerPort, Ipv4Cidr, SessionId};
+use crate::core::{BrokerPort, CidrParseError, Ipv4Cidr, SessionId};
 use crate::vm_http::{VmHttpBearerToken, VmHttpConfigError};
 
 /// An absolute path *in the guest filesystem*, carried in the session spec for
@@ -125,8 +125,12 @@ pub enum BrokerSessionSpecError {
     UnsupportedVersion(u32),
     #[error("session spec session_id is invalid: {0}")]
     SessionId(String),
-    #[error("session spec agent_ipv4_cidr {raw:?} is invalid: {reason}")]
-    Cidr { raw: String, reason: String },
+    #[error("session spec agent_ipv4_cidr {raw:?} is invalid: {source}")]
+    Cidr {
+        raw: String,
+        #[source]
+        source: CidrParseError,
+    },
     #[error("session spec bind_addr {0:?} is not a valid IPv4 address")]
     BindAddr(String),
     #[error("session spec broker_port must be non-zero")]
@@ -196,7 +200,12 @@ impl BrokerSessionSpec {
             .session_id
             .parse::<SessionId>()
             .map_err(|e| BrokerSessionSpecError::SessionId(e.to_string()))?;
-        let agent_ipv4_cidr = parse_ipv4_cidr(&raw.agent_ipv4_cidr)?;
+        let agent_ipv4_cidr = raw.agent_ipv4_cidr.parse::<Ipv4Cidr>().map_err(|source| {
+            BrokerSessionSpecError::Cidr {
+                raw: raw.agent_ipv4_cidr.clone(),
+                source,
+            }
+        })?;
         let bind_addr = raw
             .bind_addr
             .parse::<Ipv4Addr>()
@@ -233,19 +242,6 @@ impl BrokerSessionSpec {
         })?;
         Self::parse_json(&raw)
     }
-}
-
-fn parse_ipv4_cidr(raw: &str) -> Result<Ipv4Cidr, BrokerSessionSpecError> {
-    let cidr_err = |reason: &str| BrokerSessionSpecError::Cidr {
-        raw: raw.to_string(),
-        reason: reason.to_string(),
-    };
-    let (addr, prefix) = raw
-        .split_once('/')
-        .ok_or_else(|| cidr_err("missing '/prefix'"))?;
-    let addr: Ipv4Addr = addr.parse().map_err(|_| cidr_err("invalid IPv4 address"))?;
-    let prefix: u8 = prefix.parse().map_err(|_| cidr_err("invalid prefix"))?;
-    Ipv4Cidr::new(addr, prefix).map_err(|e| cidr_err(&e.to_string()))
 }
 
 #[derive(Debug, thiserror::Error)]

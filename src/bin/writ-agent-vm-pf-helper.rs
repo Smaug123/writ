@@ -16,7 +16,6 @@ use writ::agent_vm_firewall::{
 };
 use writ::agent_vm_pf_helper_policy::{
     PF_HELPER_POLICY_PATH, PF_HELPER_POLICY_REQUIRED_OWNER, PfHelperPolicy, load_pf_helper_policy,
-    parse_ipv4_cidr, parse_ipv6_cidr,
 };
 use writ::agent_vm_pf_helper_protocol::{
     PfHelperCountersDoc, PfHelperInstallReportDoc, PfHelperPreflightDoc, PfHelperProtocolDoc,
@@ -260,11 +259,17 @@ fn parse_session_network(
         .session_id
         .parse()
         .map_err(|e| format!("invalid session ID: {e}"))?;
-    let ipv4 = parse_ipv4_cidr(&args.ipv4_cidr).map_err(|e| format!("invalid --ipv4-cidr: {e}"))?;
+    let ipv4 = args
+        .ipv4_cidr
+        .parse::<Ipv4Cidr>()
+        .map_err(|e| format!("invalid --ipv4-cidr: {e}"))?;
     let ipv6 = args
         .ipv6_cidr
         .as_deref()
-        .map(|raw| parse_ipv6_cidr(raw).map_err(|e| format!("invalid --ipv6-cidr: {e}")))
+        .map(|raw| {
+            raw.parse::<Ipv6Cidr>()
+                .map_err(|e| format!("invalid --ipv6-cidr: {e}"))
+        })
         .transpose()?;
     Ok(ParsedSessionNetwork {
         session_id,
@@ -317,8 +322,8 @@ mod tests {
     fn policy() -> PfHelperPolicy {
         PfHelperPolicy::new(
             AgentNetworkPool::new(
-                parse_ipv4_cidr("10.200.0.0/16").unwrap(),
-                parse_ipv6_cidr("fd00:7772:6974::/48").unwrap(),
+                "10.200.0.0/16".parse().unwrap(),
+                "fd00:7772:6974::/48".parse().unwrap(),
             )
             .unwrap(),
             BrokerPortRange::new(49152, 65535).unwrap(),
