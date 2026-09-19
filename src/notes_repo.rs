@@ -1644,6 +1644,13 @@ fn hash_object_stdin(
     })
 }
 
+/// The compaction retry gate's deadline, in the repo it applies to.
+///
+/// A plain file of decimal milliseconds since the Unix epoch. In a bare repo
+/// git ignores names it does not know, and the leading dot keeps it out of the
+/// way of anything listing the layout.
+const COMPACTION_RETRY_FILE: &str = ".writ-compaction-retry-after";
+
 /// Per-repo state that only a notes-write lock holder may read or write.
 ///
 /// It lives *inside* the lock rather than beside it so that "consult the
@@ -1652,13 +1659,7 @@ fn hash_object_stdin(
 /// its own gate, whereas the lock is deliberately keyed on the canonical path so
 /// that two handles on one repo share it. State that gates a repo-wide operation
 /// has to be shared the same way.
-/// The compaction retry gate's deadline, in the repo it applies to.
 ///
-/// A plain file of decimal milliseconds since the Unix epoch. In a bare repo
-/// git ignores names it does not know, and the leading dot keeps it out of the
-/// way of anything listing the layout.
-const COMPACTION_RETRY_FILE: &str = ".writ-compaction-retry-after";
-
 /// Holding this is the permission to touch the compaction retry gate.
 ///
 /// The gate itself is *durable* — a file in the repo — because the process it
