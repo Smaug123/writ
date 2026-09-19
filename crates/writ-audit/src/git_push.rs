@@ -271,10 +271,9 @@ pub enum RejectBlocker {
 
 /// LEFT JOIN view of a staged push, in the column order
 /// [`git_push_audit_entry_from_row`] reads; the caller appends the
-/// `WHERE` (and any `ORDER BY`). Schema v5 dropped `git_push_attempt`
-/// so this view no longer joins on it; outcome columns alone describe
-/// the broker-visible request lifecycle and `git_push_resolution`
-/// carries the operator decision.
+/// `WHERE` (and any `ORDER BY`). Outcome columns alone describe the
+/// broker-visible request lifecycle and `git_push_resolution` carries
+/// the operator decision.
 const GIT_PUSH_AUDIT_ENTRY_SELECT_SQL: &str = "
     SELECT
         r.push_request_id,

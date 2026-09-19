@@ -3,11 +3,11 @@
 //!
 //! This computes *descriptions* — the `container` invocations and the on-disk
 //! session material the broker VM consumes — without performing any IO beyond
-//! the explicit material writer. The daemon executor (a later slice) runs these
-//! invocations, discovers the broker VM's address, and points the agent VM at
+//! the explicit material writer. The daemon executor, `broker_vm_runner`, runs
+//! these invocations, discovers the broker VM's address, and points the agent VM at
 //! it. Keeping the plan pure makes the `container` argv unit-testable against the
-//! fake-`container` pattern and ties the material to the slice-3 `writd broker`
-//! reader as its oracle.
+//! fake-`container` pattern and ties the material to the `writd broker` reader
+//! (`broker_entrypoint`) as its oracle.
 //!
 //! **Topology (per session).** The agent VM and broker VM share one `--internal`
 //! network (no NAT ⇒ the agent has no egress by topology). The broker VM is also
@@ -707,7 +707,7 @@ pub fn parse_broker_ipv4_on_network(
 /// mounted file to decide the broker is serving, could read a previous run's
 /// marker before the new `writd broker` binds — and material files are forced to
 /// `0600` even when overwriting a pre-existing inode. Round-trips through the
-/// slice-3 readers (see tests).
+/// `writd broker` readers (see tests).
 pub fn write_session_material(
     staging_dir: &Path,
     spec: &BrokerSessionSpec,

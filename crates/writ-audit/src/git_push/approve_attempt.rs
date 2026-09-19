@@ -10,26 +10,16 @@
 //! this module owns the *flat discriminants* those columns hold and the
 //! only conversion between the two representations.
 //!
-//! Before this module existed the wire names were bare string literals
-//! at every write site (`if state != "started"`, `&["started",
-//! "uncertain"]`, `SET outcome = 'pre_patch_failure'`) with a one-way
-//! `match` in the row parser. Adding an outcome meant grepping for
-//! literals; a typo was a runtime `Invariant` error at best and a
-//! silently-unreachable branch at worst. Centralising the codec makes
-//! the discriminant set enumerable — [`ApproveAttemptStateName::ALL`] and
-//! [`ApproveAttemptOutcomeName::ALL`] are what the schema-agreement
+//! The discriminant sets are enumerable: [`ApproveAttemptStateName::ALL`]
+//! and [`ApproveAttemptOutcomeName::ALL`] are what the schema-agreement
 //! tests sweep to prove the Rust enum and the SQL CHECK admit exactly
 //! the same strings.
 //!
 //! On top of that vocabulary sits [`apply`]: one total function from
 //! (state, [`ApproveAttemptTransition`]) to either the next state or an
-//! [`IllegalApproveTransition`]. Before it, the legal-transition relation
-//! had no single Rust definition — it lived in the schema's
-//! `forward_only` trigger *and*, independently, in a scatter of DAO
-//! preflights (`if state != "started"`, an `allowed_states` slice
-//! threaded through a helper, `UPDATE … WHERE state = 'started'`). The
-//! triggers remain as the backstop; the DAO now asks this function and
-//! persists what it returns.
+//! [`IllegalApproveTransition`]. The schema's `forward_only` trigger is
+//! the backstop; the DAO asks this function and persists what it
+//! returns.
 
 use writ_core::core::UnixMillis;
 use writ_vm_git::GitObjectId;
@@ -48,12 +38,9 @@ use super::{GitPushApproveAttemptOutcome, GitPushApproveAttemptState, PromoteMin
 /// have to be kept in step. (`parse_wire` is a `match` on the literals,
 /// so it is a jump table, not a linear scan.)
 ///
-/// This is the crate's only macro-generated type. It earns that by
-/// removing an invariant from the "someone must remember" column: the
-/// alternative — three hand-written items per enum plus a test that
-/// cannot actually prove `ALL` is complete — is what the first draft of
-/// this module had, and a reviewer was right to point out that the test
-/// proved less than it claimed.
+/// This is the crate's only macro-generated type. It earns that by making
+/// `ALL` complete by construction; three hand-written items per enum plus
+/// a test cannot prove that.
 macro_rules! wire_name_enum {
     (
         $(#[$meta:meta])*
@@ -172,8 +159,7 @@ impl GitPushApproveAttemptOutcome {
 /// CREATE TABLE". Two of the schema's triggers
 /// (`mint_matches_ledger`, `resolve_carries_ledger_mint`) judge writes
 /// against it, so a machine that could not see it would permit moves the
-/// database refuses — which is exactly what it did before this type
-/// existed.
+/// database refuses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApproveAttempt {
     /// The `git_push_approve_attempt` row's state.
@@ -361,12 +347,10 @@ impl GitPushApproveAttemptState {
 /// …), params)` where the parameters are the wire strings, in order,
 /// starting at `first_param`. Callers bind them after their own.
 ///
-/// This is the mechanism that removes the duplication the reviewer
-/// named: `blocks_resolution` and `is_in_flight` are written once, and
-/// the two queries that used to spell them out in SQL now derive their
-/// clause from those functions. `sql_predicate_selects_what_rust_selects`
-/// checks a generated clause against the Rust predicate for every
-/// position.
+/// `blocks_resolution` and `is_in_flight` are written once, and the two
+/// queries that need them derive their clause from those functions.
+/// `sql_predicate_selects_what_rust_selects` checks a generated clause
+/// against the Rust predicate for every position.
 pub fn position_predicate_sql(
     positions: &[AttemptPosition],
     state_col: &str,
@@ -402,7 +386,7 @@ pub fn position_predicate_sql(
 ///
 /// These are *requests*, not facts: [`apply`] decides whether the move is
 /// legal from the attempt's actual position. Construct one, apply it, and
-/// persist what comes back — the DAO no longer decides for itself what a
+/// persist what comes back; the DAO does not decide for itself what a
 /// given step may do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApproveAttemptTransition {
@@ -499,12 +483,9 @@ impl std::error::Error for IllegalApproveTransition {}
 /// This is the Rust half of a machine whose other half is the schema's
 /// `forward_only`, `mint_immutable`, `mint_matches_ledger`,
 /// `resolve_carries_ledger_mint`, and `mint_ledger_requires_started`
-/// triggers. The triggers stay — they are the unkillable layer, and
-/// correctness-over-availability says the database should refuse a
-/// contradiction even when every Rust caller is wrong. What changes is
-/// that the Rust side is no longer a scatter of `if state != "started"`
-/// preflights spread across the DAO: it is this function, and the DAO
-/// persists what it returns.
+/// triggers. The triggers are the unkillable layer: the database refuses
+/// a contradiction even when every Rust caller is wrong. The Rust side is
+/// this function, and the DAO persists what it returns.
 ///
 /// `transition_agrees_with_the_schema` in the tests drives every
 /// (position, transition) pair — including both ledger states — against a

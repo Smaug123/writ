@@ -1,9 +1,8 @@
 //! Bailiff-side client for writ's Unix-socket RPC.
 //!
-//! Speaks the same newline-terminated JSON framing the broker accepts
-//! (see `src/server.rs:1322`). Today the only verb exposed is
-//! [`WritClient::run_agent`]; future bailiff verbs (plan submit,
-//! review attach, …) hang off the same client.
+//! The verbs are [`WritClient::open_session`], [`WritClient::run_agent`]
+//! and [`WritClient::close_session`]: one connection and one version
+//! handshake per call.
 //!
 //! Wire framing: one [`ClientMessage`] per line, one [`ServerMessage`]
 //! per line in reply, read and written through
