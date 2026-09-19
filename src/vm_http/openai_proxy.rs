@@ -15,6 +15,7 @@ use crate::openai_chatgpt_auth::{
 };
 use crate::secret::{SecretKey, SecretStore};
 use crate::server::BrokerState;
+use crate::upstream_base_url::{UpstreamBaseUrl, UpstreamBaseUrlError};
 
 use super::proxy_common::{
     OpenAiBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader, ProxyStream,
@@ -34,7 +35,7 @@ pub(super) type VmHttpOpenAiProxyService<S> = VmHttpProxyService<OpenAiBackend, 
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VmHttpOpenAiProxyConfig {
-    upstream_base_url: reqwest::Url,
+    upstream_base_url: UpstreamBaseUrl,
     auth_secret: SecretKey,
     auth_kind: VmHttpOpenAiProxyAuthKind,
     chatgpt_refresh_url: reqwest::Url,
@@ -60,16 +61,8 @@ pub enum VmHttpOpenAiProxyAuthKind {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum VmHttpOpenAiProxyConfigError {
-    #[error("OpenAI proxy upstream URL must not be empty")]
-    EmptyUpstreamUrl,
-    #[error("OpenAI proxy upstream URL {raw:?} is invalid: {message}")]
-    InvalidUpstreamUrl { raw: String, message: String },
-    #[error("OpenAI proxy upstream URL {raw:?} uses unsupported scheme {scheme:?}")]
-    UnsupportedUpstreamScheme { raw: String, scheme: String },
-    #[error("OpenAI proxy upstream URL must not contain embedded credentials: {0:?}")]
-    UpstreamUrlHasCredentials(String),
-    #[error("OpenAI proxy upstream URL must not contain a query or fragment: {0:?}")]
-    UpstreamUrlHasQueryOrFragment(String),
+    #[error("OpenAI proxy upstream URL {0}")]
+    UpstreamUrl(#[from] UpstreamBaseUrlError),
     #[error("OpenAI proxy request timeout must be greater than zero")]
     EmptyTimeout,
     #[error("OpenAI proxy max request bytes must be greater than zero")]
@@ -104,10 +97,7 @@ impl VmHttpOpenAiProxyConfig {
         max_request_bytes: ByteSize,
         max_response_bytes: ByteSize,
     ) -> Result<Self, VmHttpOpenAiProxyConfigError> {
-        let raw = upstream_base_url.as_ref();
-        if raw.is_empty() {
-            return Err(VmHttpOpenAiProxyConfigError::EmptyUpstreamUrl);
-        }
+        let upstream_base_url = UpstreamBaseUrl::parse(upstream_base_url)?;
         if timeout.is_zero() {
             return Err(VmHttpOpenAiProxyConfigError::EmptyTimeout);
         }
@@ -120,36 +110,10 @@ impl VmHttpOpenAiProxyConfig {
         if max_response_bytes.is_zero() {
             return Err(VmHttpOpenAiProxyConfigError::EmptyMaxResponseBytes);
         }
-        let mut url = reqwest::Url::parse(raw).map_err(|err| {
-            VmHttpOpenAiProxyConfigError::InvalidUpstreamUrl {
-                raw: raw.to_string(),
-                message: err.to_string(),
-            }
-        })?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(VmHttpOpenAiProxyConfigError::UnsupportedUpstreamScheme {
-                raw: raw.to_string(),
-                scheme: url.scheme().to_string(),
-            });
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(VmHttpOpenAiProxyConfigError::UpstreamUrlHasCredentials(
-                raw.to_string(),
-            ));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(VmHttpOpenAiProxyConfigError::UpstreamUrlHasQueryOrFragment(
-                raw.to_string(),
-            ));
-        }
-        if !url.path().ends_with('/') {
-            let path = format!("{}/", url.path());
-            url.set_path(&path);
-        }
         let chatgpt_refresh_url = reqwest::Url::parse(CHATGPT_OAUTH_REFRESH_URL)
             .expect("CHATGPT_OAUTH_REFRESH_URL is a static, well-formed absolute URL");
         Ok(Self {
-            upstream_base_url: url,
+            upstream_base_url,
             auth_secret,
             auth_kind,
             chatgpt_refresh_url,
@@ -184,7 +148,7 @@ impl VmHttpOpenAiProxyConfig {
         Ok(self)
     }
 
-    pub fn upstream_base_url(&self) -> &reqwest::Url {
+    pub fn upstream_base_url(&self) -> &UpstreamBaseUrl {
         &self.upstream_base_url
     }
 
@@ -210,7 +174,7 @@ impl VmHttpOpenAiProxyConfig {
 }
 
 impl ProxyBackendConfig for VmHttpOpenAiProxyConfig {
-    fn upstream_base_url(&self) -> &reqwest::Url {
+    fn upstream_base_url(&self) -> &UpstreamBaseUrl {
         &self.upstream_base_url
     }
 
