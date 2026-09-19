@@ -420,8 +420,8 @@ mod tests {
     use crate::server::BrokerState;
     use crate::vm_git::VM_HTTP_CONTRACT_HEADER;
     use crate::vm_git::{
-        GitBranchName, GitCloneRepo, GitObjectId, VmGitPushMetadata, VmGitPushRequest,
-        VmGitPushStagedReceipt, encode_vm_git_push_request_body,
+        VmGitPushMetadata, VmGitPushRequest, VmGitPushStagedReceipt,
+        encode_vm_git_push_request_body,
     };
 
     fn test_body_limits() -> VmGitPushBodyLimits {
@@ -441,24 +441,9 @@ mod tests {
         VmHttpGitPushService::new(Arc::clone(state), staging, test_body_limits())
     }
 
-    fn sample_repo() -> GitCloneRepo {
-        "owner/repo".parse().unwrap()
-    }
-
-    fn sample_branch() -> GitBranchName {
-        "feature/x".parse().unwrap()
-    }
-
-    fn oid(nibble: char) -> GitObjectId {
-        std::iter::repeat_n(nibble, 40)
-            .collect::<String>()
-            .parse()
-            .unwrap()
-    }
-
-    fn sample_metadata() -> VmGitPushMetadata {
-        VmGitPushMetadata::new(sample_repo(), sample_branch(), Some(oid('a')), oid('b'))
-    }
+    use crate::test_support::{
+        sample_branch, sample_clone_repo, sample_object_id, sample_push_metadata,
+    };
 
     fn encoded_body(metadata: VmGitPushMetadata, bundle: Vec<u8>) -> Vec<u8> {
         let request = VmGitPushRequest::new(metadata, bundle).unwrap();
@@ -588,7 +573,7 @@ mod tests {
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
-        let body = encoded_body(sample_metadata(), b"bundle bytes".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"bundle bytes".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
 
         assert_eq!(response.status, VmHttpStatus::Unauthorized);
@@ -615,7 +600,7 @@ mod tests {
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, staging);
 
-        let body = encoded_body(sample_metadata(), b"bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"bundle".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
 
         assert_eq!(response.status, VmHttpStatus::Gone);
@@ -638,7 +623,7 @@ mod tests {
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"PACK bundle bytes".to_vec();
         let body = encoded_body(metadata.clone(), bundle.clone());
         let response = handle_git_push_request(&session, body, service).await;
@@ -681,7 +666,7 @@ mod tests {
         let service = git_push_service_for_test(&state, staging);
 
         let before = state.audit.table_row_count_for_test("git_push_outcome");
-        let body = encoded_body(sample_metadata(), b"PACK bundle bytes".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"PACK bundle bytes".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
         assert_eq!(response.status, VmHttpStatus::Ok);
 
@@ -726,7 +711,7 @@ mod tests {
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();
 
-        let body = encoded_body(sample_metadata(), b"tagged bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"tagged bundle".to_vec());
         let response = handle_git_push_request(
             &session,
             body,
@@ -753,7 +738,7 @@ mod tests {
         let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
-        let body = encoded_body(sample_metadata(), b"untagged bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"untagged bundle".to_vec());
         let response = handle_git_push_request(
             &session,
             body,
@@ -796,7 +781,7 @@ mod tests {
             .unwrap();
         let (staging, _tmp) = open_test_staging_store();
 
-        let body = encoded_body(sample_metadata(), b"untagged-run bundle".to_vec());
+        let body = encoded_body(sample_push_metadata(), b"untagged-run bundle".to_vec());
         let response = handle_git_push_request(
             &session,
             body,
@@ -824,7 +809,7 @@ mod tests {
         let (state, session) = broker_with_open_session(&github, loopback_net());
         let (staging, _tmp) = open_test_staging_store();
 
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let bundle = b"bundle".to_vec();
         let body_one = encoded_body(metadata.clone(), bundle.clone());
         let body_two = encoded_body(metadata, bundle);
@@ -857,7 +842,12 @@ mod tests {
         let (staging, _tmp) = open_test_staging_store();
         let service = git_push_service_for_test(&state, Arc::clone(&staging));
 
-        let metadata = VmGitPushMetadata::new(sample_repo(), sample_branch(), None, oid('c'));
+        let metadata = VmGitPushMetadata::new(
+            sample_clone_repo(),
+            sample_branch(),
+            None,
+            sample_object_id('c'),
+        );
         let body = encoded_body(metadata.clone(), b"create-bundle".to_vec());
         let response = handle_git_push_request(&session, body, service).await;
 
@@ -877,7 +867,7 @@ mod tests {
 
         let bearer_auth = bearer(token().as_str());
         let declared = declared_contract();
-        let metadata = sample_metadata();
+        let metadata = sample_push_metadata();
         let body = encoded_body(metadata.clone(), b"PACK from dispatch".to_vec());
         let content_length = body.len().to_string();
         let response = dispatch_vm_http_head_and_body(
@@ -972,7 +962,7 @@ mod tests {
                 &plan,
                 handle_git_push_request(
                     &session,
-                    encoded_body(sample_metadata(), b"bundle".to_vec()),
+                    encoded_body(sample_push_metadata(), b"bundle".to_vec()),
                     git_push_service_for_test(&state, staging),
                 ),
             )
@@ -1001,7 +991,7 @@ mod tests {
                 &plan,
                 handle_git_push_request(
                     &session,
-                    encoded_body(sample_metadata(), b"bundle".to_vec()),
+                    encoded_body(sample_push_metadata(), b"bundle".to_vec()),
                     git_push_service_for_test(&state, Arc::clone(&staging)),
                 ),
             )
@@ -1074,7 +1064,7 @@ mod tests {
                 &plan,
                 handle_git_push_request(
                     &session,
-                    encoded_body(sample_metadata(), b"x".to_vec()),
+                    encoded_body(sample_push_metadata(), b"x".to_vec()),
                     git_push_service_for_test(&state, staging),
                 ),
             )
@@ -1108,7 +1098,7 @@ mod tests {
             &plan,
             handle_git_push_request(
                 &session,
-                encoded_body(sample_metadata(), b"x".to_vec()),
+                encoded_body(sample_push_metadata(), b"x".to_vec()),
                 git_push_service_for_test(&state, Arc::clone(&staging)),
             ),
         )

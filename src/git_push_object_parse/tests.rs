@@ -3,22 +3,10 @@
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::*;
 use time::format_description::well_known::Rfc3339;
-use time::macros::datetime;
 
 use super::*;
 
-fn sample_object_id(nibble: char) -> GitObjectId {
-    GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
-}
-
-fn sample_identity(name: &str) -> CommitIdentity {
-    CommitIdentity::new(
-        name,
-        format!("{name}@example.invalid"),
-        datetime!(2024-01-15 10:30:45 UTC),
-    )
-    .expect("sample date formats")
-}
+use crate::test_support::{sample_identity, sample_object_id};
 
 // ============== Parser unit tests ==============
 
