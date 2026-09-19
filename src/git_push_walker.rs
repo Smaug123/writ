@@ -11,38 +11,33 @@
 //!
 //! The walker is parameterised over a [`GitObjectSource`] so its core
 //! orchestration can be exercised against an in-memory fixture without
-//! shelling out to git. A real implementation backed by
-//! `git cat-file --batch` lands in a later commit.
+//! shelling out to git; the production source is
+//! [`crate::git_push_objects_cat_file::CatFileObjectSource`].
 //!
-//! [`plan_branch_creation_via_rev_list`] handles topology discovery for
-//! the branch-creation case. It shells out to
-//! `git rev-list --topo-order --reverse --boundary ^<default_head>
-//! <bundle_tip>` against the staging repo and parses the output into
-//! the new-commits list and the boundary-commit seed. The
-//! `^<default_head>` exclusion is what makes this approach correct
-//! across the cases the in-walker parent-pointer DFS could not handle:
+//! [`plan_fast_forward_via_rev_list`] handles topology discovery. It
+//! shells out to `git rev-list --topo-order --reverse --boundary
+//! ^<expected_remote_head> <bundle_tip>` against the staging repo and
+//! parses the output into the new-commits list and the boundary-commit
+//! seed. The `^<expected_remote_head>` exclusion is what makes this
+//! correct where a parent-pointer DFS inside the walker was not:
 //!
-//! * The bundle's tip forks from an older default-branch commit
-//!   (current default head has advanced past the fork point). The
+//! * The bundle's tip forks from an older upstream commit. The
 //!   merge-base is excluded with everything reachable from it, so the
 //!   walker only emits the genuinely new commits.
 //! * The bundle's tip is a merge whose parents have different ages
-//!   on the default branch. Each ancestor reachable from
-//!   `default_head` is excluded regardless of which merge parent
-//!   leads there, so no already-published commit gets re-uploaded.
+//!   upstream. Each ancestor reachable from `expected_remote_head` is
+//!   excluded regardless of which merge parent leads there, so no
+//!   already-published commit gets re-uploaded.
 //!
 //! Pre-conditions: the staging repo must already contain
-//! `default_head` reachable as a commit object (typically because the
-//! orchestrator fetched it before calling the planner) plus the full
-//! bundle history that the agent shipped. The default-head fetch must
-//! retrieve full ancestry, not a shallow `--depth=1` clone: rev-list
-//! treats shallow boundaries as roots, which would silently truncate
-//! the merge-base computation and surface a wrong rejection. The
-//! planner runs `rev-parse --is-shallow-repository` first and refuses
-//! a shallow repo via [`BranchCreationPlanError::ShallowStagingRepo`].
-//!
-//! The fast-forward case is the same shape with the upstream tip in
-//! place of `default_head`; that integration lands in a later slice.
+//! `expected_remote_head` reachable as a commit object (the orchestrator
+//! fetches it before calling the planner) plus the full bundle history
+//! the agent shipped. That fetch must retrieve full ancestry, not a
+//! shallow `--depth=1` clone: rev-list treats shallow boundaries as
+//! roots, which would silently truncate the merge-base computation and
+//! surface a wrong verdict. The planner runs
+//! `rev-parse --is-shallow-repository` first and refuses a shallow repo
+//! via [`FastForwardPlanError::ShallowStagingRepo`].
 //!
 //! Signing (the detached SSH signature that drives GitHub's Verified
 //! badge) is produced inline when [`replay_commits`] is called with
@@ -64,9 +59,8 @@
 //! completes has published only Verified commits and a walk that hits
 //! an unverified one fails before its caller can move the branch ref.
 //!
-//! Callers that do not want signed commits (test fixtures, the
-//! pre-promote bring-up flows) pass `None` and the request goes out
-//! with `signature: None`, matching the pre-B1d behaviour exactly.
+//! Callers that do not want signed commits (test fixtures) pass `None`
+//! and the request goes out with `signature: None`.
 //!
 //! ## Topological pre-condition
 //!
@@ -106,8 +100,7 @@ use crate::vm_git::{GitObjectId, GitObjectIdError};
 /// whose commits is uploaded to GitHub one REST call at a time — while capping
 /// the broker's stdout buffer plus parsed vectors at a few tens of MiB. A
 /// bundle that packs enough commits to exceed it is refused
-/// ([`FastForwardPlanError::RevListOutputTooLarge`] /
-/// [`BranchCreationPlanError::RevListOutputTooLarge`]) rather than allowed to
+/// ([`FastForwardPlanError::RevListOutputTooLarge`]) rather than allowed to
 /// drive broker memory unbounded.
 pub(crate) const REV_LIST_STDOUT_BYTE_CAP: usize = 16 * 1024 * 1024;
 
@@ -525,256 +518,6 @@ async fn ensure_blob_uploaded<S: GitObjectSource>(
     Ok(new_sha)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum BranchCreationPlanError {
-    /// The `git rev-list` subprocess itself failed (unknown SHA,
-    /// missing staging repo, IO error, exit-status non-zero).
-    ///
-    /// We stringify the underlying `CleanGitError` rather than
-    /// re-exporting it: the clean-git module is `pub(crate)` and
-    /// publishing one of its variants here would force the entire
-    /// hardening helper out into the public surface. Callers in
-    /// this crate that need structured information can match on
-    /// the underlying invocation; downstream consumers only care
-    /// about the human-readable text.
-    #[error("`git rev-list` failed: {0}")]
-    Git(String),
-    #[error(
-        "`git rev-list --boundary` emitted a line that does not parse as a commit SHA: \
-         {line:?} ({reason})"
-    )]
-    InvalidRevListOutput { line: String, reason: String },
-    /// The bundle's history shares no commits with the App-side
-    /// default branch. Either the agent submitted an orphan branch
-    /// or the bundle was constructed from a different upstream than
-    /// the one we're replaying against.
-    ///
-    /// Detected by inspecting the boundary commits `rev-list
-    /// --boundary` emits: every interesting commit reachable from
-    /// `bundle_tip` is genuinely new (none of the bundle's ancestors
-    /// are reachable from `default_head`). The walker would
-    /// otherwise upload an orphan history under the App identity,
-    /// which the replay contract explicitly forbids.
-    #[error(
-        "bundle history is disjoint from the default branch head {default_head}: \
-         `git rev-list --boundary ^{default_head} {bundle_tip}` found no boundary commits, \
-         which means no ancestor of {bundle_tip} is reachable from the default branch"
-    )]
-    DisjointHistory {
-        default_head: String,
-        bundle_tip: String,
-    },
-    /// The staging repo is shallow (it has a `.git/shallow` file).
-    ///
-    /// `rev-list ^<default_head> <bundle_tip>` cannot traverse past a
-    /// shallow boundary: Git treats the shallow commit as a root, so
-    /// any ancestor older than the shallow depth is invisible. If the
-    /// bundle forked from default at a commit older than the shallow
-    /// depth, the planner would falsely report `DisjointHistory` (or
-    /// worse, succeed and upload commits that already exist on the
-    /// App side).
-    ///
-    /// The orchestrator must fetch `default_head` with full ancestry
-    /// (no `--depth`) before calling — there is no safe way for the
-    /// planner to recover from shallow state without a remote, which
-    /// it deliberately does not have.
-    #[error(
-        "staging repo at {staging_repo} is shallow: `git rev-list --boundary` cannot \
-         traverse past the shallow boundary so we cannot tell which bundle commits are \
-         new versus already on the default branch. Fetch `default_head` with full ancestry \
-         (no `--depth`) — or `git fetch --unshallow` — before calling the planner"
-    )]
-    ShallowStagingRepo { staging_repo: String },
-    /// `git rev-list --boundary` wrote more than `cap` bytes of output before
-    /// the broker stopped draining it and killed the process group.
-    ///
-    /// The output is one object id per line, and the planner allocates one
-    /// object per line, so unbounded output means unbounded broker memory. A
-    /// guest-controlled bundle (up to the staged-push size limit) can pack a
-    /// pathological number of commits whose `rev-list` output would dwarf the
-    /// host's memory. Refusing the walk keeps a hostile bundle from OOM-killing
-    /// the broker mid-approval. `cap` is the byte bound that was exceeded.
-    #[error(
-        "`git rev-list --boundary` output exceeded the {cap}-byte cap; the bundle describes \
-         too many commits to replay and the walk was refused"
-    )]
-    RevListOutputTooLarge { cap: usize },
-}
-
-impl From<CleanGitError> for BranchCreationPlanError {
-    fn from(err: CleanGitError) -> Self {
-        BranchCreationPlanError::Git(err.to_string())
-    }
-}
-
-/// Result of [`plan_branch_creation_via_rev_list`].
-///
-/// Two shapes, distinguished by whether the bundle introduces any
-/// commits the App side doesn't already have:
-///
-/// * [`Replay`](BranchCreationPlan::Replay) — the bundle contains
-///   genuinely new commits. The orchestrator must run them through
-///   [`replay_commits`] before creating the ref on the App side.
-/// * [`AlreadyOnDefault`](BranchCreationPlan::AlreadyOnDefault) — the
-///   bundle's tip is already reachable from the default branch head
-///   (it *is* the default head, or an ancestor of it). The
-///   orchestrator can skip replay entirely and create the ref pointing
-///   at the existing App-side SHA. This is the "create a branch at
-///   `main`" / "create a branch at an older release tag" case: a
-///   legitimate push the agent might make even though no objects need
-///   uploading.
-///
-/// Encoding the two shapes as an enum makes the "no replay needed but
-/// still publish the ref" case unmissable for the caller; a struct
-/// with an `Option<commits>` would let the orchestrator silently
-/// forget to create the ref when commits were absent.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BranchCreationPlan {
-    /// The bundle introduces new commits. `commits` is topologically
-    /// sorted (parents before children), suitable as the `commits`
-    /// argument to [`replay_commits`]. `seed` is pre-populated with
-    /// the boundary commits' identity mappings: each default-side
-    /// ancestor that appears as a parent slot of a walked commit maps
-    /// to itself, so [`replay_commits`] recognises it as already
-    /// published.
-    Replay {
-        commits: Vec<GitObjectId>,
-        seed: ShaMap,
-    },
-    /// The bundle tip is already reachable from the default branch
-    /// head — either equal to it or one of its ancestors. There are
-    /// no new commits to upload; the orchestrator only needs to
-    /// publish the new ref at `tip` (which is the same SHA on the App
-    /// side, since it's already on the default branch).
-    AlreadyOnDefault { tip: GitObjectId },
-}
-
-/// Plan the per-commit walk for a branch creation by shelling out
-/// `git rev-list --topo-order --reverse --boundary ^<default_head>
-/// <bundle_tip>` against the staging repo.
-///
-/// The output of `rev-list --boundary` is exactly what the walker
-/// needs:
-///
-/// * Lines without a leading `-` are interesting commits — those
-///   reachable from `bundle_tip` and *not* reachable from
-///   `default_head`. With `--topo-order --reverse` they are
-///   emitted parents-before-children, ready to feed straight into
-///   [`replay_commits`].
-/// * Lines with a leading `-` are boundary commits — uninteresting
-///   commits (reachable from `default_head`) that are parents of
-///   interesting commits. Those SHAs already exist on GitHub under
-///   the same SHA, so seeding them in the [`ShaMap`] as identity
-///   maps lets `replay_commits` resolve the boundary parents
-///   without an upload.
-///
-/// The success / failure cases the caller has to distinguish:
-///
-/// * `Ok(`[`BranchCreationPlan::Replay`]`)` — `rev-list` emitted both
-///   interesting commits and boundary commits; normal replay.
-/// * `Ok(`[`BranchCreationPlan::AlreadyOnDefault`]`)` — `rev-list`
-///   emitted nothing, meaning the bundle tip is reachable from the
-///   default branch head. Legitimate "create a branch at this
-///   existing commit" push; no upload needed.
-/// * [`BranchCreationPlanError::ShallowStagingRepo`] — the staging
-///   repo's `.git/shallow` file exists, so rev-list cannot see
-///   ancestors older than the shallow depth. The orchestrator must
-///   fetch full ancestry before calling; see the variant's doc for
-///   the failure mode this prevents.
-/// * [`BranchCreationPlanError::DisjointHistory`] — `rev-list`
-///   emitted interesting commits but no boundary commits. The
-///   bundle's history has no ancestor reachable from the default
-///   branch.
-/// * [`BranchCreationPlanError::Git`] — the `rev-list` invocation
-///   itself failed (unknown SHA, missing staging repo, IO error).
-///
-/// Pre-conditions:
-///
-/// * `staging_repo` is a bare repository the broker controls and
-///   already contains both `bundle_tip` (from unbundling) and
-///   `default_head` (the orchestrator must fetch this before
-///   calling — it cannot rely on the bundle to include it).
-/// * The staging repo is *not* shallow with respect to the default
-///   branch: every ancestor of `default_head` reachable from the
-///   bundle must be present locally so rev-list can compute the
-///   merge-base. The planner checks this before running rev-list and
-///   returns [`BranchCreationPlanError::ShallowStagingRepo`] if a
-///   `.git/shallow` file exists.
-/// * `git_program` is the resolved path to the host's `git` binary;
-///   the same value the rest of the replay pipeline uses.
-/// * `stdout_byte_cap` bounds the `rev-list --boundary` output the broker will
-///   buffer and parse (one object per line). A guest-controlled bundle that
-///   describes enough commits to exceed it is refused with
-///   [`BranchCreationPlanError::RevListOutputTooLarge`] rather than allowed to
-///   drive broker memory unbounded; pass `REV_LIST_STDOUT_BYTE_CAP`.
-pub async fn plan_branch_creation_via_rev_list(
-    bundle_tip: &GitObjectId,
-    default_head: &GitObjectId,
-    staging_repo: &Path,
-    git_program: &Path,
-    step_timeout: Duration,
-    stdout_byte_cap: usize,
-) -> Result<BranchCreationPlan, BranchCreationPlanError> {
-    let shallow_invocation = build_is_shallow_invocation(staging_repo, git_program);
-    let shallow_stdout = clean_git::run_clean_git_capture_stdout(
-        &shallow_invocation,
-        step_timeout,
-        SMALL_STDOUT_CAP,
-        None,
-    )
-    .await?;
-    if parse_is_shallow_output(&shallow_stdout)? {
-        return Err(BranchCreationPlanError::ShallowStagingRepo {
-            staging_repo: staging_repo.display().to_string(),
-        });
-    }
-
-    let invocation =
-        build_rev_list_boundary_invocation(staging_repo, git_program, bundle_tip, default_head);
-    let stdout = match clean_git::run_clean_git_capture_stdout(
-        &invocation,
-        step_timeout,
-        stdout_byte_cap,
-        None,
-    )
-    .await
-    {
-        Ok(stdout) => stdout,
-        Err(CleanGitError::StdoutCapExceeded { cap }) => {
-            return Err(BranchCreationPlanError::RevListOutputTooLarge { cap });
-        }
-        Err(err) => return Err(err.into()),
-    };
-    let (commits, boundaries) = parse_rev_list_boundary_output(&stdout)?;
-
-    if commits.is_empty() {
-        // `rev-list ^default_head bundle_tip` with no output means
-        // `bundle_tip` is reachable from `default_head` — either equal
-        // or an ancestor. The orchestrator should publish the ref at
-        // the existing App-side SHA without running replay.
-        //
-        // No boundary commits accompany this case: `--boundary` only
-        // emits parents of interesting commits, and there are no
-        // interesting commits here.
-        return Ok(BranchCreationPlan::AlreadyOnDefault {
-            tip: bundle_tip.clone(),
-        });
-    }
-    if boundaries.is_empty() {
-        return Err(BranchCreationPlanError::DisjointHistory {
-            default_head: default_head.as_str().to_string(),
-            bundle_tip: bundle_tip.as_str().to_string(),
-        });
-    }
-
-    let mut seed = ShaMap::new();
-    for boundary in boundaries {
-        seed.seed_commit_identity(boundary);
-    }
-
-    Ok(BranchCreationPlan::Replay { commits, seed })
-}
-
 /// Result of [`plan_fast_forward_via_rev_list`].
 ///
 /// Two shapes, distinguished by whether the bundle introduces any
@@ -790,7 +533,8 @@ pub async fn plan_branch_creation_via_rev_list(
 ///   both the walker and the ref-update entirely.
 ///
 /// Encoding the two shapes as an enum makes the noop case unmissable
-/// for the caller and parallels [`BranchCreationPlan`] for symmetry.
+/// for the caller; a struct with an `Option<commits>` would let the
+/// orchestrator silently forget the ref update when commits were absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FastForwardPlan {
     /// The bundle introduces new commits. `commits` is topologically
@@ -816,10 +560,9 @@ pub enum FastForwardPlanError {
     /// missing staging repo, IO error, exit-status non-zero).
     ///
     /// Stringified rather than carrying the underlying
-    /// `CleanGitError` for the same reason
-    /// [`BranchCreationPlanError::Git`] does: the clean-git module
-    /// is `pub(crate)` and publishing one of its variants here would
-    /// force the entire hardening helper out into the public surface.
+    /// `CleanGitError`: the clean-git module is `pub(crate)` and
+    /// publishing one of its variants here would force the entire
+    /// hardening helper out into the public surface.
     #[error("`git rev-list` failed: {0}")]
     Git(String),
     #[error(
@@ -860,15 +603,15 @@ pub enum FastForwardPlanError {
         expected_remote_head: String,
         bundle_tip: String,
     },
-    /// The staging repo is shallow.
+    /// The staging repo is shallow (it has a `.git/shallow` file).
     ///
-    /// Same failure mode as
-    /// [`BranchCreationPlanError::ShallowStagingRepo`]: `rev-list`
-    /// cannot traverse past a `.git/shallow` boundary, so the planner
-    /// would falsely report the wrong outcome (probably
-    /// `DivergedHistory`) if the bundle's fork point is older than the
-    /// shallow depth. The orchestrator must fetch
-    /// `expected_remote_head` with full ancestry before calling.
+    /// `rev-list` cannot traverse past a shallow boundary: Git treats
+    /// the shallow commit as a root, so any older ancestor is
+    /// invisible and the planner would falsely report the wrong
+    /// outcome (probably `DivergedHistory`) if the bundle's fork point
+    /// is older than the shallow depth. The orchestrator must fetch
+    /// `expected_remote_head` with full ancestry (no `--depth`) before
+    /// calling; the planner deliberately has no remote to recover with.
     #[error(
         "staging repo at {staging_repo} is shallow: `git rev-list --boundary` cannot \
          traverse past the shallow boundary so we cannot tell which bundle commits are \
@@ -878,8 +621,7 @@ pub enum FastForwardPlanError {
     )]
     ShallowStagingRepo { staging_repo: String },
     /// `git rev-list --boundary` wrote more than `cap` bytes before the broker
-    /// stopped draining it and killed the process group. Same failure mode as
-    /// [`BranchCreationPlanError::RevListOutputTooLarge`]: the output is one
+    /// stopped draining it and killed the process group. The output is one
     /// object id per line and the planner allocates one object per line, so a
     /// guest-controlled bundle that packs a pathological commit count could
     /// otherwise drive broker memory unbounded. The walk is refused; `cap` is
@@ -901,12 +643,9 @@ impl From<CleanGitError> for FastForwardPlanError {
 /// `git rev-list --topo-order --reverse --boundary
 /// ^<expected_remote_head> <bundle_tip>` against the staging repo.
 ///
-/// Algorithm-identical to [`plan_branch_creation_via_rev_list`] —
-/// they share every private helper — but interprets the rev-list
-/// output through the stricter fast-forward lens. A fast-forward
-/// push requires that `expected_remote_head` is an ancestor of
-/// `bundle_tip`; the planner verifies that explicitly rather than
-/// inferring it from rev-list output shape:
+/// A fast-forward push requires that `expected_remote_head` is an
+/// ancestor of `bundle_tip`; the planner verifies that explicitly
+/// rather than inferring it from rev-list output shape:
 ///
 /// * `bundle_tip == expected_remote_head` → noop, surfaces as
 ///   [`FastForwardPlan::AlreadyAtExpected`]. Detected before
@@ -925,13 +664,14 @@ impl From<CleanGitError> for FastForwardPlanError {
 ///   rewinds, orphan histories, and forks from an older common
 ///   ancestor.
 ///
-/// Pre-conditions: same as the branch-creation variant. The staging
-/// repo must contain both `bundle_tip` (from unbundling) and
+/// Pre-conditions: `staging_repo` is a bare repository the broker
+/// controls and contains both `bundle_tip` (from unbundling) and
 /// `expected_remote_head` (fetched by the orchestrator with full
-/// ancestry); the repo must not be shallow.
+/// ancestry); the repo must not be shallow. `git_program` is the
+/// resolved path to the host's `git` binary.
 ///
-/// `stdout_byte_cap` bounds the `rev-list --boundary` output the same way
-/// [`plan_branch_creation_via_rev_list`] does: output past the cap is refused
+/// `stdout_byte_cap` bounds the `rev-list --boundary` output the broker will
+/// buffer and parse (one object per line); output past the cap is refused
 /// with [`FastForwardPlanError::RevListOutputTooLarge`] so a guest-controlled
 /// bundle cannot drive broker memory unbounded. Pass `REV_LIST_STDOUT_BYTE_CAP`.
 pub async fn plan_fast_forward_via_rev_list(
@@ -950,7 +690,7 @@ pub async fn plan_fast_forward_via_rev_list(
         None,
     )
     .await?;
-    if parse_is_shallow_output(&shallow_stdout).map_err(branch_creation_to_fast_forward)? {
+    if parse_is_shallow_output(&shallow_stdout)? {
         return Err(FastForwardPlanError::ShallowStagingRepo {
             staging_repo: staging_repo.display().to_string(),
         });
@@ -976,8 +716,7 @@ pub async fn plan_fast_forward_via_rev_list(
         }
         Err(err) => return Err(err.into()),
     };
-    let (commits, boundaries) =
-        parse_rev_list_boundary_output(&stdout).map_err(branch_creation_to_fast_forward)?;
+    let (commits, boundaries) = parse_rev_list_boundary_output(&stdout)?;
 
     let diverged = || FastForwardPlanError::DivergedHistory {
         expected_remote_head: expected_remote_head.as_str().to_string(),
@@ -1015,42 +754,6 @@ pub async fn plan_fast_forward_via_rev_list(
     Ok(FastForwardPlan::Replay { commits, seed })
 }
 
-/// Total adapter from the branch-creation planner's error type to the
-/// fast-forward planner's. Used at the boundary where the parse
-/// helpers return `BranchCreationPlanError` but the fast-forward
-/// orchestration needs `FastForwardPlanError`.
-///
-/// The parse helpers only ever construct `InvalidRevListOutput` at
-/// the time of writing, so the other arms are unreachable in
-/// practice. Keeping the function total (rather than
-/// `unreachable!`-panicking) means a future refactor that lets the
-/// parse helpers emit a different variant translates cleanly into
-/// the fast-forward vocabulary rather than crashing the broker.
-/// `DisjointHistory` maps to `DivergedHistory` because the two
-/// describe the same shape ("no ancestor of bundle_tip on the App
-/// side") with different baseline names.
-fn branch_creation_to_fast_forward(err: BranchCreationPlanError) -> FastForwardPlanError {
-    match err {
-        BranchCreationPlanError::Git(msg) => FastForwardPlanError::Git(msg),
-        BranchCreationPlanError::InvalidRevListOutput { line, reason } => {
-            FastForwardPlanError::InvalidRevListOutput { line, reason }
-        }
-        BranchCreationPlanError::ShallowStagingRepo { staging_repo } => {
-            FastForwardPlanError::ShallowStagingRepo { staging_repo }
-        }
-        BranchCreationPlanError::DisjointHistory {
-            default_head,
-            bundle_tip,
-        } => FastForwardPlanError::DivergedHistory {
-            expected_remote_head: default_head,
-            bundle_tip,
-        },
-        BranchCreationPlanError::RevListOutputTooLarge { cap } => {
-            FastForwardPlanError::RevListOutputTooLarge { cap }
-        }
-    }
-}
-
 /// Build the `git -C <staging> rev-parse --is-shallow-repository`
 /// invocation: prints `true`/`false` on stdout depending on whether
 /// `.git/shallow` exists. Used as the planner's pre-flight check.
@@ -1074,17 +777,16 @@ fn build_is_shallow_invocation(staging_repo: &Path, git_program: &Path) -> Clean
 /// `true` or `false` followed by a newline; anything else is treated
 /// as malformed and surfaced via `InvalidRevListOutput` so a future
 /// Git change cannot silently regress the precondition.
-fn parse_is_shallow_output(stdout: &[u8]) -> Result<bool, BranchCreationPlanError> {
-    let text = std::str::from_utf8(stdout).map_err(|err| {
-        BranchCreationPlanError::InvalidRevListOutput {
+fn parse_is_shallow_output(stdout: &[u8]) -> Result<bool, FastForwardPlanError> {
+    let text =
+        std::str::from_utf8(stdout).map_err(|err| FastForwardPlanError::InvalidRevListOutput {
             line: format!("<non-utf8 stdout, {} bytes>", stdout.len()),
             reason: err.to_string(),
-        }
-    })?;
+        })?;
     match text.trim() {
         "true" => Ok(true),
         "false" => Ok(false),
-        other => Err(BranchCreationPlanError::InvalidRevListOutput {
+        other => Err(FastForwardPlanError::InvalidRevListOutput {
             line: other.to_string(),
             reason: "`git rev-parse --is-shallow-repository` must print `true` or `false`"
                 .to_string(),
@@ -1093,7 +795,7 @@ fn parse_is_shallow_output(stdout: &[u8]) -> Result<bool, BranchCreationPlanErro
 }
 
 /// Build the `git -C <staging> rev-list --topo-order --reverse
-/// --boundary ^<default_head> <bundle_tip>` invocation under the
+/// --boundary ^<baseline> <bundle_tip>` invocation under the
 /// hardened clean-git environment.
 ///
 /// Pure helper exposed for tests so the argv shape can be pinned
@@ -1102,7 +804,7 @@ fn build_rev_list_boundary_invocation(
     staging_repo: &Path,
     git_program: &Path,
     bundle_tip: &GitObjectId,
-    default_head: &GitObjectId,
+    baseline: &GitObjectId,
 ) -> CleanGitInvocation {
     CleanGitInvocation::new(
         git_program.to_path_buf(),
@@ -1113,7 +815,7 @@ fn build_rev_list_boundary_invocation(
             OsString::from("--topo-order"),
             OsString::from("--reverse"),
             OsString::from("--boundary"),
-            OsString::from(format!("^{}", default_head.as_str())),
+            OsString::from(format!("^{}", baseline.as_str())),
             OsString::from(bundle_tip.as_str()),
         ],
         clean_git_config_env(),
@@ -1127,18 +829,17 @@ fn build_rev_list_boundary_invocation(
 ///
 /// Each non-empty line is exactly one SHA (optionally with a `-`
 /// prefix). Anything else — a malformed SHA, a non-ASCII byte — is
-/// surfaced as [`BranchCreationPlanError::InvalidRevListOutput`]
+/// surfaced as [`FastForwardPlanError::InvalidRevListOutput`]
 /// rather than silently dropped, so a future Git change that adds
 /// noise to this output cannot regress to producing a wrong walk.
 fn parse_rev_list_boundary_output(
     stdout: &[u8],
-) -> Result<(Vec<GitObjectId>, Vec<GitObjectId>), BranchCreationPlanError> {
-    let text = std::str::from_utf8(stdout).map_err(|err| {
-        BranchCreationPlanError::InvalidRevListOutput {
+) -> Result<(Vec<GitObjectId>, Vec<GitObjectId>), FastForwardPlanError> {
+    let text =
+        std::str::from_utf8(stdout).map_err(|err| FastForwardPlanError::InvalidRevListOutput {
             line: format!("<non-utf8 stdout, {} bytes>", stdout.len()),
             reason: err.to_string(),
-        }
-    })?;
+        })?;
 
     let mut commits: Vec<GitObjectId> = Vec::new();
     let mut boundaries: Vec<GitObjectId> = Vec::new();
@@ -1152,7 +853,7 @@ fn parse_rev_list_boundary_output(
         };
         let sha = GitObjectId::new(sha_str.to_string()).map_err(|err| match err {
             GitObjectIdError::WrongLength(_) | GitObjectIdError::NonHexByte(_) => {
-                BranchCreationPlanError::InvalidRevListOutput {
+                FastForwardPlanError::InvalidRevListOutput {
                     line: line.to_string(),
                     reason: err.to_string(),
                 }
@@ -1314,8 +1015,6 @@ pub(crate) fn render_replay_message(
 }
 
 #[cfg(test)]
-mod branch_creation_plan_tests;
-#[cfg(test)]
 mod fast_forward_plan_tests;
 #[cfg(test)]
 mod render_message_tests;
@@ -1439,13 +1138,13 @@ mod spec {
         #![proptest_config(ProptestConfig::with_cases(6))]
 
         /// Any two arbitrary chains with no shared ancestor produce
-        /// [`BranchCreationPlanError::DisjointHistory`]; the planner
+        /// [`FastForwardPlanError::DivergedHistory`]; the planner
         /// never silently accepts a bundle whose history shares
-        /// nothing with the default branch, regardless of either
+        /// nothing with `expected_remote_head`, regardless of either
         /// chain's depth.
         #[test]
         fn rev_list_plan_rejects_any_disjoint_history(
-            default_chain_len in 1u32..=4,
+            upstream_chain_len in 1u32..=4,
             bundle_chain_len in 1u32..=4,
         ) {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1453,32 +1152,32 @@ mod spec {
                 .build()
                 .unwrap();
             let (_dir, repo, git) = init_test_repo();
-            let mut default_tip = commit_empty(&git, &repo, "default 0");
-            for i in 1..default_chain_len {
-                default_tip = commit_empty(&git, &repo, &format!("default {i}"));
+            let mut upstream_tip = commit_empty(&git, &repo, "upstream 0");
+            for i in 1..upstream_chain_len {
+                upstream_tip = commit_empty(&git, &repo, &format!("upstream {i}"));
             }
             run_git(&git, &repo, &["checkout", "--quiet", "--orphan", "orphan"]);
             let mut bundle_tip = commit_empty(&git, &repo, "orphan 0");
             for i in 1..bundle_chain_len {
                 bundle_tip = commit_empty(&git, &repo, &format!("orphan {i}"));
             }
-            let result = rt.block_on(plan_branch_creation_via_rev_list(
+            let result = rt.block_on(plan_fast_forward_via_rev_list(
                 &bundle_tip,
-                &default_tip,
+                &upstream_tip,
                 &repo,
                 &git,
                 TEST_GIT_TIMEOUT,
                 REV_LIST_STDOUT_BYTE_CAP,
             ));
             match result {
-                Err(BranchCreationPlanError::DisjointHistory {
-                    default_head,
+                Err(FastForwardPlanError::DivergedHistory {
+                    expected_remote_head,
                     bundle_tip: bt,
                 }) => {
-                    prop_assert_eq!(default_head, default_tip.as_str());
+                    prop_assert_eq!(expected_remote_head, upstream_tip.as_str());
                     prop_assert_eq!(bt, bundle_tip.as_str());
                 }
-                other => prop_assert!(false, "expected DisjointHistory, got {:?}", other),
+                other => prop_assert!(false, "expected DivergedHistory, got {:?}", other),
             }
         }
     }
