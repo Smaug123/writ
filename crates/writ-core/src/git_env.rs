@@ -247,14 +247,6 @@ mod tests {
     /// Locate `git` on `PATH`, or `None` where there is none — the tests that
     /// ask real git a question skip rather than fail so the suite stays
     /// portable.
-    fn git_on_path() -> Option<std::path::PathBuf> {
-        std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join("git"))
-                .find(|candidate| candidate.is_file())
-        })
-    }
-
     /// A scratch directory named after the test that owns it, so parallel tests
     /// in this module cannot collide on one pid-derived name.
     fn scratch(label: &str) -> std::path::PathBuf {
@@ -357,10 +349,7 @@ mod tests {
     /// is the whole live blast radius.
     #[test]
     fn the_recipe_stops_git_fetch_spawning_detached_maintenance() {
-        let Some(git) = git_on_path() else {
-            eprintln!("skipping: no `git` on PATH");
-            return;
-        };
+        let git = crate::test_support::required_tool("git");
         let dir = scratch("no-detached-maintenance");
         let source = dir.join("source.git");
         let destination = dir.join("destination.git");
@@ -484,10 +473,7 @@ mod tests {
     /// absent so the suite stays portable.
     #[test]
     fn the_recipe_blocks_a_real_git_config_injection() {
-        let Some(git) = git_on_path() else {
-            eprintln!("skipping: no `git` on PATH");
-            return;
-        };
+        let git = crate::test_support::required_tool("git");
 
         // Inject through every env channel a caller could inherit, then confirm
         // none reaches git once the recipe is layered on top — which is the

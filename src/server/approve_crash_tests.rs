@@ -27,7 +27,7 @@ use crate::crash_point::{CrashOutcome, CrashPlan, run_until_crash};
 use crate::fake_github::FakeGitHub;
 use crate::fake_origin::{FakeOrigin, ORIGIN_NAME, ORIGIN_OWNER};
 use crate::signing::WritSigningKey;
-use crate::test_support::{broker_state, find_in_path, github_app};
+use crate::test_support::{broker_state, github_app, required_tool};
 use crate::vm_git::{GitBranchName, GitCloneRepo, VmGitPushMetadata};
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 
@@ -55,12 +55,11 @@ pub(super) struct ApproveWorld {
 }
 
 impl ApproveWorld {
-    /// `None` when `git` is not on `PATH` (callers skip). The staged
-    /// push's target repo is on the write allowlist, so policy grants
-    /// the approve-time mint — the setup every crash-recovery oracle
+    /// The staged push's target repo is on the write allowlist, so policy
+    /// grants the approve-time mint — the setup every crash-recovery oracle
     /// wants. Use [`start_with_writable_repos`](Self::start_with_writable_repos)
     /// to exercise a policy that denies.
-    pub(super) async fn start() -> Option<Self> {
+    pub(super) async fn start() -> Self {
         let repo: RepoRef = format!("{ORIGIN_OWNER}/{ORIGIN_NAME}").parse().unwrap();
         Self::start_with_writable_repos(vec![repo]).await
     }
@@ -69,8 +68,8 @@ impl ApproveWorld {
     /// The staged push always targets `ORIGIN_OWNER/ORIGIN_NAME`; pass
     /// an allowlist that omits it to build a world whose policy denies
     /// the approve.
-    pub(super) async fn start_with_writable_repos(writable_repos: Vec<RepoRef>) -> Option<Self> {
-        let origin = FakeOrigin::start().await?;
+    pub(super) async fn start_with_writable_repos(writable_repos: Vec<RepoRef>) -> Self {
+        let origin = FakeOrigin::start().await;
         let github = FakeGitHub::start(ORIGIN_OWNER, ORIGIN_NAME, INSTALLATION_ID).await;
         // GitHub's branch is at the prerequisite — exactly the state
         // the staged receipt's lease was taken against.
@@ -142,7 +141,7 @@ impl ApproveWorld {
             })
             .unwrap();
 
-        Some(Self {
+        Self {
             state,
             github,
             origin,
@@ -152,7 +151,7 @@ impl ApproveWorld {
             work_root,
             writable_repos,
             _tmp: tmp,
-        })
+        }
     }
 
     pub(super) fn approve_message(&self) -> ClientMessage {
@@ -187,7 +186,7 @@ fn build_state(
     origin: &FakeOrigin,
     writable_repos: &[RepoRef],
 ) -> Arc<BrokerState<InMemorySecretStore>> {
-    let git = find_in_path("git").expect("callers hold a FakeOrigin, so git exists");
+    let git = required_tool("git");
     let promote_runtime = crate::git_push_promote::PromoteRuntimeConfig::new(
         git,
         origin.clone_base_url(),
@@ -224,10 +223,7 @@ fn build_state(
 /// ledger).
 #[tokio::test]
 async fn approve_pipeline_succeeds_end_to_end_against_fake_github() {
-    let Some(world) = ApproveWorld::start().await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let world = ApproveWorld::start().await;
 
     let resp = dispatch_message(world.approve_message(), &world.state).await;
     let ServerMessage::StagedPushApproved {
@@ -315,10 +311,7 @@ async fn approve_of_push_to_non_writable_repo_is_denied() {
     // to the staged repo under this policy, and the approve path must
     // reach the same verdict.
     let other: RepoRef = format!("{ORIGIN_OWNER}/some-other-repo").parse().unwrap();
-    let Some(world) = ApproveWorld::start_with_writable_repos(vec![other]).await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let world = ApproveWorld::start_with_writable_repos(vec![other]).await;
 
     let resp = dispatch_message(world.approve_message(), &world.state).await;
 
@@ -361,10 +354,7 @@ async fn approve_of_push_to_non_writable_repo_is_denied() {
 /// names are printed on failure to make a shrinkage legible.
 #[tokio::test]
 async fn counting_run_reports_the_sweeps_upper_bound() {
-    let Some(world) = ApproveWorld::start().await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let world = ApproveWorld::start().await;
 
     let plan = CrashPlan::count();
     let resp = run_until_crash(
@@ -387,8 +377,8 @@ async fn counting_run_reports_the_sweeps_upper_bound() {
 
 /// One counting run over a fresh world: the sweep's upper bound `N`
 /// and the point names (for labels). `None` when `git` is absent.
-pub(super) async fn count_points() -> Option<(usize, Vec<&'static str>)> {
-    let world = ApproveWorld::start().await?;
+pub(super) async fn count_points() -> (usize, Vec<&'static str>) {
+    let world = ApproveWorld::start().await;
     let plan = CrashPlan::count();
     run_until_crash(
         &plan,
@@ -399,7 +389,7 @@ pub(super) async fn count_points() -> Option<(usize, Vec<&'static str>)> {
     let n = plan.points_passed();
     let names = plan.names();
     assert_eq!(names.len(), n);
-    Some((n, names))
+    (n, names)
 }
 
 /// Everything the sweep needs to know about a world after a crash and
@@ -585,18 +575,13 @@ fn assert_single_publish(world: &ApproveWorld, label: &str) {
 /// reconciliation when the PATCH had already reached the fake.
 #[tokio::test]
 async fn crash_sweep_every_index_recovers_to_one_approved_publish() {
-    let Some((_, names)) = count_points().await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let (_, names) = count_points().await;
 
     let mut saw_pre_patch = false;
     let mut saw_post_patch = false;
     for (k, &name) in names.iter().enumerate() {
         let label = format!("k={k} ({name})");
-        let world = ApproveWorld::start()
-            .await
-            .expect("git existed for the counting run");
+        let world = ApproveWorld::start().await;
         let plan = CrashPlan::crash_at(k);
         let (index, _) = run_until_crash(
             &plan,
@@ -674,15 +659,10 @@ async fn crash_sweep_every_index_recovers_to_one_approved_publish() {
 /// applied PATCH.
 #[tokio::test]
 async fn crash_sweep_reject_is_permitted_exactly_when_the_patch_provably_never_fired() {
-    let Some((_, names)) = count_points().await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let (_, names) = count_points().await;
 
     for (k, &name) in names.iter().enumerate() {
-        let world = ApproveWorld::start()
-            .await
-            .expect("git existed for the counting run");
+        let world = ApproveWorld::start().await;
         let plan = CrashPlan::crash_at(k);
         run_until_crash(
             &plan,
@@ -817,14 +797,8 @@ async fn crash_sweep_reject_is_permitted_exactly_when_the_patch_provably_never_f
 fn double_crash_sampled_pairs_recover_to_one_approved_publish() {
     use proptest::test_runner::{Config, TestRunner};
 
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let (n, _) = rt
-        .block_on(count_points())
-        .expect("`git` presence checked above");
+    let (n, _) = rt.block_on(count_points());
 
     let mut config = Config::with_cases(32);
     config.source_file = Some(file!());
@@ -849,7 +823,7 @@ fn double_crash_sampled_pairs_recover_to_one_approved_publish() {
 
 async fn double_crash_case(k1: usize, k2: usize) {
     let label = format!("k1={k1}, k2={k2}");
-    let world = ApproveWorld::start().await.expect("git is on PATH");
+    let world = ApproveWorld::start().await;
     let plan = CrashPlan::crash_at(k1);
     run_until_crash(
         &plan,
@@ -898,10 +872,7 @@ async fn double_crash_case(k1: usize, k2: usize) {
 /// ever reads a dead attempt's directory.
 #[tokio::test]
 async fn torn_staging_residue_never_blocks_the_retry() {
-    let Some((_, names)) = count_points().await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let (_, names) = count_points().await;
 
     #[derive(Clone, Copy, Debug)]
     enum Tear {
@@ -922,9 +893,7 @@ async fn torn_staging_residue_never_blocks_the_retry() {
     for &k in &staging_indices {
         for tear in [Tear::TruncateBundle, Tear::EmptyDir] {
             let label = format!("k={k} ({}), {tear:?}", names[k]);
-            let world = ApproveWorld::start()
-                .await
-                .expect("git existed for the counting run");
+            let world = ApproveWorld::start().await;
             let plan = CrashPlan::crash_at(k);
             run_until_crash(
                 &plan,

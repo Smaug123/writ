@@ -498,7 +498,7 @@ mod tests {
     use crate::flake_lock::{FlakeLockError, FlakeProvisionBounds};
     use crate::flake_materialize::MaterializeError;
     use crate::secret::SecretStore;
-    use crate::test_support::find_in_path;
+    use crate::test_support::required_tool;
     use crate::vm_git::GitCloneRepo;
     use crate::vm_git_mirror_cache::MirrorCacheKey;
 
@@ -755,10 +755,7 @@ mod tests {
     /// the invariant this whole series exists to make structural.
     #[tokio::test]
     async fn provisioned_flake_records_a_complete_audit_pair() {
-        let Some(git_program) = find_in_path("git") else {
-            eprintln!("skipping: git must be on PATH");
-            return;
-        };
+        let git_program = required_tool("git");
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
         let session = session();
@@ -811,10 +808,7 @@ mod tests {
     /// effect is recorded, not dropped.
     #[tokio::test]
     async fn failed_provision_records_a_failure_outcome() {
-        let Some(git_program) = find_in_path("git") else {
-            eprintln!("skipping: git must be on PATH");
-            return;
-        };
+        let git_program = required_tool("git");
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
         let session = session();
@@ -856,10 +850,7 @@ mod tests {
     /// reject-before-begin path, with real git work having already happened.
     #[tokio::test]
     async fn unprovisionable_lock_is_refused_before_any_audit_row() {
-        let Some(git_program) = find_in_path("git") else {
-            eprintln!("skipping: git must be on PATH");
-            return;
-        };
+        let git_program = required_tool("git");
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
         let session = session();

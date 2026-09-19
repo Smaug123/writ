@@ -710,6 +710,38 @@ fn only_a_named_file_mutates_the_process_environment() {
     );
 }
 
+/// No test may report success because `git` was missing.
+///
+/// The dev shell supplies `git` (see `CLAUDE.md`), so its absence is a broken
+/// environment rather than a configuration a test should tolerate. A test that
+/// returns early on it reports the same green as one that ran, and the suite
+/// then says nothing about the very paths that most need a real git —
+/// `prepare_approve`, the crash sweeps, the fake origin. One such test went
+/// further and *panicked with the message its own `should_panic` expected*,
+/// so a git-less box saw it pass while it exercised nothing at all.
+///
+/// The spelling is the needle because the policy is about the whole shape: a
+/// tool the suite cannot do without is fetched with
+/// `writ_core::test_support::required_tool`, which panics naming the tool and
+/// the `PATH` it searched. Tools the dev shell does *not* promise — `nix`,
+/// `perl` — may still be skipped, and are not matched here.
+#[test]
+fn no_test_skips_itself_because_git_is_absent() {
+    const NEEDLES: &[&str] = &[
+        r#"skipping: git"#,
+        r#"skipping: `git`"#,
+        r#"skipping: no `git`"#,
+        r#"skipping: git and nix"#,
+    ];
+    let hits = offenders(NEEDLES, &[]);
+    assert!(
+        hits.is_empty(),
+        "these tests report success when `git` is absent; take it with \
+         `required_tool(\"git\")` so the suite fails loudly instead:\n{}",
+        hits.join("\n"),
+    );
+}
+
 /// The statement containing byte offset `at`, scanning back to the previous
 /// `;` or block boundary.
 fn statement_containing(text: &str, at: usize) -> Option<&str> {

@@ -11,7 +11,7 @@
 //! Used by the host core ([`crate::flake_provision`]), the mirror orchestrator
 //! ([`crate::flake_provision_from_mirror`]), and the VM-HTTP endpoint tests.
 
-use crate::test_support::find_in_path;
+use crate::test_support::required_tool;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -235,10 +235,7 @@ mod tests {
     /// exactly what already happened almost every time.
     #[test]
     fn a_fixture_commit_leaves_no_background_writer_behind() {
-        let Some(git_program) = find_in_path("git") else {
-            eprintln!("skipping: git must be on PATH");
-            return;
-        };
+        let git_program = required_tool("git");
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -287,10 +284,7 @@ mod tests {
     /// (that stderr is captured at all) that broke, not the formatting.
     #[test]
     fn a_failed_fixture_git_reports_gits_own_stderr() {
-        let Some(git_program) = find_in_path("git") else {
-            eprintln!("skipping: git must be on PATH");
-            return;
-        };
+        let git_program = required_tool("git");
         let temp = tempfile::tempdir().unwrap();
         let args = ["clone", "-q", "--mirror", "definitely-not-a-repo", "dest"];
 

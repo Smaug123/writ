@@ -23,7 +23,7 @@
 //! runs and machines. Callers must skip when `git` is absent (the
 //! constructor returns `None`), matching the `find_in_path("git")` precedent.
 
-use crate::test_support::{find_in_path, rev_parse, run_git};
+use crate::test_support::{required_tool, rev_parse, run_git};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 
@@ -59,11 +59,11 @@ impl Drop for FakeOrigin {
 }
 
 impl FakeOrigin {
-    /// Build the origin and start serving it. Returns `None` when
-    /// `git` is not on `PATH` (callers print a skip note, matching the
-    /// suite's convention for real-git tests).
-    pub(crate) async fn start() -> Option<Self> {
-        let git = find_in_path("git")?;
+    /// Build the origin and start serving it. Panics when `git` is not on
+    /// `PATH`: the dev shell supplies it, so its absence is a broken
+    /// environment rather than a reason to report success.
+    pub(crate) async fn start() -> Self {
+        let git = required_tool("git");
         let tmp = tempfile::tempdir().expect("fake origin tempdir");
 
         // Work repo: base commit (the prerequisite — what "GitHub"
@@ -124,14 +124,14 @@ impl FakeOrigin {
 
         let (base_url, server) = serve_dumb_http(origin).await;
 
-        Some(Self {
+        Self {
             _tmp: tmp,
             base_url,
             server,
             prereq,
             tip,
             bundle,
-        })
+        }
     }
 
     /// The clone base URL to plug into `PromoteRuntimeConfig`; the
@@ -225,10 +225,7 @@ mod tests {
     /// prerequisite, and unknown paths 404.
     #[tokio::test]
     async fn origin_serves_info_refs_for_the_prereq() {
-        let Some(origin) = FakeOrigin::start().await else {
-            eprintln!("skipping: `git` not on PATH");
-            return;
-        };
+        let origin = FakeOrigin::start().await;
         assert_ne!(origin.prereq(), origin.tip());
         assert!(!origin.bundle_bytes().is_empty());
 

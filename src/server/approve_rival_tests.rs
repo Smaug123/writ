@@ -52,19 +52,14 @@ impl Rival {
 
 #[tokio::test]
 async fn rival_ref_moves_at_every_point_never_publish_off_the_approved_baseline() {
-    let Some((n, names)) = count_points().await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let (n, names) = count_points().await;
 
     for rival in [Rival::RewindToAncestor, Rival::AdvanceToForeign] {
         let mut saw_publish = false;
         let mut saw_failure = false;
         for (k, &name) in names.iter().enumerate() {
             let label = format!("k={k} ({name}) [{rival:?}]");
-            let world = ApproveWorld::start()
-                .await
-                .expect("git existed for the counting run");
+            let world = ApproveWorld::start().await;
             // Teach the model the graph that makes the rival's moves
             // meaningful: the seeded head descends from ANCESTOR (so a
             // rewind is a *plausible* baseline for a fast-forward, not
