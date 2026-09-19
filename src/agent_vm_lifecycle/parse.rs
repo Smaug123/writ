@@ -8,7 +8,7 @@
 //! produces these strings lives in the parent module.
 
 use super::GUEST_IPV6_PROBE_UNAVAILABLE_MARKER;
-use crate::core::{AgentVmConfigError, Ipv4Cidr, Ipv6Cidr, PfInterface};
+use crate::core::{AgentVmConfigError, CidrParseError, Ipv4Cidr, Ipv6Cidr, PfInterface};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -238,11 +238,12 @@ pub struct AppleNetworkInspection {
 
 impl AppleNetworkInspection {
     pub fn parse(raw: &str) -> Result<Self, NetworkInspectionError> {
-        let ipv4_subnet = parse_ipv4_cidr_field("ipv4Subnet", &require_field(raw, "ipv4Subnet")?)?;
+        let ipv4_subnet =
+            parse_cidr_field::<Ipv4Cidr>("ipv4Subnet", &require_field(raw, "ipv4Subnet")?)?;
         let ipv4_gateway =
             parse_ipv4_addr_field("ipv4Gateway", &require_field(raw, "ipv4Gateway")?)?;
         let ipv6_subnet = extract_network_field(raw, "ipv6Subnet")
-            .map(|raw| parse_ipv6_cidr_field("ipv6Subnet", &raw))
+            .map(|raw| parse_cidr_field::<Ipv6Cidr>("ipv6Subnet", &raw))
             .transpose()?;
         let ipv6_gateway = extract_network_field(raw, "ipv6Gateway")
             .map(|raw| parse_ipv6_addr_field("ipv6Gateway", &raw))
@@ -417,34 +418,6 @@ fn addr_part(raw: &str) -> &str {
     raw.split_once('/').map(|(addr, _)| addr).unwrap_or(raw)
 }
 
-fn parse_ipv4_cidr_field(
-    field: &'static str,
-    raw: &str,
-) -> Result<Ipv4Cidr, NetworkInspectionError> {
-    let (addr, prefix) = split_cidr_field(field, raw)?;
-    let addr = addr
-        .parse::<Ipv4Addr>()
-        .map_err(|e| invalid_field(field, raw, e))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|e| invalid_field(field, raw, e))?;
-    Ipv4Cidr::new(addr, prefix).map_err(|e| invalid_field(field, raw, e))
-}
-
-fn parse_ipv6_cidr_field(
-    field: &'static str,
-    raw: &str,
-) -> Result<Ipv6Cidr, NetworkInspectionError> {
-    let (addr, prefix) = split_cidr_field(field, raw)?;
-    let addr = addr
-        .parse::<Ipv6Addr>()
-        .map_err(|e| invalid_field(field, raw, e))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|e| invalid_field(field, raw, e))?;
-    Ipv6Cidr::new(addr, prefix).map_err(|e| invalid_field(field, raw, e))
-}
-
 fn parse_ipv4_addr_field(
     field: &'static str,
     raw: &str,
@@ -463,12 +436,12 @@ fn parse_ipv6_addr_field(
         .map_err(|e| invalid_field(field, raw, e))
 }
 
-fn split_cidr_field<'a>(
+/// `addr/prefix` in either family, with the field named in the error.
+fn parse_cidr_field<T: std::str::FromStr<Err = CidrParseError>>(
     field: &'static str,
-    raw: &'a str,
-) -> Result<(&'a str, &'a str), NetworkInspectionError> {
-    raw.split_once('/')
-        .ok_or_else(|| invalid_field(field, raw, "CIDR value must contain '/'"))
+    raw: &str,
+) -> Result<T, NetworkInspectionError> {
+    raw.parse::<T>().map_err(|e| invalid_field(field, raw, e))
 }
 
 fn ipv6_addr_is_local_only(addr: Ipv6Addr) -> bool {

@@ -313,6 +313,50 @@ impl std::fmt::Display for Ipv6Cidr {
     }
 }
 
+/// Why `<address>/<prefix>` text is not an [`Ipv4Cidr`] or [`Ipv6Cidr`].
+///
+/// Messages omit the offending text: the caller names the field and quotes
+/// the value, this only says which part was wrong.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum CidrParseError {
+    #[error("CIDR value must contain '/'")]
+    MissingSlash,
+    #[error("invalid address: {0}")]
+    Address(std::net::AddrParseError),
+    #[error("invalid prefix length: {0}")]
+    Prefix(std::num::ParseIntError),
+    #[error(transparent)]
+    Shape(AgentVmConfigError),
+}
+
+fn split_cidr(raw: &str) -> Result<(&str, &str), CidrParseError> {
+    raw.split_once('/').ok_or(CidrParseError::MissingSlash)
+}
+
+impl std::str::FromStr for Ipv4Cidr {
+    type Err = CidrParseError;
+
+    /// `a.b.c.d/n`, refusing host bits (see [`Ipv4Cidr::new`]).
+    fn from_str(raw: &str) -> Result<Self, CidrParseError> {
+        let (addr, prefix) = split_cidr(raw)?;
+        let addr = addr.parse::<Ipv4Addr>().map_err(CidrParseError::Address)?;
+        let prefix = prefix.parse::<u8>().map_err(CidrParseError::Prefix)?;
+        Self::new(addr, prefix).map_err(CidrParseError::Shape)
+    }
+}
+
+impl std::str::FromStr for Ipv6Cidr {
+    type Err = CidrParseError;
+
+    /// `addr/n`, refusing host bits (see [`Ipv6Cidr::new`]).
+    fn from_str(raw: &str) -> Result<Self, CidrParseError> {
+        let (addr, prefix) = split_cidr(raw)?;
+        let addr = addr.parse::<Ipv6Addr>().map_err(CidrParseError::Address)?;
+        let prefix = prefix.parse::<u8>().map_err(CidrParseError::Prefix)?;
+        Self::new(addr, prefix).map_err(CidrParseError::Shape)
+    }
+}
+
 impl BrokerPort {
     pub fn new(port: u16) -> Result<Self, AgentVmConfigError> {
         if port == 0 {
@@ -1479,6 +1523,60 @@ mod tests {
         // ...while the gateway is no longer specially allowed (it falls under the
         // blanket deny).
         assert!(!rendered.contains("to 192.168.126.1 port"), "{rendered}");
+    }
+
+    proptest! {
+        /// `Display` and `FromStr` are inverse on every valid CIDR of either
+        /// family.
+        #[test]
+        fn ipv4_cidr_display_round_trips(raw in any::<u32>(), prefix in 0u8..=32) {
+            let cidr = Ipv4Cidr::new(Ipv4Addr::from(raw & ipv4_mask(prefix)), prefix).unwrap();
+            prop_assert_eq!(cidr.to_string().parse::<Ipv4Cidr>(), Ok(cidr));
+        }
+
+        #[test]
+        fn ipv6_cidr_display_round_trips(raw in any::<u128>(), prefix in 0u8..=128) {
+            let cidr = Ipv6Cidr::new(Ipv6Addr::from(raw & ipv6_mask(prefix)), prefix).unwrap();
+            prop_assert_eq!(cidr.to_string().parse::<Ipv6Cidr>(), Ok(cidr));
+        }
+
+        /// Whatever the text, a parse names the first part that is wrong:
+        /// no slash, then the address, then the prefix digits, then the
+        /// shape rules `new` enforces. An accepted value re-parses to
+        /// itself.
+        #[test]
+        fn ipv4_cidr_parse_names_the_first_fault(raw in "[0-9./+a-f:]{0,20}") {
+            let expected = match raw.split_once('/') {
+                None => Err(CidrParseError::MissingSlash),
+                Some((addr, prefix)) => match (addr.parse::<Ipv4Addr>(), prefix.parse::<u8>()) {
+                    (Err(e), _) => Err(CidrParseError::Address(e)),
+                    (Ok(_), Err(e)) => Err(CidrParseError::Prefix(e)),
+                    (Ok(addr), Ok(prefix)) => Ipv4Cidr::new(addr, prefix).map_err(CidrParseError::Shape),
+                },
+            };
+            let parsed = raw.parse::<Ipv4Cidr>();
+            prop_assert_eq!(&parsed, &expected);
+            if let Ok(cidr) = parsed {
+                prop_assert_eq!(cidr.to_string().parse::<Ipv4Cidr>(), Ok(cidr));
+            }
+        }
+
+        #[test]
+        fn ipv6_cidr_parse_names_the_first_fault(raw in "[0-9./+a-f:]{0,24}") {
+            let expected = match raw.split_once('/') {
+                None => Err(CidrParseError::MissingSlash),
+                Some((addr, prefix)) => match (addr.parse::<Ipv6Addr>(), prefix.parse::<u8>()) {
+                    (Err(e), _) => Err(CidrParseError::Address(e)),
+                    (Ok(_), Err(e)) => Err(CidrParseError::Prefix(e)),
+                    (Ok(addr), Ok(prefix)) => Ipv6Cidr::new(addr, prefix).map_err(CidrParseError::Shape),
+                },
+            };
+            let parsed = raw.parse::<Ipv6Cidr>();
+            prop_assert_eq!(&parsed, &expected);
+            if let Ok(cidr) = parsed {
+                prop_assert_eq!(cidr.to_string().parse::<Ipv6Cidr>(), Ok(cidr));
+            }
+        }
     }
 
     proptest! {
