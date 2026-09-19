@@ -63,7 +63,10 @@ fn parses_ui_http_config() {
     let ui = c.ui_http.as_ref().expect("ui_http parsed");
     assert_eq!(ui.bind.to_string(), "127.0.0.1:7378");
     assert!(ui.bearer_path.is_none());
-    assert_eq!(ui.bearer_path_or_default(), default_ui_http_bearer_path());
+    assert_eq!(
+        ui.bearer_path_or_default(),
+        default_paths::UI_HTTP_BEARER.resolve()
+    );
     ui.validate().expect("loopback bind validates");
 }
 
@@ -1111,7 +1114,7 @@ fn the_preflight_resolves_the_notes_repo_path() {
 
     assert_eq!(
         checked.notes_repo_path,
-        Some(default_notes_repo_path().unwrap()),
+        Some(default_paths::NOTES_REPO.resolve().unwrap()),
     );
 }
 
@@ -1131,7 +1134,7 @@ fn the_preflight_resolves_the_ui_http_bearer_path() {
 
     assert_eq!(
         checked.ui_http_bearer_path,
-        Some(default_ui_http_bearer_path().unwrap()),
+        Some(default_paths::UI_HTTP_BEARER.resolve().unwrap()),
     );
 }
 
@@ -1896,7 +1899,10 @@ fn parses_run_agent_section_with_defaults() {
     assert!(cfg.signing_key_secret.is_none());
     // The user's decision: a host-arm timeout exists, and defaults to none.
     assert_eq!(cfg.spawn_timeout_secs, None);
-    assert_eq!(cfg.notes_repo_path_or_default(), default_notes_repo_path());
+    assert_eq!(
+        cfg.notes_repo_path_or_default(),
+        default_paths::NOTES_REPO.resolve()
+    );
     assert_eq!(
         cfg.signing_key_secret_or_default().as_str(),
         DEFAULT_WRIT_SIGNING_KEY_SECRET

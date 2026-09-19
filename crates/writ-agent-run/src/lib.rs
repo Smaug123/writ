@@ -128,9 +128,6 @@ impl TryFrom<AgentRunTerminalStatus> for GuestReportedRunStatus {
 }
 
 /// What an agent run's stream looks like **in the audit log**: the bytes that
-/// are actually at `path`, plus whether there were more.
-///
-/// What an agent run's stream looks like **in the audit log**: the bytes that
 /// are actually at `path`, plus how they came to stop there.
 ///
 /// `byte_len` and `sha256_hex` describe the retained bytes — the file — and

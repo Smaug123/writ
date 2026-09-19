@@ -294,27 +294,6 @@ pub enum ClientMessage {
         operator: String,
         outcome: ReconcileOutcome,
     },
-    /// Ask writ to spawn an agent with the given prompt and capability
-    /// set, then write the signed terminal output as a note into the
-    /// caller's Git repo at `output_ref`. Bailiff is the intended
-    /// (sole) client of this RPC; see
-    /// `docs/plans/2026-05-14-bailiff-split.md`.
-    ///
-    /// `session_id` binds the run to an audit session the caller
-    /// previously opened with [`ClientMessage::OpenSession`]. When
-    /// `Some`, writ validates the session exists and is still open
-    /// before spawning, and stamps the same id into the signed
-    /// metadata so a verifier can correlate the envelope back to the
-    /// workflow session. When `None` (legacy / standalone use), writ
-    /// mints a fresh id for the signed metadata alone — no audit
-    /// session row is created, and the id is unreachable except via
-    /// the signed envelope.
-    ///
-    /// Slice A1 lands the request type only. Dispatch returns
-    /// [`ServerMessage::Error`] until slice B wires up the real spawner
-    /// and signing path; the response variant
-    /// (`ServerMessage::RunAgentCompleted`) arrives alongside its
-    /// first consumer (the bailiff binary skeleton) in slice A2.
     /// Ask writ whether its audit log corroborates a signed run note.
     ///
     /// `verify_run_envelope` proves a note is internally consistent and
@@ -333,6 +312,21 @@ pub enum ClientMessage {
         signed_metadata: SignedRunMetadata,
         signature: SshSignature,
     },
+    /// Ask writ to spawn an agent with the given prompt and capability
+    /// set, then write the signed terminal output as a note into the
+    /// caller's Git repo at `output_ref`. Bailiff is the intended
+    /// (sole) client of this RPC; see
+    /// `docs/plans/2026-05-14-bailiff-split.md`.
+    ///
+    /// `session_id` binds the run to an audit session the caller
+    /// previously opened with [`ClientMessage::OpenSession`]. When
+    /// `Some`, writ validates the session exists and is still open
+    /// before spawning, and stamps the same id into the signed
+    /// metadata so a verifier can correlate the envelope back to the
+    /// workflow session. When `None` (legacy / standalone use), writ
+    /// mints a fresh id for the signed metadata alone — no audit
+    /// session row is created, and the id is unreachable except via
+    /// the signed envelope.
     RunAgent {
         /// Prompt delivered verbatim to the spawned agent's stdin.
         /// Writ forwards the bytes but does not store, persist, or
