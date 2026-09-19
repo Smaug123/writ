@@ -93,6 +93,46 @@ pub(super) fn make_broker_state_with_extra_secrets(
     Arc::new(broker_state(Box::new(store) as Box<dyn SecretStore>, apps))
 }
 
+/// `127.0.0.0/8`: the subnet most tests give their session.
+pub(super) fn loopback_net() -> Ipv4Cidr {
+    Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap()
+}
+
+/// `127.0.0.1/32`.
+pub(super) fn loopback_host() -> Ipv4Cidr {
+    Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap()
+}
+
+/// [`make_broker_state`] plus a session for `ipv4` that is already open in the
+/// audit log: the three lines every handler test started with.
+pub(super) fn broker_with_open_session(
+    server: &MockServer,
+    ipv4: Ipv4Cidr,
+) -> (Arc<BrokerState<Box<dyn SecretStore>>>, VmHttpSession) {
+    broker_with_secrets_and_open_session(server, Vec::new(), ipv4)
+}
+
+/// [`broker_with_open_session`] with one extra secret in the store.
+pub(super) fn broker_with_secret_and_open_session(
+    server: &MockServer,
+    extra_secret: Option<(SecretKey, &str)>,
+    ipv4: Ipv4Cidr,
+) -> (Arc<BrokerState<Box<dyn SecretStore>>>, VmHttpSession) {
+    broker_with_secrets_and_open_session(server, extra_secret.into_iter().collect(), ipv4)
+}
+
+/// [`broker_with_open_session`] with extra secrets in the store.
+pub(super) fn broker_with_secrets_and_open_session(
+    server: &MockServer,
+    extra_secrets: Vec<(SecretKey, &str)>,
+    ipv4: Ipv4Cidr,
+) -> (Arc<BrokerState<Box<dyn SecretStore>>>, VmHttpSession) {
+    let state = make_broker_state_with_extra_secrets(server, extra_secrets);
+    let session = session_for_subnet(ipv4);
+    open_audit_session(&state, session.session_id());
+    (state, session)
+}
+
 pub(super) fn open_audit_session(state: &BrokerState<Box<dyn SecretStore>>, session_id: SessionId) {
     state
         .audit
@@ -357,7 +397,7 @@ async fn prepare_on_listener_uses_the_provided_bearer_and_bound_port() {
         Arc::clone(&state),
         &config,
         "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-        Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+        loopback_net(),
         bearer,
         listener,
         None,
@@ -784,7 +824,7 @@ async fn disabled_agent_run_config_route_is_not_found() {
 /// route it must be decisive.
 #[tokio::test]
 async fn the_contract_header_decides_exactly_the_routes_that_require_it() {
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    let session = session_for_subnet(loopback_host());
     let declared = VM_HTTP_CONTRACT_VERSION.to_string();
 
     for (method, target, name) in crate::vm_http::route_table::tests::ENDPOINT_MAP {
@@ -830,7 +870,7 @@ async fn the_contract_header_decides_exactly_the_routes_that_require_it() {
 /// the daemon, not to rebuild itself into the same image again.
 #[tokio::test]
 async fn a_mismatched_declaration_names_the_stale_side() {
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    let session = session_for_subnet(loopback_host());
 
     for (declared, expected_remedy) in [
         (
@@ -862,7 +902,7 @@ async fn a_mismatched_declaration_names_the_stale_side() {
 /// decided against is exactly the unbounded work this ordering exists to avoid.
 #[tokio::test]
 async fn the_contract_check_runs_before_the_body_is_read() {
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    let session = session_for_subnet(loopback_host());
     let oversized = (MAX_VM_HTTP_BODY_BYTES.get() + 1).to_string();
 
     let response = dispatch_vm_http_head_and_body(
@@ -887,7 +927,7 @@ async fn the_contract_check_runs_before_the_body_is_read() {
 /// contract version this broker speaks by asking.
 #[tokio::test]
 async fn authorization_runs_before_the_contract_check() {
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    let session = session_for_subnet(loopback_host());
 
     let response = dispatch_vm_http_head_and_body(
         &session,
@@ -911,7 +951,7 @@ async fn authorization_runs_before_the_contract_check() {
 /// valid declaration.
 #[tokio::test]
 async fn a_duplicated_contract_declaration_is_refused() {
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+    let session = session_for_subnet(loopback_host());
 
     for second in [b"3".as_slice(), b"9".as_slice(), &[0xff, 0xfe][..]] {
         let request = http::Request::builder()
@@ -1036,7 +1076,7 @@ async fn prepare_vm_http_session_returns_in_range_broker_port_and_redacted_token
         .unwrap(),
     );
     let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
-    let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
+    let source_ipv4 = loopback_net();
 
     let prepared = prepare_vm_http_session(state, &config, session_id, source_ipv4)
         .await
@@ -1068,7 +1108,7 @@ async fn running_runtime_serves_session_and_shuts_down() {
         .unwrap(),
     );
     let session_id = "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap();
-    let source_ipv4 = Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
+    let source_ipv4 = loopback_net();
     let prepared = prepare_vm_http_session(state, &config, session_id, source_ipv4)
         .await
         .unwrap();
@@ -1157,7 +1197,7 @@ async fn vm_http_server_serves_authenticated_session_request() {
     let addr = bound.local_addr().unwrap();
     let session = VmHttpSession::new(
         "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-        Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+        loopback_net(),
         token(),
     );
     let server = tokio::spawn(run_vm_http(bound.into_listener(), session.clone()));
@@ -1188,7 +1228,7 @@ async fn vm_http_server_rejects_missing_auth() {
     let addr = bound.local_addr().unwrap();
     let session = VmHttpSession::new(
         "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-        Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+        loopback_net(),
         token(),
     );
     let server = tokio::spawn(run_vm_http(bound.into_listener(), session));
@@ -1212,7 +1252,7 @@ async fn vm_http_server_exits_when_shutdown_signal_set() {
         .unwrap();
     let session = VmHttpSession::new(
         "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-        Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+        loopback_net(),
         token(),
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1254,7 +1294,7 @@ async fn nix_cli_can_authenticate_to_vm_http_nix_cache_route_with_netrc() {
     let addr = bound.local_addr().unwrap();
     let session = VmHttpSession::new(
         "51b8fd0f-6c10-454c-b0e6-7df1d60e2e6d".parse().unwrap(),
-        Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+        loopback_net(),
         token.clone(),
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1381,9 +1421,7 @@ fn source_subnet_can_be_taken_from_agent_network_ipv4() {
 #[tokio::test]
 async fn a_pre_split_proxy_path_is_unknown_and_records_nothing() {
     let github = MockServer::start().await;
-    let state = make_broker_state(&github);
-    let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-    open_audit_session(&state, session.session_id());
+    let (state, session) = broker_with_open_session(&github, loopback_host());
     let request = VmHttpRequest::new(
         "POST",
         "/v1/messages",
@@ -1523,15 +1561,14 @@ mod brokered_route_audit_oracle {
             let github = MockServer::start().await;
             let anthropic_key = SecretKey::new("anthropic-api-key").unwrap();
             let openai_key = SecretKey::new("openai-api-key").unwrap();
-            let state = make_broker_state_with_extra_secrets(
+            let (state, session) = broker_with_secrets_and_open_session(
                 &github,
                 vec![
                     (anthropic_key.clone(), "host-anthropic-key"),
                     (openai_key.clone(), "host-openai-key"),
                 ],
+                loopback_host(),
             );
-            let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-            open_audit_session(&state, session.session_id());
 
             // A real bare mirror plus a fake `nix` that archives, so flake
             // provisioning runs its full audited path without needing a nix daemon.
@@ -1819,7 +1856,7 @@ mod brokered_route_audit_oracle {
                     "GET",
                     "/v1/nix/cache/nix-cache-info",
                     Some(basic(&super::basic_authorization_value(
-                        &session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap()),
+                        &session_for_subnet(loopback_host()),
                     ))),
                     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 34567)),
                 ),

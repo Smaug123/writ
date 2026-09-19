@@ -567,14 +567,15 @@ fn write_private_file(path: &Path, body: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
 
     use base64::Engine as _;
     use wiremock::MockServer;
 
+    use super::super::tests::{broker_with_open_session, loopback_host};
+
     use super::super::tests::{make_broker_state, open_audit_session, session_for_subnet};
     use super::*;
-    use crate::core::{Ipv4Cidr, UnixMillis};
+    use crate::core::UnixMillis;
 
     #[tokio::test]
     async fn agent_run_config_route_returns_prompt_and_model_once() {
@@ -619,9 +620,7 @@ mod tests {
     #[tokio::test]
     async fn a_guest_stream_cut_at_its_deadline_is_recorded_as_cut() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000409".parse().unwrap();
         state
             .audit
@@ -703,9 +702,7 @@ mod tests {
     #[tokio::test]
     async fn agent_run_outcome_route_records_audit_and_materializes_retained_streams() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000402".parse().unwrap();
         state
             .audit
@@ -790,7 +787,7 @@ mod tests {
         // session identity.
         let github = MockServer::start().await;
         let state = make_broker_state(&github);
-        let owner = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        let owner = session_for_subnet(loopback_host());
         open_audit_session(&state, owner.session_id());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000404".parse().unwrap();
         state
@@ -893,9 +890,7 @@ mod tests {
     #[tokio::test]
     async fn a_concurrent_upload_is_refused_while_one_is_in_flight() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000406".parse().unwrap();
         let upload = launched_run(&state, session.session_id(), run_id);
         let body = serde_json::to_vec(&upload).unwrap();
@@ -948,9 +943,7 @@ mod tests {
     #[tokio::test]
     async fn an_upload_admitted_before_another_completed_is_answered_idempotently() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000408".parse().unwrap();
         let upload = launched_run(&state, session.session_id(), run_id);
         let temp = tempfile::tempdir().unwrap();
@@ -1016,9 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_upload_leaves_the_run_free_to_report_its_real_outcome() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000407".parse().unwrap();
         let upload = launched_run(&state, session.session_id(), run_id);
         let temp = tempfile::tempdir().unwrap();
@@ -1077,9 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn agent_run_outcome_rejects_unknown_run() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000405".parse().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let service =
@@ -1118,9 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn agent_run_outcome_rejects_unbounded_or_mismatched_truncated_streams() {
         let github = MockServer::start().await;
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let run_id: AgentRunId = "00000000-0000-0000-0000-000000000403".parse().unwrap();
         state
             .audit
