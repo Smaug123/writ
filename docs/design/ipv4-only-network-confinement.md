@@ -416,13 +416,14 @@ which is the vertical proof in plan stage E and not before.
 
 ## Lifecycle model
 
-Start is represented by explicit phases:
+Start is represented by explicit phases (shipped as
+`agent_vm_locked_lifecycle`, with no producer until the locked start path):
 
 ```text
 Claimed
 -> NetworkValidated            (bootstrap anchor loaded; no interface yet)
--> QuarantineInstalled         (vm placement only, provisional)
--> BrokerReady                 (vm placement only, provisional)
+-> QuarantineInstalled         (vm placement only, provisional, NOT BUILT)
+-> BrokerReady                 (vm placement only, provisional, NOT BUILT)
 -> AgentVmStarted              (initializer running, holding for release)
 -> FinalFirewallInstalled      (interface-scoped anchor, members attached,
                                 read back)
@@ -430,6 +431,23 @@ Claimed
 -> ReleaseAttempted            (persisted before the signal is sent)
 -> WorkloadReleased
 ```
+
+The two vm-only phases are named here and *not* in the code, because vm
+placement refuses new sessions (#396): a phase no session can be in is a
+representable state nothing can reach, which is the same reason
+`Ipv6IsolationMode` is a smaller set than `ConfiguredIpv6Profile`. They land
+with the placement.
+
+Moving forward and looking back are different problems, so they are different
+types. A live start advances through typestates — one per phase, each holding
+exactly the facts proven by the time it exists, each constructible only by
+consuming its predecessor — so "a workload is never released without
+`GuestSecurityLocked` and `FinalFirewallInstalled`" is a compile error rather
+than a review comment. A persisted record is a snapshot: one discriminated
+union with a variant per phase carrying that phase's facts, so no record can
+say it released a workload while naming no interfaces. Loading a record does
+not yield a typestate; reading is not progressing, and only a start that
+happened in this process may carry one on.
 
 The interface firewall becomes final *after* the agent VM starts, because
 that is when its `vmenet` member exists; this is the shipped order
@@ -585,12 +603,33 @@ plan can only ever be built from an admitted mode; there is no separate gate
 type and no bypass on the plan for tests, because a test that bypasses the
 guard is not testing it.
 
-The locked lifecycle writes state schema v3 containing interface identity,
-firewall phase, isolation profile and ABI, placement, and cleanup facts. A v2
-reader exists only to drive cleanup. A live v2 session is never relabelled as
-hardened. Upgrade requires stopping every legacy session, installing helper
-protocol v2, loading the official guest and broker image ABIs, then starting
-the new daemon. Rollback requires draining v3 sessions first.
+The locked lifecycle writes state schema v3 (shipped), whose record carries
+the phase reached and exactly that phase's facts: the resolved interfaces and
+the firewall install phase from `FinalFirewallInstalled` on, the guest's
+announced isolation ABI from `GuestSecurityLocked` on. Placement and the
+cleanup facts were already there. The wire form is loose — a phase string and
+three optional fields, because that is what JSON can say — and the reader
+refuses every combination the union cannot express, so a released session with
+no interfaces is corruption rather than something teardown has to interpret.
+
+A v3 record for a session under a profile with no phases simply has no locked
+section, and neither does a v2 record, which is what makes "a v2 record is
+never reported as hardened" structural rather than a rule. The v2 reader
+exists only to drive cleanup: a record whose version says v2 and whose shape
+carries a locked section is refused, because the version is the only claim
+about the shape. Upgrade requires stopping every legacy session, installing
+helper protocol v2, loading the official guest and broker image ABIs, then
+starting the new daemon. Rollback requires draining v3 sessions first — a
+daemon that knows only v2 refuses a v3 record outright rather than reading a
+locked session as a legacy one.
+
+The release signal is the one effect ordered by the type system rather than by
+the code's shape. `container kill --signal USR1` is a value only the state
+store mints, and only after it has written `ReleaseAttempted`; there is no
+other constructor, so the release path cannot send a signal it has not first
+written down. That is what makes a session found in `ReleaseAttempted`
+answerable: the daemon does not know whether the guest got it, and must not
+have a record that claims otherwise.
 
 ## Rejected alternatives
 
