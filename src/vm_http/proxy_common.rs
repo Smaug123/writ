@@ -99,6 +99,79 @@ pub(super) fn is_proxy_id_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
+/// The identifier that follows `prefix` in `path`, if the remainder is a
+/// non-empty run of [`is_proxy_id_byte`] bytes.
+pub(super) fn id_after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = path.strip_prefix(prefix)?;
+    if suffix.is_empty() || !suffix.bytes().all(is_proxy_id_byte) {
+        return None;
+    }
+    Some(suffix)
+}
+
+/// The canonical spelling in `table` that `raw` names, ignoring case.
+/// Backends keep their response-header allowlists as tables of canonical
+/// names and answer [`ProxyBackend::response_header_name`] through this.
+pub(super) fn canonical_header_name(raw: &str, table: &[&'static str]) -> Option<&'static str> {
+    table
+        .iter()
+        .copied()
+        .find(|name| name.eq_ignore_ascii_case(raw))
+}
+
+/// The request headers every backend forwards: the content negotiation
+/// trio, and nothing that could steer upstream auth, billing scope or
+/// feature flags. A backend allowlists more by matching before falling
+/// through to this.
+pub(super) fn common_forward_header_name(raw: &str) -> Option<reqwest::header::HeaderName> {
+    if raw.eq_ignore_ascii_case("content-type") {
+        return Some(reqwest::header::CONTENT_TYPE);
+    }
+    if raw.eq_ignore_ascii_case("accept") {
+        return Some(reqwest::header::ACCEPT);
+    }
+    if raw.eq_ignore_ascii_case("user-agent") {
+        return Some(reqwest::header::USER_AGENT);
+    }
+    None
+}
+
+/// A denial the proxy answers itself, before any upstream call: a 502 with
+/// `body` for the guest and `label` for the audit row.
+pub(super) fn auth_failure(body: &'static str, label: &'static str) -> ProxyFetch {
+    let response = VmHttpResponse::text(VmHttpStatus::BadGateway, body);
+    ProxyFetch {
+        response_bytes: response.body.len() as u64,
+        response,
+        upstream_url: None,
+        upstream_status: None,
+        error: Some(label),
+    }
+}
+
+/// The guest's request headers that `B` allowlists, in request order, each
+/// at most once: a header the allowlist admits twice (in any spelling) is
+/// refused rather than silently deduplicated, since the two values could
+/// disagree.
+pub(super) fn forward_allowlisted<B: ProxyBackend>(
+    headers: &[VmHttpHeader],
+    auth_kind: B::AuthKind,
+) -> Result<Vec<ProxyForwardHeader>, &'static str> {
+    let mut forwarded: Vec<ProxyForwardHeader> = Vec::new();
+    for header in headers {
+        let Some(name) = B::forward_header_name(&header.name, auth_kind) else {
+            continue;
+        };
+        if forwarded.iter().any(|seen| seen.name == name) {
+            return Err("duplicate forwarded header");
+        }
+        let value = reqwest::header::HeaderValue::from_str(&header.value)
+            .map_err(|_| "invalid forwarded header value")?;
+        forwarded.push(ProxyForwardHeader { name, value });
+    }
+    Ok(forwarded)
+}
+
 /// Inspect a request body for `{"stream": true}` at the top level.
 ///
 /// Used to decide whether to forward the upstream response as a streamed
@@ -514,9 +587,8 @@ impl<B: ProxyBackend> Drop for ProxyStreamBody<B> {
     }
 }
 
-/// One forwarded request header. The set of headers the broker forwards is
-/// backend-specific (see `claude_proxy_forward_header_name` and
-/// `openai_proxy_forward_header_name`), but the carrier shape is identical.
+/// One forwarded request header. Which headers are forwarded is the
+/// backend's [`ProxyBackend::forward_header_name`]; the carrier is shared.
 pub(super) struct ProxyForwardHeader {
     pub(super) name: reqwest::header::HeaderName,
     pub(super) value: reqwest::header::HeaderValue,
@@ -1173,4 +1245,92 @@ where
         return VmHttpResponse::text(VmHttpStatus::InternalServerError, "audit write failed");
     }
     response
+}
+
+#[cfg(test)]
+mod shared_helper_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A header name that is allowlisted by every backend, one that is not,
+    /// or one that only Claude's OAuth path admits, in any letter case.
+    fn header_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("content-type"),
+            Just("accept"),
+            Just("user-agent"),
+            Just("authorization"),
+            Just("cookie"),
+            Just("anthropic-beta"),
+            Just("openai-organization"),
+        ]
+        .prop_flat_map(|name| {
+            prop::collection::vec(any::<bool>(), name.len()).prop_map(move |upper| {
+                name.chars()
+                    .zip(upper)
+                    .map(|(c, up)| if up { c.to_ascii_uppercase() } else { c })
+                    .collect()
+            })
+        })
+    }
+
+    fn headers() -> impl Strategy<Value = Vec<VmHttpHeader>> {
+        prop::collection::vec(
+            (header_name(), "[ -~]{0,12}").prop_map(|(name, value)| VmHttpHeader { name, value }),
+            0..6,
+        )
+    }
+
+    proptest! {
+        /// The forwarded list is exactly the allowlisted input headers in
+        /// order, each at most once, with a duplicate refused rather than
+        /// merged; a backend's allowlist decides membership, nothing else.
+        #[test]
+        fn forward_allowlisted_keeps_exactly_the_allowlist_once_each(headers in headers()) {
+            let allowed: Vec<reqwest::header::HeaderName> = headers
+                .iter()
+                .filter_map(|h| {
+                    super::OpenAiBackend::forward_header_name(
+                        &h.name,
+                        super::super::openai_proxy::VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+                    )
+                })
+                .collect();
+            let has_duplicate = allowed
+                .iter()
+                .enumerate()
+                .any(|(i, name)| allowed[..i].contains(name));
+            let result = forward_allowlisted::<super::OpenAiBackend>(
+                &headers,
+                super::super::openai_proxy::VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+            );
+            if has_duplicate {
+                prop_assert_eq!(result.err(), Some("duplicate forwarded header"));
+            } else {
+                let forwarded = result.unwrap();
+                let names: Vec<_> = forwarded.iter().map(|h| h.name.clone()).collect();
+                prop_assert_eq!(names, allowed);
+            }
+        }
+
+        /// A canonical table entry is found under any letter case and comes
+        /// back in its canonical spelling; anything else is dropped.
+        #[test]
+        fn canonical_header_name_is_case_insensitive_over_its_table(
+            index in 0usize..3,
+            upper in prop::collection::vec(any::<bool>(), 24),
+            other in "[a-z-]{1,16}",
+        ) {
+            const TABLE: &[&str] = &["Retry-After", "X-Request-Id", "Openai-Version"];
+            let canonical = TABLE[index];
+            let spelled: String = canonical
+                .chars()
+                .zip(upper)
+                .map(|(c, up)| if up { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() })
+                .collect();
+            prop_assert_eq!(canonical_header_name(&spelled, TABLE), Some(canonical));
+            prop_assume!(!TABLE.iter().any(|t| t.eq_ignore_ascii_case(&other)));
+            prop_assert_eq!(canonical_header_name(&other, TABLE), None);
+        }
+    }
 }

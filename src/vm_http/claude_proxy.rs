@@ -15,9 +15,10 @@ use crate::upstream_base_url::{UpstreamBaseUrl, UpstreamBaseUrlError};
 
 use super::proxy_common::{
     ClaudeBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader, ProxyStream,
-    UpstreamAuth, VmHttpProxyService, is_proxy_id_byte, proxy_target_path,
+    UpstreamAuth, VmHttpProxyService, auth_failure, canonical_header_name,
+    common_forward_header_name, forward_allowlisted, id_after_prefix, proxy_target_path,
 };
-use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
+use super::{VmHttpDispatch, VmHttpHeader};
 
 // Guest-facing paths, all under `VM_ANTHROPIC_PROXY_PREFIX`: the vendor
 // namespace is what keeps `/v1/models` from meaning two different upstreams.
@@ -69,17 +70,6 @@ pub enum VmHttpClaudeProxyConfigError {
     InvalidAnthropicVersion { message: String },
 }
 
-fn claude_proxy_auth_failure(body: &'static str, label: &'static str) -> ProxyFetch {
-    let response = VmHttpResponse::text(VmHttpStatus::BadGateway, body);
-    ProxyFetch {
-        response_bytes: response.body.len() as u64,
-        response,
-        upstream_url: None,
-        upstream_status: None,
-        error: Some(label),
-    }
-}
-
 fn claude_proxy_upstream_auth(
     secret: String,
     auth_kind: VmHttpClaudeProxyAuthKind,
@@ -87,7 +77,7 @@ fn claude_proxy_upstream_auth(
     if auth_kind == VmHttpClaudeProxyAuthKind::XApiKey
         && secret.starts_with(ANTHROPIC_OAUTH_TOKEN_PREFIX)
     {
-        return Err(Box::new(claude_proxy_auth_failure(
+        return Err(Box::new(auth_failure(
             "Claude proxy auth_kind x_api_key cannot use an Anthropic OAuth token; set \
              claude_proxy.auth_kind to oauth",
             "upstream auth kind mismatch",
@@ -298,7 +288,7 @@ impl ProxyBackend for ClaudeBackend {
         let secret = match secret_store.get(config.auth_secret()) {
             Ok(Some(secret)) if !secret.is_empty() => secret,
             Ok(_) => {
-                return Err(Box::new(claude_proxy_auth_failure(
+                return Err(Box::new(auth_failure(
                     "Claude proxy auth missing",
                     "upstream auth missing",
                 )));
@@ -308,7 +298,7 @@ impl ProxyBackend for ClaudeBackend {
                     error = %err,
                     "vm http claude proxy auth secret load failed",
                 );
-                return Err(Box::new(claude_proxy_auth_failure(
+                return Err(Box::new(auth_failure(
                     "Claude proxy auth failed",
                     "upstream auth load failed",
                 )));
@@ -335,94 +325,44 @@ impl ProxyBackend for ClaudeBackend {
         // guest while still injecting its own oauth-2025-04-20 alongside.
         // Anthropic-Version is added separately by the broker and is
         // never forwarded from the guest.
-        if raw.eq_ignore_ascii_case("content-type") {
-            return Some(reqwest::header::CONTENT_TYPE);
-        }
-        if raw.eq_ignore_ascii_case("accept") {
-            return Some(reqwest::header::ACCEPT);
-        }
-        if raw.eq_ignore_ascii_case("user-agent") {
-            return Some(reqwest::header::USER_AGENT);
-        }
         if auth_kind == VmHttpClaudeProxyAuthKind::OAuth
             && raw.eq_ignore_ascii_case("anthropic-beta")
         {
             return Some(reqwest::header::HeaderName::from_static("anthropic-beta"));
         }
-        None
+        common_forward_header_name(raw)
     }
 
     fn response_header_name(raw: &str) -> Option<&'static str> {
-        if raw.eq_ignore_ascii_case("request-id") {
-            return Some("Request-Id");
-        }
-        if raw.eq_ignore_ascii_case("retry-after") {
-            return Some("Retry-After");
-        }
-        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-limit") {
-            return Some("Anthropic-Ratelimit-Requests-Limit");
-        }
-        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-remaining") {
-            return Some("Anthropic-Ratelimit-Requests-Remaining");
-        }
-        if raw.eq_ignore_ascii_case("anthropic-ratelimit-requests-reset") {
-            return Some("Anthropic-Ratelimit-Requests-Reset");
-        }
-        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-limit") {
-            return Some("Anthropic-Ratelimit-Tokens-Limit");
-        }
-        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-remaining") {
-            return Some("Anthropic-Ratelimit-Tokens-Remaining");
-        }
-        if raw.eq_ignore_ascii_case("anthropic-ratelimit-tokens-reset") {
-            return Some("Anthropic-Ratelimit-Tokens-Reset");
-        }
-        None
+        canonical_header_name(raw, CLAUDE_RESPONSE_HEADERS)
     }
 }
+
+/// Upstream response headers relayed to the guest: request correlation,
+/// retry advice, and rate-limit observability. Nothing else crosses.
+const CLAUDE_RESPONSE_HEADERS: &[&str] = &[
+    "Request-Id",
+    "Retry-After",
+    "Anthropic-Ratelimit-Requests-Limit",
+    "Anthropic-Ratelimit-Requests-Remaining",
+    "Anthropic-Ratelimit-Requests-Reset",
+    "Anthropic-Ratelimit-Tokens-Limit",
+    "Anthropic-Ratelimit-Tokens-Remaining",
+    "Anthropic-Ratelimit-Tokens-Reset",
+];
 
 fn claude_proxy_model_id(path: &str) -> Option<&str> {
-    let suffix = path.strip_prefix(VM_CLAUDE_MODELS_PREFIX)?;
-    if suffix.is_empty() || !suffix.bytes().all(is_proxy_id_byte) {
-        return None;
-    }
-    Some(suffix)
+    id_after_prefix(path, VM_CLAUDE_MODELS_PREFIX)
 }
 
+/// The guest's allowlisted headers plus the broker's own
+/// `Anthropic-Version`, which is never taken from the guest.
 fn claude_proxy_forward_headers(
     headers: &[VmHttpHeader],
     anthropic_version: &reqwest::header::HeaderValue,
     auth_kind: VmHttpClaudeProxyAuthKind,
 ) -> Result<Vec<ProxyForwardHeader>, &'static str> {
-    let mut forwarded = Vec::new();
-    let mut saw_content_type = false;
-    let mut saw_accept = false;
-    let mut saw_user_agent = false;
-    let mut saw_anthropic_beta = false;
-    let anthropic_beta_name = reqwest::header::HeaderName::from_static("anthropic-beta");
-
-    for header in headers {
-        let Some(name) = ClaudeBackend::forward_header_name(&header.name, auth_kind) else {
-            continue;
-        };
-        let duplicate = if name == reqwest::header::CONTENT_TYPE {
-            std::mem::replace(&mut saw_content_type, true)
-        } else if name == reqwest::header::ACCEPT {
-            std::mem::replace(&mut saw_accept, true)
-        } else if name == reqwest::header::USER_AGENT {
-            std::mem::replace(&mut saw_user_agent, true)
-        } else if name == anthropic_beta_name {
-            std::mem::replace(&mut saw_anthropic_beta, true)
-        } else {
-            unreachable!("Claude proxy forward header classifier returned an unknown header")
-        };
-        if duplicate {
-            return Err("duplicate forwarded Claude header");
-        }
-        let value = reqwest::header::HeaderValue::from_str(&header.value)
-            .map_err(|_| "invalid forwarded Claude header value")?;
-        forwarded.push(ProxyForwardHeader { name, value });
-    }
+    let mut forwarded = forward_allowlisted::<ClaudeBackend>(headers, auth_kind)?;
     forwarded.push(ProxyForwardHeader {
         name: reqwest::header::HeaderName::from_static("anthropic-version"),
         value: anthropic_version.clone(),
@@ -436,7 +376,6 @@ mod tests {
 
     use wiremock::MockServer;
 
-    use super::super::VmHttpSession;
     use super::super::broker_effect::broker_effect;
     use super::super::proxy_common::ProxyEffect;
     use super::super::tests::{
@@ -450,6 +389,7 @@ mod tests {
         DispatchedTestResponse, VM_HTTP_READ_TIMEOUT, VmHttpDispatch, VmHttpHeader, VmHttpRequest,
         VmHttpResponseHeader, VmHttpStatus, dispatch_vm_http_head_and_body,
     };
+    use super::super::{VmHttpResponse, VmHttpSession};
     use super::*;
     use crate::audit::{ClaudeProxyAuditDecision, ClaudeProxyAuditRoute};
     use crate::secret::SecretKey;

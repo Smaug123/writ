@@ -31,6 +31,7 @@ use crate::nix_binary_cache::{
 use crate::secret::SecretStore;
 use crate::server::BrokerState;
 
+use super::proxy_common::ProxyUpstreamBodyError;
 use super::{VmHttpDispatch, VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
 mod config;
@@ -1011,21 +1012,19 @@ fn upstream_content_length(response: &reqwest::Response) -> Option<ByteSize> {
 }
 
 async fn read_upstream_body_bounded(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max: ByteSize,
 ) -> Result<Vec<u8>, VmHttpNixCacheBodyReadError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        let chunk_len = u64::try_from(chunk.len()).expect("HTTP chunk length fits in u64");
-        let new_len = (body.len() as u64)
-            .checked_add(chunk_len)
-            .expect("HTTP response byte count overflowed before configured bound check");
-        if ByteSize::from_bytes(new_len) > max {
-            return Err(VmHttpNixCacheBodyReadError::ResponseTooLarge { max: max.get() });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    super::proxy_common::read_upstream_body_bounded(response, max)
+        .await
+        .map_err(|err| match err {
+            ProxyUpstreamBodyError::Request { source, .. } => {
+                VmHttpNixCacheBodyReadError::Request(source)
+            }
+            ProxyUpstreamBodyError::ResponseTooLarge { max, .. } => {
+                VmHttpNixCacheBodyReadError::ResponseTooLarge { max }
+            }
+        })
 }
 
 impl VmHttpNixCacheBodyReadError {

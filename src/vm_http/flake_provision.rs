@@ -37,7 +37,9 @@ use crate::vm_git::{
 };
 use crate::vm_git_mirror_cache::{GitCommitSha, MirrorCache};
 
-use super::broker_effect::{BrokeredEffect, EffectCompletion, broker_effect};
+use super::broker_effect::{
+    BrokeredEffect, EffectCompletion, broker_effect, closed_session_response,
+};
 use super::{VmHttpDispatch, VmHttpRequest, VmHttpResponse, VmHttpSession, VmHttpStatus};
 
 /// The host paths, bounds, and caches a session needs to provision flake
@@ -319,22 +321,9 @@ impl BrokeredEffect for FlakeProvisionEffect {
     }
 
     fn begin_error_response(err: &AuditError) -> Option<VmHttpResponse> {
-        // The session closed between the preflight above and the request row: a
-        // clean client error with the same status the preflight would have
-        // given, not an audit-write failure.
-        match err {
-            AuditError::Invariant("session does not exist") => Some(error_response(
-                VmHttpStatus::Unauthorized,
-                VmFlakeProvisionErrorCode::Denied,
-                "session is not active",
-            )),
-            AuditError::Invariant("session is closed") => Some(error_response(
-                VmHttpStatus::Gone,
-                VmFlakeProvisionErrorCode::Denied,
-                "session is closed",
-            )),
-            _ => None,
-        }
+        closed_session_response(err, |status, message| {
+            error_response(status, VmFlakeProvisionErrorCode::Denied, message)
+        })
     }
 
     fn audit_write_failure_response() -> VmHttpResponse {

@@ -26,6 +26,26 @@ use crate::audit::{
     AUDIT_WRITE_FAILURE_TARGET, AuditError, AuditLog, EffectAuditTable, RecordedRequest,
 };
 
+/// The clean client response for a `begin_effect` failure that means the
+/// session is gone rather than that the audit write failed: unknown is a
+/// `401`, closed is a `410`, each with the message the effect's own
+/// preflight would have given. `respond` builds the effect's typed error
+/// envelope. Anything else is `None`, the generic audit-write 500.
+pub(super) fn closed_session_response(
+    err: &AuditError,
+    respond: impl Fn(VmHttpStatus, &'static str) -> VmHttpResponse,
+) -> Option<VmHttpResponse> {
+    match err {
+        AuditError::Invariant("session does not exist") => {
+            Some(respond(VmHttpStatus::Unauthorized, "session is not active"))
+        }
+        AuditError::Invariant("session is closed") => {
+            Some(respond(VmHttpStatus::Gone, "session is closed"))
+        }
+        _ => None,
+    }
+}
+
 /// A brokered VM-HTTP effect whose `(request, outcome)` audit pair is written by
 /// the [`broker_effect`] driver, not by the effect itself.
 ///

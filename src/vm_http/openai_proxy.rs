@@ -19,9 +19,11 @@ use crate::upstream_base_url::{UpstreamBaseUrl, UpstreamBaseUrlError};
 
 use super::proxy_common::{
     OpenAiBackend, ProxyBackend, ProxyBackendConfig, ProxyFetch, ProxyForwardHeader, ProxyStream,
-    UpstreamAuth, VmHttpProxyService, is_proxy_id_byte, proxy_target_path,
+    UpstreamAuth, VmHttpProxyService, auth_failure, canonical_header_name,
+    common_forward_header_name, forward_allowlisted, id_after_prefix, is_proxy_id_byte,
+    proxy_target_path,
 };
-use super::{VmHttpDispatch, VmHttpHeader, VmHttpResponse, VmHttpStatus};
+use super::{VmHttpDispatch, VmHttpHeader};
 
 // Guest-facing paths, all under `VM_OPENAI_PROXY_PREFIX`; the upstream paths
 // these map to are unchanged (see `relative_upstream_path`).
@@ -75,17 +77,6 @@ pub enum VmHttpOpenAiProxyConfigError {
     InvalidChatgptRefreshUrl { raw: String, message: String },
     #[error("OpenAI proxy ChatGPT refresh URL {raw:?} uses unsupported scheme {scheme:?}")]
     UnsupportedChatgptRefreshScheme { raw: String, scheme: String },
-}
-
-fn openai_proxy_auth_failure(body: &'static str, label: &'static str) -> ProxyFetch {
-    let response = VmHttpResponse::text(VmHttpStatus::BadGateway, body);
-    ProxyFetch {
-        response_bytes: response.body.len() as u64,
-        response,
-        upstream_url: None,
-        upstream_status: None,
-        error: Some(label),
-    }
 }
 
 impl VmHttpOpenAiProxyConfig {
@@ -276,7 +267,7 @@ impl ProxyBackend for OpenAiBackend {
         request_headers: &[VmHttpHeader],
         config: &VmHttpOpenAiProxyConfig,
     ) -> Result<Vec<ProxyForwardHeader>, &'static str> {
-        openai_proxy_forward_headers(request_headers, config.auth_kind())
+        forward_allowlisted::<OpenAiBackend>(request_headers, config.auth_kind())
     }
 
     fn build_extras<S>(
@@ -330,7 +321,7 @@ impl ProxyBackend for OpenAiBackend {
                 let secret = match secret_store.get(config.auth_secret()) {
                     Ok(Some(secret)) if !secret.is_empty() => secret,
                     Ok(_) => {
-                        return Err(Box::new(openai_proxy_auth_failure(
+                        return Err(Box::new(auth_failure(
                             "OpenAI proxy auth missing",
                             "upstream auth missing",
                         )));
@@ -340,7 +331,7 @@ impl ProxyBackend for OpenAiBackend {
                             error = %err,
                             "vm http openai proxy auth secret load failed",
                         );
-                        return Err(Box::new(openai_proxy_auth_failure(
+                        return Err(Box::new(auth_failure(
                             "OpenAI proxy auth failed",
                             "upstream auth load failed",
                         )));
@@ -371,7 +362,7 @@ impl ProxyBackend for OpenAiBackend {
                             }
                             ChatgptOauthError::SecretStore(_) => "OpenAI proxy auth failed",
                         };
-                        Err(Box::new(openai_proxy_auth_failure(body, label)))
+                        Err(Box::new(auth_failure(body, label)))
                     }
                 }
             }
@@ -393,62 +384,32 @@ impl ProxyBackend for OpenAiBackend {
         // would otherwise let the guest pick the upstream scope. If the
         // broker ever needs to pin one, it must come from host config and
         // be injected host-side.
-        if raw.eq_ignore_ascii_case("content-type") {
-            return Some(reqwest::header::CONTENT_TYPE);
-        }
-        if raw.eq_ignore_ascii_case("accept") {
-            return Some(reqwest::header::ACCEPT);
-        }
-        if raw.eq_ignore_ascii_case("user-agent") {
-            return Some(reqwest::header::USER_AGENT);
-        }
-        None
+        common_forward_header_name(raw)
     }
 
     fn response_header_name(raw: &str) -> Option<&'static str> {
-        if raw.eq_ignore_ascii_case("openai-version") {
-            return Some("Openai-Version");
-        }
-        if raw.eq_ignore_ascii_case("openai-organization") {
-            return Some("Openai-Organization");
-        }
-        if raw.eq_ignore_ascii_case("openai-processing-ms") {
-            return Some("Openai-Processing-Ms");
-        }
-        if raw.eq_ignore_ascii_case("x-request-id") {
-            return Some("X-Request-Id");
-        }
-        if raw.eq_ignore_ascii_case("retry-after") {
-            return Some("Retry-After");
-        }
-        if raw.eq_ignore_ascii_case("x-ratelimit-limit-requests") {
-            return Some("X-Ratelimit-Limit-Requests");
-        }
-        if raw.eq_ignore_ascii_case("x-ratelimit-limit-tokens") {
-            return Some("X-Ratelimit-Limit-Tokens");
-        }
-        if raw.eq_ignore_ascii_case("x-ratelimit-remaining-requests") {
-            return Some("X-Ratelimit-Remaining-Requests");
-        }
-        if raw.eq_ignore_ascii_case("x-ratelimit-remaining-tokens") {
-            return Some("X-Ratelimit-Remaining-Tokens");
-        }
-        if raw.eq_ignore_ascii_case("x-ratelimit-reset-requests") {
-            return Some("X-Ratelimit-Reset-Requests");
-        }
-        if raw.eq_ignore_ascii_case("x-ratelimit-reset-tokens") {
-            return Some("X-Ratelimit-Reset-Tokens");
-        }
-        None
+        canonical_header_name(raw, OPENAI_RESPONSE_HEADERS)
     }
 }
 
+/// Upstream response headers relayed to the guest: request correlation,
+/// retry advice, and rate-limit observability. Nothing else crosses.
+const OPENAI_RESPONSE_HEADERS: &[&str] = &[
+    "Openai-Version",
+    "Openai-Organization",
+    "Openai-Processing-Ms",
+    "X-Request-Id",
+    "Retry-After",
+    "X-Ratelimit-Limit-Requests",
+    "X-Ratelimit-Limit-Tokens",
+    "X-Ratelimit-Remaining-Requests",
+    "X-Ratelimit-Remaining-Tokens",
+    "X-Ratelimit-Reset-Requests",
+    "X-Ratelimit-Reset-Tokens",
+];
+
 fn openai_proxy_model_id(path: &str) -> Option<&str> {
-    let suffix = path.strip_prefix(VM_OPENAI_MODELS_PREFIX)?;
-    if suffix.is_empty() || !suffix.bytes().all(is_proxy_id_byte) {
-        return None;
-    }
-    Some(suffix)
+    id_after_prefix(path, VM_OPENAI_MODELS_PREFIX)
 }
 
 fn openai_proxy_response_cancel_id(path: &str) -> Option<&str> {
@@ -458,38 +419,6 @@ fn openai_proxy_response_cancel_id(path: &str) -> Option<&str> {
         return None;
     }
     Some(id)
-}
-
-fn openai_proxy_forward_headers(
-    headers: &[VmHttpHeader],
-    auth_kind: VmHttpOpenAiProxyAuthKind,
-) -> Result<Vec<ProxyForwardHeader>, &'static str> {
-    let mut forwarded = Vec::new();
-    let mut saw_content_type = false;
-    let mut saw_accept = false;
-    let mut saw_user_agent = false;
-
-    for header in headers {
-        let Some(name) = OpenAiBackend::forward_header_name(&header.name, auth_kind) else {
-            continue;
-        };
-        let duplicate = if name == reqwest::header::CONTENT_TYPE {
-            std::mem::replace(&mut saw_content_type, true)
-        } else if name == reqwest::header::ACCEPT {
-            std::mem::replace(&mut saw_accept, true)
-        } else if name == reqwest::header::USER_AGENT {
-            std::mem::replace(&mut saw_user_agent, true)
-        } else {
-            unreachable!("OpenAI proxy forward header classifier returned an unknown header")
-        };
-        if duplicate {
-            return Err("duplicate forwarded OpenAI header");
-        }
-        let value = reqwest::header::HeaderValue::from_str(&header.value)
-            .map_err(|_| "invalid forwarded OpenAI header value")?;
-        forwarded.push(ProxyForwardHeader { name, value });
-    }
-    Ok(forwarded)
 }
 
 #[cfg(test)]
@@ -650,9 +579,11 @@ mod tests {
             },
         ];
 
-        let forwarded =
-            openai_proxy_forward_headers(&headers, VmHttpOpenAiProxyAuthKind::AuthorizationBearer)
-                .unwrap();
+        let forwarded = forward_allowlisted::<OpenAiBackend>(
+            &headers,
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+        )
+        .unwrap();
         let names: Vec<_> = forwarded
             .iter()
             .map(|h| h.name.as_str().to_owned())
@@ -692,7 +623,7 @@ mod tests {
             VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
             VmHttpOpenAiProxyAuthKind::ChatgptOauth,
         ] {
-            let forwarded = openai_proxy_forward_headers(&headers, auth_kind).unwrap();
+            let forwarded = forward_allowlisted::<OpenAiBackend>(&headers, auth_kind).unwrap();
             let names: Vec<_> = forwarded
                 .iter()
                 .map(|h| h.name.as_str().to_owned())
@@ -728,8 +659,10 @@ mod tests {
                 value: "application/json".into(),
             },
         ];
-        let result =
-            openai_proxy_forward_headers(&headers, VmHttpOpenAiProxyAuthKind::AuthorizationBearer);
+        let result = forward_allowlisted::<OpenAiBackend>(
+            &headers,
+            VmHttpOpenAiProxyAuthKind::AuthorizationBearer,
+        );
         assert!(result.is_err());
     }
 
