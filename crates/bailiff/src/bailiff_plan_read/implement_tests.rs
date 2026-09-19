@@ -20,13 +20,12 @@ use writ::run_envelope::SignedRunEnvelope;
 use writ::run_verify::AllowedSigners;
 use writ::signing::WritSigningKey;
 use writ::vm_git::GitObjectId;
-use writ::writ_client::RunAgentCompleted;
 
 /// Build a freshly-signed envelope under `signing_key`. Mirrors
 /// the same-named helper in `bailiff_plan_write::implement_tests`
 /// so the envelope shape matches what writ produces today.
 fn freshly_signed(signing_key: &WritSigningKey) -> SignedRunEnvelope {
-    signed_envelope(
+    signed_output(
         signing_key,
         b"implementer prose",
         b"implementer-prompt",
@@ -37,31 +36,6 @@ fn freshly_signed(signing_key: &WritSigningKey) -> SignedRunEnvelope {
             },
         }],
     )
-}
-
-/// Stand up a writ repo containing one signed envelope and return
-/// the `RunAgentCompleted` reply bailiff would have seen, so the
-/// round-trip test can drive `write_implement_note` end-to-end.
-fn writ_repo_with_envelope(
-    tmp: &TempDir,
-    signing_key: &WritSigningKey,
-) -> (NotesRepo, RunAgentCompleted) {
-    let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
-    let envelope = freshly_signed(signing_key);
-    let body = envelope.to_bytes();
-    let target = writ_repo
-        .write_note(
-            &writ_notes_ref(),
-            envelope.metadata.run_id.to_string().as_bytes(),
-            &body,
-        )
-        .unwrap();
-    let completed = RunAgentCompleted {
-        output_oid: target,
-        signed_metadata: envelope.metadata,
-        signature: envelope.signature,
-    };
-    (writ_repo, completed)
 }
 
 /// Plant a ready-made [`ImplementNote`] directly at its implement
@@ -115,7 +89,7 @@ fn read_implement_note_returns_none_when_no_implement_recorded() {
 fn read_implement_note_round_trips_through_write_implement_note() {
     let tmp = TempDir::new().unwrap();
     let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-    let (writ_repo, completed) = writ_repo_with_envelope(&tmp, &signing_key);
+    let (writ_repo, completed) = writ_repo_with_envelope(&tmp, &freshly_signed(&signing_key));
     let bailiff = bailiff_repo(&tmp);
     let allowed = AllowedSigners::from_openssh_lines(SIGNING_PUB).unwrap();
     let plan_id = PlanId::new();

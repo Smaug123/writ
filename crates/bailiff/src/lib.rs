@@ -18,3 +18,5 @@ pub mod bailiff_plan_write;
 pub mod bailiff_repo_guard;
 pub mod bailiff_stage;
 pub mod output;
+#[cfg(test)]
+mod test_support;
