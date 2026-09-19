@@ -415,12 +415,6 @@ fn materialize_agent_run_stream(
             "outcome stream byte count exceeds audit limit",
         ));
     }
-    if !is_sha256_hex(&upload.sha256_hex) || !is_sha256_hex(&upload.retained_sha256_hex) {
-        return Err(VmHttpResponse::text(
-            VmHttpStatus::BadRequest,
-            "invalid outcome stream hash",
-        ));
-    }
     if crate::agent_run::sha256_hex(&retained) != upload.retained_sha256_hex {
         return Err(VmHttpResponse::text(
             VmHttpStatus::BadRequest,
@@ -509,17 +503,6 @@ fn materialize_agent_run_stream(
         stopped_at_deadline: upload.stopped_at_deadline,
     }
     .to_summary())
-}
-
-fn is_sha256_hex(raw: &str) -> bool {
-    // Lowercase-only: agent_run::sha256_hex emits lowercase, and the
-    // downstream byte-string comparison is case-sensitive. Accepting
-    // uppercase here would only let it fail later with a misleading hash
-    // mismatch error.
-    raw.len() == 64
-        && raw
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// [`write_new_0600`](writ_core::private_fs::write_new_0600), except that a

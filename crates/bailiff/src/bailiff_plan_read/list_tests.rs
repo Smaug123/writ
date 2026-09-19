@@ -26,9 +26,7 @@ use crate::bailiff_plan_note::{
 use crate::bailiff_plan_state::PlanState;
 use tempfile::TempDir;
 use writ::agent_run::{AgentRunId, sha256_hex};
-use writ::core::{
-    CapabilitySet, NotesRef, RepoRef, SessionId, Sha256Hex, SshSignature, UnixMillis,
-};
+use writ::core::{CapabilitySet, NotesRef, RepoRef, SessionId, SshSignature, UnixMillis};
 use writ::protocol::SignedRunMetadata;
 use writ::run_envelope::OutputEnvelope;
 use writ::signing::WritSigningKey;
@@ -50,8 +48,8 @@ fn sample_metadata_and_signature(completed_at_millis: i64) -> (SignedRunMetadata
         stdout_truncated_at: None,
         stderr_truncated_at: None,
     };
-    let output_sha = Sha256Hex::try_new(sha256_hex(&output.to_bytes())).unwrap();
-    let prompt_sha = Sha256Hex::try_new(sha256_hex(b"agent-prompt")).unwrap();
+    let output_sha = sha256_hex(&output.to_bytes());
+    let prompt_sha = sha256_hex(b"agent-prompt");
     let metadata = SignedRunMetadata {
         run_id: AgentRunId::new(),
         session_id: SessionId::new(),

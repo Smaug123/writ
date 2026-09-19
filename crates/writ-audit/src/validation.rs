@@ -50,14 +50,6 @@ pub(super) fn validate_stream_summary(
     label: &'static str,
 ) -> Result<(), AuditError> {
     agent_run_stream_path_to_text(&summary.path, label)?;
-    validate_sha256_hex(&summary.sha256_hex, label)?;
-    Ok(())
-}
-
-pub(super) fn validate_sha256_hex(value: &str, label: &'static str) -> Result<(), AuditError> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(labeled_invariant(label, "sha256 hex digest is invalid"));
-    }
     Ok(())
 }
 

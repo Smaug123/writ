@@ -269,10 +269,8 @@ pub enum VerifyError {
 /// corroborate this?" — is answered correctly and means nothing, because the
 /// bytes the asker actually holds were never part of the question.
 pub fn check_output_digest(envelope: &SignedRunEnvelope) -> Result<(), VerifyError> {
-    let actual_hex = sha256_hex(&envelope.output);
-    let actual = Sha256Hex::try_new(actual_hex)
-        .expect("sha256_hex returns canonical 64-lowercase-hex output");
-    if actual.as_str() != envelope.metadata.output_envelope_sha256.as_str() {
+    let actual = sha256_hex(&envelope.output);
+    if actual != envelope.metadata.output_envelope_sha256 {
         return Err(VerifyError::OutputDigestMismatch {
             expected: envelope.metadata.output_envelope_sha256.clone(),
             actual,
@@ -330,8 +328,8 @@ mod tests {
             stderr_truncated_at: None,
         };
         let output_bytes = output.to_bytes();
-        let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
-        let prompt_sha = Sha256Hex::try_new(sha256_hex(b"prompt")).unwrap();
+        let output_sha = sha256_hex(&output_bytes);
+        let prompt_sha = sha256_hex(b"prompt");
         let metadata = SignedRunMetadata {
             run_id: AgentRunId::new(),
             session_id: SessionId::new(),

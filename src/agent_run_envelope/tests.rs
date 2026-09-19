@@ -68,7 +68,7 @@ use crate::test_support::ED25519_SIGNING_PEM as TEST_SIGNING_PEM;
 /// against the envelope's canonical bytes.
 #[tokio::test]
 async fn materialize_vm_envelope_packs_streams_and_signs_metadata() {
-    use crate::core::{CapabilitySet, RepoRef, Sha256Hex};
+    use crate::core::{CapabilitySet, RepoRef};
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
     use crate::signing::WritSigningKey;
 
@@ -89,7 +89,7 @@ async fn materialize_vm_envelope_packs_streams_and_signs_metadata() {
         stderr,
     );
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt bytes")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt bytes");
     let capabilities = vec![CapabilitySet::WorkspaceWrite {
         repo: RepoRef {
             owner: "smaug123".into(),
@@ -149,11 +149,7 @@ async fn materialize_vm_envelope_packs_streams_and_signs_metadata() {
     // the same digest.
     assert_eq!(
         crate::agent_run::sha256_hex(&decoded.output),
-        materialized
-            .envelope
-            .metadata
-            .output_envelope_sha256
-            .as_str(),
+        materialized.envelope.metadata.output_envelope_sha256,
     );
 }
 
@@ -164,7 +160,6 @@ async fn materialize_vm_envelope_packs_streams_and_signs_metadata() {
 /// shape obligation is identical.
 #[tokio::test]
 async fn materialize_vm_envelope_propagates_nonzero_exit_code() {
-    use crate::core::Sha256Hex;
     use crate::signing::WritSigningKey;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -178,7 +173,7 @@ async fn materialize_vm_envelope_propagates_nonzero_exit_code() {
         b"explosion in aisle 5\n",
     );
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let materialized = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
@@ -200,7 +195,6 @@ async fn materialize_vm_envelope_propagates_nonzero_exit_code() {
 /// verifiers tell prefix-from-whole.
 #[tokio::test]
 async fn materialize_vm_envelope_caps_streams_at_max_run_agent_stream_bytes() {
-    use crate::core::Sha256Hex;
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
     use crate::signing::WritSigningKey;
 
@@ -220,7 +214,7 @@ async fn materialize_vm_envelope_caps_streams_at_max_run_agent_stream_bytes() {
         b"",
     );
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let materialized = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
@@ -253,7 +247,6 @@ async fn materialize_vm_envelope_preserves_guest_truncation_flag() {
     use crate::agent_run::{
         AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus, sha256_hex,
     };
-    use crate::core::Sha256Hex;
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
     use crate::signing::WritSigningKey;
 
@@ -294,7 +287,7 @@ async fn materialize_vm_envelope_preserves_guest_truncation_flag() {
         },
     };
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let materialized = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
@@ -337,7 +330,6 @@ async fn materialize_envelope_marks_a_stream_cut_at_the_deadline_as_a_prefix() {
     use crate::agent_run::{
         AgentRunOutcome, AgentRunStreamSummary, AgentRunTerminalStatus, sha256_hex,
     };
-    use crate::core::Sha256Hex;
     use crate::run_envelope::{OutputEnvelope, SignedRunEnvelope};
     use crate::signing::WritSigningKey;
 
@@ -376,7 +368,7 @@ async fn materialize_envelope_marks_a_stream_cut_at_the_deadline_as_a_prefix() {
         },
     };
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let materialized = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
@@ -414,7 +406,6 @@ async fn materialize_envelope_marks_a_stream_cut_at_the_deadline_as_a_prefix() {
 /// declines to vouch for the file.
 #[tokio::test]
 async fn a_stream_file_rewritten_after_its_outcome_row_is_refused() {
-    use crate::core::Sha256Hex;
     use crate::signing::WritSigningKey;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -435,7 +426,7 @@ async fn a_stream_file_rewritten_after_its_outcome_row_is_refused() {
     )
     .unwrap();
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let err = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
@@ -461,7 +452,6 @@ async fn a_stream_file_rewritten_after_its_outcome_row_is_refused() {
 /// over bytes the row contradicts.
 #[tokio::test]
 async fn a_stream_file_that_grew_past_the_read_cap_is_refused() {
-    use crate::core::Sha256Hex;
     use crate::signing::WritSigningKey;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -477,7 +467,7 @@ async fn a_stream_file_that_grew_past_the_read_cap_is_refused() {
     let cap = crate::server::MAX_RUN_AGENT_STREAM_BYTES;
     fs::write(&outcome.outcome.stdout.path, vec![b'x'; cap + 1024]).unwrap();
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let err = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
@@ -503,7 +493,6 @@ async fn a_stream_file_that_grew_past_the_read_cap_is_refused() {
 /// digest catches it.
 #[tokio::test]
 async fn an_over_cap_stream_file_swapped_for_different_bytes_is_refused() {
-    use crate::core::Sha256Hex;
     use crate::signing::WritSigningKey;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -523,7 +512,7 @@ async fn an_over_cap_stream_file_swapped_for_different_bytes_is_refused() {
     let swapped = vec![b'b'; cap + 1024];
     fs::write(&outcome.outcome.stdout.path, &swapped).unwrap();
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let err = materialize_signed_run_envelope(
         &outcome,
         SessionId::new(),
@@ -592,7 +581,6 @@ async fn the_stream_read_stops_once_the_file_outgrows_its_row() {
 /// Under a timeout, because the regression this pins is a hang.
 #[tokio::test]
 async fn a_stream_path_that_is_not_a_regular_file_is_refused() {
-    use crate::core::Sha256Hex;
     use crate::signing::WritSigningKey;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -614,7 +602,7 @@ async fn a_stream_path_that_is_not_a_regular_file_is_refused() {
             .status;
     assert!(mkfifo.success(), "could not create the FIFO under test");
 
-    let prompt_sha256 = Sha256Hex::try_new(crate::agent_run::sha256_hex(b"prompt")).unwrap();
+    let prompt_sha256 = crate::agent_run::sha256_hex(b"prompt");
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         materialize_signed_run_envelope(

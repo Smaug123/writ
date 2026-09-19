@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use crate::core::SessionId;
+use crate::core::{SessionId, Sha256Hex};
 
 /// Errors returned by [`materialize_signed_run_envelope`].
 ///
@@ -47,9 +47,9 @@ pub enum MaterializeRunEnvelopeError {
         stream: &'static str,
         path: PathBuf,
         recorded_byte_len: u64,
-        recorded_sha256: String,
+        recorded_sha256: Sha256Hex,
         found_byte_len: u64,
-        found_sha256: String,
+        found_sha256: Sha256Hex,
     },
     #[error(
         "{stream} log file {} is not a regular file; refusing to read it",
@@ -165,9 +165,7 @@ pub async fn materialize_signed_run_envelope(
         stderr_truncated_at,
     };
     let output_envelope_bytes = output_envelope.to_bytes();
-    let output_envelope_sha256_str = crate::agent_run::sha256_hex(&output_envelope_bytes);
-    let output_envelope_sha256 = crate::core::Sha256Hex::try_new(output_envelope_sha256_str)
-        .expect("sha256_hex returns canonical 64-lowercase-hex output");
+    let output_envelope_sha256 = crate::agent_run::sha256_hex(&output_envelope_bytes);
 
     let metadata = SignedRunMetadata {
         run_id: outcome.outcome.run_id,
@@ -256,7 +254,7 @@ struct StreamReadback {
     file_byte_len: u64,
     /// SHA-256 of the whole file, directly comparable with the outcome row's
     /// `sha256_hex` (which also describes the file).
-    file_sha256_hex: String,
+    file_sha256_hex: Sha256Hex,
 }
 
 async fn read_stream_capped_from_disk(

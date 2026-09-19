@@ -43,7 +43,7 @@ fn seed_synthetic_outcome(
     let stream = |label: &str| AgentRunStreamSummary {
         path: PathBuf::from(format!("/tmp/agent-runs/{run_id}/{label}.log")),
         byte_len: 0,
-        sha256_hex: "0".repeat(64),
+        sha256_hex: crate::core::Sha256Hex::try_new("0".repeat(64)).expect("64 hex digits"),
         truncated: false,
         stopped_at_deadline: false,
     };

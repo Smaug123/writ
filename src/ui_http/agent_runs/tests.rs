@@ -11,7 +11,7 @@
 use super::*;
 use crate::agent_run::AgentRunOutcome;
 use crate::audit::{AgentRunAuditRecord, AgentRunOutcomeAuditRecord, AuditLog};
-use crate::core::SessionRecord;
+use crate::core::{SessionRecord, Sha256Hex};
 use crate::ui_http::{UiHttpBearerToken, serve_ui_http_request};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -20,12 +20,15 @@ use std::sync::Arc;
 
 const BEARER: &str = "agent-runs-test-bearer";
 
-fn sha256_hex() -> impl Strategy<Value = String> {
+fn sha256_hex() -> impl Strategy<Value = Sha256Hex> {
     proptest::collection::vec(
         proptest::sample::select(b"0123456789abcdef".to_vec()),
         64..=64,
     )
-    .prop_map(|bytes| String::from_utf8(bytes).expect("hex digits are ASCII"))
+    .prop_map(|bytes| {
+        Sha256Hex::try_new(String::from_utf8(bytes).expect("hex digits are ASCII"))
+            .expect("64 lowercase hex digits")
+    })
 }
 
 /// Previews are operator-facing free text that reaches JSON verbatim,
@@ -343,7 +346,8 @@ async fn stdout_and_stderr_are_not_transposed() {
     let stream = |digit: char| AgentRunStreamSummary {
         path: std::path::PathBuf::from("/logs/run.log"),
         byte_len: 0,
-        sha256_hex: std::iter::repeat_n(digit, 64).collect(),
+        sha256_hex: Sha256Hex::try_new(std::iter::repeat_n(digit, 64).collect::<String>())
+            .expect("64 hex digits"),
         truncated: false,
         stopped_at_deadline: false,
     };

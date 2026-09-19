@@ -2072,12 +2072,8 @@ mod tests {
         let metadata = writ::protocol::SignedRunMetadata {
             run_id: writ::agent_run::AgentRunId::new(),
             session_id: SessionId::new(),
-            prompt_sha256: writ::core::Sha256Hex::try_new(writ::agent_run::sha256_hex(b"prompt"))
-                .unwrap(),
-            output_envelope_sha256: writ::core::Sha256Hex::try_new(writ::agent_run::sha256_hex(
-                &output,
-            ))
-            .unwrap(),
+            prompt_sha256: writ::agent_run::sha256_hex(b"prompt"),
+            output_envelope_sha256: writ::agent_run::sha256_hex(&output),
             capabilities: Vec::new(),
             exit_code: 0,
             completed_at: writ::core::UnixMillis::from_millis(1_700_000_000),

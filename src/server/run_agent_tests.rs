@@ -204,7 +204,7 @@ async fn run_agent_round_trip_signs_and_writes_note() {
     assert_eq!(signed_metadata.signing_key_fingerprint, fingerprint);
     assert_eq!(signed_metadata.exit_code, 0);
     let expected_prompt_hash = crate::agent_run::sha256_hex(prompt_text.as_bytes());
-    assert_eq!(signed_metadata.prompt_sha256.as_str(), expected_prompt_hash);
+    assert_eq!(signed_metadata.prompt_sha256, expected_prompt_hash);
 
     // 2. Detached signature verifies against the canonical bytes.
     verifying_key
@@ -233,7 +233,7 @@ async fn run_agent_round_trip_signs_and_writes_note() {
     // mangled the binary payload.
     assert_eq!(
         crate::agent_run::sha256_hex(&envelope.output),
-        signed_metadata.output_envelope_sha256.as_str(),
+        signed_metadata.output_envelope_sha256,
     );
     // 5. Decode the inner `OutputEnvelope` and assert the captured
     // streams match what the child actually wrote: `cat` echoes
@@ -294,7 +294,7 @@ async fn run_agent_signs_non_zero_exit() {
         stderr_truncated_at: None,
     };
     assert_eq!(
-        signed_metadata.output_envelope_sha256.as_str(),
+        signed_metadata.output_envelope_sha256,
         crate::agent_run::sha256_hex(&empty_envelope.to_bytes()),
     );
 }
@@ -424,7 +424,7 @@ async fn run_agent_captures_stderr_in_envelope() {
     // would survive but a verifier re-deriving the digest would
     // see a mismatch. Re-derive it from the encoded envelope here.
     assert_eq!(
-        signed_metadata.output_envelope_sha256.as_str(),
+        signed_metadata.output_envelope_sha256,
         crate::agent_run::sha256_hex(&envelope.output),
     );
 }

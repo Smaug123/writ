@@ -18,6 +18,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
+use writ_core::core::Sha256Hex;
 
 pub const VM_AGENT_RUN_PATH_PREFIX: &str = "/v1/agent-runs";
 pub const MAX_AGENT_PROMPT_BYTES: usize = 1024 * 1024;
@@ -48,7 +49,7 @@ pub struct AgentPrompt(String);
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentPromptSummary {
     pub byte_len: u64,
-    pub sha256_hex: String,
+    pub sha256_hex: Sha256Hex,
     pub redacted_preview: String,
 }
 
@@ -170,7 +171,7 @@ impl TryFrom<AgentRunTerminalStatus> for GuestReportedRunStatus {
 pub struct AgentRunStreamSummary {
     pub path: PathBuf,
     pub byte_len: u64,
-    pub sha256_hex: String,
+    pub sha256_hex: Sha256Hex,
     pub truncated: bool,
     /// Writ stopped reading at the deadline; the remainder is unknown and
     /// unbounded. **Only the host arm can set this**: the guest never gives its
@@ -192,7 +193,7 @@ pub struct AgentRunOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentRunStreamUpload {
     pub byte_len: u64,
-    pub sha256_hex: String,
+    pub sha256_hex: Sha256Hex,
     pub truncated: bool,
     /// The guest's capture stopped at its drain deadline rather than at EOF.
     ///
@@ -214,7 +215,7 @@ pub struct AgentRunStreamUpload {
     /// `false`, which is what such a guest would have meant.
     #[serde(default)]
     pub stopped_at_deadline: bool,
-    pub retained_sha256_hex: String,
+    pub retained_sha256_hex: Sha256Hex,
     pub retained_base64: String,
 }
 
@@ -389,9 +390,13 @@ pub fn vm_agent_run_outcome_path(run_id: AgentRunId) -> String {
 }
 
 #[cfg(any(feature = "host", feature = "vm-client"))]
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    hex_lower(digest.as_ref())
+pub fn sha256_hex(bytes: &[u8]) -> Sha256Hex {
+    Sha256Hex::from_digest(
+        ring::digest::digest(&ring::digest::SHA256, bytes)
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 digests are 32 bytes"),
+    )
 }
 
 /// SHA-256 over bytes that arrive a chunk at a time, yielding the same
@@ -415,8 +420,14 @@ impl Sha256Stream {
         self.0.update(bytes);
     }
 
-    pub fn finish_hex(self) -> String {
-        hex_lower(self.0.finish().as_ref())
+    pub fn finish_hex(self) -> Sha256Hex {
+        Sha256Hex::from_digest(
+            self.0
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 digests are 32 bytes"),
+        )
     }
 }
 
@@ -425,17 +436,6 @@ impl Default for Sha256Stream {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[cfg(any(feature = "host", feature = "vm-client"))]
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 // --- CorrelationId ----------------------------------------------------
@@ -725,6 +725,7 @@ mod process_runner {
     use std::process::{Child, Command, Stdio};
     use std::thread;
 
+    use writ_core::core::Sha256Hex;
     use writ_core::process_spawn;
 
     use super::{
@@ -763,11 +764,11 @@ mod process_runner {
         /// Length of the bytes at `path`.
         pub retained_byte_len: u64,
         /// SHA-256 of the bytes at `path`.
-        pub retained_sha256_hex: String,
+        pub retained_sha256_hex: Sha256Hex,
         /// Length of the whole stream, retained or not.
         pub full_byte_len: u64,
         /// SHA-256 of the whole stream, retained or not.
-        pub full_sha256_hex: String,
+        pub full_sha256_hex: Sha256Hex,
         /// Whether writ stopped reading at the run's deadline rather than at the
         /// stream's end.
         ///
@@ -2645,7 +2646,7 @@ mod tests {
         let summary = prompt.summary();
 
         assert_eq!(summary.byte_len, prompt.byte_len());
-        assert_eq!(summary.sha256_hex.len(), 64);
+        assert_eq!(summary.sha256_hex, sha256_hex(prompt.as_bytes()));
         let debug = format!("{summary:?}");
         assert!(!debug.contains(prompt.as_str()), "{debug}");
         assert_eq!(summary.redacted_preview, "<redacted>");
@@ -3704,13 +3705,16 @@ mod tests {
     #[test]
     fn a_guest_outcome_upload_rejects_a_timed_out_status_on_the_wire() {
         let upload = |status: &str| {
+            // Built without hashing so the test stays feature-free; any
+            // well-formed value serves, the digest is not what is under test.
+            let empty = Sha256Hex::from_digest(&[0; 32]);
             format!(
                 r#"{{"run_id":"00000000-0000-0000-0000-000000000306",
                     "status":"{status}","exit_code":0,
-                    "stdout":{{"byte_len":0,"sha256_hex":"","truncated":false,
-                               "retained_sha256_hex":"","retained_base64":""}},
-                    "stderr":{{"byte_len":0,"sha256_hex":"","truncated":false,
-                               "retained_sha256_hex":"","retained_base64":""}}}}"#
+                    "stdout":{{"byte_len":0,"sha256_hex":"{empty}","truncated":false,
+                               "retained_sha256_hex":"{empty}","retained_base64":""}},
+                    "stderr":{{"byte_len":0,"sha256_hex":"{empty}","truncated":false,
+                               "retained_sha256_hex":"{empty}","retained_base64":""}}}}"#
             )
         };
         serde_json::from_str::<VmAgentRunOutcomeUpload>(&upload("failed"))

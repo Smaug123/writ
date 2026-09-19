@@ -67,7 +67,7 @@ pub enum RunProvenanceFinding {
     /// compares hashes.
     PromptMismatch {
         signed: Sha256Hex,
-        audited: String,
+        audited: Sha256Hex,
     },
     ExitCodeMismatch {
         signed: i32,
@@ -164,7 +164,7 @@ pub fn cross_check(signed: &SignedRunMetadata, audited: &AuditedRun) -> Vec<RunP
             audited: audited.request.session_id,
         });
     }
-    if signed.prompt_sha256.as_str() != audited.request.prompt.sha256_hex {
+    if signed.prompt_sha256 != audited.request.prompt.sha256_hex {
         findings.push(RunProvenanceFinding::PromptMismatch {
             signed: signed.prompt_sha256.clone(),
             audited: audited.request.prompt.sha256_hex.clone(),

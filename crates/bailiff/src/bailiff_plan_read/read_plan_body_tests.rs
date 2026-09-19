@@ -9,7 +9,7 @@ use super::*;
 use crate::bailiff_plan_note::PlanId;
 use tempfile::TempDir;
 use writ::agent_run::{AgentRunId, sha256_hex};
-use writ::core::{CapabilitySet, RepoRef, SessionId, Sha256Hex, UnixMillis};
+use writ::core::{CapabilitySet, RepoRef, SessionId, UnixMillis};
 use writ::protocol::SignedRunMetadata;
 use writ::signing::WritSigningKey;
 use writ::vm_git::GitObjectId;
@@ -23,8 +23,8 @@ fn signed_envelope_with_output(
     output: OutputEnvelope,
 ) -> SignedRunEnvelope {
     let output_bytes = output.to_bytes();
-    let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
-    let prompt_sha = Sha256Hex::try_new(sha256_hex(b"planner-prompt")).unwrap();
+    let output_sha = sha256_hex(&output_bytes);
+    let prompt_sha = sha256_hex(b"planner-prompt");
     let metadata = SignedRunMetadata {
         run_id: AgentRunId::new(),
         session_id: SessionId::new(),
@@ -367,8 +367,8 @@ fn decode_output_failure_when_output_is_not_output_envelope_json() {
     let tmp = TempDir::new().unwrap();
     let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
     let output_bytes = b"not an output envelope".to_vec();
-    let output_sha = Sha256Hex::try_new(sha256_hex(&output_bytes)).unwrap();
-    let prompt_sha = Sha256Hex::try_new(sha256_hex(b"prompt")).unwrap();
+    let output_sha = sha256_hex(&output_bytes);
+    let prompt_sha = sha256_hex(b"prompt");
     let metadata = SignedRunMetadata {
         run_id: AgentRunId::new(),
         session_id: SessionId::new(),
