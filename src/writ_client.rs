@@ -1094,7 +1094,6 @@ mod end_to_end_tests {
     //! The only mock is the GitHub installation-token endpoint, which
     //! `RunAgent` never touches but which `BrokerState` requires a
     //! non-empty registry for.
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1103,23 +1102,15 @@ mod end_to_end_tests {
 
     use super::*;
     use crate::agent_run::{AgentPrompt, sha256_hex};
-    use crate::audit::AuditLog;
-    use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef, TtlSeconds};
-    use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+    use crate::core::{AgentKind, CapabilitySet, NotesRef, RepoRef};
     use crate::notes_repo::NotesRepo;
-    use crate::policy::PolicyConfig;
     use crate::run_envelope::SignedRunEnvelope;
     use crate::run_verify::{AllowedSigners, verify_run_envelope};
-    use crate::secret::{SecretKey, SecretStore};
-    use crate::server::{
-        BrokerState, RunAgentSpawnConfig, prepare_broker_listener, serve_broker_with_agent_vm,
-    };
     use crate::signing::WritSigningKey;
-    use crate::test_support::{InMemorySecretStore, find_in_path};
+    use crate::test_support::{SpawnedBroker, cat_run_agent_spawn, claude_broker_state};
 
     use crate::test_support::ED25519_SIGNING_PEM as SIGNING_PEM;
     use crate::test_support::ED25519_SIGNING_PUB as SIGNING_PUB;
-    use crate::test_support::RSA_TEST_1_PEM as TEST_PRIV;
 
     /// End-to-end socket round-trip.
     ///
@@ -1145,72 +1136,14 @@ mod end_to_end_tests {
         let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
         let bailiff_repo = NotesRepo::init_or_open(tmp.path().join("bailiff-bare")).unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let cat = find_in_path("cat").expect("cat must be on PATH for the round-trip test");
-
-        // `BrokerState` requires a non-empty GitHub registry; RunAgent
-        // never mints a token so the wiremock URL is unused. The
-        // smallest dependency that satisfies the invariant.
         let github_server = MockServer::start().await;
-        let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemorySecretStore::default();
-        store.put(&pk, TEST_PRIV).unwrap();
-        let mut apps = BTreeMap::new();
-        apps.insert(
-            AgentKind::Claude,
-            GitHubAppConfig {
-                app_id: 42,
-                installation_id: 999,
-                installation_owner: "o".into(),
-                private_key_secret: pk,
-                api_base: github_server.uri(),
-            },
-        );
-        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-
-        let state = Arc::new(BrokerState {
-            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-            minter,
-            secrets: store,
-            policy: PolicyConfig {
-                writable_repos: vec![],
-                default_ttl: TtlSeconds::new(3600).unwrap(),
-            },
-            staging_store: None,
-            notes_repo: Some(Arc::new(writ_repo)),
-            signing_key: Some(signing_key.clone()),
-            run_agent_spawn: Some(RunAgentSpawnConfig {
-                command: cat,
-                args: Vec::new(),
-                agent_kind: crate::core::AgentKind::Claude,
-                log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
-                    .unwrap(),
-                timeout: None,
-            }),
-            agent_run_slots: Default::default(),
-            promote_runtime: None,
-            git_data_http: std::sync::OnceLock::new(),
-            mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
-            chatgpt_oauth_authority: Default::default(),
-        });
-
-        // Bind a tempsocket and spawn the broker accept loop. The
-        // listener is owned by the spawned task; the test reaches it
-        // through the path. `prepare_broker_listener` refuses to bind
-        // in a directory with group/world bits — `tempfile::tempdir`
-        // default is 0755 on macOS, so we explicitly chmod 700.
-        use std::os::unix::fs::PermissionsExt;
-        let socket_dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-        let socket_path = socket_dir.path().join("writ.sock");
-        let listener = prepare_broker_listener(&socket_path).await.unwrap();
-        let broker_state = Arc::clone(&state);
-        let broker_task = tokio::spawn(async move {
-            // `agent_vm = None` matches the production daemon paths
-            // that don't run a daemon-managed VM. RunAgent doesn't
-            // touch the agent-vm daemon either.
-            let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-        });
+        let mut state = claude_broker_state(&github_server.uri(), "o");
+        state.notes_repo = Some(Arc::new(writ_repo));
+        state.signing_key = Some(signing_key.clone());
+        state.run_agent_spawn = Some(cat_run_agent_spawn(tmp.path()));
+        let state = Arc::new(state);
+        let broker_task = SpawnedBroker::start(Arc::clone(&state)).await;
+        let socket_path = broker_task.socket_path.clone();
 
         // --- Client request (bailiff side) --------------------------
         let prompt_text = "noop\n";
@@ -1307,8 +1240,7 @@ mod end_to_end_tests {
         assert_eq!(envelope.metadata, completed.signed_metadata);
         assert_eq!(envelope.signature, completed.signature);
 
-        broker_task.abort();
-        let _ = broker_task.await;
+        broker_task.stop().await;
     }
 
     /// A prompt at the high end of the `MAX_AGENT_PROMPT_BYTES`
@@ -1322,63 +1254,17 @@ mod end_to_end_tests {
     /// always a frame the broker accepts.
     #[tokio::test]
     async fn run_agent_carries_large_prompt_through_framing() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let writ_repo = NotesRepo::init_or_open(tmp.path().join("writ-bare")).unwrap();
         let signing_key = WritSigningKey::from_openssh_pem(SIGNING_PEM).unwrap();
-        let cat = find_in_path("cat").expect("cat must be on PATH");
-
         let github_server = MockServer::start().await;
-        let pk = SecretKey::new("gh-app-pk").unwrap();
-        let store = InMemorySecretStore::default();
-        store.put(&pk, TEST_PRIV).unwrap();
-        let mut apps = BTreeMap::new();
-        apps.insert(
-            AgentKind::Claude,
-            GitHubAppConfig {
-                app_id: 42,
-                installation_id: 999,
-                installation_owner: "o".into(),
-                private_key_secret: pk,
-                api_base: github_server.uri(),
-            },
-        );
-        let minter = GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap());
-        let state = Arc::new(BrokerState {
-            audit: Arc::new(AuditLog::open_in_memory().unwrap()),
-            minter,
-            secrets: store,
-            policy: PolicyConfig {
-                writable_repos: vec![],
-                default_ttl: TtlSeconds::new(3600).unwrap(),
-            },
-            staging_store: None,
-            notes_repo: Some(Arc::new(writ_repo)),
-            signing_key: Some(signing_key.clone()),
-            run_agent_spawn: Some(RunAgentSpawnConfig {
-                command: cat,
-                args: Vec::new(),
-                agent_kind: crate::core::AgentKind::Claude,
-                log_root: crate::config::AgentRunLogRoot::check(tmp.path().join("agent-runs"))
-                    .unwrap(),
-                timeout: None,
-            }),
-            agent_run_slots: Default::default(),
-            promote_runtime: None,
-            git_data_http: std::sync::OnceLock::new(),
-            mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
-            chatgpt_oauth_authority: Default::default(),
-        });
-        let socket_dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))
-            .unwrap();
-        let socket_path = socket_dir.path().join("writ.sock");
-        let listener = prepare_broker_listener(&socket_path).await.unwrap();
-        let broker_state = Arc::clone(&state);
-        let broker_task = tokio::spawn(async move {
-            let _ = serve_broker_with_agent_vm(listener, broker_state, None).await;
-        });
+        let mut state = claude_broker_state(&github_server.uri(), "o");
+        state.notes_repo = Some(Arc::new(writ_repo));
+        state.signing_key = Some(signing_key.clone());
+        state.run_agent_spawn = Some(cat_run_agent_spawn(tmp.path()));
+        let state = Arc::new(state);
+        let broker_task = SpawnedBroker::start(Arc::clone(&state)).await;
+        let socket_path = broker_task.socket_path.clone();
 
         // 1 MiB minus a small margin (control char `\u{0001}` is one
         // byte raw, but the prompt validator counts raw bytes; the
@@ -1421,7 +1307,6 @@ mod end_to_end_tests {
             sha256_hex(big.as_bytes())
         );
 
-        broker_task.abort();
-        let _ = broker_task.await;
+        broker_task.stop().await;
     }
 }

@@ -46,7 +46,7 @@ host = [
 # those moved to writ-vm-client.
 # Exposes `writ::test_support` (in-memory secret store, PATH lookups, key
 # fixtures) to downstream crates' tests; never enabled by a production build.
-test-support = []
+test-support = ["dep:tempfile"]
 vm-client = ["dep:writ-vm-client", "writ-agent-run/vm-client", "dep:writ-vm-git"]
 
 [[bin]]
@@ -75,6 +75,9 @@ path = "src/bin/writd.rs"
 required-features = ["host"]
 
 [dependencies]
+# Optional so `test_support` (behind `test-support`) can hand out tempdirs; the
+# dev-dependency below covers this crate's own `cfg(test)` builds.
+tempfile = { version = "3", optional = true }
 writ-core = { path = "crates/writ-core" }
 # Non-optional: `agent_run` is re-exported as `writ::agent_run` in all builds.
 # The runtime bits (runner, hashing) come from its host/vm-client features,

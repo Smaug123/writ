@@ -7,21 +7,16 @@
 //! items and the parent's private `crate::*` imports; the explicit `use`s
 //! below cover the test-only constructors these helpers call.
 use super::*;
+use crate::test_support::claude_broker_state;
 pub(super) use crate::test_support::{InMemorySecretStore, shell_quote_path};
-use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use writ_core::byte_size::ByteSize;
 
 use crate::audit::AuditLog;
-use crate::core::{
-    BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, RepoRef, TtlSeconds,
-};
-use crate::github::{GitHubAppConfig, GitHubAppRegistryConfig, GitHubMinter};
+use crate::core::{BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr};
 use crate::nix_binary_cache::NixTrustedPublicKeys;
-use crate::policy::PolicyConfig;
-use crate::secret::SecretKey;
 use crate::vm_git::VmGitPushBodyLimits;
 use crate::vm_git_bundle::{GitCredentialBoundary, GitSecretEnvVar};
 use crate::vm_http::{VmHttpGitCloneConfig, VmHttpNixCacheConfig};
@@ -36,36 +31,9 @@ pub(super) fn make_state() -> Arc<BrokerState<InMemorySecretStore>> {
 }
 
 pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemorySecretStore>> {
-    let key = SecretKey::new("gh-app-pk").unwrap();
-    let mut apps = BTreeMap::new();
-    apps.insert(
-        AgentKind::Claude,
-        GitHubAppConfig {
-            app_id: 42,
-            installation_id: 999,
-            installation_owner: "o".into(),
-            private_key_secret: key,
-            api_base: "http://127.0.0.1".into(),
-        },
-    );
-    Arc::new(BrokerState {
-        audit: Arc::new(audit),
-        minter: GitHubMinter::new_registry(GitHubAppRegistryConfig::new(apps).unwrap()),
-        secrets: InMemorySecretStore::default(),
-        policy: PolicyConfig {
-            writable_repos: Vec::<RepoRef>::new(),
-            default_ttl: TtlSeconds::new(3600).unwrap(),
-        },
-        staging_store: None,
-        notes_repo: None,
-        signing_key: None,
-        run_agent_spawn: None,
-        agent_run_slots: Default::default(),
-        promote_runtime: None,
-        git_data_http: std::sync::OnceLock::new(),
-        mirror_pins: crate::vm_git_mirror_cache::MirrorPins::new(),
-        chatgpt_oauth_authority: Default::default(),
-    })
+    let mut state = claude_broker_state("http://127.0.0.1", "o");
+    state.audit = Arc::new(audit);
+    Arc::new(state)
 }
 
 pub(super) fn write_fake_tool(
