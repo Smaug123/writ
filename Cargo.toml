@@ -47,7 +47,7 @@ host = [
 # those moved to writ-vm-client.
 # Exposes `writ::test_support` (in-memory secret store, PATH lookups, key
 # fixtures) to downstream crates' tests; never enabled by a production build.
-test-support = ["dep:tempfile"]
+test-support = ["dep:tempfile", "writ-core/test-support"]
 vm-client = ["dep:writ-vm-client", "writ-agent-run/vm-client", "dep:writ-vm-git"]
 
 [[bin]]
@@ -133,3 +133,4 @@ writ-agent-run = { path = "crates/writ-agent-run", features = ["test-support"] }
 # `test-support` exposes audit's `*_for_test` DAO read-back helpers to writ's
 # tests (vm_http proxy tests, git_push_approve tests).
 writ-audit = { path = "crates/writ-audit", features = ["test-support"] }
+writ-core = { path = "crates/writ-core", features = ["test-support"] }

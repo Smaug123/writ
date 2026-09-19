@@ -2,7 +2,6 @@
 
 use super::*;
 use proptest::prelude::*;
-use std::path::PathBuf;
 use std::process::Command;
 use writ_core::byte_size::ByteSize;
 use writ_core::git_env::apply_clean_git_config;
@@ -148,29 +147,15 @@ fn push_limits() -> VmGitPushBodyLimits {
     VmGitPushBodyLimits::new(ByteSize::of(4096), ByteSize::of(1024), ByteSize::of(1024)).unwrap()
 }
 
-fn required_test_tool(name: &str) -> PathBuf {
-    let path = std::env::var_os("PATH")
-        .unwrap_or_else(|| panic!("PATH must contain {name} for vm_git tests"));
-    for dir in std::env::split_paths(&path) {
-        let candidate = if dir.is_absolute() {
-            dir.join(name)
-        } else {
-            std::env::current_dir().unwrap().join(dir).join(name)
-        };
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!("{name} not found on PATH for vm_git tests");
-}
-
 fn git_check_ref_format_branch_accepts(raw: &str) -> bool {
     writ_core::process_spawn::output(
-        apply_clean_git_config(&mut Command::new(required_test_tool("git")))
-            .args(["check-ref-format", "--branch", raw])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()),
+        apply_clean_git_config(&mut Command::new(writ_core::test_support::required_tool(
+            "git",
+        )))
+        .args(["check-ref-format", "--branch", raw])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped()),
     )
     .unwrap_or_else(|err| panic!("failed to run git check-ref-format: {err}"))
     .status

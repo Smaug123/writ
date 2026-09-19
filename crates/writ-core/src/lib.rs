@@ -24,6 +24,8 @@ pub mod private_fs;
 pub mod process_group;
 pub mod process_spawn;
 pub mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod validated_string;
 
 #[doc(hidden)]
