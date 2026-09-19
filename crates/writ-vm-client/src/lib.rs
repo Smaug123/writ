@@ -105,6 +105,25 @@ pub enum VmWorkspaceWarmStep {
     DevShell,
 }
 
+/// Which external command a step of the guest workflow ran, for naming it
+/// in a spawn or exit failure.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Step {
+    Clone(VmGitCloneStep),
+    Push(VmGitPushStep),
+    Warm(VmWorkspaceWarmStep),
+}
+
+impl std::fmt::Display for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Step::Clone(step) => write!(f, "{step} git command"),
+            Step::Push(step) => write!(f, "{step} git command"),
+            Step::Warm(step) => write!(f, "{step} command"),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VmGitCloneCommandError {
     #[error("destination path must not be empty")]
@@ -172,25 +191,11 @@ pub enum VmClientError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{step} git command could not be spawned: {source}")]
-    GitSpawn {
-        step: VmGitCloneStep,
-        source: std::io::Error,
-    },
-    #[error("{step} git command failed with status {status}: {stderr}")]
-    GitFailed {
-        step: VmGitCloneStep,
-        status: ExitStatus,
-        stderr: String,
-    },
-    #[error("{step} command could not be spawned: {source}")]
-    NixSpawn {
-        step: VmWorkspaceWarmStep,
-        source: std::io::Error,
-    },
-    #[error("{step} command failed with status {status}: {stderr}")]
-    NixFailed {
-        step: VmWorkspaceWarmStep,
+    #[error("{step} could not be spawned: {source}")]
+    Spawn { step: Step, source: std::io::Error },
+    #[error("{step} failed with status {status}: {stderr}")]
+    Failed {
+        step: Step,
         status: ExitStatus,
         stderr: String,
     },
@@ -203,17 +208,6 @@ pub enum VmClientError {
     /// timeout as if the broker had enforced it.
     #[error("cannot report this run to the broker: {0}")]
     UnreportableStatus(#[from] writ_agent_run::GuestCannotReportStatus),
-    #[error("{step} git command could not be spawned: {source}")]
-    GitPushSpawn {
-        step: VmGitPushStep,
-        source: std::io::Error,
-    },
-    #[error("{step} git command failed with status {status}: {stderr}")]
-    GitPushFailed {
-        step: VmGitPushStep,
-        status: ExitStatus,
-        stderr: String,
-    },
     #[error("local branch {branch} resolves to {actual} but the push asserts new_head {expected}")]
     BranchHeadMismatch {
         branch: String,
@@ -977,33 +971,12 @@ fn run_git_command(
     args: Vec<OsString>,
     cwd: &Path,
 ) -> Result<(), VmClientError> {
-    let mut command = Command::new(git_program);
-    // The guest's own git must not be steerable by guest-side config either: a
-    // `~/.gitconfig` or `/etc/gitconfig` inside the image could bind a
-    // `credential.helper` or `core.fsmonitor` and get code run under this
-    // process. Denials only (not the HOME-clearing variant): these invocations
-    // authenticate to nothing — the bundle is a local file this client already
-    // fetched — so there is no reason to disturb HOME as well.
-    apply_git_config_denials(&mut command);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .env_remove(VM_BROKER_URL_ENV)
-        .env_remove(VM_BROKER_TOKEN_ENV)
-        .env("GIT_TERMINAL_PROMPT", "0");
-    let output = process_spawn::output(&mut command)
-        .map_err(|source| VmClientError::GitSpawn { step, source })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(VmClientError::GitFailed {
-        step,
-        status: output.status,
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    run_step(
+        &mut clone_git_command(git_program, args, cwd),
+        Step::Clone(step),
+        false,
+    )
+    .map(|_| ())
 }
 
 fn run_git_command_output(
@@ -1012,29 +985,55 @@ fn run_git_command_output(
     args: Vec<OsString>,
     cwd: &Path,
 ) -> Result<std::process::Output, VmClientError> {
+    run_step(
+        &mut clone_git_command(git_program, args, cwd),
+        Step::Clone(step),
+        true,
+    )
+}
+
+/// Git for the clone and status steps, run from `cwd`.
+///
+/// The guest's own git must not be steerable by guest-side config either: a
+/// `~/.gitconfig` or `/etc/gitconfig` inside the image could bind a
+/// `credential.helper` or `core.fsmonitor` and get code run under this
+/// process. Denials only (not the HOME-clearing variant): these invocations
+/// authenticate to nothing — the bundle is a local file this client already
+/// fetched — so there is no reason to disturb HOME as well.
+fn clone_git_command(git_program: &Path, args: Vec<OsString>, cwd: &Path) -> Command {
     let mut command = Command::new(git_program);
-    // The guest's own git must not be steerable by guest-side config either: a
-    // `~/.gitconfig` or `/etc/gitconfig` inside the image could bind a
-    // `credential.helper` or `core.fsmonitor` and get code run under this
-    // process. Denials only (not the HOME-clearing variant): these invocations
-    // authenticate to nothing — the bundle is a local file this client already
-    // fetched — so there is no reason to disturb HOME as well.
     apply_git_config_denials(&mut command);
     command
         .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .env_remove(VM_BROKER_URL_ENV)
         .env_remove(VM_BROKER_TOKEN_ENV)
         .env("GIT_TERMINAL_PROMPT", "0");
-    let output = process_spawn::output(&mut command)
-        .map_err(|source| VmClientError::GitSpawn { step, source })?;
+    command
+}
+
+/// Run one step's command with stdin closed and stderr captured. Success
+/// yields the output (stdout captured only when `capture_stdout`); anything
+/// else is the step-tagged failure.
+fn run_step(
+    command: &mut Command,
+    step: Step,
+    capture_stdout: bool,
+) -> Result<std::process::Output, VmClientError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::piped());
+    let output =
+        process_spawn::output(command).map_err(|source| VmClientError::Spawn { step, source })?;
     if output.status.success() {
         return Ok(output);
     }
-    Err(VmClientError::GitFailed {
+    Err(VmClientError::Failed {
         step,
         status: output.status,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -1192,24 +1191,12 @@ fn run_git_push_command(
     step: VmGitPushStep,
     args: Vec<OsString>,
 ) -> Result<(), VmClientError> {
-    let mut command = Command::new(git_program);
-    configure_push_git_env(&mut command);
-    apply_git_config_denials(&mut command);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let output = process_spawn::output(&mut command)
-        .map_err(|source| VmClientError::GitPushSpawn { step, source })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(VmClientError::GitPushFailed {
-        step,
-        status: output.status,
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    run_step(
+        &mut push_git_command(git_program, args),
+        Step::Push(step),
+        false,
+    )
+    .map(|_| ())
 }
 
 fn run_git_push_command_output(
@@ -1217,24 +1204,20 @@ fn run_git_push_command_output(
     step: VmGitPushStep,
     args: Vec<OsString>,
 ) -> Result<std::process::Output, VmClientError> {
+    run_step(
+        &mut push_git_command(git_program, args),
+        Step::Push(step),
+        true,
+    )
+}
+
+/// Git for the push steps: the push environment plus the config denials.
+fn push_git_command(git_program: &Path, args: Vec<OsString>) -> Command {
     let mut command = Command::new(git_program);
     configure_push_git_env(&mut command);
     apply_git_config_denials(&mut command);
+    command.args(args);
     command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = process_spawn::output(&mut command)
-        .map_err(|source| VmClientError::GitPushSpawn { step, source })?;
-    if output.status.success() {
-        return Ok(output);
-    }
-    Err(VmClientError::GitPushFailed {
-        step,
-        status: output.status,
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
 }
 
 /// Repository-selecting Git environment variables that override `-C <workdir>`.
@@ -1665,21 +1648,9 @@ fn run_nix_command(
     command
         .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
         .env_remove(VM_BROKER_URL_ENV)
         .env_remove(VM_BROKER_TOKEN_ENV);
-    let output = process_spawn::output(&mut command)
-        .map_err(|source| VmClientError::NixSpawn { step, source })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(VmClientError::NixFailed {
-        step,
-        status: output.status,
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    run_step(&mut command, Step::Warm(step), false).map(|_| ())
 }
 
 fn require_clean_workspace(git_program: &Path, destination: &Path) -> Result<(), VmClientError> {

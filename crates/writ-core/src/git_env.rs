@@ -225,17 +225,13 @@ pub fn apply_clean_git_config(command: &mut std::process::Command) -> &mut std::
     command
 }
 
-/// [`apply_clean_git_config`] for a tokio command.
+/// [`apply_clean_git_config`] for a tokio command: the same recipe applied
+/// to the `std` command tokio wraps, so the two cannot drift.
 #[cfg(feature = "host")]
 pub fn apply_clean_git_config_async(
     command: &mut tokio::process::Command,
 ) -> &mut tokio::process::Command {
-    for (name, value) in CLEAN_GIT_CONFIG_ENV {
-        command.env(name, value);
-    }
-    for name in GIT_CONFIG_REMOVE_ENV {
-        command.env_remove(name);
-    }
+    apply_clean_git_config(command.as_std_mut());
     command
 }
 
@@ -259,17 +255,13 @@ pub fn apply_git_config_denials(command: &mut std::process::Command) -> &mut std
     command
 }
 
-/// [`apply_git_config_denials`] for a tokio command.
+/// [`apply_git_config_denials`] for a tokio command, by the same route as
+/// [`apply_clean_git_config_async`].
 #[cfg(feature = "host")]
 pub fn apply_git_config_denials_async(
     command: &mut tokio::process::Command,
 ) -> &mut tokio::process::Command {
-    for (name, value) in GIT_CONFIG_DENY_ENV {
-        command.env(name, value);
-    }
-    for name in GIT_CONFIG_REMOVE_ENV {
-        command.env_remove(name);
-    }
+    apply_git_config_denials(command.as_std_mut());
     command
 }
 
