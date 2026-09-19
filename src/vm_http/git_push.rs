@@ -203,7 +203,7 @@ impl<'a, S: SecretStore + Send + Sync + 'static> GitPushEffect<'a, S> {
         // sessions and non-run sessions return `None` and the column stays NULL.
         let correlation_id = service
             .audit()
-            .correlation_id_for_session(session.session_id())
+            .agent_run_for_session(session.session_id())
             .map_err(|err| {
                 tracing::error!(
                     target: AUDIT_WRITE_FAILURE_TARGET,
@@ -217,7 +217,8 @@ impl<'a, S: SecretStore + Send + Sync + 'static> GitPushEffect<'a, S> {
                     VmGitPushErrorCode::PushFailed,
                     "audit read failed",
                 )
-            })?;
+            })?
+            .and_then(|run| run.correlation_id);
 
         Ok(Self {
             service,

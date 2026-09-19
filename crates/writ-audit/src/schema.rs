@@ -189,13 +189,24 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<(), AuditError> {
             .find(|m| m.version == current + 1)
             .expect("MIGRATIONS covers 1..=SCHEMA_VERSION contiguously (compile-time asserted)");
 
-        tx.execute_batch(next.sql)?;
-        tx.execute(
-            "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-            params![next.version, next.name, now_unix_ms()],
-        )?;
+        apply_migration(&tx, next, now_unix_ms())?;
         tx.commit()?;
     }
+}
+
+/// Run one migration's SQL inside `tx` and record it in
+/// `schema_version`, so the two land or fail together.
+fn apply_migration(
+    tx: &rusqlite::Transaction<'_>,
+    migration: &Migration,
+    applied_at_ms: i64,
+) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(migration.sql)?;
+    tx.execute(
+        "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![migration.version, migration.name, applied_at_ms],
+    )?;
+    Ok(())
 }
 
 fn ensure_schema_version_table(conn: &Connection) -> Result<(), AuditError> {
@@ -268,6 +279,20 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bring a fresh database to the schema just *before* `version`, one
+    /// immediate transaction per migration as [`migrate`] would, so a
+    /// test can plant rows the migration under test must cope with.
+    fn migrate_below(conn: &mut Connection, version: i32) {
+        ensure_schema_version_table(conn).unwrap();
+        for migration in MIGRATIONS.iter().take_while(|m| m.version < version) {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            apply_migration(&tx, migration, 1).unwrap();
+            tx.commit().unwrap();
+        }
+    }
     use crate::AuditLog;
     use crate::test_support::sample_session;
     use tempfile::NamedTempFile;
@@ -483,19 +508,7 @@ mod tests {
         let request_id = RequestId::new();
         {
             let mut conn = Connection::open(db.path()).unwrap();
-            ensure_schema_version_table(&conn).unwrap();
-            for migration in MIGRATIONS.iter().take_while(|m| m.version < 11) {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .unwrap();
-                tx.execute_batch(migration.sql).unwrap();
-                tx.execute(
-                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-                    params![migration.version, migration.name, 1_i64],
-                )
-                .unwrap();
-                tx.commit().unwrap();
-            }
+            migrate_below(&mut conn, 11);
             conn.execute(
                 "INSERT INTO session (session_id, opened_at, agent_kind) \
                  VALUES (?1, 1, 'claude')",
@@ -565,19 +578,7 @@ mod tests {
         // and stop. `AuditLog::open` would otherwise run v2 first.
         {
             let mut conn = Connection::open(db.path()).unwrap();
-            ensure_schema_version_table(&conn).unwrap();
-            for migration in MIGRATIONS.iter().take_while(|m| m.version < 2) {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .unwrap();
-                tx.execute_batch(migration.sql).unwrap();
-                tx.execute(
-                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-                    params![migration.version, migration.name, 1_i64],
-                )
-                .unwrap();
-                tx.commit().unwrap();
-            }
+            migrate_below(&mut conn, 2);
 
             // Plant a legacy 'approved' row by walking the audit chain
             // the v1 schema requires (session → request → staged
@@ -655,19 +656,7 @@ mod tests {
         let session_id = SessionId::new();
         {
             let mut conn = Connection::open(db.path()).unwrap();
-            ensure_schema_version_table(&conn).unwrap();
-            for migration in MIGRATIONS.iter().take_while(|m| m.version < 9) {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .unwrap();
-                tx.execute_batch(migration.sql).unwrap();
-                tx.execute(
-                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-                    params![migration.version, migration.name, 1_i64],
-                )
-                .unwrap();
-                tx.commit().unwrap();
-            }
+            migrate_below(&mut conn, 9);
             conn.execute(
                 "INSERT INTO session (session_id, opened_at, agent_kind) \
                  VALUES (?1, 1, 'claude')",
@@ -776,19 +765,7 @@ mod tests {
         let stopped_mid_mint = RequestId::new();
         {
             let mut conn = Connection::open(db.path()).unwrap();
-            ensure_schema_version_table(&conn).unwrap();
-            for migration in MIGRATIONS.iter().take_while(|m| m.version < 11) {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .unwrap();
-                tx.execute_batch(migration.sql).unwrap();
-                tx.execute(
-                    "INSERT INTO schema_version (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-                    params![migration.version, migration.name, 1_i64],
-                )
-                .unwrap();
-                tx.commit().unwrap();
-            }
+            migrate_below(&mut conn, 11);
             conn.execute(
                 "INSERT INTO session (session_id, opened_at, agent_kind) \
                  VALUES (?1, 1, 'claude')",
