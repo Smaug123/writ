@@ -4,7 +4,7 @@ use super::*;
 use crate::agent_vm_lifecycle::{AgentVmSessionStateStatus, NetworkHealth};
 use crate::audit::GitPushOutcomeResult;
 use crate::core::{GitHubAccess, GitHubRequest, RepoRef, Sha256Hex, SshKeyFingerprint};
-use crate::vm_git::{GitCloneRepo, WorkspaceWarmMode};
+use crate::vm_git::WorkspaceWarmMode;
 use proptest::prelude::*;
 use std::path::PathBuf;
 
@@ -19,9 +19,7 @@ fn sample_repo() -> RepoRef {
     }
 }
 
-fn sample_clone_repo() -> GitCloneRepo {
-    "owner/repo".parse().unwrap()
-}
+use crate::test_support::{sample_clone_repo, sample_object_id};
 
 // --- ClientMessage roundtrips -----------------------------------------
 
@@ -682,13 +680,6 @@ fn sample_request_id() -> RequestId {
 
 fn sample_agent_run_id() -> AgentRunId {
     "f2f2f2f2-0000-0000-0000-000000000001".parse().unwrap()
-}
-
-fn sample_object_id(nibble: char) -> GitObjectId {
-    std::iter::repeat_n(nibble, 40)
-        .collect::<String>()
-        .parse()
-        .unwrap()
 }
 
 fn sample_staged_summary() -> StagedPushSummary {

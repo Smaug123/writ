@@ -637,34 +637,17 @@ pub async fn commit_prepared_promotion(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
 
     use serde_json::json;
-    use time::macros::datetime;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::git_push_walker::test_fixture::InMemoryGitObjectSource;
     use crate::git_push_walker::{ShaMap, StagingCommit, StagingTree};
-    use crate::github_git_db::{CommitIdentity, GitDataHttp};
+    use crate::github_git_db::GitDataHttp;
 
-    fn sample_repo() -> RepoRef {
-        RepoRef::from_str("owner/name").unwrap()
-    }
-
-    fn sample_object_id(nibble: char) -> GitObjectId {
-        GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
-    }
-
-    fn sample_identity(name: &str) -> CommitIdentity {
-        CommitIdentity::new(
-            name,
-            format!("{name}@example.invalid"),
-            datetime!(2024-01-15 10:30:45 UTC),
-        )
-        .expect("sample date formats")
-    }
+    use crate::test_support::{sample_identity, sample_object_id, sample_repo};
 
     fn client_against(server: &MockServer, token: &str) -> GitDataClient {
         GitDataClient::new(&GitDataHttp::production(), server.uri(), token.to_string())

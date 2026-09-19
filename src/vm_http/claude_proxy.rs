@@ -476,9 +476,11 @@ mod tests {
     use super::super::broker_effect::broker_effect;
     use super::super::proxy_common::ProxyEffect;
     use super::super::tests::{
-        bearer, make_broker_state, make_broker_state_with_extra_secret, open_audit_session,
-        raw_http_response, raw_http_response_with_headers, serve_raw_http_once,
-        services_with_claude_proxy, session_for_subnet, token,
+        bearer, raw_http_response, raw_http_response_with_headers, serve_raw_http_once,
+        services_with_claude_proxy, token,
+    };
+    use super::super::tests::{
+        broker_with_open_session, broker_with_secret_and_open_session, loopback_host, loopback_net,
     };
     use super::super::{
         DispatchedTestResponse, VM_HTTP_READ_TIMEOUT, VmHttpDispatch, VmHttpHeader, VmHttpRequest,
@@ -486,7 +488,6 @@ mod tests {
     };
     use super::*;
     use crate::audit::{ClaudeProxyAuditDecision, ClaudeProxyAuditRoute};
-    use crate::core::Ipv4Cidr;
     use crate::secret::SecretKey;
     use std::sync::Arc;
 
@@ -606,12 +607,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new_with_anthropic_version(
@@ -764,12 +764,11 @@ mod tests {
 
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -833,12 +832,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -896,12 +894,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -953,9 +950,7 @@ mod tests {
     async fn claude_proxy_models_route_rejects_post_with_method_not_allowed() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1000,9 +995,7 @@ mod tests {
     async fn claude_proxy_missing_host_secret_is_bad_gateway_without_upstream_call() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1050,12 +1043,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-bearer-token").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-bearer-token")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1117,12 +1109,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-oauth-token").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-oauth-token")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1204,12 +1195,11 @@ mod tests {
     async fn claude_proxy_x_api_key_rejects_oauth_token_shape_before_upstream() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "sk-ant-oat01-host-oauth-token")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1259,12 +1249,11 @@ mod tests {
     async fn claude_proxy_rejects_duplicate_forwarded_headers() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1319,12 +1308,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1406,12 +1394,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1488,12 +1475,11 @@ mod tests {
     async fn claude_proxy_auth_denial_is_audited_without_contacting_upstream() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_net(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(
@@ -1551,12 +1537,11 @@ mod tests {
     async fn a_refused_local_response_outcome_records_neither_row() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("anthropic-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-anthropic-key")),
+            loopback_net(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpClaudeProxyService::new(
             Arc::clone(&state),
             VmHttpClaudeProxyConfig::new(

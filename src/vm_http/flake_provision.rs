@@ -491,6 +491,8 @@ mod tests {
 
     use wiremock::MockServer;
 
+    use super::super::tests::loopback_net;
+
     use super::super::tests::{
         bearer, make_broker_state, open_audit_session, record_contents_read_grant,
         session_for_subnet, token,
@@ -500,7 +502,7 @@ mod tests {
     };
     use super::*;
     use crate::audit::FlakeProvisionAuditOutcome;
-    use crate::core::{Ipv4Cidr, RepoRef, UnixMillis};
+    use crate::core::{RepoRef, UnixMillis};
     use crate::flake_fixtures::{
         NO_INPUT_LOCK, SSH_INPUT_LOCK, fake_nix_archiving, fake_nix_failing, flake_mirror_with_lock,
     };
@@ -595,7 +597,7 @@ mod tests {
     }
 
     fn session() -> VmHttpSession {
-        session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap())
+        session_for_subnet(loopback_net())
     }
 
     fn no_flake_provision_services() -> VmHttpServices<Box<dyn SecretStore>> {

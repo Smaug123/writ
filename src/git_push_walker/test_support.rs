@@ -6,34 +6,15 @@
 
 use super::*;
 pub(super) use crate::test_support::{
-    commit_empty, commit_merge, init_test_repo, required_tool, rev_parse, run_git,
-    shell_quote_path, write_executable_script,
+    commit_empty, commit_merge, init_test_repo, required_tool, rev_parse, run_git, sample_identity,
+    sample_object_id, sample_repo, shell_quote_path, write_executable_script,
 };
-use std::str::FromStr;
 
 use crate::github_git_db::GitDataHttp;
 
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-pub(super) fn sample_repo() -> RepoRef {
-    RepoRef::from_str("owner/name").unwrap()
-}
-
-pub(super) fn sample_object_id(nibble: char) -> GitObjectId {
-    GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
-}
-
-pub(super) fn sample_identity(name: &str) -> CommitIdentity {
-    use time::macros::datetime;
-    CommitIdentity::new(
-        name,
-        format!("{name}@example.invalid"),
-        datetime!(2024-01-15 10:30:45 UTC),
-    )
-    .expect("sample date formats")
-}
 
 pub(super) fn client_against(server: &MockServer, token: &str) -> GitDataClient {
     GitDataClient::new(&GitDataHttp::production(), server.uri(), token.to_string())

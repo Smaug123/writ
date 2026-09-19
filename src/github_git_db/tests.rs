@@ -1,20 +1,12 @@
 //! Tests for the GitHub Git Database client, domain types, and wire DTOs. Split out of `github_git_db.rs` (an inline `#[cfg(test)]` module); tests unchanged.
 
-use std::str::FromStr;
-
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
-fn sample_repo() -> RepoRef {
-    RepoRef::from_str("owner/name").unwrap()
-}
-
-fn sample_object_id(nibble: char) -> GitObjectId {
-    GitObjectId::new(std::iter::repeat_n(nibble, 40).collect::<String>()).unwrap()
-}
+use crate::test_support::{sample_object_id, sample_repo};
 
 fn client_against(server: &MockServer, token: &str) -> GitDataClient {
     GitDataClient::new(&GitDataHttp::production(), server.uri(), token.to_string())

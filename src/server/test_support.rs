@@ -8,6 +8,7 @@
 
 pub(super) use crate::test_support::{
     InMemorySecretStore, broker_state, claude_broker_state, find_in_path, required_tool_any,
+    sample_branch, sample_clone_repo, sample_object_id,
 };
 use std::path::PathBuf;
 
@@ -229,21 +230,6 @@ pub(super) fn make_state_with_approve_ready(
     // unaffected.
     inner.policy.writable_repos = vec![repo("owner", "repo")];
     (state, tmp)
-}
-
-pub(super) fn sample_clone_repo() -> crate::vm_git::GitCloneRepo {
-    "owner/repo".parse().unwrap()
-}
-
-pub(super) fn sample_branch() -> crate::vm_git::GitBranchName {
-    "feature/x".parse().unwrap()
-}
-
-pub(super) fn sample_object_id(nibble: char) -> crate::vm_git::GitObjectId {
-    std::iter::repeat_n(nibble, 40)
-        .collect::<String>()
-        .parse()
-        .unwrap()
 }
 
 /// Mirror of the same-named helper in `audit::git_push::tests`; the

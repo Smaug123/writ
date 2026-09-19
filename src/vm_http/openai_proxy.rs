@@ -543,13 +543,15 @@ mod tests {
         bearer, make_broker_state, make_broker_state_with_extra_secret, open_audit_session,
         raw_http_response_with_headers, serve_raw_http_once, session_for_subnet, token,
     };
+    use super::super::tests::{
+        broker_with_open_session, broker_with_secret_and_open_session, loopback_host, loopback_net,
+    };
     use super::super::{
         VM_HTTP_READ_TIMEOUT, VmHttpDispatch, VmHttpHeader, VmHttpRequest, VmHttpServices,
         VmHttpSession, VmHttpStatus, dispatch_vm_http_head_and_body,
     };
     use super::*;
     use crate::audit::{OpenAiProxyAuditDecision, OpenAiProxyAuditRoute};
-    use crate::core::Ipv4Cidr;
     use crate::secret::{SecretKey, SecretStore};
 
     async fn route_openai_proxy_request<S: SecretStore + Send + Sync + 'static>(
@@ -949,12 +951,11 @@ mod tests {
         .await;
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("openai-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-openai-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpOpenAiProxyService::new(
             Arc::clone(&state),
             VmHttpOpenAiProxyConfig::new(
@@ -1066,12 +1067,11 @@ mod tests {
     async fn openai_proxy_auth_denial_is_audited_without_contacting_upstream() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("openai-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-openai-key")),
+            loopback_net(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpOpenAiProxyService::new(
             Arc::clone(&state),
             VmHttpOpenAiProxyConfig::new(
@@ -1126,12 +1126,11 @@ mod tests {
     async fn openai_proxy_unsupported_route_is_audited_with_404() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("openai-api-key").unwrap();
-        let state = make_broker_state_with_extra_secret(
+        let (state, session) = broker_with_secret_and_open_session(
             &github,
             Some((secret_key.clone(), "host-openai-key")),
+            loopback_host(),
         );
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
         let service = VmHttpOpenAiProxyService::new(
             Arc::clone(&state),
             VmHttpOpenAiProxyConfig::new(
@@ -1224,7 +1223,7 @@ mod tests {
             chatgpt_auth_bundle_json(far_future, "acct-rotated-7", true, "refresh-token-123");
         let state =
             make_broker_state_with_extra_secret(&github, Some((secret_key.clone(), &bundle)));
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        let session = session_for_subnet(loopback_host());
         open_audit_session(&state, session.session_id());
         let service = VmHttpOpenAiProxyService::new(
             Arc::clone(&state),
@@ -1326,7 +1325,7 @@ mod tests {
         let bundle = chatgpt_auth_bundle_json(stale_exp, "acct-before", false, "refresh-stale");
         let state =
             make_broker_state_with_extra_secret(&github, Some((secret_key.clone(), &bundle)));
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
+        let session = session_for_subnet(loopback_host());
         open_audit_session(&state, session.session_id());
         let service = VmHttpOpenAiProxyService::new(
             Arc::clone(&state),
@@ -1395,9 +1394,7 @@ mod tests {
     async fn openai_proxy_chatgpt_oauth_returns_502_with_login_required_when_secret_missing() {
         let github = MockServer::start().await;
         let secret_key = SecretKey::new("openai-chatgpt-auth").unwrap();
-        let state = make_broker_state(&github);
-        let session = session_for_subnet(Ipv4Cidr::new(Ipv4Addr::LOCALHOST, 32).unwrap());
-        open_audit_session(&state, session.session_id());
+        let (state, session) = broker_with_open_session(&github, loopback_host());
         let service = VmHttpOpenAiProxyService::new(
             Arc::clone(&state),
             VmHttpOpenAiProxyConfig::new(
