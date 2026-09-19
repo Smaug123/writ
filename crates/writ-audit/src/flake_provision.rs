@@ -210,43 +210,6 @@ impl crate::effect_table::EffectAuditTable for FlakeProvisionAuditTable {
 }
 
 impl AuditLog {
-    /// Write *only* the request row of a provisioning pair. Test-only: the
-    /// handler reaches this table through the two-phase guard
-    /// (`begin_effect` + `complete`), which is what keeps the request row
-    /// durable before `nix flake archive` runs *and* forbids leaving it
-    /// unpaired. See [`AuditLog::record_claude_proxy_request`] for what the
-    /// tests need an unpaired write for.
-    #[cfg(test)]
-    pub(crate) fn record_flake_provision_request(
-        &self,
-        r: &FlakeProvisionRequestRecord<'_>,
-    ) -> Result<(), AuditError> {
-        validate_flake_provision_request(r)?;
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            crate::validation::check_session_open(&tx, r.session_id)?;
-            insert_flake_provision_request_row(&tx, r)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
-    /// Write *only* the outcome row of a provisioning pair. Test-only, for the
-    /// same reason as [`AuditLog::record_flake_provision_request`]; the FK
-    /// enforces that the request row exists.
-    #[cfg(test)]
-    pub(crate) fn record_flake_provision_outcome(
-        &self,
-        r: &FlakeProvisionOutcomeRecord<'_>,
-    ) -> Result<(), AuditError> {
-        self.with_conn_mut(|c| {
-            let tx = c.transaction()?;
-            insert_flake_provision_outcome_row(&tx, r)?;
-            tx.commit()?;
-            Ok(())
-        })
-    }
-
     pub fn list_flake_provision_requests_for_session(
         &self,
         id: SessionId,
@@ -367,59 +330,6 @@ fn nonneg(value: Option<i64>, what: &'static str) -> Result<u64, AuditError> {
 mod tests {
     use super::*;
     use crate::test_support::sample_session;
-    use proptest::prelude::*;
-
-    /// Raw request-table rows (every column, in insert order) for equivalence
-    /// assertions — the flake analogue of `proxy_table`'s `dump_request_rows`.
-    #[allow(clippy::type_complexity)]
-    fn dump_flake_request_rows(log: &AuditLog) -> Vec<(String, String, i64, String, String, i64)> {
-        log.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT request_id, session_id, received_at, flake_dir, cache_dir, input_count \
-                 FROM flake_provision_request ORDER BY rowid",
-            )?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
-        .unwrap()
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn dump_flake_outcome_rows(
-        log: &AuditLog,
-    ) -> Vec<(String, i64, String, i64, i64, Option<String>)> {
-        log.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT request_id, completed_at, status, archived_path_count, archived_bytes, \
-                 error FROM flake_provision_outcome ORDER BY rowid",
-            )?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
-        .unwrap()
-    }
 
     fn request(
         request_id: RequestId,
@@ -442,9 +352,9 @@ mod tests {
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
 
-        log.record_flake_provision_request(&request(request_id, s.session_id))
+        log.seed_effect_request::<FlakeProvisionAuditTable>(&request(request_id, s.session_id))
             .unwrap();
-        log.record_flake_provision_outcome(&FlakeProvisionOutcomeRecord {
+        log.seed_effect_outcome::<FlakeProvisionAuditTable>(&FlakeProvisionOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_200),
             result: FlakeProvisionResult::Success {
@@ -482,9 +392,9 @@ mod tests {
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
 
-        log.record_flake_provision_request(&request(request_id, s.session_id))
+        log.seed_effect_request::<FlakeProvisionAuditTable>(&request(request_id, s.session_id))
             .unwrap();
-        log.record_flake_provision_outcome(&FlakeProvisionOutcomeRecord {
+        log.seed_effect_outcome::<FlakeProvisionAuditTable>(&FlakeProvisionOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_200),
             result: FlakeProvisionResult::Failure {
@@ -512,7 +422,7 @@ mod tests {
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
 
-        log.record_flake_provision_request(&request(request_id, s.session_id))
+        log.seed_effect_request::<FlakeProvisionAuditTable>(&request(request_id, s.session_id))
             .unwrap();
         let entries = log
             .list_flake_provision_requests_for_session(s.session_id)
@@ -520,31 +430,6 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].completed_at, None);
         assert_eq!(entries[0].outcome, None);
-    }
-
-    #[test]
-    fn request_rejects_closed_or_missing_session() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
-            .unwrap();
-
-        let closed = log
-            .record_flake_provision_request(&request(RequestId::new(), s.session_id))
-            .unwrap_err();
-        assert!(
-            matches!(closed, AuditError::Invariant("session is closed")),
-            "got: {closed:?}"
-        );
-
-        let missing = log
-            .record_flake_provision_request(&request(RequestId::new(), SessionId::new()))
-            .unwrap_err();
-        assert!(
-            matches!(missing, AuditError::Invariant("session does not exist")),
-            "got: {missing:?}"
-        );
     }
 
     #[test]
@@ -556,7 +441,7 @@ mod tests {
         let mut empty_flake = request(RequestId::new(), s.session_id);
         empty_flake.flake_dir = "";
         assert!(matches!(
-            log.record_flake_provision_request(&empty_flake)
+            log.seed_effect_request::<FlakeProvisionAuditTable>(&empty_flake)
                 .unwrap_err(),
             AuditError::LabeledInvariant {
                 label: "Flake provision",
@@ -567,7 +452,7 @@ mod tests {
         let mut empty_cache = request(RequestId::new(), s.session_id);
         empty_cache.cache_dir = "";
         assert!(matches!(
-            log.record_flake_provision_request(&empty_cache)
+            log.seed_effect_request::<FlakeProvisionAuditTable>(&empty_cache)
                 .unwrap_err(),
             AuditError::LabeledInvariant {
                 label: "Flake provision",
@@ -582,11 +467,11 @@ mod tests {
         let s = sample_session();
         log.open_session(&s).unwrap();
         let request_id = RequestId::new();
-        log.record_flake_provision_request(&request(request_id, s.session_id))
+        log.seed_effect_request::<FlakeProvisionAuditTable>(&request(request_id, s.session_id))
             .unwrap();
 
         let err = log
-            .record_flake_provision_outcome(&FlakeProvisionOutcomeRecord {
+            .seed_effect_outcome::<FlakeProvisionAuditTable>(&FlakeProvisionOutcomeRecord {
                 request_id,
                 completed_at: UnixMillis::from_millis(1_700_000_200),
                 result: FlakeProvisionResult::Failure { error: "" },
@@ -605,7 +490,7 @@ mod tests {
     fn outcome_without_request_is_rejected_by_foreign_key() {
         let log = AuditLog::open_in_memory().unwrap();
         let err = log
-            .record_flake_provision_outcome(&FlakeProvisionOutcomeRecord {
+            .seed_effect_outcome::<FlakeProvisionAuditTable>(&FlakeProvisionOutcomeRecord {
                 request_id: RequestId::new(),
                 completed_at: UnixMillis::from_millis(1),
                 result: FlakeProvisionResult::Success {
@@ -621,76 +506,5 @@ mod tests {
             e.to_string().to_lowercase().contains("foreign key"),
             "expected FK violation, got: {e}"
         );
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
-
-        /// The generic guard's two-phase path (`begin_effect` + `complete`) must be
-        /// behaviour-preserving for flake-provision: it leaves both tables
-        /// byte-for-byte identical to the direct `record_flake_provision_request` +
-        /// `record_flake_provision_outcome`. This is the equivalence that lets the
-        /// VM-HTTP driver adopt the guard here (a later stage) without changing a
-        /// single persisted row — the flake analogue of `proxy_table`'s
-        /// `begin_then_complete_matches_the_two_phase_writers`.
-        #[test]
-        fn begin_then_complete_matches_the_direct_flake_writers(
-            // Non-empty, NUL-free paths (SQLite TEXT can't carry NUL); leading
-            // slash keeps them recognisable as directories without constraining
-            // the bytes otherwise.
-            flake_dir in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
-            cache_dir in "/[\\x01-\\x7e&&[^\\x00]]{0,80}",
-            input_count in 0u64..=100_000,
-            is_success in any::<bool>(),
-            archived_path_count in 0u64..=(i64::MAX as u64),
-            archived_bytes in 0u64..=(i64::MAX as u64),
-            error in "[\\x01-\\x7e]{1,80}",
-        ) {
-            let direct = AuditLog::open_in_memory().unwrap();
-            let guarded = std::sync::Arc::new(AuditLog::open_in_memory().unwrap());
-            let s = sample_session();
-            direct.open_session(&s).unwrap();
-            guarded.open_session(&s).unwrap();
-
-            let request_id = RequestId::new();
-            let request = FlakeProvisionRequestRecord {
-                request_id,
-                session_id: s.session_id,
-                received_at: UnixMillis::from_millis(1_700_000_100),
-                flake_dir: &flake_dir,
-                cache_dir: &cache_dir,
-                input_count,
-            };
-            let result = if is_success {
-                FlakeProvisionResult::Success {
-                    archived_path_count,
-                    archived_bytes,
-                }
-            } else {
-                FlakeProvisionResult::Failure { error: &error }
-            };
-            let outcome = FlakeProvisionOutcomeRecord {
-                request_id,
-                completed_at: UnixMillis::from_millis(1_700_000_200),
-                result,
-            };
-
-            direct.record_flake_provision_request(&request).unwrap();
-            direct.record_flake_provision_outcome(&outcome).unwrap();
-            guarded
-                .begin_effect::<FlakeProvisionAuditTable>(&request)
-                .unwrap()
-                .complete(&outcome)
-                .unwrap();
-
-            prop_assert_eq!(
-                dump_flake_request_rows(&direct),
-                dump_flake_request_rows(&guarded)
-            );
-            prop_assert_eq!(
-                dump_flake_outcome_rows(&direct),
-                dump_flake_outcome_rows(&guarded)
-            );
-        }
     }
 }

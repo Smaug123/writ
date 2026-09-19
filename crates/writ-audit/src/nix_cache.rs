@@ -81,30 +81,6 @@ pub struct NixCacheAuditEntry {
 }
 
 impl AuditLog {
-    /// Write *only* the request row of a VM Nix cache pair. Test-only: the
-    /// serve path is authority-free, so *every* production write of this table
-    /// is the coalesced
-    /// [`record_nix_cache_request_and_outcome`](AuditLog::record_nix_cache_request_and_outcome)
-    /// below. See [`AuditLog::record_claude_proxy_request`] for what the tests
-    /// need an unpaired write for.
-    #[cfg(test)]
-    pub(crate) fn record_nix_cache_request(
-        &self,
-        r: &NixCacheRequestRecord<'_>,
-    ) -> Result<(), AuditError> {
-        self.record_proxy_request::<NixCacheAuditTable>(r)
-    }
-
-    /// Write *only* the outcome row of a VM Nix cache pair. Test-only, for the
-    /// same reason as [`AuditLog::record_nix_cache_request`].
-    #[cfg(test)]
-    pub(crate) fn record_nix_cache_outcome(
-        &self,
-        r: &NixCacheOutcomeRecord<'_>,
-    ) -> Result<(), AuditError> {
-        self.record_proxy_outcome::<NixCacheAuditTable>(r)
-    }
-
     /// Persist a VM Nix cache request row and its outcome row in a single
     /// commit. The Nix cache serve path grants no authority, so — unlike a
     /// grant/mint — the request row need not be durable before the fetch; one
@@ -240,7 +216,7 @@ mod tests {
         decision: &NixCacheAuditDecision,
         route: NixCacheAuditRoute,
     ) -> Result<(), AuditError> {
-        log.record_nix_cache_request(&NixCacheRequestRecord {
+        log.seed_effect_request::<NixCacheAuditTable>(&NixCacheRequestRecord {
             request_id,
             session_id,
             received_at: UnixMillis::from_millis(1_700_000_100),
@@ -266,7 +242,7 @@ mod tests {
             NixCacheAuditRoute::CacheInfo,
         )
         .unwrap();
-        log.record_nix_cache_outcome(&NixCacheOutcomeRecord {
+        log.seed_effect_outcome::<NixCacheAuditTable>(&NixCacheOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_120),
             http_status: 200,
@@ -319,7 +295,7 @@ mod tests {
             NixCacheAuditRoute::Unsupported,
         )
         .unwrap();
-        log.record_nix_cache_outcome(&NixCacheOutcomeRecord {
+        log.seed_effect_outcome::<NixCacheAuditTable>(&NixCacheOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_101),
             http_status: 401,
@@ -356,7 +332,7 @@ mod tests {
             NixCacheAuditRoute::Nar,
         )
         .unwrap();
-        log.record_nix_cache_outcome(&NixCacheOutcomeRecord {
+        log.seed_effect_outcome::<NixCacheAuditTable>(&NixCacheOutcomeRecord {
             request_id,
             completed_at: UnixMillis::from_millis(1_700_000_130),
             http_status: 200,
@@ -377,45 +353,10 @@ mod tests {
     }
 
     #[test]
-    fn nix_cache_request_rejects_closed_or_missing_session() {
-        let log = AuditLog::open_in_memory().unwrap();
-        let s = sample_session();
-        log.open_session(&s).unwrap();
-        log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_050))
-            .unwrap();
-
-        let closed = record_nix_cache_request(
-            &log,
-            RequestId::new(),
-            s.session_id,
-            &NixCacheAuditDecision::Allow,
-            NixCacheAuditRoute::CacheInfo,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(closed, AuditError::Invariant("session is closed")),
-            "got: {closed:?}"
-        );
-
-        let missing = record_nix_cache_request(
-            &log,
-            RequestId::new(),
-            SessionId::new(),
-            &NixCacheAuditDecision::Allow,
-            NixCacheAuditRoute::CacheInfo,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(missing, AuditError::Invariant("session does not exist")),
-            "got: {missing:?}"
-        );
-    }
-
-    #[test]
     fn nix_cache_outcome_without_request_is_rejected() {
         let log = AuditLog::open_in_memory().unwrap();
         let err = log
-            .record_nix_cache_outcome(&NixCacheOutcomeRecord {
+            .seed_effect_outcome::<NixCacheAuditTable>(&NixCacheOutcomeRecord {
                 request_id: RequestId::new(),
                 completed_at: UnixMillis::from_millis(1),
                 http_status: 502,

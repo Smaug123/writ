@@ -1422,7 +1422,7 @@ proptest! {
     /// variant, and assert the result fails to parse.
     #[test]
     fn client_message_rejects_unknown_top_level_fields(
-        variant_index in 0usize..13,
+        msg in proptest::sample::select(sample_client_messages()),
         // ASCII-letters-only key, excluded against the union of every
         // variant's known field names below.
         unknown_key in "[a-z]{1,16}",
@@ -1434,10 +1434,10 @@ proptest! {
             "request_id", "reason", "operator",
             "outcome",
             "capabilities", "purpose", "output_ref",
+            "protocol_version", "signed_metadata", "signature",
         ];
         prop_assume!(!KNOWN_FIELDS.contains(&unknown_key.as_str()));
 
-        let msg = sample_client_message(variant_index);
         let mut value = serde_json::to_value(&msg).unwrap();
         value.as_object_mut().unwrap().insert(
             unknown_key.clone(),
@@ -1447,37 +1447,75 @@ proptest! {
         let result = serde_json::from_value::<ClientMessage>(value.clone());
         prop_assert!(
             result.is_err(),
-            "variant {variant_index} accepted unknown key {unknown_key:?}: {value}",
+            "{} accepted unknown key {unknown_key:?}: {value}",
+            client_message_variant_name(&msg),
         );
     }
 }
 
 /// One sample per `ClientMessage` variant. The order is fixed so the
 /// proptest's variant index is stable across runs.
-fn sample_client_message(index: usize) -> ClientMessage {
-    match index {
-        0 => ClientMessage::OpenSession {
+/// The name of a message's variant. The `match` is exhaustive on purpose:
+/// adding a variant fails to compile here, which is the reminder to add a
+/// sample of it to [`sample_client_messages`].
+fn client_message_variant_name(msg: &ClientMessage) -> &'static str {
+    match msg {
+        ClientMessage::Hello { .. } => "Hello",
+        ClientMessage::OpenSession { .. } => "OpenSession",
+        ClientMessage::CloseSession { .. } => "CloseSession",
+        ClientMessage::Request { .. } => "Request",
+        ClientMessage::StartAgentVm { .. } => "StartAgentVm",
+        ClientMessage::StartAgentRun { .. } => "StartAgentRun",
+        ClientMessage::StopAgentVm { .. } => "StopAgentVm",
+        ClientMessage::ListAgentVms { .. } => "ListAgentVms",
+        ClientMessage::ListStagedPushes { .. } => "ListStagedPushes",
+        ClientMessage::ShowStagedPush { .. } => "ShowStagedPush",
+        ClientMessage::RejectStagedPush { .. } => "RejectStagedPush",
+        ClientMessage::ApproveStagedPush { .. } => "ApproveStagedPush",
+        ClientMessage::ReconcileStagedPush { .. } => "ReconcileStagedPush",
+        ClientMessage::VerifyAgentRun { .. } => "VerifyAgentRun",
+        ClientMessage::RunAgent { .. } => "RunAgent",
+    }
+}
+
+/// Every variant of `ClientMessage` must appear in this list exactly once;
+/// [`sample_client_messages_cover_every_variant`] checks it against
+/// [`client_message_variant_name`]'s exhaustive `match`.
+const CLIENT_MESSAGE_VARIANT_COUNT: usize = 15;
+
+/// One sample of every `ClientMessage` variant, for properties that must hold
+/// for each of them.
+fn sample_client_messages() -> Vec<ClientMessage> {
+    vec![
+        ClientMessage::Hello {
+            protocol_version: 1,
+        },
+        ClientMessage::VerifyAgentRun {
+            signed_metadata: sample_signed_run_metadata(),
+            signature: sample_ssh_signature(),
+        },
+        ClientMessage::OpenSession {
             label: Some("fix bug".into()),
             agent_kind: Some(AgentKind::Claude),
             agent_model: Some("claude-test".into()),
         },
-        1 => ClientMessage::CloseSession {
+        ClientMessage::CloseSession {
             session_id: fixed_session_id(),
         },
-        2 => ClientMessage::Request {
+        ClientMessage::Request {
             session_id: fixed_session_id(),
             capability: CapabilityRequest::GitHub(GitHubRequest::Metadata {
                 repo: sample_repo(),
             }),
         },
-        3 => ClientMessage::StartAgentVm {
+        ClientMessage::StartAgentVm {
             label: None,
             agent_kind: None,
             agent_model: None,
             workspace: None,
             guest_command: vec!["true".into()],
         },
-        4 => ClientMessage::StartAgentRun {
+        ClientMessage::StartAgentRun {
             label: None,
             agent_kind: AgentKind::Claude,
             agent_model: "claude-test".into(),
@@ -1489,20 +1527,20 @@ fn sample_client_message(index: usize) -> ClientMessage {
             prompt: AgentPrompt::new("p"),
             correlation_id: None,
         },
-        5 => ClientMessage::StopAgentVm {
+        ClientMessage::StopAgentVm {
             session_id: fixed_session_id(),
         },
-        6 => ClientMessage::ListAgentVms {},
-        7 => ClientMessage::ListStagedPushes { session_id: None },
-        8 => ClientMessage::ShowStagedPush {
+        ClientMessage::ListAgentVms {},
+        ClientMessage::ListStagedPushes { session_id: None },
+        ClientMessage::ShowStagedPush {
             request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
         },
-        9 => ClientMessage::RejectStagedPush {
+        ClientMessage::RejectStagedPush {
             request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
             operator: "alice".into(),
             reason: RejectionReason::try_new("leaks credentials").unwrap(),
         },
-        10 => ClientMessage::RunAgent {
+        ClientMessage::RunAgent {
             prompt: AgentPrompt::new("hello"),
             capabilities: vec![CapabilitySet::WorkspaceRead {
                 repo: sample_repo(),
@@ -1514,11 +1552,11 @@ fn sample_client_message(index: usize) -> ClientMessage {
             agent_kind: None,
             agent_model: None,
         },
-        11 => ClientMessage::ApproveStagedPush {
+        ClientMessage::ApproveStagedPush {
             request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
             operator: "alice".into(),
         },
-        12 => ClientMessage::ReconcileStagedPush {
+        ClientMessage::ReconcileStagedPush {
             request_id: "12345678-1234-1234-1234-123456789012".parse().unwrap(),
             operator: "alice".into(),
             outcome: ReconcileOutcome::Applied {
@@ -1526,8 +1564,20 @@ fn sample_client_message(index: usize) -> ClientMessage {
                 reason: "verified".into(),
             },
         },
-        other => unreachable!("variant index out of range: {other}"),
-    }
+    ]
+}
+
+#[test]
+fn sample_client_messages_cover_every_variant() {
+    let names: std::collections::BTreeSet<&str> = sample_client_messages()
+        .iter()
+        .map(client_message_variant_name)
+        .collect();
+    assert_eq!(
+        names.len(),
+        CLIENT_MESSAGE_VARIANT_COUNT,
+        "every variant needs one sample: {names:?}"
+    );
 }
 
 /// `VerifyAgentRun` carries only the metadata and its signature — never the

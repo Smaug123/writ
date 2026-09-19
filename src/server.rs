@@ -646,7 +646,7 @@ pub(crate) async fn request_capability<S: SecretStore + Send + Sync>(
     state: &Arc<BrokerState<S>>,
 ) -> CapabilityOutcome {
     // Preflight the session for a readable client error. The
-    // authoritative check runs inside `record_pre_mint`'s transaction
+    // authoritative check runs inside `begin_effect`'s transaction
     // (and the `request_requires_open_session` trigger behind it) —
     // without that, a CloseSession racing this check would land before
     // the insert and we'd write against a closed session. This preflight

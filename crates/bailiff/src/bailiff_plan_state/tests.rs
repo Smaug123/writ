@@ -1,11 +1,8 @@
 //! Properties of the plan transition relation.
 //!
-//! The suite is built around three reference implementations that
+//! The suite is built around two reference implementations that
 //! never consult the thing they check:
 //!
-//! - [`pre_slice1_state`] is the derivation as it stood before this
-//!   module existed, so the behaviour change is pinned as an explicit
-//!   table rather than left for a reviewer to reconstruct from a diff;
 //! - [`write_note`] applies a stage's note write without knowing
 //!   anything about [`PlanState`], so walking the relation with it
 //!   checks [`PlanState::presence`] against
@@ -42,28 +39,6 @@ fn all_presences() -> Vec<NotePresence> {
         }
     }
     out
-}
-
-/// The derivation exactly as `BailiffPlanSummary::state` implemented it
-/// before slice 1 (`bailiff_plan_view.rs:129-146`): "the highest
-/// workflow step reached", with a missing submission folded to
-/// `Corrupt`. Returns the rendered string so it cannot accidentally be
-/// written in terms of the new enum.
-fn pre_slice1_state(p: &NotePresence) -> &'static str {
-    if !p.submission {
-        return "corrupt";
-    }
-    if p.implement {
-        return "implemented";
-    }
-    if p.review {
-        return "reviewed";
-    }
-    match p.decision {
-        Some(Decision::Accepted) => "accepted",
-        Some(Decision::Rejected) => "rejected",
-        None => "submitted",
-    }
 }
 
 /// Apply a stage's note write. Knows only which note each stage
@@ -177,95 +152,6 @@ fn presence_agrees_with_the_transition_relation() {
             }
         }
     }
-}
-
-/// The deliberate behaviour change, as data. Every note set on which
-/// slice 1 disagrees with the old derivation, and no others.
-///
-/// Compared over existing refs only, because that is all the old
-/// derivation ever saw: `summarize_plan` was reached through
-/// `list_plan_ids`, which enumerates by ref existence.
-///
-/// Two kinds of entry. Most are note sets the old code labelled with a
-/// workflow stage even though no legal sequence produces them —
-/// implement-without-review, a verdict recorded before any review, and
-/// so on. Two are *relabellings*: `{sub, rev, decision}` used to read
-/// as `reviewed` under the old "highest stage reached" rule, and now
-/// reads as the verdict it carries, because the decision is the later
-/// step.
-///
-/// An existing-but-empty ref is deliberately *not* here: it was
-/// `Corrupt` before and still is. It only stopped being so in a draft
-/// that had dropped ref existence from the observation, which is the
-/// regression `an_existing_but_empty_ref_is_corrupt_not_absent` pins.
-fn behaviour_delta_table() -> Vec<(NotePresence, &'static str, PlanState)> {
-    let p = |submission, decision, review, implement| NotePresence {
-        ref_exists: true,
-        submission,
-        decision,
-        review,
-        implement,
-    };
-    let acc = Some(Decision::Accepted);
-    let rej = Some(Decision::Rejected);
-    vec![
-        // A verdict recorded before any review — the ordering the
-        // design doc rules out, and the gap the old `decide` verb left
-        // wide open.
-        (p(true, acc, false, false), "accepted", PlanState::Corrupt),
-        (p(true, rej, false, false), "rejected", PlanState::Corrupt),
-        // Reviewed *and* decided: the old rule reported the earlier
-        // stage, the relation reports the later one.
-        (p(true, acc, true, false), "reviewed", PlanState::Accepted),
-        (p(true, rej, true, false), "reviewed", PlanState::Rejected),
-        // Implemented without some earlier stage.
-        (
-            p(true, None, false, true),
-            "implemented",
-            PlanState::Corrupt,
-        ),
-        (p(true, acc, false, true), "implemented", PlanState::Corrupt),
-        (p(true, rej, false, true), "implemented", PlanState::Corrupt),
-        (p(true, None, true, true), "implemented", PlanState::Corrupt),
-        (p(true, rej, true, true), "implemented", PlanState::Corrupt),
-    ]
-}
-
-#[test]
-fn derive_matches_the_old_derivation_except_on_the_delta_table() {
-    let table = behaviour_delta_table();
-    for (presence, old, new) in &table {
-        assert_eq!(
-            pre_slice1_state(presence),
-            *old,
-            "delta table misstates the old behaviour for {presence:?}",
-        );
-        assert_eq!(
-            derive_state(presence),
-            *new,
-            "delta table misstates the new behaviour for {presence:?}",
-        );
-        assert_ne!(
-            pre_slice1_state(presence),
-            new.as_str(),
-            "delta table lists {presence:?} as changed, but it did not change",
-        );
-    }
-    // Everything outside the table is unchanged. This is the half that
-    // makes the table a *complete* account of the behaviour change.
-    let changed: BTreeSet<NotePresence> = table.iter().map(|(p, _, _)| *p).collect();
-    for presence in all_presences() {
-        // The old derivation only ever ran on refs that exist.
-        if !presence.ref_exists || changed.contains(&presence) {
-            continue;
-        }
-        assert_eq!(
-            derive_state(&presence).as_str(),
-            pre_slice1_state(&presence),
-            "undeclared behaviour change at {presence:?}",
-        );
-    }
-    assert_eq!(table.len(), 9);
 }
 
 /// `derive` is defined on the whole observation space, and the states

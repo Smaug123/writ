@@ -247,48 +247,6 @@ impl GitDataClient {
         Ok(parsed.sha)
     }
 
-    /// `GET /repos/{owner}/{repo}` — fetch repository metadata and
-    /// return the App-side default branch name.
-    ///
-    /// The replay walker needs this for the branch-creation case: when
-    /// the agent's bundle does not name an `expected_remote_head` (the
-    /// branch does not yet exist on GitHub), the walker still has to
-    /// find a boundary commit that delimits which bundle commits are
-    /// new. The default branch's tip is that boundary, and this method
-    /// is the first hop in resolving it.
-    ///
-    /// The repo metadata response carries many fields; only
-    /// `default_branch` is exposed. Validation happens at the
-    /// boundary: a name GitHub returns that fails [`GitBranchName::new`]
-    /// surfaces as [`GitDataError::InvalidDefaultBranch`] rather than
-    /// being silently coerced.
-    pub async fn get_default_branch(&self, repo: &RepoRef) -> Result<GitBranchName, GitDataError> {
-        let url = format!(
-            "{}/repos/{}/{}",
-            self.api_base.trim_end_matches('/'),
-            repo.owner,
-            repo.name,
-        );
-        let response = self
-            .http
-            .get(&url)
-            .timeout(self.small_call)
-            .bearer_auth(&self.token)
-            .header("Accept", ACCEPT_HEADER)
-            .header("X-GitHub-Api-Version", API_VERSION_HEADER)
-            .header("User-Agent", USER_AGENT_HEADER)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GitDataError::ApiError { status, body });
-        }
-        let parsed: RepoMetadataResponse = response.json().await?;
-        GitBranchName::new(parsed.default_branch)
-            .map_err(|source| GitDataError::InvalidDefaultBranch { source })
-    }
-
     /// `GET /repos/{owner}/{repo}/git/ref/heads/{branch}` — return
     /// the App-side commit SHA the named branch currently points at.
     ///

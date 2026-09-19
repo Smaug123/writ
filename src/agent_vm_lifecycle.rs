@@ -313,21 +313,6 @@ pub struct BoundedOutput {
     pub truncated: bool,
 }
 
-impl BoundedOutput {
-    /// stdout and stderr concatenated (stdout first), for diagnostics that do not
-    /// care which stream a line came from.
-    pub fn combined(self) -> String {
-        let mut out = self.stdout;
-        if !self.stderr.is_empty() {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&self.stderr);
-        }
-        out
-    }
-}
-
 /// The byte-bounded *tail* captured by
 /// [`ProcessInvocation::run_capturing_merged_tail`]: the last `max_bytes` of a
 /// command's merged output, for salvaging the newest lines of a crash log.
