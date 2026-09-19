@@ -383,7 +383,7 @@
             install -D -m 0555 ${guestInit}/bin/writ-agent-vm-guest-init \
               $out/sbin/writ-agent-vm-guest-init
           '';
-          # The locked profile's rootfs invariants (plan stage B3), checked over
+          # The locked profile's rootfs invariants, checked over
           # the closure the image is assembled from, i.e. the rootfs as it will
           # be presented: no setuid or setgid file anywhere; the initializer's
           # own binary and its directory carry no write bit; and the initializer
@@ -425,9 +425,7 @@
               esac
             done
           '';
-          # grep/sed/awk/find and curl now ship in production (see the guest
-          # dev toolset in guestRoot below), so they are no longer forbidden.
-          # What stays proof-only is the egress/DNS negative-control set the
+          # The proof-only set is the egress/DNS negative control the
           # prove-*.sh harnesses use to demonstrate the no-egress firewall:
           # keeping wget/dig/nslookup out of production preserves a meaningful
           # "proof tools must not leak into prod" regression guard, and curl
@@ -447,9 +445,9 @@
               fi
             '')
             productionForbiddenBins;
-          # gawk/gnugrep now ship in the production base image, so the proof
-          # image inherits them; proofTools only needs to add the egress/DNS
-          # probe tools that stay out of production (wget, dig, nslookup).
+          # gawk/gnugrep ship in the production base image, so the proof image
+          # inherits them; proofTools adds only the egress/DNS probe tools that
+          # stay out of production (wget, dig, nslookup).
           proofTools = [
             guestPkgs.bind.dnsutils
             guestPkgs.wget
