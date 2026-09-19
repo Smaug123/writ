@@ -16,7 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::git_push_promote::UpdateRefError;
 use crate::github_git_db::{CommitIdentity, GitDataError};
-use crate::test_support::{find_in_path, rev_parse, run_git, sample_object_id};
+use crate::test_support::{find_in_path, required_tool, rev_parse, run_git, sample_object_id};
 use crate::vm_git::GitBranchName;
 use crate::vm_git_bundle::{GitCloneBaseUrl, GitCredentialBoundary, GitSecretEnvVar};
 use writ_core::git_env::apply_clean_git_config;
@@ -201,7 +201,7 @@ async fn prepare_refuses_pre_existing_staging_dir() {
 /// the orchestrator's planner reads from. Returns the staging dir
 /// plus the two SHAs.
 fn build_real_staging_repo() -> (tempfile::TempDir, PathBuf, GitObjectId, GitObjectId) {
-    let git = find_in_path("git").expect("real-git integration tests need `git` on PATH");
+    let git = required_tool("git");
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     let staging = tmp.path().join("staging.git");
@@ -292,7 +292,7 @@ fn ref_response_body(branch: &str, sha: &GitObjectId) -> serde_json::Value {
 fn runtime_pointed_at(staging_parent: &Path) -> PromoteRuntimeConfig {
     // Use the *real* `git` binary so the planner and CatFileObjectSource
     // can run against the staging repo.
-    let git = find_in_path("git").expect("real-git integration tests need `git` on PATH");
+    let git = required_tool("git");
     PromoteRuntimeConfig::new(
         git,
         GitCloneBaseUrl::github(),
@@ -315,10 +315,6 @@ fn runtime_pointed_at(staging_parent: &Path) -> PromoteRuntimeConfig {
 /// counts on each mock plus the returned `new_app_tip`.
 #[tokio::test]
 async fn run_approve_advances_branch_when_bundle_is_fast_forward() {
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let (tmp, staging_path, parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -391,10 +387,6 @@ async fn run_approve_advances_branch_when_bundle_is_fast_forward() {
 /// does not issue any upload or PATCH.
 #[tokio::test]
 async fn run_approve_refuses_when_branch_moved_before_walk() {
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let (tmp, staging_path, parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -447,10 +439,6 @@ async fn run_approve_refuses_when_branch_moved_before_walk() {
 /// the returned `new_app_tip` is the lease anchor itself.
 #[tokio::test]
 async fn run_approve_returns_noop_after_lease_check_when_bundle_tip_equals_lease() {
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let (tmp, staging_path, _parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -499,10 +487,6 @@ async fn run_approve_returns_noop_after_lease_check_when_bundle_tip_equals_lease
 /// PATCH) rather than resolve the push as approved.
 #[tokio::test]
 async fn run_approve_noop_refuses_when_branch_moved_away_from_lease() {
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let (tmp, staging_path, _parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -552,10 +536,6 @@ async fn run_approve_noop_refuses_when_branch_moved_away_from_lease() {
 /// `PostPatchFailure` after it.
 #[tokio::test]
 async fn run_approve_surfaces_update_ref_failure_after_walk() {
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let (tmp, staging_path, parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -631,10 +611,6 @@ async fn run_approve_surfaces_update_ref_failure_after_walk() {
 /// it was.
 #[tokio::test]
 async fn prepare_approve_uploads_every_object_but_never_patches() {
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let (tmp, staging_path, parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -753,10 +729,7 @@ fn write_stalling_cat_file_wrapper(dir: &Path, git: &Path, sleep: &Path) -> Path
 /// CI.
 #[tokio::test]
 async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
-    let Some(git) = find_in_path("git") else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let git = required_tool("git");
     let Some(sleep) = find_in_path("sleep") else {
         eprintln!("skipping: `sleep` not on PATH");
         return;
@@ -861,10 +834,6 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
 /// issuing it: the `expect(0)` on the PATCH mock is the assertion.
 #[tokio::test]
 async fn commit_rechecks_lease_and_refuses_when_branch_moved_after_prepare() {
-    if find_in_path("git").is_none() {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    }
     let (tmp, staging_path, parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -944,11 +913,6 @@ async fn commit_rechecks_lease_and_refuses_when_branch_moved_after_prepare() {
 #[tokio::test]
 #[should_panic(expected = "PATCH authorised by the wrong attempt")]
 async fn commit_under_another_attempts_witness_panics() {
-    if find_in_path("git").is_none() {
-        // `should_panic` cannot be skipped conditionally, so panic
-        // with the expected message to keep a git-less box green.
-        panic!("PATCH authorised by the wrong attempt (skipped: `git` not on PATH)");
-    }
     let (tmp, staging_path, parent, child) = build_real_staging_repo();
     let staging = StagingRepo::from_path_for_test(staging_path);
     let runtime = runtime_pointed_at(tmp.path());
@@ -1013,11 +977,8 @@ async fn commit_under_another_attempts_witness_panics() {
 #[tokio::test]
 async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
     use crate::fake_origin::FakeOrigin;
-    let Some(origin) = FakeOrigin::start().await else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
-    let git = find_in_path("git").expect("FakeOrigin::start returned Some, so git exists");
+    let origin = FakeOrigin::start().await;
+    let git = required_tool("git");
     let work_root = tempfile::tempdir().unwrap();
     let runtime = PromoteRuntimeConfig::new(
         git.clone(),
@@ -1072,10 +1033,7 @@ async fn prepare_staging_repo_fetches_prereq_from_fake_origin() {
 /// `bundle unbundle` with usage status.
 #[tokio::test]
 async fn unbundle_invocation_runs_against_real_git() {
-    let Some(git) = find_in_path("git") else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let git = required_tool("git");
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     let staging = tmp.path().join("staging.git");
@@ -1140,10 +1098,7 @@ async fn unbundle_invocation_runs_against_real_git() {
 /// `RunApproveError::BundleTipNotACommit`.
 #[tokio::test]
 async fn run_approve_rejects_non_commit_bundle_tip() {
-    let Some(git) = find_in_path("git") else {
-        eprintln!("skipping: `git` not on PATH");
-        return;
-    };
+    let git = required_tool("git");
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     let staging_path = tmp.path().join("staging.git");
