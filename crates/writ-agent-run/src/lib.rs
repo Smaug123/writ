@@ -16,7 +16,6 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use uuid::Uuid;
 use writ_core::core::Sha256Hex;
 
 pub const VM_AGENT_RUN_PATH_PREFIX: &str = "/v1/agent-runs";
@@ -38,9 +37,10 @@ pub const MAX_CORRELATION_ID_BYTES: usize = 64;
 pub const MIN_RUN_PURPOSE_BYTES: usize = 1;
 pub const MAX_RUN_PURPOSE_BYTES: usize = 128;
 
-#[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AgentRunId(Uuid);
+writ_core::uuid_id!(
+    /// Identifies one managed agent run, on both sides of the broker.
+    AgentRunId
+);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AgentPrompt(String);
@@ -246,46 +246,6 @@ pub struct VmAgentRunConfigResponse {
 pub struct AgentPromptError {
     byte_len: usize,
     max_bytes: usize,
-}
-
-impl AgentRunId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn as_uuid(self) -> Uuid {
-        self.0
-    }
-
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-}
-
-impl Default for AgentRunId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::str::FromStr for AgentRunId {
-    type Err = uuid::Error;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        raw.parse().map(Self)
-    }
-}
-
-impl fmt::Display for AgentRunId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl fmt::Debug for AgentRunId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "AgentRunId({})", self.0)
-    }
 }
 
 impl AgentPrompt {
