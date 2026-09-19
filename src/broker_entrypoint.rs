@@ -512,20 +512,12 @@ async fn serve_broker(
 
 /// Resolve when the process receives SIGTERM or SIGINT.
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler for broker");
-        let mut interrupt =
-            signal(SignalKind::interrupt()).expect("install SIGINT handler for broker");
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = interrupt.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler for broker");
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler for broker");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = interrupt.recv() => {}
     }
 }
 
