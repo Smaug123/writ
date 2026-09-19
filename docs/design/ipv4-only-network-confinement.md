@@ -545,14 +545,24 @@ proof record is never left with nothing startable for want of a pin. `dual_stack
 start on this platform, because it too runs the root prelaunch.
 
 When `locked_v1` admits, admission is conditional on host-gathered runtime
-evidence, not on the spelling alone: the helper's protocol probe reports v2,
-the image's isolation-ABI label is v1, and the platform is one the proof has
-been run against. "Platform" is two identifiers, because PF and vmnet belong
-to macOS while the guest kernel ships with the CLI, and macOS updates change
-vmnet behaviour without touching the CLI version (this subsystem's journal
-records RA behaviour changing across an OS update): the Apple `container` CLI
-version line (today `1.0.0`, build `ee848e3`) and the macOS build
-(`sw_vers` BuildVersion, today `25G72`). A third fact is host-local and no
+evidence, not on the spelling alone (the evidence, the probes that gather it
+and the decision over them are shipped in `agent_vm_locked_admission`;
+nothing calls them while the profile is closed): the helper's protocol probe
+reports v2, the image's isolation-ABI label is v1, and the platform is one
+the proof has been run against. "Platform" is three identifiers. Two of them
+are the host's, because PF and vmnet belong to macOS while the guest kernel
+ships with the CLI, and macOS updates change vmnet behaviour without touching
+the CLI version (this subsystem's journal records RA behaviour changing
+across an OS update): the Apple `container` CLI version line (today `1.4.1`,
+build `9a8917c`) and the macOS build (`sw_vers` BuildVersion, today `25G72`).
+The third is the guest image's *resolved manifest digest*, read from the same
+bounded `container inspect` the label comes from. The label is self-asserted
+and so a compatibility signal only — any image can stamp it — while the
+digest is identity, and it is also what the locked start path gives `container
+run` in place of the tag, so the image admitted is the image started. The
+three are pinned as whole records rather than as three independent lists: the
+proof is an experiment on one combination, and two facts each proven
+separately were never proven together. A fourth fact is host-local and no
 pin captures it: the effective placement of the `writ/session/*` anchor in
 the main ruleset. A `pass in quick` in `/etc/pf.conf` ahead of that anchor
 means no session rule is ever consulted, while every child-anchor readback
@@ -562,11 +572,15 @@ readback. The helper therefore reads the main ruleset back and reports
 whether writ's anchor is present and precedes every `quick` pass and every
 other filter anchor, and that report is admission evidence too. A preflight
 failure is not a reason to fall back to another profile: it says the anchor
-does not confine, which no profile survives. Both are exact-match pins against a
-list the proof maintains, so a host update closes the profile until the proof
-is re-run there. The list starts empty and a platform enters it only in the
-same change that records the proof passing on it, so the code that can admit
-the profile lands before the profile actually admits anywhere. Those are inputs to `admit`, gathered at start, so that a
+does not confine, which no profile survives. The platform pins are exact
+matches against a list the proof maintains, so a host update closes the
+profile until the proof is re-run there. The list starts empty and a platform
+enters it only in the same change that records the proof passing on it, so the
+code that can admit the profile lands before the profile actually admits
+anywhere. A probe that cannot be started, hangs, floods its byte cap, exits
+non-zero, or prints something unreadable yields an *unreadable fact*, which
+refuses and names that fact; there is no path on which a failed probe reads
+as a satisfied one. Those are inputs to `admit`, gathered at start, so that a
 plan can only ever be built from an admitted mode; there is no separate gate
 type and no bypass on the plan for tests, because a test that bypasses the
 guard is not testing it.

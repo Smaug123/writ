@@ -32,6 +32,24 @@ use capture::{Absorb, CaptureBuffer, CapturePolicy};
 
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long to wait for the leader to be reapable after the group kill, on the
+/// arms that kill a child they have *not* observed exit.
+///
+/// Those arms tolerate `EPERM` from `killpg` as "the group is already empty",
+/// which is sound for a child this process could signal. It is not sound for a
+/// child it could not: a command launched through `sudo` becomes root (sudo
+/// `exec`s it directly when no policy close hook is needed, so this is the
+/// *direct* child, not a descendant), and an unprivileged parent's `kill(2)`
+/// on it is a real permission failure wearing the same errno. Reaping such a
+/// child would block until it chose to exit, which is exactly the unbounded
+/// wait the whole-call deadline exists to rule out.
+///
+/// So the reap gets a grace period rather than forever. It is generous next to
+/// the microseconds a successful `killpg` needs, and giving up on it costs at
+/// most one unreaped child — which the caller is about to report as a timeout
+/// anyway, and whose lifetime is the privileged side's to bound.
+const POST_KILL_REAP_GRACE: Duration = Duration::from_secs(5);
+
 /// Upper bound on captured stderr. A [`StderrMode::Capture`] child's stderr is
 /// drained to EOF (so it never stalls on a full pipe) but only a line-aligned
 /// tail of at most this many bytes is retained: a verbose or hostile child
@@ -149,6 +167,12 @@ pub(crate) enum SupervisorError {
 
 /// Spawn `command` as a process-group leader, wait up to `timeout` for it to
 /// exit, then SIGKILL the whole group regardless of outcome.
+///
+/// `timeout` bounds the whole call, including the capture drains. The one
+/// thing that can run past it is reaping a child the group kill did not
+/// actually kill, which is bounded separately by [`POST_KILL_REAP_GRACE`] and
+/// then abandoned — so the true worst case is `timeout + POST_KILL_REAP_GRACE`
+/// and never longer.
 ///
 /// The caller must have fully configured `command` (program, argv, env, cwd,
 /// stdin) *except* stdout, stderr, and the process group, which this function
@@ -299,11 +323,13 @@ pub(crate) async fn run_supervised(
             // `Exited` arm — `killpg` can find no live member and report a benign
             // EPERM on macOS. Mark the exit as observed so that EPERM is
             // tolerated: we own this group (we created it with `process_group(0)`)
-            // and can always signal a live member, so EPERM here can only mean
-            // the group is already empty, never a real permission failure.
+            // and can signal any live member we have the privilege to signal, so
+            // EPERM here means the group is empty — *unless* the command raised
+            // its own privilege, as one launched through `sudo` does. That case
+            // is why the reap below is bounded rather than trusting the kill.
             cleanup_guard.tolerate_empty_group();
             let kill = cleanup_guard.kill_now_io();
-            let _ = child.wait().await;
+            reap_after_kill(&mut child).await;
             cleanup_guard.disarm();
             // Both outcomes below discard captured output by contract, so the
             // drains are aborted rather than awaited. Awaiting them would
@@ -319,17 +345,32 @@ pub(crate) async fn run_supervised(
         ChildExitObservation::TimedOut => {
             // Same exposure as the blocking timeout arm: the child may exit of its
             // own accord between the deadline and this kill, emptying the group.
-            // We have not reaped it, so an empty group is the only thing `EPERM`
-            // can mean, and a timeout must not surface as a kill failure.
+            // We have not reaped it, so an empty group is what `EPERM` means for
+            // a child we could have signalled, and a timeout must not surface as
+            // a kill failure. For one that raised its own privilege it means the
+            // kill did not take, which is what bounds the reap below.
             cleanup_guard.tolerate_empty_group();
             let kill = cleanup_guard.kill_now_io();
-            let _ = child.wait().await;
+            reap_after_kill(&mut child).await;
             cleanup_guard.disarm();
             abort_captures(stdout_drain, stderr_drain);
             kill.map_err(|source| SupervisorError::KillProcessGroup { pgid, source })?;
             Ok(SupervisedOutcome::TimedOut)
         }
     }
+}
+
+/// Reap a child that was killed rather than observed exiting, under
+/// [`POST_KILL_REAP_GRACE`].
+///
+/// A successful group kill makes this return at once. A kill that did not take
+/// — see [`POST_KILL_REAP_GRACE`] — would otherwise block forever, so the wait
+/// is abandoned and the child left unreaped. Dropping the [`Command`]'s child
+/// afterwards detaches it; it was already outside this process's control, and
+/// the caller's outcome (a timeout, or a rejected capture) does not depend on
+/// its status.
+async fn reap_after_kill(child: &mut tokio::process::Child) {
+    let _ = tokio::time::timeout(POST_KILL_REAP_GRACE, child.wait()).await;
 }
 
 /// Drop both capture drains without waiting for EOF.
@@ -1268,6 +1309,81 @@ pub(crate) use writ_core::process_group::kill_process_group;
 mod tests {
     use super::*;
     use crate::test_support::required_tool;
+
+    /// A child the group kill does not reach still leaves the call inside its
+    /// bound, rather than blocking forever on a reap that will never come.
+    ///
+    /// The production shape of this is a probe launched through `sudo`: sudo
+    /// `exec`s the command directly when no policy close hook is needed, so the
+    /// *direct* child is root, an unprivileged `killpg` on it is `EPERM`, and
+    /// `EPERM` is exactly what this module treats as "the group is already
+    /// empty". A test cannot become root, but it can produce the same
+    /// observable state — a kill that reports success and a live child — by
+    /// having the child leave the group the supervisor created for it, which is
+    /// what the `pre_exec` below does.
+    #[tokio::test]
+    async fn a_child_the_group_kill_does_not_reach_still_ends_inside_the_bound() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("escaped.pid");
+        let mut command = Command::new(required_tool("sh"));
+        command.arg("-c").arg(format!(
+            "printf '%s\\n' \"$$\" > {}; exec sleep 600",
+            pid_file.display()
+        ));
+        // Read this process's group *before* the spawn: by the time the closure
+        // runs, std has already made the child its own group leader, so asking
+        // then would only return the group we are trying to leave. The parent's
+        // group is in the same session and already exists, which is what
+        // `setpgid` requires of a target it did not create.
+        // SAFETY: `getpgrp` takes no arguments and cannot fail.
+        let parent_pgid = unsafe { libc::getpgrp() };
+        // SAFETY: `setpgid` is async-signal-safe, allocates nothing, and touches
+        // no memory shared with the parent — the only things a `pre_exec`
+        // closure may do between `fork` and `execve`. std sets the requested
+        // process group before running these closures, so this overrides it.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, parent_pgid) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let timeout = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let outcome = run_supervised(
+            &mut command,
+            timeout,
+            StdoutMode::Discard,
+            StderrMode::Discard,
+        )
+        .await
+        .expect("supervised sh run");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, SupervisedOutcome::TimedOut),
+            "a child that never exits is a timeout, not {outcome:?}",
+            outcome = match outcome {
+                SupervisedOutcome::Exited { status, .. } => format!("Exited({status})"),
+                SupervisedOutcome::TimedOut => "TimedOut".to_string(),
+                SupervisedOutcome::StdoutCapExceeded { cap } => format!("StdoutCapExceeded({cap})"),
+            }
+        );
+        assert!(
+            elapsed < timeout + POST_KILL_REAP_GRACE + Duration::from_secs(20),
+            "the call took {elapsed:?}, past its {timeout:?} deadline and the \
+             {POST_KILL_REAP_GRACE:?} reap grace"
+        );
+
+        // The escaped child is genuinely outside the supervisor's reach, so the
+        // test that created it cleans it up rather than leaving it to age out.
+        let recorded = std::fs::read_to_string(&pid_file).expect("the child records its pid");
+        let pid: libc::pid_t = recorded.trim().parse().expect("a pid");
+        // SAFETY: `kill` takes no pointers; SIGKILL on a pid this test created.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 
     #[tokio::test]
     async fn captures_stdout_and_stderr_on_nonzero_exit() {

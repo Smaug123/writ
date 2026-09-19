@@ -2966,6 +2966,7 @@ dependencies = [
  "writ-agent-run",
  "writ-audit",
  "writ-core",
+ "writ-guest-init",
  "writ-vm-client",
  "writ-vm-git",
  "xz2",

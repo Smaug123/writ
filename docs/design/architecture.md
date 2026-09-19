@@ -1199,10 +1199,12 @@ whole store to the workload and an initializer, loader, or libc the workload
 owns would be its to replace for a restarted container), the locked identity
 `writ` 1000:1000 in `/etc/passwd`
 with an empty root-owned `/home/writ` and `/workspace` for the initializer to
-chown, and the `org.writ.agent-vm.isolation-abi` label, whose value is read
-from `crates/writ-guest-init/isolation-abi-version` — the same file the crate
-compiles `ISOLATION_ABI_VERSION` from, so the label and the ready record
-cannot disagree. The image build scans its closure for setuid/setgid files and
+chown, and the `org.writ.agent-vm.isolation-abi` label, whose name and
+value are read from `crates/writ-guest-init/isolation-abi-label` and
+`…/isolation-abi-version` — the same two files the crate compiles
+`ISOLATION_ABI_LABEL` and `ISOLATION_ABI_VERSION` from, so the label the image
+stamps, the label the host's locked-profile admission looks for, and the
+number the ready record announces cannot disagree. The image build scans its closure for setuid/setgid files and
 asserts the initializer is a regular file with no `/nix/store` reference
 whose binary and directory carry no write bit. The image's
 entrypoint is deliberately unchanged: the legacy profile still launches it as
@@ -1269,6 +1271,20 @@ each entry point (`start_session`, `accept_agent_run_session`,
 `writ-agent-vm-runner start`), before a session has an id and so before an audit
 row, a subprocess, or a state record; stop and persisted-state decoding stay
 permissive, so narrowing the admitted set can never strand a running session.
+
+`agent_vm_locked_admission` holds what the locked profile's admission *will*
+be, built and tested but not wired: `LockedV1RuntimeEvidence` is six facts the
+host reads from its own tools (the PF helper's protocol version and preflight
+report, the guest image's isolation-ABI label and resolved manifest digest, the
+Apple `container` CLI version line, the macOS build), each of which may be
+`Unreadable` rather than absent; `gather_locked_v1_evidence` runs the five
+probes under a byte cap and a deadline and cannot fail, only observe less; and
+`ConfiguredIpv6Profile::admit_locked` is the pure decision over the evidence
+and a `ProvenPlatforms` allowlist of (CLI, macOS build, image digest) records
+the vertical proof has been run against. The shipped allowlist is empty, so
+nothing admits; `admit` is unchanged and still refuses the profile outright,
+and `Ipv6IsolationMode` gains no variant, so no session can be persisted in a
+mode no start path exists for. See §5.5 and Stages D–E of the plan.
 
 There is deliberately **no admission check on the plan itself**. A plan carries
 an `Ipv6IsolationMode`, every mode admits, and the only closed profile has no
