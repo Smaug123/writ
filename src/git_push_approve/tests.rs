@@ -850,7 +850,7 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
     server.verify().await;
 }
 
-/// The reviewer scenario for the last-second lease recheck: both
+/// The scenario for the last-second lease recheck: both
 /// prepare-side lease checks pass, then — during the interval the
 /// broker spends closing the object source and writing the
 /// `Uncertain` row — another actor rewinds the branch. A
