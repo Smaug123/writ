@@ -16,7 +16,7 @@ default = ["host"]
 # `host` does NOT enable `vm-client`: the broker never runs the guest HTTP
 # client. It depends directly on what it actually uses — `reqwest` for its own
 # outbound HTTP (GitHub minter, VM proxies) and `writ-vm-git` for the shared
-# wire types — so `--features host` no longer compiles `vm_client.rs`.
+# wire types.
 host = [
     "writ-core/host",
     "writ-agent-run/host",
@@ -41,10 +41,9 @@ host = [
     "dep:xz2",
     "dep:zstd",
 ]
-# The guest client now lives in the `writ-vm-client` crate; `writ`'s only
-# remaining vm-client code is the `writ-vm` binary, which uses the re-exports
-# (agent_run runner, vm_git wire types) but no reqwest/base64/ring directly —
-# those moved to writ-vm-client.
+# The guest client lives in the `writ-vm-client` crate; `writ`'s only
+# vm-client code is the `writ-vm` binary, which uses the re-exports (agent_run
+# runner, vm_git wire types) and depends on nothing else of its own.
 # Exposes `writ::test_support` (in-memory secret store, PATH lookups, key
 # fixtures) to downstream crates' tests; never enabled by a production build.
 test-support = ["dep:tempfile", "writ-core/test-support"]
