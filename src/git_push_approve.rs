@@ -35,7 +35,7 @@ use std::path::PathBuf;
 
 use crate::audit::UncertainAttempt;
 use crate::clean_git::{
-    self, CleanGitEnv, CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env,
+    self, CleanGitEnv, CleanGitError, CleanGitInvocation, SMALL_STDOUT_CAP, clean_git_config_env,
 };
 use crate::core::{ApproveAttemptId, RepoRef};
 use crate::git_push_objects_cat_file::{CatFileObjectSource, OpenError};
@@ -114,8 +114,7 @@ pub enum RunApproveError {
 /// failed (init, fetch, unbundle); the prepare layer's job is purely
 /// to assemble a staging repo whose state the planner can read, so
 /// these are reported separately even though they share a single
-/// `CleanGitError` cause type (kept out of the rustdoc-resolved link
-/// surface because the `clean_git` module is `pub(crate)`).
+/// [`CleanGitError`] cause type.
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareStagingError {
     #[error("approve staging dir already exists: {0}")]
@@ -132,18 +131,12 @@ pub enum PrepareStagingError {
         #[source]
         source: std::io::Error,
     },
-    /// Stringified rather than carrying the underlying `CleanGitError`:
-    /// the clean-git module is `pub(crate)` and publishing one of its
-    /// variants here would force the entire hardening helper into the
-    /// public surface for no caller benefit — handlers log the cause,
-    /// they don't pattern-match on it. Same precedent as
-    /// [`FastForwardPlanError::Git`].
     #[error("`git init --bare` against staging dir failed: {0}")]
-    GitInit(String),
+    GitInit(#[source] CleanGitError),
     #[error("`git fetch` of prerequisite commit into staging dir failed: {0}")]
-    GitFetch(String),
+    GitFetch(#[source] CleanGitError),
     #[error("`git bundle unbundle` of staged push bundle failed: {0}")]
-    GitUnbundle(String),
+    GitUnbundle(#[source] CleanGitError),
 }
 
 /// An approve pipeline that has run every step that provably cannot
@@ -584,19 +577,19 @@ async fn run_prepare_steps(
     let init = build_init_bare_invocation(runtime, staging_dir);
     clean_git::run_clean_git(&init, runtime.step_timeout(), None)
         .await
-        .map_err(|e| PrepareStagingError::GitInit(e.to_string()))?;
+        .map_err(PrepareStagingError::GitInit)?;
     crate::crash_point::point("prepare::repo_initialised").await;
 
     let fetch = build_fetch_prereq_invocation(runtime, staging_dir, repo, expected_remote_head);
     clean_git::run_clean_git(&fetch, runtime.step_timeout(), Some(token.as_str()))
         .await
-        .map_err(|e| PrepareStagingError::GitFetch(e.to_string()))?;
+        .map_err(PrepareStagingError::GitFetch)?;
     crate::crash_point::point("prepare::prereq_fetched").await;
 
     let unbundle = build_unbundle_invocation(runtime, staging_dir, &bundle_path);
     clean_git::run_clean_git(&unbundle, runtime.step_timeout(), None)
         .await
-        .map_err(|e| PrepareStagingError::GitUnbundle(e.to_string()))?;
+        .map_err(PrepareStagingError::GitUnbundle)?;
     crate::crash_point::point("prepare::unbundled").await;
 
     Ok(())

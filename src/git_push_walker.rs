@@ -554,17 +554,12 @@ pub enum FastForwardPlan {
     AlreadyAtExpected { tip: GitObjectId },
 }
 
-#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum FastForwardPlanError {
     /// The `git rev-list` subprocess itself failed (unknown SHA,
     /// missing staging repo, IO error, exit-status non-zero).
-    ///
-    /// Stringified rather than carrying the underlying
-    /// `CleanGitError`: the clean-git module is `pub(crate)` and
-    /// publishing one of its variants here would force the entire
-    /// hardening helper out into the public surface.
     #[error("`git rev-list` failed: {0}")]
-    Git(String),
+    Git(#[from] CleanGitError),
     #[error(
         "`git rev-list --boundary` emitted a line that does not parse as a commit SHA: \
          {line:?} ({reason})"
@@ -631,12 +626,6 @@ pub enum FastForwardPlanError {
          too many commits to replay and the walk was refused"
     )]
     RevListOutputTooLarge { cap: usize },
-}
-
-impl From<CleanGitError> for FastForwardPlanError {
-    fn from(err: CleanGitError) -> Self {
-        FastForwardPlanError::Git(err.to_string())
-    }
 }
 
 /// Plan the per-commit walk for a fast-forward push by shelling out
