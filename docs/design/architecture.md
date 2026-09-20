@@ -1307,6 +1307,22 @@ firewall → await `security-ready` → release), rather than more variants on
 `AgentVmStartStep`: that enum's interpreter is synchronous and store-less, and
 the locked tail is neither. Each step names the `LockedPhase` it establishes.
 
+`agent_vm_locked_session::run_locked_start` is the interpreter for that
+sequence, built and tested but with no caller (admission still refuses the
+profile). It advances E1's typestates and the persisted record together:
+`NetworkValidated` once the shared prefix has run, `AgentVmStarted` after
+create → readback → start, `FinalFirewallInstalled` from the helper's own
+install report (refused unless it reached `reresolve`), `GuestSecurityLocked`
+from the guest's `security-ready` record, then `record_release_attempted` —
+which writes the phase and mints the `ReleaseSignal` in one call, so the
+daemon cannot send a signal it has not written down. A locked plan claims a
+locked record at `Claimed`, since `advance_locked` refuses one that is not
+already locked, and `start_steps` stops after the shared prefix for a locked
+plan. Every failure leaves the workload unreleased except the two from the release
+onwards — a `kill` that failed, and a final write that failed after a `kill`
+that succeeded — which report that the workload may be running rather than
+that it stayed put.
+
 `agent_vm_locked_start` is the locked profile's launch and its readback,
 built and tested but with no caller.
 `AgentVmSessionPlan::locked_create_vm_invocation` emits a `container create`:

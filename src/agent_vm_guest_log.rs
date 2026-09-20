@@ -247,7 +247,7 @@ impl GuestLogChannel {
     /// The same channel with waiting bounds a test can sit through, rather
     /// than ones sized for a VM boot.
     #[cfg(test)]
-    fn with_wait_bounds_for_test(
+    pub(crate) fn with_wait_bounds_for_test(
         mut self,
         poll_interval: Duration,
         overall_timeout: Duration,

@@ -750,6 +750,79 @@ length assertion so a new mode cannot slip through unanswered.
 
 ---
 
+**E2c-2 landed.** `agent_vm_locked_session::run_locked_start` walks the
+sequence: create, read back, start, install the interface-scoped anchor, wait
+for the guest's record, then release. Two things move at every step — the
+typestate that carries the proof forward, and the record that says what a
+crash would find — and the record is always written before the effect whose
+completion it would otherwise have to infer.
+
+Three pieces had to land with it. A locked plan now claims a *locked* record
+at `Claimed`, because `advance_locked` refuses a record that is not already
+locked, so a locked session claiming a legacy one could never record a phase.
+`start_steps` returns the shared prefix and stops for a locked plan, rather
+than projecting the legacy `container run` a locked session must never make.
+And the final firewall install is run capturing its output, so the interfaces
+in `FirewallFacts` are the ones the helper resolved rather than any the host
+guessed; an install that stopped short of `reresolve` is refused, because the
+phases after the load are the ones that check the anchor says what was asked
+for.
+
+`GuestLogChannel` is passed in rather than built inside, so the bounds the
+host waits under are the caller's to state — and so a test does not have to
+sit out a budget sized for a VM boot.
+
+The release ordering could not be weakened to test it, which is the outcome
+Stage E1 was designed for: `send_release` needs a `ReleaseSignal`, and
+`record_release_attempted` is the only thing that makes one, so there is no
+version of this function that sends before recording. The test asserts the
+consequence instead — the fake `kill` copies the session's record as it runs,
+and that copy already says `release_attempted`.
+
+A review round found two things the first draft got wrong, both about what
+happens either side of the release. The configured guest environment was
+dropped — the create was given no `--env-file`, so a managed session would
+have started a VM that could not reach its own broker; the plan now
+materialises the file and the create is given it, for exactly as long as it
+takes to read it. And a record that could not be written *after* a successful
+`kill` was classified as "never released", which is the one answer that is
+certainly wrong: the signal had been delivered. That failure now says the
+workload may be running, which is what the `ReleaseAttempted` already on disk
+means.
+
+A second round found a race this stage introduced. Every step ran under the
+bounded probe, which stops *waiting* at its deadline but cannot stop the
+process: the PF helper runs behind `sudo`, so the root half is beyond an
+unprivileged daemon's `kill(2)`. Harmless for a read — the fact is simply
+unread — but for an *install* it means the daemon could move on to teardown,
+flush the anchor, and have the helper load its rules afterwards, leaving an
+anchor behind for a session that no longer exists. The install is now waited
+for, bounded in bytes but not in time, which is what the legacy launch does
+with the same command. A test with a three-second helper fails the moment
+anyone reintroduces a shorter deadline.
+
+The same round asked for a pre-release read of the guest's `/proc/1/status`
+against B1's `LockedAwaitingRelease`, and this stage deliberately does not do
+it. The release is gated on two host-observed facts: the image the runtime
+actually built — the readback also confirms PID 1 is the initializer, running
+as root, with no interposed runtime init — and the initializer's own
+`security-ready` record, which its handoff emits only after the capability
+drop the record asserts. A `/proc` read would mean a `container exec` into the
+guest, the move layer 2 exists to avoid, to learn something those two already
+bound. What it would additionally catch is an *admitted image whose
+initializer is buggy*: a real if narrow gap, and E3's to close with evidence
+rather than this path's to close with an exec.
+
+Six weakenings were injected and fail these tests: a readback whose verdict is
+discarded, a firewall install accepted at a phase before `reresolve`, a create
+that drops the guest environment, a post-release write failure classified as
+unreleased, an install that fails, and one that floods.
+Every failure before the release leaves the workload unreleased, asserted by
+the absence of any `kill` in the fake tool's log rather than by inspecting the
+code path.
+
+---
+
 ## Stage E3: The vertical proof, with host-owned evidence
 
 **Dependencies:** Stages E2, C2b, and C3.

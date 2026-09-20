@@ -21,6 +21,8 @@ pub mod agent_vm_locked_admission;
 #[cfg(feature = "host")]
 pub mod agent_vm_locked_lifecycle;
 #[cfg(feature = "host")]
+pub mod agent_vm_locked_session;
+#[cfg(feature = "host")]
 pub mod agent_vm_locked_start;
 #[cfg(feature = "host")]
 pub mod agent_vm_pf_helper_policy;

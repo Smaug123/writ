@@ -244,12 +244,30 @@ const AGENT_VM_SESSION_STATE_VERSION: u32 = 3;
 const AGENT_VM_SESSION_STATE_MIN_READ_VERSION: u32 = 2;
 
 impl AgentVmSessionState {
+    /// The record a start claims before it creates anything.
+    ///
+    /// A locked plan claims a *locked* record, at
+    /// [`LockedPhase::Claimed`] — the phase whose own docs say the session id
+    /// and subnet are allocated and nothing exists on the host, which is
+    /// exactly what a claim is. Every other profile claims a legacy record
+    /// carrying `status`. That dispatch is what makes the locked phases
+    /// reachable at all: `advance_locked` refuses a record that is not already
+    /// locked, so a locked session that claimed a legacy record could never
+    /// record a single phase.
     pub(super) fn from_start_plan(
         plan: &AgentVmSessionPlan,
         status: AgentVmSessionStateStatus,
     ) -> Self {
+        let lifecycle = match plan.ipv6_mode {
+            Ipv6IsolationMode::Ipv4OnlyLockedV1 => {
+                SessionLifecycle::Locked(LockedLifecycle::Claimed)
+            }
+            Ipv6IsolationMode::DualStackRequired | Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => {
+                SessionLifecycle::Legacy(status)
+            }
+        };
         Self {
-            lifecycle: SessionLifecycle::Legacy(status),
+            lifecycle,
             // Built here rather than read, so it is what this binary writes.
             schema: StateSchema::V3,
             session_id: plan.session_id,
