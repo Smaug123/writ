@@ -408,11 +408,74 @@ pub struct BrokerUrl(String);
 pub enum Ipv6IsolationMode {
     DualStackRequired,
     Ipv4OnlyNoGuestIpv6,
+    /// The locked profile: IPv6 denied on the agent's bridge by the same
+    /// interface-scoped anchor [`Self::Ipv4OnlyNoGuestIpv6`] uses, and inside
+    /// the guest by an initializer that writes the sysctls and then drops
+    /// every capability, so the workload cannot undo them.
+    ///
+    /// A session can be *recorded* in this mode but cannot yet reach it:
+    /// `ConfiguredIpv6Profile::admit` still refuses the profile, so nothing
+    /// builds a plan carrying it. What the variant buys now is that every
+    /// place which dispatches on the mode has had to answer for it — several
+    /// of those were `== Ipv4OnlyNoGuestIpv6` comparisons that would have
+    /// quietly handed a locked session the legacy answer.
+    ///
+    /// **Managed sessions only.** A locked session is released by a
+    /// [`ReleaseSignal`], which only
+    /// the state store mints, and only after it has recorded the attempt. A
+    /// start path with no store therefore cannot release a locked guest at
+    /// all, which is why [`start_agent_vm_session`] refuses this mode rather
+    /// than running it down the legacy sequence.
+    Ipv4OnlyLockedV1,
 }
 
 impl Ipv6IsolationMode {
     /// Every mode, for tests that range over all of them.
-    pub const ALL: [Self; 2] = [Self::DualStackRequired, Self::Ipv4OnlyNoGuestIpv6];
+    pub const ALL: [Self; 3] = [
+        Self::DualStackRequired,
+        Self::Ipv4OnlyNoGuestIpv6,
+        Self::Ipv4OnlyLockedV1,
+    ];
+
+    /// Whether a session under this mode is started with a guest command the
+    /// host releases, rather than by the image's own entrypoint.
+    ///
+    /// Both IPv4-only modes hold the workload until the host says go — the
+    /// legacy one behind a prelaunch script waiting on a file, the locked one
+    /// behind an initializer waiting for `SIGUSR1` — so both need a guest
+    /// command to have something to release.
+    pub fn requires_guest_command(self) -> bool {
+        match self {
+            Self::DualStackRequired => false,
+            Self::Ipv4OnlyNoGuestIpv6 | Self::Ipv4OnlyLockedV1 => true,
+        }
+    }
+
+    /// Whether the session's PF anchor carries an IPv6 rule derived from the
+    /// network's own `/64`.
+    ///
+    /// Only the dual-stack mode does. The IPv4-only modes get an
+    /// interface-scoped `inet6` deny instead, which is not derived from the
+    /// session's CIDR — so for them the recorded `firewall_ipv6_cidr` is
+    /// absent, and a record carrying one is refused.
+    pub fn has_firewall_ipv6_cidr(self) -> bool {
+        match self {
+            Self::DualStackRequired => true,
+            Self::Ipv4OnlyNoGuestIpv6 | Self::Ipv4OnlyLockedV1 => false,
+        }
+    }
+
+    /// Whether a session under this mode can be started without a state
+    /// store.
+    ///
+    /// Only the locked profile cannot: its release signal exists only once
+    /// the store has recorded the attempt to send it.
+    pub fn startable_without_a_state_store(self) -> bool {
+        match self {
+            Self::DualStackRequired | Self::Ipv4OnlyNoGuestIpv6 => true,
+            Self::Ipv4OnlyLockedV1 => false,
+        }
+    }
 }
 
 /// What an operator wrote in `ipv6_mode`, before anything decides whether a
@@ -713,6 +776,14 @@ pub enum GuestEnvironmentError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentVmLifecycleRunError {
+    /// This start path has no state store, and the locked profile's release
+    /// signal exists only once a store has recorded the attempt to send it.
+    /// See [`Ipv6IsolationMode::Ipv4OnlyLockedV1`].
+    #[error(
+        "the ipv4_only_locked_v1 profile can only be started as a managed session: \
+         its release signal is minted by the state store, which this start path has none of"
+    )]
+    LockedProfileNeedsAStateStore,
     #[error(transparent)]
     Start(Box<StartFailure>),
     #[error("start failed: {original}; cleanup also failed: {cleanup}")]
@@ -1321,14 +1392,21 @@ impl BrokerUrl {
 /// created resources is informational (see [`AgentVmOwnerToken`]); it does not
 /// gate cleanup.
 ///
-/// There is deliberately no admission check here, because a plan cannot carry a
-/// closed profile: a plan holds an [`Ipv6IsolationMode`], every mode admits (see
-/// `each_configured_profile_says_whether_a_session_may_start_under_it`), and the
-/// only closed profile has no mode to be built from. The compiler enforces what
-/// a runtime check here would only restate. A future closed profile that *does*
-/// get an active mode would break that, and the exhaustive `admit` test is where
-/// it has to be decided.
+/// There is deliberately no *admission* check here: a plan holds an
+/// [`Ipv6IsolationMode`], and admission decides which modes a plan can be
+/// built with in the first place.
+///
+/// There is, however, a check that this path can carry out what the plan asks
+/// for. [`Ipv6IsolationMode::Ipv4OnlyLockedV1`] is refused, because a locked
+/// session ends with a release signal that only the state store can mint
+/// (see [`ReleaseSignal`]) and this path has no store. Running the locked
+/// sequence here would leave a guest that had been started, confined, and
+/// never released — so it is refused before anything is created, which is the
+/// one point at which refusing costs nothing.
 pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLifecycleRunError> {
+    if !plan.ipv6_mode().startable_without_a_state_store() {
+        return Err(AgentVmLifecycleRunError::LockedProfileNeedsAStateStore);
+    }
     for step in plan.start_steps() {
         if let Err((failure, outcome)) = run_start_step(plan, &step) {
             return fail_after_cleanup(failure, plan, outcome);
@@ -1644,10 +1722,7 @@ fn firewall_ipv6_cidr_for_mode(
     ipv6_mode: Ipv6IsolationMode,
     network: AgentNetwork,
 ) -> Option<Ipv6Cidr> {
-    match ipv6_mode {
-        Ipv6IsolationMode::DualStackRequired => Some(network.ipv6()),
-        Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
-    }
+    ipv6_mode.has_firewall_ipv6_cidr().then(|| network.ipv6())
 }
 
 fn validate_guest_env_name(name: &str) -> Result<(), AgentVmLifecycleConfigError> {
@@ -1780,26 +1855,49 @@ mod configured_profile_tests {
         );
     }
 
+    /// An older binary's spelling of the mode, which is the point of this
+    /// test: a set with no locked variant.
+    ///
+    /// Written out rather than borrowed from the production type. Until the
+    /// locked mode existed, [`Ipv6IsolationMode`] *was* this set and could
+    /// stand in for the older binary; now that it has the variant, a stand-in
+    /// has to be something that does not.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum OlderIpv6IsolationMode {
+        #[allow(dead_code)]
+        DualStackRequired,
+        #[allow(dead_code)]
+        Ipv4OnlyNoGuestIpv6,
+    }
+
     /// The new spelling parses here, and is refused by a binary that predates
     /// it — which is what makes rolling back fail closed.
     ///
-    /// An older `writd` typed this field as [`Ipv6IsolationMode`], so it reads
-    /// `ipv4_only_locked_v1` as an unknown variant and refuses to start,
-    /// rather than falling back to some default and running a config it does
-    /// not understand. That is the behaviour a rollback depends on, so it is
-    /// asserted rather than assumed.
+    /// An older `writd` reads `ipv4_only_locked_v1` as an unknown variant and
+    /// refuses to start, rather than falling back to some default and running
+    /// a config it does not understand. That is the behaviour a rollback
+    /// depends on, so it is asserted rather than assumed.
     #[test]
     fn the_locked_spelling_parses_here_and_is_unknown_to_an_older_binary() {
         assert_eq!(
             serde_json::from_str::<ConfiguredIpv6Profile>("\"ipv4_only_locked_v1\"").unwrap(),
             ConfiguredIpv6Profile::Ipv4OnlyLockedV1
         );
+        assert_eq!(
+            serde_json::from_str::<Ipv6IsolationMode>("\"ipv4_only_locked_v1\"").unwrap(),
+            Ipv6IsolationMode::Ipv4OnlyLockedV1
+        );
         // Exactly what an older binary's field type does with it.
-        assert!(serde_json::from_str::<Ipv6IsolationMode>("\"ipv4_only_locked_v1\"").is_err());
+        assert!(serde_json::from_str::<OlderIpv6IsolationMode>("\"ipv4_only_locked_v1\"").is_err());
 
         // The spellings that binary does know still mean the same thing to it.
         for spelling in ["dual_stack_required", "ipv4_only_no_guest_ipv6"] {
             let quoted = format!("\"{spelling}\"");
+            assert!(
+                serde_json::from_str::<OlderIpv6IsolationMode>(&quoted).is_ok(),
+                "{spelling}"
+            );
             assert!(
                 serde_json::from_str::<Ipv6IsolationMode>(&quoted).is_ok(),
                 "{spelling}"
@@ -2308,12 +2406,13 @@ mod spec {
             rejected += 1;
 
             let mut wrong_firewall_ipv6 = state_json_value(&state);
-            wrong_firewall_ipv6["firewall_ipv6_cidr"] = match plan.ipv6_mode() {
-                Ipv6IsolationMode::DualStackRequired => serde_json::Value::Null,
-                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => {
+            // Whatever the mode records, record the other thing.
+            wrong_firewall_ipv6["firewall_ipv6_cidr"] =
+                if plan.ipv6_mode().has_firewall_ipv6_cidr() {
+                    serde_json::Value::Null
+                } else {
                     serde_json::Value::String(state.network().ipv6().to_string())
-                }
-            };
+                };
             assert_state_json_rejected(wrong_firewall_ipv6);
             rejected += 1;
 

@@ -211,6 +211,7 @@ struct PersistedAgentVmSessionState {
 enum PersistedIpv6IsolationMode {
     DualStackRequired,
     Ipv4OnlyNoGuestIpv6,
+    Ipv4OnlyLockedV1,
 }
 
 /// The locked lifecycle on the wire.
@@ -356,7 +357,7 @@ impl AgentVmSessionState {
         let broker_port_range =
             BrokerPortRange::new(persisted.broker_port_min, persisted.broker_port_max)
                 .map_err(|err| corrupt_state(format!("invalid broker port range: {err}")))?;
-        let ipv6_mode = persisted.ipv6_mode.into();
+        let ipv6_mode: Ipv6IsolationMode = persisted.ipv6_mode.into();
         let image = ContainerImage::new(persisted.image)
             .map_err(|err| corrupt_state(format!("invalid image: {err}")))?;
         let resources = AgentVmResources::new(persisted.cpus, persisted.memory_mib)
@@ -365,10 +366,9 @@ impl AgentVmSessionState {
         broker_port_range
             .require_contains(&broker_ports)
             .map_err(|err| corrupt_state(format!("invalid broker ports: {err}")))?;
-        if ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 && persisted.guest_command.is_empty()
-        {
+        if ipv6_mode.requires_guest_command() && persisted.guest_command.is_empty() {
             return Err(corrupt_state(
-                "IPv4-only guest IPv6 preflight requires an explicit guest command",
+                "a held-until-released profile requires an explicit guest command",
             ));
         }
 
@@ -1054,10 +1054,10 @@ impl From<&AgentVmSessionState> for PersistedAgentVmSessionState {
             subnet_index: value.subnet_index,
             ipv4_cidr: value.network.ipv4().to_string(),
             ipv6_cidr: value.network.ipv6().to_string(),
-            firewall_ipv6_cidr: match value.ipv6_mode {
-                Ipv6IsolationMode::DualStackRequired => Some(value.network.ipv6().to_string()),
-                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => None,
-            },
+            firewall_ipv6_cidr: value
+                .ipv6_mode
+                .has_firewall_ipv6_cidr()
+                .then(|| value.network.ipv6().to_string()),
             network_name: value.names.network().to_string(),
             vm_name: value.names.vm().to_string(),
             broker_ports: value
@@ -1194,6 +1194,7 @@ impl From<Ipv6IsolationMode> for PersistedIpv6IsolationMode {
         match value {
             Ipv6IsolationMode::DualStackRequired => Self::DualStackRequired,
             Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => Self::Ipv4OnlyNoGuestIpv6,
+            Ipv6IsolationMode::Ipv4OnlyLockedV1 => Self::Ipv4OnlyLockedV1,
         }
     }
 }
@@ -1203,6 +1204,7 @@ impl From<PersistedIpv6IsolationMode> for Ipv6IsolationMode {
         match value {
             PersistedIpv6IsolationMode::DualStackRequired => Self::DualStackRequired,
             PersistedIpv6IsolationMode::Ipv4OnlyNoGuestIpv6 => Self::Ipv4OnlyNoGuestIpv6,
+            PersistedIpv6IsolationMode::Ipv4OnlyLockedV1 => Self::Ipv4OnlyLockedV1,
         }
     }
 }

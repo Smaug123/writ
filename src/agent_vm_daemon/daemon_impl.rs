@@ -1110,7 +1110,7 @@ impl AgentVmDaemon {
         // mode provisions a ULA on purpose, so only the no-guest-IPv6 mode forbids
         // a global-scope address.
         let require_no_ipv6 = match ipv6_mode {
-            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => "1",
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 | Ipv6IsolationMode::Ipv4OnlyLockedV1 => "1",
             Ipv6IsolationMode::DualStackRequired => "0",
         };
         guest_env.push(AgentVmGuestEnvVar::new(

@@ -538,9 +538,16 @@ representable without a start path behind it:
   carrying B1's capability profile and the image's digest, and the
   `container kill --signal USR1` that E1's `ReleaseSignal` wraps. Still no
   caller.
-- **E2c**, the daemon's locked start sequence driving E1's typestates through
-  E2a and E2b, the post-release migration off `container exec`, and the
-  profile opening on an empty host-placement pin list, in one change.
+- **E2c**, in three parts, because building it found that the locked start
+  does not fit the machine the legacy one runs on:
+  - **E2c-1**, the mode itself. `Ipv6IsolationMode` gains `Ipv4OnlyLockedV1`,
+    the state schema gains its spelling, every place that dispatches on the
+    mode answers for it, and the locked sequence is projected as its own
+    ordered data. `admit` still refuses the profile.
+  - **E2c-2**, the daemon interpreting that sequence through E1's typestates.
+  - **E2c-3**, the post-release migration off `container exec`, `admit`
+    calling `admit_locked`, and runner parity — the profile opening on an
+    empty host-placement pin list.
 
 **Correctness oracle:**
 - Fake-tool daemon tests: the recorded `container run` argv contains exactly
@@ -694,6 +701,52 @@ the argv spelling of a capability, one that ignores the `/proc` relaxation,
 one that ignores PID 1's identity, one that ignores `useInit`, a launch that
 swaps the relaxation for the legacy kernel argument, and a launch that goes
 back to a single `container run`.
+
+---
+
+**E2c-1 landed, and found that the locked start is a different machine.**
+
+`start_agent_vm_session` is synchronous, iterates `AgentVmStartStep`, and is
+the entry point for *both* the daemon and `writ-agent-vm-runner`. The locked
+tail does not fit it: waiting for the guest record is a bounded async poll,
+and the release is minted by the state store rather than constructed by a
+caller. Adding locked variants to `AgentVmStartStep` would have handed that
+interpreter steps it has no way to carry out.
+
+So the locked sequence is its own ordered type, `LockedStartStep`, sitting
+next to the `LockedPhase` each step establishes. `AgentVmStartStep` is
+untouched.
+
+**A locked session is therefore managed-only, structurally.** Its release
+signal exists only once the state store has recorded the attempt to send it
+(Stage E1), so a start path with no store could start a guest, confine it, and
+never release it. `start_agent_vm_session` refuses the locked mode before it
+creates anything, and a test asserts nothing ran. That is also what the
+`start_agent_vm_session` doc comment anticipated when it said a future closed
+profile with an active mode would break its "a plan cannot carry a closed
+profile" reasoning — this is that profile, and the refusal is the answer.
+
+The mode variant's value right now is the compiler. Five exhaustive matches
+had to answer for it, and — more to the point — five `== Ipv4OnlyNoGuestIpv6`
+comparisons would have quietly handed a locked session the legacy answer.
+Those are now `Ipv6IsolationMode` predicates (`requires_guest_command`,
+`has_firewall_ipv6_cidr`, `startable_without_a_state_store`) named for the
+question each site asks, so a mode added later must decide rather than inherit
+a branch.
+
+One test had to be rewritten rather than extended. Stage D's
+`the_locked_spelling_parses_here_and_is_unknown_to_an_older_binary` used this
+build's `Ipv6IsolationMode` as the stand-in for an older binary, which was
+only valid while that type lacked the variant. The stand-in is now an explicit
+two-variant enum in the test, so the rollback property is still tested rather
+than quietly lost.
+
+Two weakenings were injected and fail these tests: a storeless start that runs
+the locked profile, and a locked mode that does not require a guest command.
+The second exposed a tautology on the way — the first version of its test
+asked `requires_guest_command` what to expect, so it passed whatever the
+predicate said; the expected answers are now written out per mode, with a
+length assertion so a new mode cannot slip through unanswered.
 
 ---
 
