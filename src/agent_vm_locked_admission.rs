@@ -49,7 +49,7 @@ use crate::agent_vm_firewall::PfPreflightUnclean;
 use crate::agent_vm_lifecycle::{
     AgentVmToolPaths, ConfiguredIpv6Profile, ContainerImage, ProcessInvocation,
 };
-use crate::process_supervisor::{self, StderrMode, StdoutMode, SupervisedOutcome, SupervisorError};
+use crate::agent_vm_probe::{BoundedProbe, ProbeRunFailure, run_bounded_probe};
 
 use crate::agent_vm_pf_helper_protocol::{
     PF_HELPER_PREFLIGHT_MAX_BYTES, PF_HELPER_PROTOCOL_MAX_BYTES, PF_HELPER_PROTOCOL_VERSION,
@@ -92,8 +92,13 @@ impl<T> Observed<T> {
 
 /// Why a probe yielded no fact.
 ///
+/// [`ProbeRunFailure`]'s variants plus [`ProbeFailure::Unparseable`]. The
+/// shared runner reports only how the *run* went, because a tool that ran,
+/// succeeded, and printed something this host cannot read is a fact about the
+/// output; admission refuses on either, so it names them together.
+///
 /// The detail behind [`ProbeFailure::Spawn`] (the `std::io::Error`) is logged
-/// by the gatherer rather than carried here: this type is part of the pure
+/// by the runner rather than carried here: this type is part of the pure
 /// decision, and an admission refusal names *which* fact was unreadable, not
 /// the errno behind it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -119,6 +124,18 @@ pub enum ProbeFailure {
     /// run's outcome is unknown, which is not a fact.
     #[error("the probe could not be supervised to completion")]
     Unsupervised,
+}
+
+impl From<ProbeRunFailure> for ProbeFailure {
+    fn from(failure: ProbeRunFailure) -> Self {
+        match failure {
+            ProbeRunFailure::Spawn => Self::Spawn,
+            ProbeRunFailure::TimedOut => Self::TimedOut,
+            ProbeRunFailure::OutputTooLarge => Self::OutputTooLarge,
+            ProbeRunFailure::Failed => Self::Failed,
+            ProbeRunFailure::Unsupervised => Self::Unsupervised,
+        }
+    }
 }
 
 // --- the individual facts ---------------------------------------------------
@@ -691,28 +708,16 @@ pub const FAST_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// which resolves an image and can be slow on a cold start.
 pub const CONTAINER_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One probe: what to run, how much of its output to accept, how long to
-/// wait for it.
-///
-/// Inert data with no invariant between its fields, so the fields are public:
-/// this describes a command, it does not authorise one.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LockedV1Probe {
-    pub invocation: ProcessInvocation,
-    pub byte_cap: usize,
-    pub timeout: Duration,
-}
-
 /// The five commands the gatherer runs, projected as data before any of them
 /// runs — so what the daemon will execute as root is inspectable, and the
 /// tests can assert it without a host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockedV1ProbePlan {
-    pub helper_protocol: LockedV1Probe,
-    pub preflight: LockedV1Probe,
-    pub image_inspect: LockedV1Probe,
-    pub container_cli: LockedV1Probe,
-    pub macos_build: LockedV1Probe,
+    pub helper_protocol: BoundedProbe,
+    pub preflight: BoundedProbe,
+    pub image_inspect: BoundedProbe,
+    pub container_cli: BoundedProbe,
+    pub macos_build: BoundedProbe,
 }
 
 impl LockedV1ProbePlan {
@@ -732,17 +737,17 @@ impl LockedV1ProbePlan {
             )
         };
         Self {
-            helper_protocol: LockedV1Probe {
+            helper_protocol: BoundedProbe {
                 invocation: helper("protocol-version"),
                 byte_cap: PF_HELPER_PROTOCOL_MAX_BYTES,
                 timeout: FAST_PROBE_TIMEOUT,
             },
-            preflight: LockedV1Probe {
+            preflight: BoundedProbe {
                 invocation: helper("preflight"),
                 byte_cap: PF_HELPER_PREFLIGHT_MAX_BYTES,
                 timeout: FAST_PROBE_TIMEOUT,
             },
-            image_inspect: LockedV1Probe {
+            image_inspect: BoundedProbe {
                 invocation: ProcessInvocation::new(
                     tools.container(),
                     ["image", "inspect", image.as_str()],
@@ -750,12 +755,12 @@ impl LockedV1ProbePlan {
                 byte_cap: IMAGE_INSPECT_MAX_BYTES,
                 timeout: CONTAINER_PROBE_TIMEOUT,
             },
-            container_cli: LockedV1Probe {
+            container_cli: BoundedProbe {
                 invocation: ProcessInvocation::new(tools.container(), ["--version"]),
                 byte_cap: VERSION_LINE_MAX_BYTES,
                 timeout: CONTAINER_PROBE_TIMEOUT,
             },
-            macos_build: LockedV1Probe {
+            macos_build: BoundedProbe {
                 invocation: ProcessInvocation::new(sw_vers, ["-buildVersion"]),
                 byte_cap: VERSION_LINE_MAX_BYTES,
                 timeout: FAST_PROBE_TIMEOUT,
@@ -770,7 +775,7 @@ impl LockedV1ProbePlan {
     }
 
     /// Every probe, in the order [`gather_locked_v1_evidence`] runs them.
-    pub fn probes(&self) -> [&LockedV1Probe; 5] {
+    pub fn probes(&self) -> [&BoundedProbe; 5] {
         [
             &self.helper_protocol,
             &self.preflight,
@@ -782,7 +787,7 @@ impl LockedV1ProbePlan {
 
     /// [`Self::probes`], mutably: for a caller that wants to change every
     /// probe's cap or deadline without restating the list.
-    pub fn probes_mut(&mut self) -> [&mut LockedV1Probe; 5] {
+    pub fn probes_mut(&mut self) -> [&mut BoundedProbe; 5] {
         [
             &mut self.helper_protocol,
             &mut self.preflight,
@@ -855,92 +860,17 @@ fn parse_or_unreadable<T, E>(text: &str, parse: impl FnOnce(&str) -> Result<T, E
     }
 }
 
-/// Run one probe under its cap and deadline, yielding its stdout or why there
-/// is none.
+/// Run one probe and record what it said, or why it said nothing.
 ///
-/// Through [`process_supervisor::run_supervised`], so the probe is spawned as
-/// the leader of its own process group and the whole group is SIGKILLed when
-/// the deadline expires or the capture is rejected. Killing only the direct
-/// child would not do: the privileged probes are `sudo` wrapping the helper
-/// wrapping `pfctl`, and a wedged `pfctl` would outlive a `sudo` we killed on
-/// its own, holding the captured pipe open and accumulating with every
-/// refused start.
-///
-/// The one thing the group kill cannot promise is the privileged half. `sudo`
-/// puts a *root* process on the other side of the boundary — its own, since it
-/// `exec`s the command directly when no policy close hook is needed — and an
-/// unprivileged daemon's `kill(2)` on that is `EPERM`. The supervisor bounds
-/// the reap that follows such a kill rather than waiting on it, so the
-/// deadline still holds for the daemon; what it does not hold for is the root
-/// process, whose lifetime is the helper's own bounds to keep. The guarantee
-/// is therefore the weaker, stated one: the daemon stops waiting inside its
-/// deadline, reports the fact as unreadable, and does not admit — and it may
-/// leave a wedged root helper behind while doing so.
-async fn run_probe(probe: &LockedV1Probe) -> Observed<String> {
-    let mut command = tokio::process::Command::new(probe.invocation.program());
-    command
-        .args(probe.invocation.args())
-        .stdin(std::process::Stdio::null());
-    let outcome = process_supervisor::run_supervised(
-        &mut command,
-        probe.timeout,
-        StdoutMode::Capture {
-            byte_cap: probe.byte_cap,
-        },
-        StderrMode::Capture,
-    )
-    .await;
-    match outcome {
-        Err(SupervisorError::Spawn(error)) => {
-            tracing::warn!(
-                probe = %probe.invocation.display_shell(),
-                %error,
-                "locked-profile admission probe could not be started"
-            );
-            Observed::Unreadable(ProbeFailure::Spawn)
-        }
-        Err(error) => {
-            tracing::warn!(
-                probe = %probe.invocation.display_shell(),
-                %error,
-                "locked-profile admission probe could not be supervised"
-            );
-            Observed::Unreadable(ProbeFailure::Unsupervised)
-        }
-        Ok(SupervisedOutcome::TimedOut) => {
-            tracing::warn!(
-                probe = %probe.invocation.display_shell(),
-                timeout_secs = probe.timeout.as_secs(),
-                "locked-profile admission probe timed out"
-            );
-            Observed::Unreadable(ProbeFailure::TimedOut)
-        }
-        Ok(SupervisedOutcome::StdoutCapExceeded { cap }) => {
-            tracing::warn!(
-                probe = %probe.invocation.display_shell(),
-                byte_cap = cap,
-                "locked-profile admission probe exceeded its output cap"
-            );
-            Observed::Unreadable(ProbeFailure::OutputTooLarge)
-        }
-        Ok(SupervisedOutcome::Exited {
-            status,
-            stdout,
-            stderr,
-            ..
-        }) => {
-            if status.success() {
-                Observed::Read(String::from_utf8_lossy(&stdout).into_owned())
-            } else {
-                tracing::warn!(
-                    probe = %probe.invocation.display_shell(),
-                    %status,
-                    stderr = %String::from_utf8_lossy(&stderr).trim(),
-                    "locked-profile admission probe failed"
-                );
-                Observed::Unreadable(ProbeFailure::Failed)
-            }
-        }
+/// The run policy — process group, deadline, byte cap, what counts as
+/// success — is [`run_bounded_probe`]'s, shared with the guest record
+/// channel. All this adds is the vocabulary the decision is written in:
+/// a failed run is an [`Observed::Unreadable`] fact rather than an error,
+/// because the gatherer always produces a complete evidence record.
+async fn run_probe(probe: &BoundedProbe) -> Observed<String> {
+    match run_bounded_probe(probe, "locked-profile admission probe").await {
+        Ok(stdout) => Observed::Read(stdout),
+        Err(failure) => Observed::Unreadable(failure.into()),
     }
 }
 

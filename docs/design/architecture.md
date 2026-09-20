@@ -1288,6 +1288,20 @@ cleanup-only. `ReleaseSignal` is the one effect the types order: only
 the daemon cannot send a signal it has not first written down. See §5.5 and
 Stage E1 of the plan.
 
+`agent_vm_guest_log` is the host's read side of a locked guest's one-way
+record channel, built and tested but with no caller. `scan_guest_log` decides
+what one bounded `container logs` read reports — nothing yet, the
+initializer's `security-ready` record, or its `handoff-failed` one — and
+refuses everything else: a line wearing the record prefix that does not parse,
+a second record, a log too large to read whole. `GuestLogChannel` polls that
+read to a deadline and yields the `GuestFacts` Stage E1's
+`guest_security_locked` takes, only for a lone ready record naming the ABI
+this host implements. The read is plain `container logs <vm>`, because `-n`
+keeps the last n lines and a flooding guest could push the record out of that
+window. `agent_vm_probe` holds the bounded-run policy the channel shares with
+the admission gatherer below: one supervised process group, one byte cap, one
+deadline. See §5.5 and Stage E2 of the plan.
+
 `agent_vm_locked_admission` holds what the locked profile's admission *will*
 be, built and tested but not wired: `LockedV1RuntimeEvidence` is six facts the
 host reads from its own tools (the PF helper's protocol version and preflight
