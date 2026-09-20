@@ -876,7 +876,7 @@ impl Probe {
     }
 
     /// This probe's entry in a plan.
-    fn of_mut(self, plan: &mut LockedV1ProbePlan) -> &mut LockedV1Probe {
+    fn of_mut(self, plan: &mut LockedV1ProbePlan) -> &mut BoundedProbe {
         match self {
             Probe::HelperProtocol => &mut plan.helper_protocol,
             Probe::Preflight => &mut plan.preflight,
