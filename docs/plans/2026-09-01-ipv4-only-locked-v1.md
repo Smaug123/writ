@@ -545,9 +545,8 @@ representable without a start path behind it:
     mode answers for it, and the locked sequence is projected as its own
     ordered data. `admit` still refuses the profile.
   - **E2c-2**, the daemon interpreting that sequence through E1's typestates.
-  - **E2c-3**, the post-release migration off `container exec`, `admit`
-    calling `admit_locked`, and runner parity — the profile opening on an
-    empty host-placement pin list.
+  - **E2c-3**, in three parts of its own — see below; the profile opens last,
+    on an empty host-placement pin list.
 
 **Correctness oracle:**
 - Fake-tool daemon tests: the recorded `container run` argv contains exactly
@@ -820,6 +819,188 @@ unreleased, an install that fails, and one that floods.
 Every failure before the release leaves the workload unreleased, asserted by
 the absence of any `kill` in the fake tool's log rather than by inspecting the
 code path.
+
+---
+
+## Stage E2c-3: the post-release channel, and the profile opens
+
+**Dependencies:** E2c-2.
+
+Three concerns, and the word between them is "and", so they are three
+branches. The order is forced: the record channel is infrastructure the daemon
+consumes, the daemon's use of it must work before a real session can reach it,
+and the profile may only open once both hold.
+
+One thing E2c-2 deliberately left to its caller has to become structural here.
+`run_locked_start` sends the release whenever the guest says it is ready; the
+design requires the host not to release until *its own broker* is up, because
+the release is what tells the guest the broker exists (there is no
+broker-ready file any more). A caller obligation in a doc comment is the shape
+Stage E1 refused for the release signal, and it is refused here too: the proof
+is a value the broker's own spawn produces.
+
+---
+
+### Stage E2c-3a: the post-release record channel
+
+**Dependencies:** E2c-2.
+
+**Implements:** Layer 2, "workspace-bootstrap success and bounded failure
+records use the same host-side log channel as `security-ready`".
+
+The locked guest's bootstrap script stops waiting for a broker-ready file —
+being released *is* that signal — and prints versioned `bootstrap-ok` and
+bounded `bootstrap-failed` records to PID 1's stdout instead of touching
+sentinel files. The host gains a reader for them on E2a's channel.
+
+The two record kinds share a channel and have nothing else in common, and the
+reader must encode that. `security-ready` is emitted before any
+repository-controlled code exists and gates release. A bootstrap record is
+emitted *after* release, by code running as the same UID as PID 1, which can
+print whatever it likes — so it ends a wait, is reported to an operator, and
+carries no authority. The reader for bootstrap records must therefore refuse
+to read a `security-ready` record as anything at all: a workload that prints
+one is not making a claim the host will act on.
+
+Inert: no caller. The legacy path keeps its files and its `exec` polling
+untouched.
+
+**Correctness oracle:**
+- Property over fuzzed `container logs` output: a bootstrap record is read
+  only when it is exactly a rendered record on its own line; a
+  `security-ready` line is never read as a bootstrap outcome, however it is
+  positioned; two bootstrap records are refused, as `security-ready` already
+  is.
+- The failure record's message is bounded exactly as today's failure file is,
+  and a guest that floods the channel is refused rather than read in part.
+- The locked guest script contains no broker-ready wait and no sentinel-file
+  write, asserted against the script text; the legacy script is unchanged,
+  asserted by its existing tests still passing.
+- A weakening that reads a post-release `security-ready` as a bootstrap
+  outcome fails these tests.
+
+---
+
+**E2c-3a landed.** The two vocabularies are separated by their *prefix*
+(`writ-agent-vm-bootstrap` against the initializer's
+`writ-agent-vm-guest-init`), which turns "a bootstrap reader must never read a
+`security-ready` record" from a rule into something neither reader can do:
+each sees only its own prefix. Both directions are stated as properties.
+
+The scripts are not duplicated. The sentinel writes became two substitution
+points — where success is reported, and where a failure reason is sent — so
+the legacy profile's substitution reproduces today's scripts and a test
+asserts exactly that, by putting the legacy signalling back into the locked
+script and finding the legacy script. Any divergence in the nix prologue, the
+egress gate or the workspace init fails there.
+
+The failure emitter is shell, so its bound is `tr` and `cut` semantics rather
+than an argument: `LC_ALL=C tr -c '[:alnum:][:punct:] ' ' '` leaves only
+single-byte characters, which is what makes the `cut -c` bound a byte bound
+and stops a split multibyte character growing when the host decodes it. A test
+runs the real emitter under `/bin/sh` against reasons a guest can actually
+produce — multi-line, control bytes, non-ASCII, four thousand characters — and
+requires the host's parser to accept every result.
+
+Three comments in the shared script fragments named the sentinel files; they
+now describe what the code does under either profile.
+
+One thing the existing tests caught: the first version of the shared scanner
+counted prefixed lines before parsing any, which changed a landed answer — a
+malformed line beside a valid record became `Repeated` instead of `Malformed`.
+The shared helper now parses as it finds, so the first thing wrong with a log
+in reading order is still the thing reported.
+
+A review round caught two things, and the first was a straight miss against
+this plan. The locked script was to stop waiting for the broker-ready file,
+because being released *is* that signal — and it still had the wait. Nothing
+in the locked start creates that file, so the script would have blocked
+forever on it, never reaching the gate, the workspace init, or any outcome to
+report. The wait is now part of the signalling scheme, present only where a
+daemon touches the file.
+
+The second: the failure bound kept the *head* of the reason. The sentinel path
+deliberately tails its failure file because a workspace init that fails after
+a great deal of progress prints the actionable error last, so keeping the
+first 380 bytes keeps the progress and throws away the error. The emitter now
+tails too, and a test feeds it forty lines of progress followed by a Nix error
+and requires the error to survive.
+
+Four weakenings were injected and fail these tests: a bootstrap reader that
+accepts the initializer's prefix, a locked script that keeps writing the
+sentinel files, one that keeps the broker-ready wait, and a failure bound that
+keeps the head instead of the tail.
+
+---
+
+### Stage E2c-3b: the daemon runs a locked session end to end
+
+**Dependencies:** E2c-3a.
+
+**Implements:** Layer 2 host side, the remainder: the daemon's start arm
+dispatching on the mode, broker-readiness as a precondition the types carry,
+and the post-release wait on the log channel.
+
+The daemon's start arm dispatches: a locked plan claims its record, runs the
+shared prefix, and hands off to `run_locked_start`; every other mode is
+untouched. `run_locked_start` gains a parameter that only the broker's spawn
+produces, so the release cannot be ordered before broker readiness by a caller
+that forgot — the same move `ReleaseSignal` makes for the record.
+
+After the release, the daemon waits on the bootstrap record rather than
+polling files over `container exec`. At that point a locked session has no
+`exec` in its life at all.
+
+**Correctness oracle:**
+- Fake-tool daemon test over a full locked start: the invocation log contains
+  no `exec` for a locked session, at any point — not merely after the `kill`.
+- `run_locked_start` cannot be called without the broker-readiness value (a
+  compile-time fact, as with `ReleaseSignal`); a test asserts the daemon's
+  arm obtains it from the spawn rather than constructing one.
+- A bootstrap failure is surfaced to the operator with its bounded reason, and
+  the session is cleaned up; a bootstrap *success* is asserted to gate nothing
+  that carries authority, by enumerating every consumer of the start's success
+  (grants, proxies, staged pushes) and showing none keys off it.
+- The legacy profile's start sequence is unchanged, asserted by its existing
+  fake-tool tests.
+
+---
+
+### Stage E2c-3c: the profile opens
+
+**Dependencies:** E2c-3b.
+
+**Implements:** Persistence and compatibility, the admission half:
+`ConfiguredIpv6Profile::admit` consulting `admit_locked`, and both front doors
+agreeing.
+
+`admit` becomes evidence-taking for the locked profile: the daemon gathers
+Stage D's six facts and passes them to `admit_locked` with
+`ProvenPlatforms::shipped()`, which is **empty**. So at the end of this stage
+the profile is open in the code and admits on no host at all; Stage E3 adds
+the first (CLI, macOS build, image digest) record in the same change that
+records its proof passing.
+
+`writ-agent-vm-runner`'s `start` and `managed-start` call the same library
+gatherer and the same `admit`, so the runner cannot start a locked session on
+a host the daemon would refuse. Note the storeless `start` refuses the locked
+mode regardless (E2c-1): admission parity is about not acquiring a profile
+through a second front door, not about the raw path gaining a capability it
+structurally cannot have.
+
+**Correctness oracle:**
+- `admit` yields `Ipv4OnlyLockedV1` under exactly D's admitting evidence and
+  refuses otherwise, swept over the same grid D sweeps.
+- The "creates nothing" test runs for every refusing combination: no
+  subprocess beyond the probes, no audit row, no state record.
+- The shipped allowlist admits nothing, and a test asserts every entry in it
+  names a proof record — vacuously true while it is empty, and the assertion
+  that stops it being filled in without one.
+- The runner refuses every evidence combination the daemon refuses, with the
+  probes faked, and builds a locked plan only under the admitting one.
+- Stop and reconcile of a persisted locked session need no evidence: the
+  persisted-session tests run under a daemon whose evidence gathering is
+  scripted to fail.
 
 ---
 

@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc c294a149971dc75c8753b269d6b4bb001b1697efb5014c69540d2d532a51a636 # shrinks to first = SecurityReady { abi: 0 }, second = SecurityReady { abi: 0 }, noise = [], position = 0
 cc 5ecf444eb5e4adf3f54cec44185fbbfa874837fa612a34538d8214e09659225b # shrinks to malformed = "writ-agent-vm-guest-init ", record = SecurityReady { abi: 0 }, noise = [], position = 0, with_record = false
+cc 8e65ba2cd339e215654da792c73cc18ecb85f16be3422e6b445049ee5231cfc6 # shrinks to malformed = "writ-agent-vm-guest-init ", record = SecurityReady { abi: 0 }, noise = [], position = 0, with_record = true

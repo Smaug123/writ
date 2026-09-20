@@ -4,6 +4,7 @@
 use super::guest_command::*;
 use super::test_support::*;
 use super::*;
+use crate::agent_vm_guest_log::{GuestBootstrapRecord, GuestBootstrapReport, scan_bootstrap_log};
 use crate::vm_git::WorkspaceWarmMode;
 use std::fs;
 use std::process::Command;
@@ -421,4 +422,194 @@ fn both_guest_scripts_share_the_nix_prologue() {
     assert!(!nix.contains("nix-command flakes"));
     assert!(workspace.contains(r#"repo="$1""#));
     assert!(!nix.contains(r#"repo="$1""#));
+}
+
+/// The locked scripts differ from the legacy ones in exactly two things, and
+/// both are the channel: how the guest learns the broker is up, and where it
+/// reports its outcome.
+///
+/// Asserted by putting the legacy signalling *back* into the locked script
+/// and finding the legacy script — so any *other* divergence, in the nix
+/// prologue, the egress gate or the workspace init, fails here. That is the
+/// property worth holding: the locked profile changes the channel, not the
+/// bootstrap.
+#[test]
+fn the_locked_scripts_differ_from_the_legacy_ones_only_in_the_channel() {
+    for (legacy, locked) in [
+        (
+            nix_setup_script(),
+            nix_setup_script_with_signals(BootstrapSignals::LogRecords),
+        ),
+        (
+            workspace_bootstrap_script(),
+            workspace_bootstrap_script_with_signals(BootstrapSignals::LogRecords),
+        ),
+    ] {
+        let restored = locked
+            .replace(
+                BootstrapSignals::LogRecords.ok(),
+                BootstrapSignals::SentinelFiles.ok(),
+            )
+            .replace(
+                BootstrapSignals::LogRecords.fail_sink(),
+                BootstrapSignals::SentinelFiles.fail_sink(),
+            )
+            .replace(BootstrapSignals::LogRecords.prelude(), "");
+        // The locked script omits the broker-ready wait entirely, so put it
+        // back where the legacy one has it: immediately before the gate.
+        let restored = restored.replace(
+            "\negress_gate() {",
+            &format!(
+                "{}\negress_gate() {{",
+                BootstrapSignals::SentinelFiles.broker_ready_wait()
+            ),
+        );
+        assert_eq!(restored, legacy);
+    }
+}
+
+/// A locked script reports through the log channel and touches no sentinel.
+#[test]
+fn the_locked_scripts_report_through_records_not_sentinels() {
+    for script in [
+        nix_setup_script_with_signals(BootstrapSignals::LogRecords),
+        workspace_bootstrap_script_with_signals(BootstrapSignals::LogRecords),
+    ] {
+        assert!(
+            !script.contains("bootstrap-ok") && !script.contains("bootstrap-failed"),
+            "a locked script must not write the daemon-polled sentinels: {script}"
+        );
+        assert!(script.contains("writ-agent-vm-bootstrap ok"));
+        assert!(script.contains("_writ_bootstrap_failed"));
+    }
+}
+
+/// The success line the locked script prints is exactly the record the host
+/// parses, so the two sides of the channel cannot drift.
+#[test]
+fn the_locked_success_line_is_the_record_the_host_reads() {
+    let rendered = GuestBootstrapRecord::Ok.render();
+    let script = nix_setup_script_with_signals(BootstrapSignals::LogRecords);
+    assert!(
+        script.contains(&rendered),
+        "the script must print exactly {rendered:?}: {script}"
+    );
+    assert_eq!(
+        scan_bootstrap_log(&rendered),
+        Ok(GuestBootstrapReport::Finished(GuestBootstrapRecord::Ok))
+    );
+}
+
+/// The failure emitter the locked script defines produces a record the host
+/// reads, for reasons a guest can actually produce: multi-line, control
+/// bytes, non-ASCII, and far too long.
+///
+/// Run as real shell rather than reasoned about, because the bound is `tr` and
+/// `cut` semantics and those are what the guest will execute.
+#[test]
+fn the_locked_failure_emitter_produces_a_record_the_host_reads() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!(
+        "{}\n_writ_bootstrap_failed\n",
+        BootstrapSignals::LogRecords.prelude()
+    );
+    let path = crate::test_support::write_executable_script(dir.path(), "emit.sh", &script);
+    let control = format!("a {}[31mcontrol{}[0m sequence", '\u{1b}', '\u{1b}');
+    let long = "x".repeat(4000);
+    for reason in [
+        "workspace init failed with exit 3",
+        "line one\nline two\ttabbed",
+        control.as_str(),
+        "naive unicode \u{2026} reason",
+        long.as_str(),
+    ] {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = writ_core::process_spawn::spawn(&mut command).expect("the emitter runs");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(reason.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().expect("the emitter finishes");
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        let scanned = scan_bootstrap_log(&printed);
+        assert!(
+            matches!(
+                scanned,
+                Ok(GuestBootstrapReport::Finished(
+                    GuestBootstrapRecord::Failed { .. }
+                ))
+            ),
+            "reason {reason:?} printed {printed:?}, scanned {scanned:?}"
+        );
+    }
+}
+
+/// A locked script waits for no broker-ready file. Nothing in the locked
+/// start creates one — being released *is* that signal — so a script that
+/// waited would block forever on a file that never appears.
+#[test]
+fn the_locked_scripts_wait_for_no_broker_ready_file() {
+    for script in [
+        nix_setup_script_with_signals(BootstrapSignals::LogRecords),
+        workspace_bootstrap_script_with_signals(BootstrapSignals::LogRecords),
+    ] {
+        assert!(
+            !script.contains("broker-ready"),
+            "a locked script must not wait for a file nothing creates: {script}"
+        );
+    }
+    // The legacy scripts still do, because the daemon still touches it.
+    for script in [nix_setup_script(), workspace_bootstrap_script()] {
+        assert!(script.contains("/run/writ-agent-vm/broker-ready"));
+    }
+}
+
+/// A bootstrap failure keeps its *tail*, because that is where the actionable
+/// error is: a workspace init that fails after a great deal of progress
+/// prints the error last, and the sentinel path tails its failure file for
+/// exactly this reason.
+#[test]
+fn a_long_bootstrap_failure_keeps_the_error_at_its_end() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!(
+        "{}\n_writ_bootstrap_failed\n",
+        BootstrapSignals::LogRecords.prelude()
+    );
+    let path = crate::test_support::write_executable_script(dir.path(), "emit.sh", &script);
+    let reason = format!(
+        "{}\nerror: builder for drv failed with exit code 1",
+        "copying path 'nix/store/some-long-progress-line' from cache\n".repeat(40)
+    );
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = writ_core::process_spawn::spawn(&mut command).expect("the emitter runs");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(reason.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("the emitter finishes");
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        printed.contains("builder for drv failed with exit code 1"),
+        "the actionable error must survive the bound: {printed:?}"
+    );
+    assert!(matches!(
+        scan_bootstrap_log(&printed),
+        Ok(GuestBootstrapReport::Finished(
+            GuestBootstrapRecord::Failed { .. }
+        ))
+    ));
 }
