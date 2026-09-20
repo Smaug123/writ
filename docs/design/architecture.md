@@ -1288,6 +1288,25 @@ cleanup-only. `ReleaseSignal` is the one effect the types order: only
 the daemon cannot send a signal it has not first written down. See §5.5 and
 Stage E1 of the plan.
 
+`Ipv6IsolationMode` has a third variant, `Ipv4OnlyLockedV1`. A session can be
+recorded in it (state schema v3 carries the spelling) but cannot reach it:
+`ConfiguredIpv6Profile::admit` still refuses the profile. What the variant
+buys is that every site dispatching on the mode answers for it — the
+`== Ipv4OnlyNoGuestIpv6` comparisons that would have handed a locked session
+the legacy answer are now predicates named for the question each asks
+(`requires_guest_command`, `has_firewall_ipv6_cidr`,
+`startable_without_a_state_store`).
+
+**Locked sessions are managed-only, structurally.** The release signal exists
+only once the state store has recorded the attempt to send it, so a start path
+with no store could start a guest, confine it, and never release it:
+`start_agent_vm_session` refuses the mode before creating anything. For the
+same reason the locked sequence is its own ordered type,
+`agent_vm_locked_start::LockedStartStep` (create → verify → start → final
+firewall → await `security-ready` → release), rather than more variants on
+`AgentVmStartStep`: that enum's interpreter is synchronous and store-less, and
+the locked tail is neither. Each step names the `LockedPhase` it establishes.
+
 `agent_vm_locked_start` is the locked profile's launch and its readback,
 built and tested but with no caller.
 `AgentVmSessionPlan::locked_create_vm_invocation` emits a `container create`:

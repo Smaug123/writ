@@ -651,3 +651,103 @@ async fn run_capturing_output_bounded_does_not_deadlock_on_a_one_sided_flood_pas
     assert!(out.truncated, "a flood past the cap must flag truncation");
     assert_eq!(out.stdout.len(), 64, "stdout must be capped at max_bytes");
 }
+
+/// A storeless start refuses the locked profile before it creates anything.
+///
+/// The refusal is structural, not a policy: a locked session ends with a
+/// release signal that only the state store mints, so a path with no store
+/// could start a guest, confine it, and never release it. Refusing at the
+/// door is the one moment at which refusing costs nothing — and the assertion
+/// that *nothing ran* is what says it happened there.
+#[test]
+fn a_storeless_start_refuses_the_locked_profile_before_creating_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("argv.log");
+    let tool = crate::test_support::write_executable_script(
+        dir.path(),
+        "container",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexit 0\n",
+            log = crate::test_support::shell_quote_path(&log),
+        ),
+    );
+    let plan = AgentVmSessionPlan::new(
+        session_id(),
+        pool(),
+        9,
+        ports(),
+        BrokerPortRange::new(49152, 65535).unwrap(),
+        Ipv6IsolationMode::Ipv4OnlyLockedV1,
+        ContainerImage::new("alpine:latest").unwrap(),
+        vec!["sleep".into(), "600".into()],
+        AgentVmResources::new(1, 512).unwrap(),
+        AgentVmToolPaths::new(&tool, dir.path().join("pf-helper"), dir.path().join("sudo")),
+    )
+    .unwrap();
+
+    let error = start_agent_vm_session(&plan).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AgentVmLifecycleRunError::LockedProfileNeedsAStateStore
+        ),
+        "{error:?}"
+    );
+    assert!(
+        !log.exists(),
+        "the refusal must come before any container command runs"
+    );
+}
+
+/// The other modes are unaffected: refusing the locked profile here is about
+/// the release signal, not about tightening the storeless path in general.
+#[test]
+fn a_storeless_start_still_admits_the_other_modes() {
+    for mode in Ipv6IsolationMode::ALL {
+        assert_eq!(
+            mode.startable_without_a_state_store(),
+            mode != Ipv6IsolationMode::Ipv4OnlyLockedV1,
+            "{mode:?}"
+        );
+    }
+}
+
+/// A profile whose workload is held until the host releases it cannot be
+/// planned without a guest command: there would be nothing to release.
+///
+/// The expected answer is written out per mode rather than read from
+/// `requires_guest_command`, which is the predicate under test — asking it
+/// what it expects would pass whatever it said. The length assertion is what
+/// makes a mode added later fail here until someone decides its answer.
+#[test]
+fn a_held_until_released_profile_requires_a_guest_command() {
+    let expected = [
+        (Ipv6IsolationMode::DualStackRequired, false),
+        (Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6, true),
+        (Ipv6IsolationMode::Ipv4OnlyLockedV1, true),
+    ];
+    assert_eq!(
+        expected.len(),
+        Ipv6IsolationMode::ALL.len(),
+        "every mode needs an answer here"
+    );
+    for (mode, needs_command) in expected {
+        let planned = AgentVmSessionPlan::new(
+            session_id(),
+            pool(),
+            9,
+            ports(),
+            BrokerPortRange::new(49152, 65535).unwrap(),
+            mode,
+            ContainerImage::new("alpine:latest").unwrap(),
+            Vec::new(),
+            AgentVmResources::new(1, 512).unwrap(),
+            AgentVmToolPaths::new("container", "pf-helper", "sudo"),
+        );
+        assert_eq!(
+            planned.is_err(),
+            needs_command,
+            "{mode:?} with no guest command"
+        );
+    }
+}

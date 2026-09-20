@@ -76,7 +76,9 @@ use std::collections::BTreeSet;
 
 use writ_guest_init::capability_argv::TemporaryCapability;
 
+use crate::agent_vm_lifecycle::ProcessInvocation;
 use crate::agent_vm_locked_admission::ImageDigest;
+use crate::agent_vm_locked_lifecycle::LockedPhase;
 
 /// Where the official image installs the guest initializer.
 ///
@@ -336,6 +338,74 @@ mod wire {
     pub(super) struct UserId {
         pub(super) uid: u32,
         pub(super) gid: u32,
+    }
+}
+
+// --- the locked start sequence, as ordered data ------------------------------
+
+/// One step of the locked profile's start, in the order it happens.
+///
+/// A separate machine from [`AgentVmStartStep`](crate::agent_vm_lifecycle::AgentVmStartStep)
+/// rather than more variants on it, because the two are interpreted by
+/// different things. The legacy steps are each a process the synchronous
+/// runner runs and checks; the locked sequence's tail is not — waiting for the
+/// guest record is a bounded poll, and the release is minted by the state
+/// store rather than constructed by a caller. Keeping them apart means the
+/// legacy interpreter cannot be handed a step it has no way to carry out, and
+/// the locked phases stay next to the [`LockedPhase`] they establish.
+///
+/// Every variant carries what an operator would want to see in a dry run, and
+/// nothing an interpreter needs beyond it: Stage E2c wires the daemon to this
+/// order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LockedStartStep {
+    /// `container create`: resolve the image tag and build the VM's
+    /// configuration without running it.
+    CreateVm(ProcessInvocation),
+    /// `container inspect`: read back what was built, and refuse to go on
+    /// unless it is what was asked for.
+    VerifyVm(ProcessInvocation),
+    /// `container start`: run the verified VM. Its PID 1 is the initializer,
+    /// which locks itself down and then waits to be released.
+    StartVm(ProcessInvocation),
+    /// Replace the bootstrap anchor with the interface-scoped one, now that
+    /// the VM's bridge exists.
+    InstallFinalFirewall(ProcessInvocation),
+    /// Read the guest's `security-ready` record from its own log channel.
+    /// Bounded and polled, so it is a wait rather than a command.
+    AwaitGuestSecurityLocked(ProcessInvocation),
+    /// `container kill --signal USR1`, which the state store mints only after
+    /// recording that it was about to be sent. The invocation here is for
+    /// display: an interpreter must obtain the real one from the store.
+    ReleaseWorkload(ProcessInvocation),
+}
+
+impl LockedStartStep {
+    /// The phase this step establishes once it succeeds.
+    ///
+    /// Two steps share [`LockedPhase::AgentVmStarted`]: verifying the created
+    /// VM proves nothing new about the *host*, and starting it is what makes
+    /// the initializer run. Nothing establishes [`LockedPhase::Claimed`],
+    /// which is where a start begins rather than something it reaches.
+    pub fn establishes(&self) -> LockedPhase {
+        match self {
+            Self::CreateVm(_) | Self::VerifyVm(_) | Self::StartVm(_) => LockedPhase::AgentVmStarted,
+            Self::InstallFinalFirewall(_) => LockedPhase::FinalFirewallInstalled,
+            Self::AwaitGuestSecurityLocked(_) => LockedPhase::GuestSecurityLocked,
+            Self::ReleaseWorkload(_) => LockedPhase::ReleaseAttempted,
+        }
+    }
+
+    /// What this step runs, for a dry run to print.
+    pub fn invocation(&self) -> &ProcessInvocation {
+        match self {
+            Self::CreateVm(invocation)
+            | Self::VerifyVm(invocation)
+            | Self::StartVm(invocation)
+            | Self::InstallFinalFirewall(invocation)
+            | Self::AwaitGuestSecurityLocked(invocation)
+            | Self::ReleaseWorkload(invocation) => invocation,
+        }
     }
 }
 

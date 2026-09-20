@@ -9,7 +9,9 @@
 //! `agent_vm_lifecycle.rs` to keep that file readable; behaviour is unchanged.
 
 use super::*;
-use crate::agent_vm_locked_start::{GUEST_INIT_PATH, locked_readonly_path_argv};
+use crate::agent_vm_guest_log::GuestLogChannel;
+use crate::agent_vm_locked_lifecycle::LOCKED_RELEASE_SIGNAL;
+use crate::agent_vm_locked_start::{GUEST_INIT_PATH, LockedStartStep, locked_readonly_path_argv};
 use writ_guest_init::capability_argv::locked_capability_argv_profile;
 
 impl AgentVmSessionPlan {
@@ -60,7 +62,7 @@ impl AgentVmSessionPlan {
         tools: AgentVmToolPaths,
     ) -> Result<Self, AgentVmLifecycleConfigError> {
         broker_port_range.require_contains(&broker_ports)?;
-        if ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 && guest_command.is_empty() {
+        if ipv6_mode.requires_guest_command() && guest_command.is_empty() {
             return Err(AgentVmLifecycleConfigError::EmptyGuestCommandForIpv4OnlyNoGuestIpv6);
         }
         let (network, names) = derive_session_network(session_id, pool, subnet_index)?;
@@ -317,7 +319,10 @@ impl AgentVmSessionPlan {
             Ipv6IsolationMode::DualStackRequired => {
                 self.validate_dual_stack_ipv6_inspection(inspection)?;
             }
-            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => {
+            // Both IPv4-only profiles ask the same question of the network:
+            // writ never requests an IPv6 subnet for either, so an inspected
+            // network that reports one is a network this session did not plan.
+            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 | Ipv6IsolationMode::Ipv4OnlyLockedV1 => {
                 validate_ipv4_only_observed_ipv6(inspection)?;
             }
         }
@@ -485,6 +490,53 @@ impl AgentVmSessionPlan {
             self.tools.container.clone(),
             ["start".to_string(), self.names.vm.clone()],
         )
+    }
+
+    /// `container inspect <vm>` — the readback of the created VM, whose output
+    /// [`LockedContainerShape`](crate::agent_vm_locked_start::LockedContainerShape)
+    /// parses.
+    pub fn locked_verify_vm_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.tools.container.clone(),
+            ["inspect".to_string(), self.names.vm.clone()],
+        )
+    }
+
+    /// The locked profile's start, after the shared network and bootstrap-PF
+    /// prefix, as the ordered data an interpreter follows.
+    ///
+    /// The prefix is not repeated here: probing, creating and validating the
+    /// network and loading the bootstrap anchor are the same work under every
+    /// profile, and [`Self::start_steps`] already projects them. What this
+    /// adds is everything from the VM onwards, which is where the profiles
+    /// stop agreeing.
+    ///
+    /// Stage E2c-1 projects it; the daemon interprets it in E2c-2. Note the
+    /// release step's invocation is for display only — the one that may
+    /// actually be sent is minted by
+    /// [`AgentVmSessionStateStore::record_release_attempted`](crate::agent_vm_lifecycle::AgentVmSessionStateStore::record_release_attempted).
+    pub fn locked_start_sequence(&self, env_file: Option<&Path>) -> Vec<LockedStartStep> {
+        vec![
+            LockedStartStep::CreateVm(self.locked_create_vm_invocation(env_file)),
+            LockedStartStep::VerifyVm(self.locked_verify_vm_invocation()),
+            LockedStartStep::StartVm(self.locked_start_vm_invocation()),
+            LockedStartStep::InstallFinalFirewall(self.firewall_install_invocation(true)),
+            LockedStartStep::AwaitGuestSecurityLocked(
+                GuestLogChannel::new(&self.tools.container, &self.names.vm)
+                    .probe()
+                    .invocation
+                    .clone(),
+            ),
+            LockedStartStep::ReleaseWorkload(ProcessInvocation::new(
+                self.tools.container.clone(),
+                [
+                    "kill".to_string(),
+                    "--signal".to_string(),
+                    LOCKED_RELEASE_SIGNAL.to_string(),
+                    self.names.vm.clone(),
+                ],
+            )),
+        ]
     }
 
     fn start_vm_invocation_with_env_file(&self, env_file: Option<&Path>) -> ProcessInvocation {

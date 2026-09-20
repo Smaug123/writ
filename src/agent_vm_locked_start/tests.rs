@@ -19,6 +19,7 @@ use std::path::Path;
 use super::*;
 use crate::agent_vm_lifecycle::AgentVmSessionPlan;
 use crate::agent_vm_lifecycle::test_support::plan;
+use crate::agent_vm_locked_lifecycle::LockedPhase;
 use writ_guest_init::capability_argv::{
     LOCKED_CAPABILITY_ARGV_PROFILE, parse_locked_capability_argv_profile,
 };
@@ -410,4 +411,117 @@ fn an_interposed_runtime_init_is_refused() {
         .verify(&admitted())
         .unwrap_err();
     assert_eq!(verdict, LockedShapeMismatch::RuntimeInitInterposed);
+}
+
+// --- the locked start sequence ----------------------------------------------
+
+/// The sequence reaches every phase a start can establish, in order, and each
+/// step establishes exactly the phase its position implies.
+///
+/// `Claimed` is deliberately absent: it is where a start begins, not
+/// something a step reaches. `WorkloadReleased` is absent too — the step
+/// establishes `ReleaseAttempted`, and whether the signal landed is not a
+/// thing the sequence can assert, which is the whole point of E1's treating
+/// the two alike.
+#[test]
+fn the_sequence_establishes_the_phases_in_order() {
+    let plan = test_plan();
+    let steps = plan.locked_start_sequence(None);
+    let phases: Vec<LockedPhase> = steps.iter().map(LockedStartStep::establishes).collect();
+    assert_eq!(
+        phases,
+        vec![
+            LockedPhase::AgentVmStarted,
+            LockedPhase::AgentVmStarted,
+            LockedPhase::AgentVmStarted,
+            LockedPhase::FinalFirewallInstalled,
+            LockedPhase::GuestSecurityLocked,
+            LockedPhase::ReleaseAttempted,
+        ]
+    );
+    let mut sorted = phases.clone();
+    sorted.sort();
+    assert_eq!(phases, sorted, "the sequence must not go backwards");
+}
+
+/// The VM is created, read back, and only then started — in that order. This
+/// is the ordering the readback exists for, so it is asserted on the sequence
+/// as well as on the argv.
+#[test]
+fn the_sequence_verifies_between_creating_and_starting() {
+    let plan = test_plan();
+    let steps = plan.locked_start_sequence(None);
+    let subcommands: Vec<String> = steps
+        .iter()
+        .map(|step| {
+            step.invocation()
+                .args_lossy()
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    let create = subcommands.iter().position(|a| a == "create").unwrap();
+    let inspect = subcommands.iter().position(|a| a == "inspect").unwrap();
+    let start = subcommands.iter().position(|a| a == "start").unwrap();
+    assert!(create < inspect && inspect < start, "{subcommands:?}");
+}
+
+/// The final firewall is installed before the guest is waited on, and the
+/// guest is waited on before the release. The host's backstop is therefore in
+/// place for the whole time the guest is running, and the release happens only
+/// after the guest has said it locked itself down.
+#[test]
+fn the_host_backstop_precedes_the_guest_handshake_and_the_release() {
+    let plan = test_plan();
+    let steps = plan.locked_start_sequence(None);
+    let position = |wanted: LockedPhase| {
+        steps
+            .iter()
+            .position(|step| step.establishes() == wanted)
+            .expect("phase present")
+    };
+    assert!(
+        position(LockedPhase::FinalFirewallInstalled) < position(LockedPhase::GuestSecurityLocked)
+    );
+    assert!(position(LockedPhase::GuestSecurityLocked) < position(LockedPhase::ReleaseAttempted));
+}
+
+/// The release step's invocation is the `container kill --signal USR1` an
+/// operator would see in a dry run — and nothing more. The one that may
+/// actually be sent is minted by the state store, which is what makes
+/// "recorded before sent" structural rather than remembered.
+#[test]
+fn the_release_step_displays_the_signal_it_does_not_authorise() {
+    let plan = test_plan();
+    let steps = plan.locked_start_sequence(None);
+    let release = steps
+        .iter()
+        .find(|step| matches!(step, LockedStartStep::ReleaseWorkload(_)))
+        .expect("the sequence ends with a release");
+    assert_eq!(
+        release.invocation().args_lossy(),
+        vec![
+            "kill".to_string(),
+            "--signal".to_string(),
+            "USR1".to_string(),
+            plan.names().vm().to_string(),
+        ]
+    );
+}
+
+/// The guest handshake reads the log channel, not a `container exec`. Layer 2
+/// promises the host creates no privileged process in a locked guest, and a
+/// sequence that reached for `exec` would break that before E2c-2 had a
+/// chance to.
+#[test]
+fn the_sequence_never_execs_into_the_guest() {
+    let plan = test_plan();
+    for step in plan.locked_start_sequence(None) {
+        let args = step.invocation().args_lossy();
+        assert!(
+            args.first().map(String::as_str) != Some("exec"),
+            "the locked sequence must not exec into the guest: {args:?}"
+        );
+    }
 }
