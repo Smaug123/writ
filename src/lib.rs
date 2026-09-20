@@ -31,6 +31,8 @@ pub mod agent_vm_pf_helper_protocol;
 #[cfg(feature = "host")]
 pub mod agent_vm_probe;
 #[cfg(feature = "host")]
+pub mod agent_vm_proof;
+#[cfg(feature = "host")]
 pub use writ_audit as audit;
 #[cfg(feature = "host")]
 pub(crate) use writ_core::bearer;
