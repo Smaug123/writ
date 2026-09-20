@@ -31,6 +31,18 @@ pub(super) fn make_state() -> Arc<BrokerState<InMemorySecretStore>> {
     make_state_with_audit(AuditLog::open_in_memory().unwrap())
 }
 
+/// A broker state whose agent-run bounds are as small as they go: one
+/// running, one waiting.
+///
+/// For the tests about what happens to a request the bound refuses.
+pub(super) fn make_state_with_one_run_admitted() -> Arc<BrokerState<InMemorySecretStore>> {
+    let one = std::num::NonZeroUsize::new(1).unwrap();
+    let mut state = claude_broker_state("http://127.0.0.1", "o");
+    state.audit = Arc::new(AuditLog::open_in_memory().unwrap());
+    state.agent_run_slots = crate::server::AgentRunSlots::new(one, one).unwrap();
+    Arc::new(state)
+}
+
 pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemorySecretStore>> {
     let mut state = claude_broker_state("http://127.0.0.1", "o");
     state.audit = Arc::new(audit);

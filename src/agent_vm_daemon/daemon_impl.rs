@@ -92,24 +92,6 @@ impl AgentVmDaemon {
     /// again wherever the answer was wanted. A refusal still costs only those
     /// probes — no network, no VM, no state record — which is what keeps it
     /// safe to ask before the session has an identity.
-    /// [`Self::admitted_profile`] for the agent-run route, which one
-    /// placement cannot serve at all.
-    ///
-    /// Placement first, and the ordering matters more than it did: it is the
-    /// more specific answer — this route does not exist on the v1 broker VM
-    /// under any profile — and, now that deciding a profile reads the host, it
-    /// is also the free one. A vm-placement config asked the other way round
-    /// waits out five probes to be told something that was true before they
-    /// ran, in the wrong words.
-    pub async fn admitted_profile_for_agent_run(
-        &self,
-    ) -> Result<AdmittedProfile, AgentVmDaemonError> {
-        if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
-            return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
-        }
-        self.admitted_profile().await
-    }
-
     pub async fn admitted_profile(&self) -> Result<AdmittedProfile, AgentVmDaemonError> {
         Ok(admit_on_this_host(
             self.config.lifecycle.ipv6_profile,
@@ -189,13 +171,20 @@ impl AgentVmDaemon {
         outcome
     }
 
-    /// Accept an agent run: mint its ids, answer everything answerable without
-    /// waiting, and take a place in the queue.
+    /// Accept an agent run: answer everything answerable, take a place in the
+    /// queue, decide what it may start as, and mint its ids.
     ///
-    /// Deliberately not `async`. Nothing here awaits, so a caller can have the
-    /// run's ids without writd having done anything slow — which is the whole
-    /// contract `StartAgentRun` now offers, and a property worth being able to
-    /// read off the signature rather than trusting a comment.
+    /// The one thing it awaits is the admission decision, which for the locked
+    /// profile is five host probes. That used to be free, and this function
+    /// used to await nothing at all — but a decision that *is* work cannot be
+    /// made anywhere cheaper, and it belongs here rather than in the caller
+    /// for the reason every other refusal does: it has to happen inside the
+    /// queue bound. A request the bound refuses must not be able to make writd
+    /// run five subprocesses on its behalf first.
+    ///
+    /// What the old signature was protecting survives: writd still starts
+    /// nothing before the caller is told the run's name. Probing is what
+    /// decides whether there is a run to name.
     ///
     /// > An accepted run has been *named*, not started. Nothing is recorded
     /// > about it, no VM exists, and it holds no slot: only a place in the
@@ -217,15 +206,9 @@ impl AgentVmDaemon {
     /// [`AgentVmDaemon::complete_agent_run_session`] gives both back rather than
     /// leaving either behind.
     #[allow(clippy::too_many_arguments)]
-    pub fn accept_agent_run_session<S: SecretStore + Send + Sync + 'static>(
+    pub async fn accept_agent_run_session<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: &BrokerState<S>,
-        // Decided by the caller, because deciding it is five probes and this
-        // is deliberately not `async`: the point of accepting is that a
-        // caller gets its ids without writd awaiting anything. Taking the
-        // decision rather than making it also means a run cannot be accepted
-        // without one having been made.
-        admitted: AdmittedProfile,
         label: Option<String>,
         agent_kind: AgentKind,
         agent_model: String,
@@ -234,12 +217,11 @@ impl AgentVmDaemon {
         tags: AgentRunTags,
     ) -> Result<AcceptedAgentRun, AgentVmDaemonError> {
         // Everything refusable is refused before the run has an identity, so a
-        // refusal names no session that never existed. The profile was decided
-        // by the caller, for the same reason and before the same line.
-        // Placement is the more specific answer, so it comes first: a vm
-        // config under a profile no session may start under would otherwise
-        // be told about the profile, when this route does not exist on the v1
-        // broker VM under any profile.
+        // refusal names no session that never existed. Placement is the most
+        // specific answer and the cheapest, so it comes first: a vm config
+        // under a profile this host refuses would otherwise be told about the
+        // profile — and made to wait out its probes — when this route does not
+        // exist on the v1 broker VM under any profile.
         if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
             return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
         }
@@ -267,16 +249,28 @@ impl AgentVmDaemon {
             }
         })?;
 
-        // The last thing that can refuse this request, and the reason it happens
-        // here rather than alongside the wait it guards: past this line the run
-        // has a name, and a name its caller may already be acting on. So the
-        // admission bound is consulted synchronously, in the same breath as the
-        // malformed-request answers above — a run writd will not queue learns so
-        // now, before it is told what it would have been called.
+        // The bound, and the reason it is consulted here rather than alongside
+        // the wait it guards: past this line the run has a name, and a name its
+        // caller may already be acting on. So it is consulted in the same
+        // breath as the malformed-request answers above — a run writd will not
+        // queue learns so now, before it is told what it would have been
+        // called.
+        //
+        // It is also the last cheap thing, and everything after it is inside
+        // it. That ordering became load-bearing when admission started reading
+        // the host: `place` is held across the probes, so the number of
+        // requests that can have writd probing on their behalf at once is the
+        // number of runs it will admit, rather than the number of clients that
+        // can connect.
         let place = state
             .agent_run_slots
             .enqueue()
             .map_err(AgentVmDaemonError::AgentRunQueueFull)?;
+
+        // What this run's session may start as. Under the locked profile this
+        // is five host probes; under the others it is a match on the
+        // configured spelling and costs nothing.
+        let admitted = self.admitted_profile().await?;
 
         let registration = self.register_accepted_agent_run(session_id);
         Ok(AcceptedAgentRun {
@@ -449,16 +443,17 @@ impl AgentVmDaemon {
         prompt: AgentPrompt,
         tags: AgentRunTags,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
-        let accepted = self.accept_agent_run_session(
-            &state,
-            self.admitted_profile_for_agent_run().await?,
-            label,
-            agent_kind,
-            agent_model,
-            workspace,
-            prompt,
-            tags,
-        )?;
+        let accepted = self
+            .accept_agent_run_session(
+                &state,
+                label,
+                agent_kind,
+                agent_model,
+                workspace,
+                prompt,
+                tags,
+            )
+            .await?;
         self.complete_agent_run_session(state, accepted).await
     }
 

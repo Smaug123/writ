@@ -1277,9 +1277,18 @@ of adding.
 
 The decision is asked **once** per start and threaded onward, because it is no
 longer free: five subprocesses, and two readings of a host could disagree.
-`AcceptedAgentRun` therefore carries the `AdmittedProfile` its caller decided
-on, which also keeps `accept_agent_run_session` non-`async` — the point of
-accepting is that a caller gets its ids without writd awaiting anything.
+`AcceptedAgentRun` carries the `AdmittedProfile` decided when the run was
+accepted, and `accept_agent_run_session` is where that happens — after
+`enqueue`, so the probes run inside the pending-run bound rather than outside
+it. That ordering is what keeps "how many runs writd will admit" and "how many
+requests can have it probing at once" the same number; a guard test asserts
+it, beside the one saying this is the only place that enqueues.
+
+`--dry-run` cannot ask at all, since it must run nothing.
+`ConfiguredIpv6Profile::is_decided_by_the_host` is the pure question it asks
+instead: for the locked profile the runner prints the *probes*, which are the
+first thing a real start would run and the only part of it a dry run can
+know.
 
 Both front doors (`start_session` / `accept_agent_run_session`, and
 `writ-agent-vm-runner start`) come through the one function, so the runner

@@ -695,7 +695,7 @@ mutually exclusive and the locked profile takes the one whose completion it
 can observe, with host PF the backstop either way. A test asserts the kernel
 arg is absent, naming that reason.
 
-Six weakenings were injected and fail these tests: a readback that compares
+Eight weakenings were injected and fail these tests: a readback that compares
 the argv spelling of a capability, one that ignores the `/proc` relaxation,
 one that ignores PID 1's identity, one that ignores `useInit`, a launch that
 swaps the relaxation for the legacy kernel argument, and a launch that goes
@@ -1047,11 +1047,32 @@ prints *the probes*, which is the honest preview and the only part of the
 start a dry run can know. `ConfiguredIpv6Profile::is_decided_by_the_host` is
 the pure question a caller that must run nothing asks first.
 
-That is the third place in this slice where a pure function becoming effectful
-broke something downstream, and the pattern is worth naming: every caller that
-was relying on admission being free had to be found, because none of them said
-so. The compiler found two (the `async` boundary) and a reviewer found the
-other two, which is the wrong ratio.
+A fourth round found the last one, and it is the most consequential. Deciding
+the profile had been hoisted out of `accept_agent_run_session` — that function
+is not `async` on purpose — which put the five probes *outside* the
+pending-run bound `enqueue` takes. Concurrent requests could therefore have
+writd probing on their behalf without limit: the bound went on bounding the
+runs writd remembers and stopped bounding the work it does per request.
+
+So admission moved back inside, after the bound, and `accept_agent_run_session`
+became `async`. What its old signature was protecting survives — writd still
+starts nothing before the caller is told the run's name — but the reason it
+awaited nothing has expired: a decision that *is* work cannot be made
+anywhere cheaper, and every other refusal in that function is ordered against
+the bound for exactly this reason. `place` is now held across the probes, so
+the number of requests that can have writd probing at once is the number of
+runs it will admit. The existing spawn-hygiene-style guard on that function
+gained the ordering as a second assertion, beside the one that says this is
+the only place that enqueues.
+
+That is four places in this slice where a pure function becoming effectful
+broke something downstream, and the pattern is worth naming: every caller
+relying on admission being free had to be found, because none of them said so.
+The compiler found two of them — the ones the `async` boundary touched — and a
+reviewer found the other four. A type that made "this is now work" visible to
+callers would have found them all; `async` was that type for two of the four,
+and for the rest the cost was invisible because nothing about an ordering says
+what it is protecting.
 
 Six weakenings were injected and fail these tests: a locked session wrapped
 with the sentinel scripts, a release that accepts any listening broker, an
@@ -1188,8 +1209,9 @@ Five weakenings were injected and fail these tests: an allowlist entry whose
 proof run names no date, a door that probes a host other than the one it was
 asked about, a door that probes for the profiles decided on their spelling, a
 reconcile that asks admission on its way to a teardown, an agent-run route
-that asks about the profile before the placement, and a dry run that asks for
-a decision before it looks at the flag.
+that asks about the profile before the placement, a dry run that asks for a
+decision before it looks at the flag, an accept that probes before taking its
+place in the queue, and a placement check moved after the probes.
 
 ---
 

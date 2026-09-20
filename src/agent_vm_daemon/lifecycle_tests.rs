@@ -2125,7 +2125,6 @@ async fn accepting_an_agent_run_names_it_without_starting_anything() {
     let accepted = daemon
         .accept_agent_run_session(
             &state,
-            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
             Some("named".into()),
             AgentKind::Claude,
             "claude-test".into(),
@@ -2133,6 +2132,7 @@ async fn accepting_an_agent_run_names_it_without_starting_anything() {
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
         )
+        .await
         .expect("a well-formed run under a free bound is accepted");
 
     assert!(
@@ -2201,7 +2201,6 @@ async fn stopping_an_accepted_run_before_it_starts_prevents_the_start() {
     let accepted = daemon
         .accept_agent_run_session(
             &state,
-            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
             Some("queued".into()),
             AgentKind::Claude,
             "claude-test".into(),
@@ -2209,6 +2208,7 @@ async fn stopping_an_accepted_run_before_it_starts_prevents_the_start() {
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
         )
+        .await
         .expect("the queue has room for one");
     let session_id = accepted.session_id();
 
@@ -2442,7 +2442,6 @@ async fn dropping_an_accepted_run_gives_back_everything_it_took() {
     let accepted = daemon
         .accept_agent_run_session(
             &state,
-            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
             Some("abandoned".into()),
             AgentKind::Claude,
             "claude-test".into(),
@@ -2450,6 +2449,7 @@ async fn dropping_an_accepted_run_gives_back_everything_it_took() {
             crate::agent_run::AgentPrompt::new("do it"),
             crate::agent_vm_daemon::AgentRunTags::default(),
         )
+        .await
         .expect("the queue has room for one");
     assert_eq!(
         daemon.accepted_agent_run_count(),
@@ -3088,6 +3088,60 @@ async fn vm_placement_refuses_an_agent_run_before_probing_the_host() {
     assert!(
         !args_log.exists(),
         "nothing should have been run: {:?}",
+        fs::read_to_string(&args_log)
+    );
+}
+
+/// The queue bound is taken before the probes, not after them.
+///
+/// Deciding the locked profile is five subprocesses. A request the bound will
+/// refuse must not be able to make writd run them first, or the bound stops
+/// bounding the work writd does per request and bounds only the runs it
+/// remembers — and the number of requests that can have it probing at once
+/// becomes the number of clients that can connect.
+#[tokio::test]
+async fn a_run_the_queue_bound_refuses_runs_no_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let fake_tool =
+        write_fake_locked_probe_tool(dir.path(), &args_log, LockedProbeHost::Unrecorded);
+    let (config, _state_store) = daemon_config_with_ipv6_profile(
+        dir.path(),
+        &fake_tool,
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+    );
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_one_run_admitted();
+
+    // Fill the admission semaphore: one running plus one waiting is all this
+    // state will admit.
+    let _held: Vec<_> = (0..2)
+        .map(|_| state.agent_run_slots.enqueue().expect("within the bound"))
+        .collect();
+
+    let err = daemon
+        .accept_agent_run_session(
+            &state,
+            Some("over the bound".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AgentVmDaemonError::AgentRunQueueFull(_)),
+        "the bound is the answer: got {err:?}"
+    );
+    assert!(
+        !args_log.exists(),
+        "a run the bound refused must have run no probe: {:?}",
         fs::read_to_string(&args_log)
     );
 }

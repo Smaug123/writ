@@ -495,17 +495,9 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 // listing. Deferring puts the naming first: writd starts nothing
                 // until it has told someone what it would be called.
                 //
-                // Both refusals below happen before the run has a name. The
-                // profile is decided here rather than inside `accept` because
-                // deciding it awaits five host probes, and accepting
-                // deliberately awaits nothing at all — and the placement,
-                // which this route may not have at all, is checked before
-                // those probes rather than after them.
-                let accepted = match agent_vm.admitted_profile_for_agent_run().await {
-                    Err(refused) => Err(refused),
-                    Ok(admitted) => agent_vm.accept_agent_run_session(
+                match agent_vm
+                    .accept_agent_run_session(
                         state,
-                        admitted,
                         label,
                         agent_kind,
                         agent_model,
@@ -519,9 +511,9 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                             correlation_id,
                             purpose: None,
                         },
-                    ),
-                };
-                match accepted {
+                    )
+                    .await
+                {
                     Ok(accepted) => {
                         let session_id = accepted.session_id();
                         let run_id = accepted.run_id();
