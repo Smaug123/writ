@@ -1044,10 +1044,80 @@ enum BrokerReplyError {
     },
 }
 
-fn call(
-    socket_path: &Path,
-    msg: &ClientMessage,
-) -> Result<ServerMessage, Box<dyn std::error::Error>> {
+/// Which step of one call to the daemon was in flight when the socket
+/// failed. The three share a cause type and differ only in which syscall
+/// the operator should read the `io::Error` as, which is what a `step`
+/// field says and three near-identical variants would not.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CallStep {
+    Write,
+    Flush,
+    Read,
+}
+
+impl std::fmt::Display for CallStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CallStep::Write => "writing request to",
+            CallStep::Flush => "flushing request to",
+            CallStep::Read => "reading reply from",
+        })
+    }
+}
+
+/// Everything one call to the daemon can fail at, from connecting to
+/// decoding what came back.
+#[derive(Debug, thiserror::Error)]
+enum BrokerCallError {
+    #[error("cannot connect to {}: {source}", socket_path.display())]
+    Connect {
+        socket_path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("timed out waiting for the writ daemon at {}", socket_path.display())]
+    BudgetExhausted { socket_path: PathBuf },
+    #[error(
+        "cannot bound the call to the writ daemon at {}: {source}",
+        socket_path.display()
+    )]
+    SetTimeout {
+        socket_path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("encoding request for writ daemon as JSON failed: {source}")]
+    Encode {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{step} writ daemon at {} failed: {source}", socket_path.display())]
+    Transport {
+        socket_path: PathBuf,
+        step: CallStep,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Both directions of version skew arrive as `Error` from the daemon: a
+    /// new one refusing our version, and an old one that could not parse
+    /// `Hello` at all. The daemon's own prose is the only diagnosis there is.
+    #[error("writ and writd disagree about the host protocol, so nothing was run: {message}")]
+    ProtocolSkew { message: String },
+    #[error(
+        "writ daemon at {} answered the version handshake with {reply:?} instead of accepting \
+         version {expected}",
+        socket_path.display()
+    )]
+    HandshakeNotAccepted {
+        socket_path: PathBuf,
+        reply: Box<ServerMessage>,
+        expected: u32,
+    },
+    #[error(transparent)]
+    Reply(#[from] BrokerReplyError),
+}
+
+fn call(socket_path: &Path, msg: &ClientMessage) -> Result<ServerMessage, BrokerCallError> {
     call_with_timeout(socket_path, msg, CALL_TIMEOUT)
 }
 
@@ -1055,9 +1125,11 @@ fn call_with_timeout(
     socket_path: &Path,
     msg: &ClientMessage,
     timeout: std::time::Duration,
-) -> Result<ServerMessage, Box<dyn std::error::Error>> {
-    let stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("cannot connect to {}: {e}", socket_path.display()))?;
+) -> Result<ServerMessage, BrokerCallError> {
+    let stream = UnixStream::connect(socket_path).map_err(|source| BrokerCallError::Connect {
+        socket_path: socket_path.to_path_buf(),
+        source,
+    })?;
 
     // `timeout` is a budget for the whole call, not for each blocking read.
     // The socket options behind it (`SO_RCVTIMEO`/`SO_SNDTIMEO`) are per
@@ -1083,19 +1155,14 @@ fn call_with_timeout(
         // Both directions of skew arrive as `Error`: a new daemon refusing our
         // version, and an old one that could not parse `Hello` at all.
         ServerMessage::Error { message } => {
-            return Err(format!(
-                "writ and writd disagree about the host protocol, so nothing was run: {message}"
-            )
-            .into());
+            return Err(BrokerCallError::ProtocolSkew { message });
         }
         other => {
-            return Err(format!(
-                "writ daemon at {} answered the version handshake with {other:?} instead of \
-                 accepting version {}",
-                socket_path.display(),
-                writ::protocol::HOST_PROTOCOL_VERSION,
-            )
-            .into());
+            return Err(BrokerCallError::HandshakeNotAccepted {
+                socket_path: socket_path.to_path_buf(),
+                reply: Box::new(other),
+                expected: writ::protocol::HOST_PROTOCOL_VERSION,
+            });
         }
     }
 
@@ -1114,18 +1181,24 @@ fn apply_remaining_budget(
     socket_path: &Path,
     stream: &UnixStream,
     deadline: std::time::Instant,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), BrokerCallError> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
-        return Err(format!(
-            "timed out waiting for the writ daemon at {}",
-            socket_path.display()
-        )
-        .into());
+        return Err(BrokerCallError::BudgetExhausted {
+            socket_path: socket_path.to_path_buf(),
+        });
     }
+    let set_timeout = |source| BrokerCallError::SetTimeout {
+        socket_path: socket_path.to_path_buf(),
+        source,
+    };
     // Both sides, so a stuck broker can't wedge the CLI on either write or read.
-    stream.set_read_timeout(Some(remaining))?;
-    stream.set_write_timeout(Some(remaining))?;
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(set_timeout)?;
+    stream
+        .set_write_timeout(Some(remaining))
+        .map_err(set_timeout)?;
     Ok(())
 }
 
@@ -1144,32 +1217,25 @@ fn write_and_read_reply(
     reader: &mut BufReader<&UnixStream>,
     msg: &ClientMessage,
     deadline: std::time::Instant,
-) -> Result<ServerMessage, Box<dyn std::error::Error>> {
+) -> Result<ServerMessage, BrokerCallError> {
     apply_remaining_budget(socket_path, stream, deadline)?;
     let line = writ::protocol::framing::encode_frame(msg)
-        .map_err(|e| format!("encoding request for writ daemon as JSON failed: {e}"))?;
+        .map_err(|source| BrokerCallError::Encode { source })?;
+
+    let at = |step| {
+        move |source| BrokerCallError::Transport {
+            socket_path: socket_path.to_path_buf(),
+            step,
+            source,
+        }
+    };
 
     let mut w = stream;
-    w.write_all(line.as_bytes()).map_err(|e| {
-        format!(
-            "writing request to writ daemon at {} failed: {e}",
-            socket_path.display()
-        )
-    })?;
-    w.flush().map_err(|e| {
-        format!(
-            "flushing request to writ daemon at {} failed: {e}",
-            socket_path.display()
-        )
-    })?;
+    w.write_all(line.as_bytes()).map_err(at(CallStep::Write))?;
+    w.flush().map_err(at(CallStep::Flush))?;
 
     let mut reply = String::new();
-    let bytes_read = reader.read_line(&mut reply).map_err(|e| {
-        format!(
-            "reading reply from writ daemon at {} failed: {e}",
-            socket_path.display()
-        )
-    })?;
+    let bytes_read = reader.read_line(&mut reply).map_err(at(CallStep::Read))?;
     if bytes_read == 0 {
         return Err(BrokerReplyError::ClosedWithoutReply {
             socket_path: socket_path.to_path_buf(),
@@ -1272,7 +1338,10 @@ mod tests {
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let err = apply_remaining_budget(path, &stream, past).unwrap_err();
 
-        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            matches!(err, BrokerCallError::BudgetExhausted { ref socket_path } if socket_path == path),
+            "expected BudgetExhausted for {path:?}, got {err:?}"
+        );
         assert_eq!(
             stream.read_timeout().unwrap(),
             Some(std::time::Duration::from_secs(1)),
@@ -1300,59 +1369,52 @@ mod tests {
         .unwrap_err();
         task.join().unwrap();
 
-        let msg = err.to_string();
+        // Naming the variant is what says the raw serde EOF never reached
+        // the operator: an unparsed reply would have been `IncompleteJson`.
         assert!(
-            msg.contains("closed the connection without sending a reply"),
-            "unexpected error: {msg}",
-        );
-        assert!(
-            !msg.starts_with("EOF while parsing"),
-            "should not surface raw serde EOF: {msg}",
+            matches!(
+                err,
+                BrokerCallError::Reply(BrokerReplyError::ClosedWithoutReply { .. })
+            ),
+            "expected ClosedWithoutReply, got {err:?}"
         );
     }
 
     #[test]
     fn decode_server_reply_reports_blank_line_as_empty_reply() {
         let err = decode_server_reply(Path::new("/tmp/writ.sock"), "\n").unwrap_err();
-        let msg = err.to_string();
 
+        // `EmptyReply` rather than a JSON error is the assertion: a blank line
+        // is refused before serde ever sees it.
         assert!(
-            msg.contains("sent an empty reply"),
-            "unexpected error: {msg}",
-        );
-        assert!(
-            !msg.contains("EOF while parsing"),
-            "blank replies should not be parsed as JSON: {msg}",
+            matches!(err, BrokerReplyError::EmptyReply { .. }),
+            "expected EmptyReply, got {err:?}"
         );
     }
 
     #[test]
     fn decode_server_reply_reports_incomplete_json_with_context() {
         let err = decode_server_reply(Path::new("/tmp/writ.sock"), "{").unwrap_err();
-        let msg = err.to_string();
 
         assert!(
-            msg.contains("sent an incomplete JSON reply"),
-            "unexpected error: {msg}",
-        );
-        assert!(
-            msg.contains("reply preview: \"{\""),
-            "missing reply preview: {msg}",
+            matches!(
+                err,
+                BrokerReplyError::IncompleteJson { ref preview, .. } if preview == "\"{\""
+            ),
+            "expected IncompleteJson carrying the frame as its preview, got {err:?}"
         );
     }
 
     #[test]
     fn decode_server_reply_reports_malformed_json_with_context() {
         let err = decode_server_reply(Path::new("/tmp/writ.sock"), "not json\n").unwrap_err();
-        let msg = err.to_string();
 
         assert!(
-            msg.contains("sent an invalid JSON reply"),
-            "unexpected error: {msg}",
-        );
-        assert!(
-            msg.contains("reply preview: \"not json\""),
-            "missing reply preview: {msg}",
+            matches!(
+                err,
+                BrokerReplyError::InvalidJson { ref preview, .. } if preview == "\"not json\""
+            ),
+            "expected InvalidJson carrying the frame as its preview, got {err:?}"
         );
     }
 
