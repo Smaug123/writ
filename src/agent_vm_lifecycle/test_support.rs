@@ -12,11 +12,11 @@ use crate::core::BrokerPort;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use uuid::Uuid;
 
-pub(super) fn session_id() -> SessionId {
+pub(crate) fn session_id() -> SessionId {
     SessionId::from_uuid(Uuid::from_u128(0x51b8_fd0f_6c10_454c_b0e6_7df1_d60e_2e6d))
 }
 
-pub(super) fn pool() -> AgentNetworkPool {
+pub(crate) fn pool() -> AgentNetworkPool {
     AgentNetworkPool::new(
         Ipv4Cidr::new(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
         Ipv6Cidr::new(
@@ -28,15 +28,15 @@ pub(super) fn pool() -> AgentNetworkPool {
     .unwrap()
 }
 
-pub(super) fn ports() -> BrokerPorts {
+pub(crate) fn ports() -> BrokerPorts {
     BrokerPorts::new([BrokerPort::new(51375).unwrap()]).unwrap()
 }
 
-pub(super) fn plan(index: u16) -> AgentVmSessionPlan {
+pub(crate) fn plan(index: u16) -> AgentVmSessionPlan {
     plan_with_ipv6_mode(index, Ipv6IsolationMode::DualStackRequired)
 }
 
-pub(super) fn plan_with_ipv6_mode(index: u16, ipv6_mode: Ipv6IsolationMode) -> AgentVmSessionPlan {
+pub(crate) fn plan_with_ipv6_mode(index: u16, ipv6_mode: Ipv6IsolationMode) -> AgentVmSessionPlan {
     AgentVmSessionPlan::new(
         session_id(),
         pool(),
@@ -54,7 +54,7 @@ pub(super) fn plan_with_ipv6_mode(index: u16, ipv6_mode: Ipv6IsolationMode) -> A
     .with_owner_token(AgentVmOwnerToken::new("writ-test-owner"))
 }
 
-pub(super) fn plan_with_broker_placement(
+pub(crate) fn plan_with_broker_placement(
     index: u16,
     broker_placement: BrokerPlacement,
 ) -> AgentVmSessionPlan {

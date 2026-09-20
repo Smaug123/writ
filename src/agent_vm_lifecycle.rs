@@ -1817,7 +1817,7 @@ mod state_schema_tests;
 #[cfg(test)]
 mod state_store_tests;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 /// Property-based specification for `agent_vm_lifecycle`.
 ///

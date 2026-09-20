@@ -1288,6 +1288,32 @@ cleanup-only. `ReleaseSignal` is the one effect the types order: only
 the daemon cannot send a signal it has not first written down. See §5.5 and
 Stage E1 of the plan.
 
+`agent_vm_locked_start` is the locked profile's launch and its readback,
+built and tested but with no caller.
+`AgentVmSessionPlan::locked_create_vm_invocation` emits a `container create`:
+the shared `base_container_argv`, Stage B1's capability profile, a
+`--read-only-path NONE` plus give-back that relaxes exactly `/proc/sys`, the
+image by *tag*, and `/sbin/writ-agent-vm-guest-init` as the container command
+with the guest command behind it. `LockedContainerShape` is what `container
+inspect <vm>` reports, and `verify` accepts only the admitted digest, exactly
+B1's capability set over a dropped-all base, exactly that `/proc` relaxation,
+no interposed runtime init, and the initializer as a root PID 1. Only then
+does `locked_start_vm_invocation` (`container start <vm>`) run it: create
+resolves and records the image without executing it, so a repointed tag is
+refused before its PID 1 exists.
+
+Two facts shape it, both measured on Apple `container` 1.4.1. A local image
+cannot be named by digest — `name@sha256:…` is resolved against the registry
+and a bare digest is refused — so the admitted-image guarantee is taken by
+readback rather than by reference, which is also stronger: it reports what the
+runtime built rather than what the host asked for, and `container inspect`
+spells capabilities `CAP_CHOWN` where `--cap-add` spells them `CHOWN`. And
+vminit mounts `/proc/sys` read-only, while the B1 handoff must write
+`disable_ipv6` (a missing one is a handoff failure), so the launch relaxes
+that one path; the legacy profile's `--kernel-arg ipv6.disable=1` is excluded
+because it removes the very sysctl the handoff requires. See §5.5 and Stage
+E2b of the plan.
+
 `agent_vm_guest_log` is the host's read side of a locked guest's one-way
 record channel, built and tested but with no caller. `scan_guest_log` decides
 what one bounded `container logs` read reports — nothing yet, the
