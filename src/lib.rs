@@ -42,6 +42,12 @@ pub mod broker_vm;
 pub mod broker_vm_runner;
 #[cfg(feature = "host")]
 pub(crate) mod clean_git;
+/// The cause type three public error enums carry. The module stays
+/// crate-private — callers have no business building a hardened git
+/// invocation — but an error they can receive has to be nameable, or
+/// they can only match it by its `Display` text.
+#[cfg(feature = "host")]
+pub use clean_git::CleanGitError;
 #[cfg(feature = "host")]
 pub mod cli;
 #[cfg(feature = "host")]

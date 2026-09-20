@@ -55,7 +55,7 @@ pub(crate) struct CleanGitEnv {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CleanGitError {
+pub enum CleanGitError {
     #[error(
         "git program must be absolute or discoverable on PATH before clearing the child environment: {0}"
     )]
@@ -76,7 +76,7 @@ pub(crate) enum CleanGitError {
     Failed {
         status: ExitStatus,
         /// The child's captured stderr, tail-capped and with any bound secret
-        /// redacted (see [`sanitize_git_stderr`]). Carries the real diagnosis
+        /// redacted. Carries the real diagnosis
         /// (`Authentication failed`, `Could not resolve host`, …) that a bare
         /// exit status hides.
         stderr: String,

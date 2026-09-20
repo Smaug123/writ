@@ -43,7 +43,7 @@ use std::ffi::OsString;
 use std::io;
 use std::num::ParseIntError;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -114,11 +114,9 @@ struct CatFileChild {
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     /// The `git` program could not be located or canonicalized under
-    /// the same rules the rest of the replay pipeline uses. The
-    /// underlying `CleanGitError` is stringified to keep the
-    /// hardening module's variants out of the public surface.
+    /// the same rules the rest of the replay pipeline uses.
     #[error("could not resolve git program: {0}")]
-    GitProgram(String),
+    GitProgram(#[from] CleanGitError),
     #[error("could not spawn `git cat-file --batch`: {0}")]
     Spawn(#[source] io::Error),
     #[error("`git cat-file --batch` child did not expose a pid")]
@@ -131,10 +129,16 @@ pub enum OpenError {
     MissingStdout,
 }
 
-impl From<CleanGitError> for OpenError {
-    fn from(err: CleanGitError) -> Self {
-        OpenError::GitProgram(err.to_string())
-    }
+/// Failures from [`CatFileObjectSource::close`].
+///
+/// `NonZeroExit` is the only one that says anything about the child's
+/// own behaviour; the rest are the reaping sequence failing under us.
+#[derive(Debug, thiserror::Error)]
+pub enum CloseError {
+    #[error("`git cat-file --batch` could not be reaped: {0}")]
+    Reap(#[from] io::Error),
+    #[error("`git cat-file --batch` exited with non-zero status: {status}")]
+    NonZeroExit { status: ExitStatus },
 }
 
 impl CatFileObjectSource {
@@ -215,7 +219,7 @@ impl CatFileObjectSource {
     /// is `None`), so a local `ProcessGroupCleanupGuard` takes
     /// over and SIGKILLs the process group if anything between here
     /// and the final `disarm()` panics or has its await cancelled.
-    pub async fn close(mut self) -> io::Result<()> {
+    pub async fn close(mut self) -> Result<(), CloseError> {
         let pgid = self.pgid;
         let mutex = self
             .inner
@@ -256,9 +260,7 @@ impl CatFileObjectSource {
         let status = child.wait().await?;
         guard.disarm();
         if !status.success() {
-            return Err(io::Error::other(format!(
-                "`git cat-file --batch` exited with non-zero status: {status}"
-            )));
+            return Err(CloseError::NonZeroExit { status });
         }
         Ok(())
     }
@@ -747,10 +749,9 @@ mod tests {
             .close()
             .await
             .expect_err("close must surface non-zero exit");
-        let msg = err.to_string();
         assert!(
-            msg.contains("non-zero status"),
-            "expected non-zero-status diagnostic, got: {msg}"
+            matches!(err, CloseError::NonZeroExit { status } if !status.success()),
+            "expected NonZeroExit, got {err:?}"
         );
     }
 

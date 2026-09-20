@@ -648,12 +648,11 @@ async fn fast_forward_plan_surfaces_timeout_when_subprocess_stalls() {
     .await
     .expect_err("sleeping probe must time out");
     match err {
-        FastForwardPlanError::Git(msg) => {
-            assert!(
-                msg.contains("timed out"),
-                "expected timeout indication in error, got: {msg}",
-            );
+        FastForwardPlanError::Git(CleanGitError::TimedOut(deadline)) => {
+            // The planner passes the caller's timeout down rather than
+            // imposing one of its own.
+            assert_eq!(deadline, short_timeout);
         }
-        other => panic!("expected Git, got {other:?}"),
+        other => panic!("expected Git(TimedOut), got {other:?}"),
     }
 }

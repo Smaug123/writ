@@ -15,6 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::git_push_promote::UpdateRefError;
+use crate::git_push_walker::{GitObjectSourceError, ReplayError};
 use crate::github_git_db::{CommitIdentity, GitDataError};
 use crate::test_support::{find_in_path, required_tool, rev_parse, run_git, sample_object_id};
 use crate::vm_git::GitBranchName;
@@ -812,11 +813,10 @@ async fn prepare_approve_bounds_a_stalled_cat_file_traversal() {
     // the timeout diagnostic — not a hang, and not a whole-traversal
     // timeout that would also have failed a slow-but-legitimate push.
     match outcome {
-        Err(RunApproveError::Execute(ExecuteError::Replay(ref replay))) => assert!(
-            replay.to_string().contains("timed out"),
-            "expected a read-timeout replay error, got: {replay}"
-        ),
-        other => panic!("expected Execute(Replay(read timeout)), got {other:?}"),
+        Err(RunApproveError::Execute(ExecuteError::Replay(ReplayError::Source(
+            GitObjectSourceError::ReadTimedOut { .. },
+        )))) => {}
+        other => panic!("expected Execute(Replay(Source(ReadTimedOut))), got {other:?}"),
     }
 
     // The stall is upstream of any upload; verify no POST/PATCH fired.
