@@ -13,7 +13,7 @@ use writ::agent_vm_lifecycle::{
     default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
     stop_agent_vm_session, stop_managed_agent_vm_session,
 };
-use writ::agent_vm_locked_admission::admit_on_this_host;
+use writ::agent_vm_locked_admission::{LockedV1ProbePlan, admit_on_this_host};
 use writ::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
@@ -241,11 +241,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.cmd {
         Cmd::Start(args) => {
-            let dry_run = args.dry_run;
-            let plan = build_start_plan(args, tools).await?;
-            if dry_run {
-                print_start_invocations(&plan.start_invocations());
+            if args.dry_run {
+                // Before admission, not after: for one profile admission *is*
+                // five commands, and a dry run runs none.
+                print_start_dry_run(args, &tools).await?;
             } else {
+                let plan = build_start_plan(args, tools).await?;
                 // Ownership is guarded inside start_agent_vm_session itself: its
                 // ProbeNetworkAbsent / ProbeVmAbsent steps refuse to start (and
                 // later tear down) infrastructure this call did not create. This
@@ -269,12 +270,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::ManagedStart(args) => {
-            let dry_run = args.start.dry_run;
             let state_dir = args.state_dir;
-            let plan = build_start_plan(args.start, tools).await?;
-            if dry_run {
-                print_start_invocations(&plan.start_invocations());
+            if args.start.dry_run {
+                print_start_dry_run(args.start, &tools).await?;
             } else {
+                let plan = build_start_plan(args.start, tools).await?;
                 let state_dir = resolve_state_dir(state_dir)?;
                 let store = AgentVmSessionStateStore::new(state_dir);
                 let state = start_managed_agent_vm_session(&store, &plan)?;
@@ -307,6 +307,30 @@ fn resolve_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std:
         Some(path) => path,
         None => default_agent_vm_state_dir()?,
     })
+}
+
+/// Show what a start would run, without running any of it.
+///
+/// For a profile admission decides on its spelling, that is the start's own
+/// invocations, as it always was. For the locked profile it cannot be: the
+/// decision is five commands, and what follows them depends on their answers,
+/// so the preview is those commands. They are the honest answer — they are
+/// the first thing the real start would run, and the only part of it a dry
+/// run can know.
+async fn print_start_dry_run(
+    args: StartArgs,
+    tools: &AgentVmToolPaths,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = ConfiguredIpv6Profile::from(args.ipv6_mode);
+    if profile.is_decided_by_the_host() {
+        let image = ContainerImage::new(args.image)?;
+        let probes = LockedV1ProbePlan::for_host(tools, &image);
+        print_invocations(&probes.probes().map(|probe| probe.invocation.clone()));
+        return Ok(());
+    }
+    let plan = build_start_plan(args, tools.clone()).await?;
+    print_start_invocations(&plan.start_invocations());
+    Ok(())
 }
 
 async fn build_start_plan(
@@ -434,6 +458,7 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use writ::agent_vm_locked_admission::{LockedV1Fact, LockedV1Refused};
 
     #[test]
@@ -539,6 +564,45 @@ mod tests {
             build_start_plan(start_args(mode), tools())
                 .await
                 .unwrap_or_else(|e| panic!("{mode}: {e}"));
+        }
+    }
+
+    /// `--dry-run` runs nothing — including the admission it would otherwise
+    /// have to run before it knew what to print.
+    ///
+    /// The flag's promise is that it prints commands instead of running them,
+    /// and for the locked profile the decision about whether there is a start
+    /// at all *is* five commands. So the preview is those commands, and the
+    /// test that matters is the negative one: the tools were never invoked.
+    #[tokio::test]
+    async fn a_dry_run_runs_nothing_whichever_profile_decides_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran.log");
+        let tool = dir.path().join("tool");
+        std::fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = AgentVmToolPaths::new(&tool, &tool, &tool);
+
+        for mode in [
+            "ipv4-only-locked-v1",
+            "ipv4-only-no-guest-ipv6",
+            "dual-stack-required",
+        ] {
+            print_start_dry_run(start_args(mode), &tools)
+                .await
+                .unwrap_or_else(|e| panic!("{mode}: {e}"));
+            assert!(
+                !ran.exists(),
+                "{mode}: a dry run must run nothing, and ran {:?}",
+                std::fs::read_to_string(&ran)
+            );
         }
     }
 

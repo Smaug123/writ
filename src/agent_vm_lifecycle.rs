@@ -545,6 +545,23 @@ pub enum ConfiguredIpv6Profile {
     Ipv4OnlyLockedV1,
 }
 
+impl ConfiguredIpv6Profile {
+    /// Whether deciding this profile reads facts off the host.
+    ///
+    /// Only the locked one does, and the difference is not a detail of how
+    /// admission is implemented: for every other profile the answer is
+    /// already known, and for this one it is five commands whose answers
+    /// decide whether there is a session to describe at all. A caller that
+    /// must run nothing — `--dry-run` — has to ask this before it asks for a
+    /// decision.
+    pub fn is_decided_by_the_host(self) -> bool {
+        match self {
+            Self::DualStackRequired | Self::Ipv4OnlyNoGuestIpv6 => false,
+            Self::Ipv4OnlyLockedV1 => true,
+        }
+    }
+}
+
 /// Where the per-session vm_http broker runs.
 ///
 /// `Host` (the default) spins the broker up in-process on the macOS host and the

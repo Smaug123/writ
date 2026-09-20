@@ -1037,7 +1037,23 @@ is asserted — over the env file a real locked start produced, against
 `OwnedDirectory::ALL`. It fails without the fix and would catch the next path
 added to the prologue.
 
-Five weakenings were injected and fail these tests: a locked session wrapped
+A third round found the same mistake in its last hiding place. `--dry-run`
+promises to print commands rather than run them, and that promise held for
+free while admission was pure. It is not free now: a locked `start --dry-run`
+was running all five probes, the privileged helper among them, before the
+caller ever looked at the flag. A dry run for that profile therefore cannot
+reach a plan at all — what follows the probes depends on what they say — so it
+prints *the probes*, which is the honest preview and the only part of the
+start a dry run can know. `ConfiguredIpv6Profile::is_decided_by_the_host` is
+the pure question a caller that must run nothing asks first.
+
+That is the third place in this slice where a pure function becoming effectful
+broke something downstream, and the pattern is worth naming: every caller that
+was relying on admission being free had to be found, because none of them said
+so. The compiler found two (the `async` boundary) and a reviewer found the
+other two, which is the wrong ratio.
+
+Six weakenings were injected and fail these tests: a locked session wrapped
 with the sentinel scripts, a release that accepts any listening broker, an
 `exec` anywhere in the locked path, a bootstrap reader that ends its wait on a
 `security-ready` line, and a locked guest left with the image's `HOME`.
@@ -1171,8 +1187,9 @@ stringifying the refusal so the test can say so by downcasting.
 Five weakenings were injected and fail these tests: an allowlist entry whose
 proof run names no date, a door that probes a host other than the one it was
 asked about, a door that probes for the profiles decided on their spelling, a
-reconcile that asks admission on its way to a teardown, and an agent-run route
-that asks about the profile before the placement.
+reconcile that asks admission on its way to a teardown, an agent-run route
+that asks about the profile before the placement, and a dry run that asks for
+a decision before it looks at the flag.
 
 ---
 
