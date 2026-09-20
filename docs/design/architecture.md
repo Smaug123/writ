@@ -1219,7 +1219,7 @@ as UID 1000, and that the released identity cannot write the initializer or
 its directory. See `ipv4-only-network-confinement.md`, layer 2.
 `AgentVmSessionPlan`/`StopPlan`
 (`agent_vm_lifecycle.rs:160,193`); `AgentVmSessionState`/`Store`
-(`agent_vm_lifecycle/state_store.rs`); the start-step state machine
+(`agent_vm_lifecycle/state_store.rs`, **state schema v3**); the start-step state machine
 `AgentVmStartStep` (ProbeNetworkAbsent → CreateNetwork → InspectAndValidate →
 InstallFirewall → ProbeVmAbsent → StartVm → InstallGuestIpv6Deny →
 ProbeAndValidateGuestIpv6 → ReleaseGuestCommand); firewall
@@ -1271,6 +1271,22 @@ each entry point (`start_session`, `accept_agent_run_session`,
 `writ-agent-vm-runner start`), before a session has an id and so before an audit
 row, a subprocess, or a state record; stop and persisted-state decoding stay
 permissive, so narrowing the admitted set can never strand a running session.
+
+`agent_vm_locked_lifecycle` holds the locked profile's start sequence as an
+ordered lifecycle, also built and tested but not wired. A live start would
+advance through typestates (`Claimed` … `WorkloadReleased`), each holding the
+facts proven by the time it exists and each constructible only from its
+predecessor, so releasing a workload without `GuestSecurityLocked` and
+`FinalFirewallInstalled` is a compile error. A persisted record carries the
+snapshot instead — `LockedLifecycle`, one variant per phase with that phase's
+facts — because reading is not progressing. State schema v3 is that section
+plus everything v2 had; a record with no locked section is a session under a
+profile that has no phases, and a v2 record (which cannot have one) loads
+cleanup-only. `ReleaseSignal` is the one effect the types order: only
+`AgentVmSessionStateStore::record_release_attempted` mints the
+`container kill --signal USR1`, and only after writing `ReleaseAttempted`, so
+the daemon cannot send a signal it has not first written down. See §5.5 and
+Stage E1 of the plan.
 
 `agent_vm_locked_admission` holds what the locked profile's admission *will*
 be, built and tested but not wired: `LockedV1RuntimeEvidence` is six facts the

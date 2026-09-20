@@ -13,6 +13,13 @@ use super::*;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::OpenOptionsExt;
 
+use crate::agent_vm_firewall::PfInstallPhase;
+use crate::agent_vm_locked_lifecycle::{
+    FirewallFacts, GuestFacts, GuestSecurityLocked, LOCKED_RELEASE_SIGNAL, LockedLifecycle,
+    LockedPhase, ReleaseAttempted,
+};
+use crate::core::PfInterface;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentVmSessionStateError {
     #[error("agent VM state file already exists for session {session_id}: {path}")]
@@ -55,9 +62,68 @@ pub enum AgentVmSessionStateError {
     },
 }
 
+/// Which schema version a loaded record was written under.
+///
+/// Provenance, not a knob. A [`StateSchema::V2`] record was written by a
+/// daemon that had no phase model, so it carries everything teardown needs and
+/// nothing else — it can never be reported as locked, because there is no
+/// locked section in a v2 file to report. Loading one is how an operator who
+/// upgraded without draining gets their sessions cleaned up rather than a
+/// refusal; the intended upgrade drains first and so never sees one.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StateSchema {
+    V2,
+    V3,
+}
+
+impl StateSchema {
+    /// Whether the record is good for teardown and nothing else.
+    pub fn is_cleanup_only(self) -> bool {
+        matches!(self, Self::V2)
+    }
+}
+
+/// What a record says about where its session got to.
+///
+/// Two profiles, two models. The shipped profiles have the coarse
+/// `Starting`/`Running` they have always had; `ipv4_only_locked_v1` has the
+/// ordered phases of [`crate::agent_vm_locked_lifecycle`], because its release
+/// step is a gate whose "was it sent?" the daemon must be able to answer after
+/// a crash. Keeping them as one DU rather than one struct with optional fields
+/// is what stops a legacy record carrying half a phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionLifecycle {
+    Legacy(AgentVmSessionStateStatus),
+    Locked(LockedLifecycle),
+}
+
+impl SessionLifecycle {
+    /// The coarse status, for listings and for the legacy transitions.
+    ///
+    /// A projection, not a second source of truth: a locked session is
+    /// `Running` exactly once its workload was released, and `Starting` before
+    /// that. Anything that needs to know *which* phase asks
+    /// [`AgentVmSessionState::locked_phase`].
+    pub fn status(&self) -> AgentVmSessionStateStatus {
+        match self {
+            Self::Legacy(status) => *status,
+            Self::Locked(locked) => {
+                if locked.phase() == LockedPhase::WorkloadReleased {
+                    AgentVmSessionStateStatus::Running
+                } else {
+                    AgentVmSessionStateStatus::Starting
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentVmSessionState {
-    status: AgentVmSessionStateStatus,
+    lifecycle: SessionLifecycle,
+    /// Which schema the record was read from. A record this process built
+    /// (rather than loaded) is [`StateSchema::V3`]: it is what we would write.
+    schema: StateSchema,
     session_id: SessionId,
     pool: AgentNetworkPool,
     subnet_index: u16,
@@ -107,6 +173,12 @@ pub(super) struct AgentVmSessionStateLock {
 struct PersistedAgentVmSessionState {
     version: u32,
     status: AgentVmSessionStateStatus,
+    /// The locked profile's phase and facts. Absent on every v2 record (the
+    /// field did not exist) and on every v3 record for a legacy profile, which
+    /// is what makes "a v2 record is never reported as locked" structural
+    /// rather than a rule someone has to remember.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked: Option<PersistedLockedLifecycle>,
     session_id: SessionId,
     ipv4_pool: String,
     ipv6_pool: String,
@@ -141,7 +213,34 @@ enum PersistedIpv6IsolationMode {
     Ipv4OnlyNoGuestIpv6,
 }
 
-const AGENT_VM_SESSION_STATE_VERSION: u32 = 2;
+/// The locked lifecycle on the wire.
+///
+/// Loose where [`LockedLifecycle`] is tight: the phase is a string and the
+/// facts are optional, because that is what JSON can say. `from_persisted`
+/// turns it into the DU and refuses every combination the DU cannot express —
+/// a released workload with no interfaces, a claimed session carrying an ABI —
+/// so the looseness stops at the boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedLockedLifecycle {
+    phase: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    firewall_install_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    isolation_abi: Option<u32>,
+}
+
+/// The schema this binary writes.
+const AGENT_VM_SESSION_STATE_VERSION: u32 = 3;
+
+/// The oldest schema this binary reads. A v2 record loads as
+/// [`StateSchema::V2`]: cleanup-only, never locked. Rolling *back* is what
+/// fails closed — a daemon that only knows v2 refuses a v3 record outright
+/// rather than reading a locked session as a legacy one, which is why the
+/// upgrade note says to drain v3 sessions before rolling back.
+const AGENT_VM_SESSION_STATE_MIN_READ_VERSION: u32 = 2;
 
 impl AgentVmSessionState {
     pub(super) fn from_start_plan(
@@ -149,7 +248,9 @@ impl AgentVmSessionState {
         status: AgentVmSessionStateStatus,
     ) -> Self {
         Self {
-            status,
+            lifecycle: SessionLifecycle::Legacy(status),
+            // Built here rather than read, so it is what this binary writes.
+            schema: StateSchema::V3,
             session_id: plan.session_id,
             pool: plan.pool,
             subnet_index: plan.subnet_index(),
@@ -165,6 +266,23 @@ impl AgentVmSessionState {
             image: plan.image.clone(),
             guest_command: plan.guest_command.clone(),
             resources: plan.resources,
+        }
+    }
+
+    /// A copy of this record under `lifecycle`.
+    ///
+    /// Test-only, and not a bypass of anything: the gate on running a locked
+    /// session is `ConfiguredIpv6Profile::admit`, which refuses the profile
+    /// outright, and no production path can reach this because nothing builds
+    /// a `LockedLifecycle` — the typestates that make one are only produced by
+    /// the locked start path, which Stage E2 writes. Tests need locked records
+    /// now so that the reader, the release gate and reconciliation can be
+    /// pinned before anything can produce one.
+    #[cfg(test)]
+    pub(crate) fn with_locked_lifecycle_for_test(&self, lifecycle: LockedLifecycle) -> Self {
+        Self {
+            lifecycle: SessionLifecycle::Locked(lifecycle),
+            ..self.clone()
         }
     }
 
@@ -190,12 +308,29 @@ impl AgentVmSessionState {
     fn from_persisted(
         persisted: PersistedAgentVmSessionState,
     ) -> Result<Self, AgentVmSessionStateError> {
-        if persisted.version != AGENT_VM_SESSION_STATE_VERSION {
-            return Err(AgentVmSessionStateError::UnsupportedVersion {
-                version: persisted.version,
-                supported: AGENT_VM_SESSION_STATE_VERSION,
-            });
+        let schema = match persisted.version {
+            AGENT_VM_SESSION_STATE_MIN_READ_VERSION => StateSchema::V2,
+            AGENT_VM_SESSION_STATE_VERSION => StateSchema::V3,
+            version => {
+                return Err(AgentVmSessionStateError::UnsupportedVersion {
+                    version,
+                    supported: AGENT_VM_SESSION_STATE_VERSION,
+                });
+            }
+        };
+        // A v2 writer had no `locked` field, so a v2 record carrying one was
+        // not written by a v2 writer. Refuse rather than read it: the version
+        // is the only claim about the shape, and a record whose shape and
+        // version disagree is one we cannot say anything about.
+        if schema.is_cleanup_only() && persisted.locked.is_some() {
+            return Err(corrupt_state(
+                "schema v2 record carries a locked lifecycle section".to_string(),
+            ));
         }
+        let lifecycle = match persisted.locked {
+            None => SessionLifecycle::Legacy(persisted.status),
+            Some(locked) => SessionLifecycle::Locked(locked_lifecycle_from_persisted(locked)?),
+        };
 
         let ipv4_pool = parse_state_ipv4_cidr("ipv4_pool", &persisted.ipv4_pool)?;
         let ipv6_pool = parse_state_ipv6_cidr("ipv6_pool", &persisted.ipv6_pool)?;
@@ -274,7 +409,8 @@ impl AgentVmSessionState {
         }
 
         Ok(Self {
-            status: persisted.status,
+            lifecycle,
+            schema,
             session_id: persisted.session_id,
             pool,
             subnet_index: persisted.subnet_index,
@@ -300,15 +436,56 @@ impl AgentVmSessionState {
         })
     }
 
-    fn with_status(&self, status: AgentVmSessionStateStatus) -> Self {
-        Self {
-            status,
-            ..self.clone()
+    /// The legacy `Starting`/`Running` transition. Locked sessions do not
+    /// have one: their progress is a phase, and only a typestate moves it.
+    fn with_status(
+        &self,
+        status: AgentVmSessionStateStatus,
+    ) -> Result<Self, AgentVmSessionStateError> {
+        // A v2 record is a teardown obligation, not a session to promote.
+        // Promoting one would rewrite it as v3 — leaving the caller holding a
+        // value that no longer matches what is on disk — and would treat a
+        // record that predates the phase model as a live session.
+        if self.schema.is_cleanup_only() {
+            return Err(state_mismatch(
+                self.session_id,
+                "a schema v2 record is a cleanup obligation, not a session to promote",
+            ));
+        }
+        match &self.lifecycle {
+            SessionLifecycle::Legacy(_) => Ok(Self {
+                lifecycle: SessionLifecycle::Legacy(status),
+                ..self.clone()
+            }),
+            SessionLifecycle::Locked(_) => Err(state_mismatch(
+                self.session_id,
+                "a locked session advances by phase, not by status",
+            )),
         }
     }
 
+    /// The coarse status. See [`SessionLifecycle::status`] for what it means
+    /// for a locked session.
     pub fn status(&self) -> AgentVmSessionStateStatus {
-        self.status
+        self.lifecycle.status()
+    }
+
+    pub fn lifecycle(&self) -> &SessionLifecycle {
+        &self.lifecycle
+    }
+
+    /// How far a locked session's start got, or `None` for a session under a
+    /// profile that has no phases.
+    pub fn locked_phase(&self) -> Option<LockedPhase> {
+        match &self.lifecycle {
+            SessionLifecycle::Legacy(_) => None,
+            SessionLifecycle::Locked(locked) => Some(locked.phase()),
+        }
+    }
+
+    /// Which schema this record was read from. See [`StateSchema`].
+    pub fn schema(&self) -> StateSchema {
+        self.schema
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -364,6 +541,38 @@ impl AgentVmSessionState {
     }
 }
 
+/// The `container kill --signal USR1` that releases a locked workload.
+///
+/// Minted only by [`AgentVmSessionStateStore::record_release_attempted`], and
+/// only once that call has persisted [`LockedPhase::ReleaseAttempted`]. There
+/// is no other constructor and the field is private to this module, so "the
+/// record is written before the signal is sent" is not a rule the release path
+/// has to remember — it is the only way to get hold of the thing to send.
+///
+/// Why it matters: the signal's outcome is not knowable. A `kill` that fails
+/// or times out does not prove the signal was not delivered, and the daemon
+/// can die between delivery and recording it. A record written afterwards
+/// would therefore be a record that can say "never released" of a workload
+/// that is running.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseSignal(ProcessInvocation);
+
+impl ReleaseSignal {
+    pub fn invocation(&self) -> &ProcessInvocation {
+        &self.0
+    }
+}
+
+/// What [`AgentVmSessionStateStore::record_release_attempted`] hands back: the
+/// updated record, the phase value the start path carries on with, and the one
+/// signal it may send.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedRelease {
+    pub state: AgentVmSessionState,
+    pub attempted: ReleaseAttempted,
+    pub signal: ReleaseSignal,
+}
+
 impl AgentVmSessionStateStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -417,7 +626,7 @@ impl AgentVmSessionStateStore {
                 "running promotion requires the unchanged Starting state record",
             ));
         }
-        let mut running = state.with_status(AgentVmSessionStateStatus::Running);
+        let mut running = state.with_status(AgentVmSessionStateStatus::Running)?;
         running.broker_ipv4 = Some(broker_ipv4);
         self.write_replace(&running)?;
         Ok(running)
@@ -462,9 +671,119 @@ impl AgentVmSessionStateStore {
                 "running promotion requires the unchanged Starting state record",
             ));
         }
-        let running = state.with_status(AgentVmSessionStateStatus::Running);
+        let running = state.with_status(AgentVmSessionStateStatus::Running)?;
         self.write_replace(&running)?;
         Ok(running)
+    }
+
+    /// Advance a locked session to its next phase.
+    ///
+    /// Refuses a phase that is not strictly later than the recorded one, and
+    /// refuses [`LockedPhase::ReleaseAttempted`] outright: that phase has its
+    /// own door ([`Self::record_release_attempted`]), which is what ties
+    /// writing it to minting the signal.
+    pub fn advance_locked(
+        &self,
+        state: &AgentVmSessionState,
+        lifecycle: LockedLifecycle,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        if lifecycle.phase() == LockedPhase::ReleaseAttempted {
+            return Err(state_mismatch(
+                state.session_id(),
+                "release_attempted is written by record_release_attempted, which mints the signal",
+            ));
+        }
+        let _lock = self.lock_store()?;
+        self.write_locked_unlocked(state, lifecycle)
+    }
+
+    /// Persist [`LockedPhase::ReleaseAttempted`] and hand back the signal to
+    /// send. See [`ReleaseSignal`] for why this is one call.
+    ///
+    /// Takes the [`GuestSecurityLocked`] value by move: the caller must hold
+    /// the proof that the guest locked itself and its interface-scoped anchor
+    /// was read back, and it cannot hold that proof twice.
+    pub fn record_release_attempted(
+        &self,
+        state: &AgentVmSessionState,
+        locked: GuestSecurityLocked,
+        tools: &AgentVmToolPaths,
+    ) -> Result<RecordedRelease, AgentVmSessionStateError> {
+        let attempted = locked.release_attempted();
+        let _lock = self.lock_store()?;
+        let state = self.write_locked_unlocked(state, attempted.lifecycle())?;
+        // Only now, with the record on disk, does the signal exist.
+        let signal = ReleaseSignal(ProcessInvocation::new(
+            tools.container(),
+            [
+                "kill".to_string(),
+                "--signal".to_string(),
+                LOCKED_RELEASE_SIGNAL.to_string(),
+                state.names().vm().to_string(),
+            ],
+        ));
+        Ok(RecordedRelease {
+            state,
+            attempted,
+            signal,
+        })
+    }
+
+    fn write_locked_unlocked(
+        &self,
+        state: &AgentVmSessionState,
+        lifecycle: LockedLifecycle,
+    ) -> Result<AgentVmSessionState, AgentVmSessionStateError> {
+        let current = self.load_unlocked(state.session_id())?;
+        if &current != state {
+            return Err(state_mismatch(
+                state.session_id(),
+                "advancing a locked session requires the unchanged state record",
+            ));
+        }
+        let Some(recorded) = state.locked_phase() else {
+            return Err(state_mismatch(
+                state.session_id(),
+                "only a locked session advances by phase",
+            ));
+        };
+        // One equality, covering every question: that this is the next step,
+        // and that it carries the recorded facts forward unchanged. See
+        // `LockedLifecycle::previous`.
+        let SessionLifecycle::Locked(recorded_lifecycle) = state.lifecycle() else {
+            unreachable!("locked_phase() above returned Some")
+        };
+        if lifecycle.previous().as_ref() != Some(recorded_lifecycle) {
+            let message = if lifecycle.previous().map(|previous| previous.phase())
+                == Some(recorded_lifecycle.phase())
+            {
+                "an advance carries the recorded facts forward unchanged".to_string()
+            } else {
+                format!(
+                    "locked phase {} is not the step after the recorded {recorded}",
+                    lifecycle.phase()
+                )
+            };
+            return Err(state_mismatch(state.session_id(), message));
+        }
+        let advanced = AgentVmSessionState {
+            lifecycle: SessionLifecycle::Locked(lifecycle),
+            ..state.clone()
+        };
+        self.write_replace(&advanced)?;
+        Ok(advanced)
+    }
+
+    /// Overwrite an existing record with `state`. See
+    /// [`AgentVmSessionState::with_locked_lifecycle_for_test`] for why the
+    /// tests need this and why it bypasses no gate.
+    #[cfg(test)]
+    pub(crate) fn overwrite_for_test(
+        &self,
+        state: &AgentVmSessionState,
+    ) -> Result<(), AgentVmSessionStateError> {
+        let _lock = self.lock_store()?;
+        self.write_replace(state)
     }
 
     pub fn load(
@@ -721,7 +1040,14 @@ impl From<&AgentVmSessionState> for PersistedAgentVmSessionState {
     fn from(value: &AgentVmSessionState) -> Self {
         Self {
             version: AGENT_VM_SESSION_STATE_VERSION,
-            status: value.status,
+            // The projection, so an older *reader* of this field — and an
+            // operator reading the file — still sees a coarse status it
+            // understands. The locked section below is the authority.
+            status: value.lifecycle.status(),
+            locked: match &value.lifecycle {
+                SessionLifecycle::Legacy(_) => None,
+                SessionLifecycle::Locked(locked) => Some(locked_lifecycle_to_persisted(locked)),
+            },
             session_id: value.session_id,
             ipv4_pool: value.pool.ipv4_base().to_string(),
             ipv6_pool: value.pool.ipv6_base().to_string(),
@@ -751,6 +1077,116 @@ impl From<&AgentVmSessionState> for PersistedAgentVmSessionState {
             memory_mib: value.resources.memory_mib(),
         }
     }
+}
+
+fn locked_lifecycle_to_persisted(locked: &LockedLifecycle) -> PersistedLockedLifecycle {
+    PersistedLockedLifecycle {
+        phase: locked.phase().as_str().to_string(),
+        interfaces: locked
+            .firewall()
+            .map(|firewall| {
+                firewall
+                    .interfaces()
+                    .iter()
+                    .map(|interface| interface.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        firewall_install_phase: locked
+            .firewall()
+            .map(|firewall| firewall.install_phase().as_str().to_string()),
+        isolation_abi: locked.guest().map(|guest| guest.isolation_abi()),
+    }
+}
+
+/// Rebuild the [`LockedLifecycle`] DU from the wire form, refusing every
+/// combination the DU cannot express.
+///
+/// The phase decides which facts must be present, so a record that reached
+/// `release_attempted` without naming the interfaces its anchor was scoped to
+/// is corrupt — not a released session with an empty interface list, which is
+/// what a tolerant reader would hand to teardown.
+fn locked_lifecycle_from_persisted(
+    persisted: PersistedLockedLifecycle,
+) -> Result<LockedLifecycle, AgentVmSessionStateError> {
+    let phase = LockedPhase::parse(&persisted.phase)
+        .ok_or_else(|| corrupt_state(format!("unknown locked phase {:?}", persisted.phase)))?;
+
+    let firewall = match (
+        phase >= LockedPhase::FinalFirewallInstalled,
+        persisted.interfaces.is_empty(),
+        persisted.firewall_install_phase.as_deref(),
+    ) {
+        (false, true, None) => None,
+        (false, ..) => {
+            return Err(corrupt_state(format!(
+                "locked phase {phase} carries firewall facts it cannot have"
+            )));
+        }
+        (true, false, Some(install_phase)) => {
+            let interfaces = persisted
+                .interfaces
+                .iter()
+                .map(|name| PfInterface::new(name.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| corrupt_state(format!("invalid locked interface: {err}")))?;
+            let install_phase = PfInstallPhase::parse(install_phase).ok_or_else(|| {
+                corrupt_state(format!("unknown firewall install phase {install_phase:?}"))
+            })?;
+            Some(
+                FirewallFacts::new(interfaces, install_phase)
+                    .map_err(|err| corrupt_state(err.to_string()))?,
+            )
+        }
+        (true, ..) => {
+            return Err(corrupt_state(format!(
+                "locked phase {phase} is missing the firewall facts it implies"
+            )));
+        }
+    };
+
+    let guest = match (
+        phase >= LockedPhase::GuestSecurityLocked,
+        persisted.isolation_abi,
+    ) {
+        (false, None) => None,
+        (true, Some(abi)) => Some(GuestFacts::new(abi)),
+        (false, Some(_)) => {
+            return Err(corrupt_state(format!(
+                "locked phase {phase} carries a guest isolation ABI it cannot have"
+            )));
+        }
+        (true, None) => {
+            return Err(corrupt_state(format!(
+                "locked phase {phase} is missing the guest isolation ABI it implies"
+            )));
+        }
+    };
+
+    Ok(match (phase, firewall, guest) {
+        (LockedPhase::Claimed, None, None) => LockedLifecycle::Claimed,
+        (LockedPhase::NetworkValidated, None, None) => LockedLifecycle::NetworkValidated,
+        (LockedPhase::AgentVmStarted, None, None) => LockedLifecycle::AgentVmStarted,
+        (LockedPhase::FinalFirewallInstalled, Some(firewall), None) => {
+            LockedLifecycle::FinalFirewallInstalled(firewall)
+        }
+        (LockedPhase::GuestSecurityLocked, Some(firewall), Some(guest)) => {
+            LockedLifecycle::GuestSecurityLocked(firewall, guest)
+        }
+        (LockedPhase::ReleaseAttempted, Some(firewall), Some(guest)) => {
+            LockedLifecycle::ReleaseAttempted(firewall, guest)
+        }
+        (LockedPhase::WorkloadReleased, Some(firewall), Some(guest)) => {
+            LockedLifecycle::WorkloadReleased(firewall, guest)
+        }
+        // Unreachable: the two matches above already established, per phase,
+        // exactly which facts are present. Fail closed rather than panic.
+        (phase, _, _) => {
+            return Err(corrupt_state(format!(
+                "locked phase {phase} does not agree with its recorded facts"
+            )));
+        }
+    })
 }
 
 impl From<Ipv6IsolationMode> for PersistedIpv6IsolationMode {

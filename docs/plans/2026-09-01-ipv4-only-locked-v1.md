@@ -420,6 +420,64 @@ produces only a stop plan.
 - Every v2 record in `proptest-regressions` and the existing state-store tests
   still loads, as cleanup-only, and is never reported as locked.
 
+**Landed, with five notes.**
+
+Four holes a review found over three rounds, every one the same shape: the
+snapshot union is publicly constructible, so the store is the only thing
+between a caller and a record, and each guard it had covered one field. The
+first was separate — `FirewallFacts::new` now refuses an empty interface set,
+because a value the writer could build and the reader could not accept is a
+record that stops reconciliation reaching *any* session (`load_all` fails
+whole) — and so was promoting a cleanup-only v2 record, now refused outright
+because it would rewrite the record as v3 and leave the caller holding a value
+that no longer matches the disk.
+
+The other two (a `Claimed` record advanced straight to `WorkloadReleased`; an
+advance that rewrote the interfaces, and then the guest ABI, an earlier phase
+recorded) were whack-a-mole, so the guards are gone. `advance_locked` now
+makes one comparison: rewind the proposed snapshot a step
+(`LockedLifecycle::previous`) and require it to equal the recorded one. That
+asks, in a single equality, every question the field-by-field guards had to
+remember to ask, and a phase that later gains a fact is covered without
+touching the store. The property `an_advance_is_exactly_a_rewind` states it
+over facts that vary independently of the phase, with a companion test
+pinning that the generator reaches both answers; the pre-review guard fails
+it. That property runs fewer cases than the default on purpose: each case
+writes and re-reads a real fsynced record, and what the rule *says* is
+covered exhaustively and for nothing by `rewinding_a_snapshot_yields_the_one_before_it`,
+so the store-backed cases only have to show the store applies it.
+
+`QuarantineInstalled` and `BrokerReady` are not in the code. Vm placement
+refuses new sessions (#396), so a phase no session can be in would be a
+representable state nothing can reach — the same argument that keeps
+`Ipv6IsolationMode` a smaller set than `ConfiguredIpv6Profile`. They land with
+the placement, and the design record says so.
+
+The model is two types, because moving forward and looking back are different
+problems. The typestates carry a live start; each is constructible only by
+consuming its predecessor, so the stage's "`ReleaseAttempted` is
+unconstructible from any other pair of phases" is the compile-time fact the
+oracle allowed for rather than a test. The snapshot `LockedLifecycle` is what
+a record says: a union with one variant per phase carrying that phase's facts,
+so the reader refuses a released session that names no interfaces instead of
+handing teardown an empty list.
+
+"Persisted before the signal is sent" is structural, not ordered by hand.
+`ReleaseSignal` wraps the `container kill --signal USR1` and has no
+constructor outside the state store, which mints it only after writing
+`ReleaseAttempted`; `advance_locked` refuses to write that phase at all, so
+there is one door and it is the one that hands over the signal. The test
+covers the outcomes that matter — the kill succeeded, failed, or never ran
+(where a timeout and a daemon that died before sending both land, since
+neither leaves the host any more certain).
+
+Locked records exist only in tests until E2, through two `#[cfg(test)]`
+helpers (`with_locked_lifecycle_for_test`, `overwrite_for_test`). They bypass
+no gate: admission is `ConfiguredIpv6Profile::admit`, which refuses the
+profile outright, and nothing in production builds a `LockedLifecycle` because
+nothing builds the typestates that make one. E2 replaces them with the real
+start path and should re-run the phase sweep against it.
+
 ---
 
 ## Stage E2: Host-placement locked start, and the profile opens
