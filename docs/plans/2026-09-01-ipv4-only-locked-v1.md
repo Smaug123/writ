@@ -1082,6 +1082,79 @@ structurally cannot have.
 
 ---
 
+**E2c-3c landed, and deleted a front door rather than adding a second.**
+
+`ConfiguredIpv6Profile::admit` is gone, and with it `Ipv6ProfileClosed`. There
+is one door, `admit_on_this_host`, and it is exhaustive on the configured
+profile: two profiles are decided on their spelling and read nothing off the
+host, the locked one gathers Stage D's six facts and asks `admit_locked` with
+`ProvenPlatforms::shipped()`. The daemon and `writ-agent-vm-runner` both call
+it, so parity is not something a test has to check — there is one function and
+both callers are it. What the runner's test checks is that it *is* that
+function: the refusal is the sentence `LockedV1Refused` words, not one of the
+runner's own.
+
+Deleting the pure `admit` was the whole point. A profile whose answer depends
+on the host cannot be decided by a pure function, and keeping one beside an
+evidence-taking one would have been exactly the second front door this stage
+exists to avoid.
+
+The cost of asking changed, and the code had to say so. Admission was free and
+asked wherever the answer was wanted; it is now five subprocesses, so it is
+asked once per start and threaded. `accept_agent_run_session` is deliberately
+not `async` — a caller gets its run's ids without writd awaiting anything —
+so it *takes* an `AdmittedProfile` rather than deciding one, and
+`AcceptedAgentRun` carries it to the start. Accepting a run therefore cannot
+happen without a decision having been made, and the decision the start uses is
+the one the caller was answered on.
+
+The two types stopped being different sizes. `ConfiguredIpv6Profile` and
+`Ipv6IsolationMode` are now variant for variant the same set, so the
+justification in their docs — "the configured set must name profiles that
+exist only to be refused" — was no longer true and was rewritten rather than
+left standing. What keeps them apart is standing, not size: one is a request,
+the other is proof a session may run in it. The test that asserted the
+configured set was larger is replaced by one asserting the two spell the same
+profile the same way, so an operator reading a state record reads their own
+word back.
+
+A shipped allowlist entry is now four fields, not three: the fourth is the
+dated proof run that put it there. The first attempt at this was a
+`docs/proven-platforms.md` the test `include_str!`d, and the Nix gate rejected
+it — the build's source filter excludes `docs/`, so the file was simply not
+there. That was the better answer arriving by the shorter road. A field cannot
+be forgotten the way a cross-file convention can: there is no way to write an
+entry without being asked where the proof is, and
+`every_shipped_platform_names_a_dated_proof_run` refuses an answer with no
+date in it, because a proof is a statement about a moment. Its own predicate
+is tested against the answers that dodge the question (blank, "proven", "see
+the plan"), since the list it guards is empty and would otherwise not say a
+word until the first platform was added — the moment it is needed.
+
+The refusal's cost is asserted against the probe plan rather than against a
+list of commands somebody thought to exclude: the daemon's fake logs every
+argv, and every line must be one of `LockedV1ProbePlan::for_host`'s. Swept over
+four hosts that refuse over different facts, because what a refusal costs must
+not depend on which fact refused it.
+
+Reconcile is the other half of that. Its test now runs under a host whose
+probes all fail *and* asserts no probe was run at all — not merely that
+teardown tolerated a refusing host, but that it never asked. A daemon that
+gathered evidence on the way to a teardown would be one an unreadable host
+could not be cleaned up on.
+
+One thing could not be weakened, which is worth recording as a success rather
+than a gap: `LockedV1Admission` has no public constructor, so an attempt to
+have the door return an admission carrying a digest other than the probed one
+does not compile.
+
+Four weakenings were injected and fail these tests: an allowlist entry with no
+row in the record, a door that probes a host other than the one it was asked
+about, a door that probes for the profiles decided on their spelling, and a
+reconcile that asks admission on its way to a teardown.
+
+---
+
 ## Stage E3: The vertical proof, with host-owned evidence
 
 **Dependencies:** Stages E2, C2b, and C3.

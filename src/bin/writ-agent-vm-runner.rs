@@ -13,6 +13,7 @@ use writ::agent_vm_lifecycle::{
     default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
     stop_agent_vm_session, stop_managed_agent_vm_session,
 };
+use writ::agent_vm_locked_admission::admit_on_this_host;
 use writ::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
@@ -218,14 +219,18 @@ impl From<BrokerPlacementArg> for BrokerPlacement {
     }
 }
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(e) = run().await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// A single-threaded runtime, because the only thing awaited here is
+/// admission — five host probes, run one after another. The work this
+/// command exists to do stays synchronous.
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let cli = Cli::parse();
     let tools = AgentVmToolPaths::new(
@@ -237,7 +242,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match cli.cmd {
         Cmd::Start(args) => {
             let dry_run = args.dry_run;
-            let plan = build_start_plan(args, tools)?;
+            let plan = build_start_plan(args, tools).await?;
             if dry_run {
                 print_start_invocations(&plan.start_invocations());
             } else {
@@ -266,7 +271,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::ManagedStart(args) => {
             let dry_run = args.start.dry_run;
             let state_dir = args.state_dir;
-            let plan = build_start_plan(args.start, tools)?;
+            let plan = build_start_plan(args.start, tools).await?;
             if dry_run {
                 print_start_invocations(&plan.start_invocations());
             } else {
@@ -304,11 +309,24 @@ fn resolve_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std:
     })
 }
 
-fn build_start_plan(
+async fn build_start_plan(
     args: StartArgs,
     tools: AgentVmToolPaths,
 ) -> Result<AgentVmSessionPlan, Box<dyn std::error::Error>> {
     let parsed = parse_session(&args.session)?;
+    let image = ContainerImage::new(args.image)?;
+    // The same door the daemon comes through, with the same allowlist, so
+    // this command cannot start a session on a host `writd` would refuse. It
+    // is the *whole* of the parity: there is one function, and both callers
+    // are it.
+    //
+    // Note that the storeless `start` refuses the locked profile regardless
+    // (it has no store to mint a release signal with). Parity here is about
+    // not acquiring a profile through a second front door, not about this
+    // path gaining a capability it structurally cannot have.
+    let admitted = admit_on_this_host(ConfiguredIpv6Profile::from(args.ipv6_mode), &tools, &image)
+        .await
+        .map_err(|refused| refused.to_string())?;
     let broker_ports = BrokerPorts::new(
         args.broker_ports
             .into_iter()
@@ -322,18 +340,11 @@ fn build_start_plan(
         args.session.subnet_index,
         broker_ports,
         broker_port_range,
-        // The same admission the daemon applies, for the same reason: this
-        // command starts a real session, and a profile no new session may run
-        // under must not acquire one through a second front door.
-        ConfiguredIpv6Profile::from(args.ipv6_mode)
-            .admit()
-            .map_err(|closed| closed.to_string())?
-            // A plan carries the mode; the rest of the decision (the locked
-            // profile's admitted image digest) is for the start path that can
-            // use it, and this one refuses that profile outright — it has no
-            // state store, so it could never release the guest.
-            .ipv6_mode(),
-        ContainerImage::new(args.image)?,
+        // A plan carries the mode; the rest of the decision — the locked
+        // profile's admitted image digest — is for a start path with a state
+        // store, which this is not.
+        admitted.ipv6_mode(),
+        image,
         args.guest_command,
         AgentVmResources::new(args.cpus, args.memory_mib)?,
         tools,
@@ -484,17 +495,35 @@ mod tests {
     }
 
     /// This binary is a second front door onto the same machinery, and a
-    /// profile no new session may run under must not acquire one through it.
-    #[test]
-    fn starting_under_a_closed_profile_is_refused_here_too() {
+    /// profile this host has no proof record for must not acquire one
+    /// through it.
+    ///
+    /// Parity with the daemon is structural rather than asserted: there is
+    /// one `admit_on_this_host`, and both doors are it. What is asserted here
+    /// is that this door goes through it — the refusal is the one
+    /// `LockedV1Refused` words, not a sentence of this binary's own.
+    ///
+    /// The tool paths are bare names, so the probes fail to spawn and the
+    /// refusal is about the first fact that could not be read. That is the
+    /// honest answer on a machine with no Apple `container`, which is where
+    /// this test runs.
+    #[tokio::test]
+    async fn starting_under_an_unproven_profile_is_refused_here_too() {
         let err = build_start_plan(start_args("ipv4-only-locked-v1"), tools())
-            .expect_err("a closed profile must not start a session")
+            .await
+            .expect_err("a profile with no proof record must not start a session")
             .to_string();
-        assert!(err.contains("not implemented"), "{err}");
+        assert!(
+            err.contains("PF helper's protocol version could not be read"),
+            "{err}"
+        );
 
-        // The profiles that admit still do.
+        // The profiles decided on their spelling still admit, and reach no
+        // probe on the way.
         for mode in ["dual-stack-required", "ipv4-only-no-guest-ipv6"] {
-            build_start_plan(start_args(mode), tools()).unwrap_or_else(|e| panic!("{mode}: {e}"));
+            build_start_plan(start_args(mode), tools())
+                .await
+                .unwrap_or_else(|e| panic!("{mode}: {e}"));
         }
     }
 

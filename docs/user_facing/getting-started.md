@@ -260,12 +260,21 @@ never asks `container` for an IPv6 subnet, so the start fails closed at network
 validation. This has been true since the profile was introduced and is not a
 regression; a session that cannot be confined does not run.
 
-`ipv4_only_locked_v1` names the intended successor to the ipv4-only profile, in
-which the guest cannot undo the deny at all. It is recognised so that a config
-naming it is refused for the right reason rather than read as a typo, and
-refused because it is not built yet. A `writd` older than this change rejects
-that spelling outright as an unknown value, which is what makes rolling back
-fail closed rather than silently running under some other profile.
+`ipv4_only_locked_v1` is the successor to the ipv4-only profile, in which the
+guest cannot undo the deny at all: an initializer writes the sysctls and drops
+every capability before the agent's command starts. It is the one profile whose
+admission is a claim about your *host* rather than about what you asked for —
+writd reads the PF helper's protocol version and preflight report, the guest
+image's isolation-ABI label and resolved digest, the Apple `container` version
+and the macOS build, and starts a session only if that exact combination
+appears in the allowlist writ ships, each entry of which records the dated
+proof run behind it. That list is empty today, so the profile starts a session
+nowhere; a config naming it is refused with the fact that was missing, and your
+existing sessions are untouched.
+
+A `writd` older than this change rejects that spelling outright as an unknown
+value, which is what makes rolling back fail closed rather than silently
+running under some other profile.
 
 
 Before that block does anything useful you need four things on disk:

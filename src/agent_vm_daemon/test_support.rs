@@ -762,3 +762,124 @@ exit 0
     fs::set_permissions(&path, permissions).unwrap();
     path
 }
+
+/// A host the locked profile's admission probes read differently.
+///
+/// Every one of them refuses, because the shipped allowlist is empty — but
+/// they refuse over different facts, and the point of sweeping them is that
+/// what a refusal *costs* must not depend on which fact refused it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LockedProbeHost {
+    /// Every probe answers, and the platform is simply not in the record.
+    Unrecorded,
+    /// The PF helper is too old to bound this daemon.
+    OldHelper,
+    /// The guest image declares no isolation ABI.
+    ImageWithoutAbiLabel,
+    /// Nothing answers at all.
+    Silent,
+}
+
+impl LockedProbeHost {
+    pub(super) const ALL: [Self; 4] = [
+        Self::Unrecorded,
+        Self::OldHelper,
+        Self::ImageWithoutAbiLabel,
+        Self::Silent,
+    ];
+}
+
+/// A fake `container` + `pf-helper` + `sudo` that answers the five admission
+/// probes as `host` would, and logs every argv it was given.
+///
+/// The log is what the "a refusal creates nothing" test reads: it has to
+/// contain the probes and nothing else.
+pub(super) fn write_fake_locked_probe_tool(
+    dir: &Path,
+    args_log: &Path,
+    host: LockedProbeHost,
+) -> PathBuf {
+    let path = dir.join("fake-locked-probe-tool");
+    let helper_version = match host {
+        LockedProbeHost::OldHelper => 1,
+        _ => crate::agent_vm_pf_helper_protocol::PF_HELPER_PROTOCOL_VERSION,
+    };
+    let labels = match host {
+        LockedProbeHost::ImageWithoutAbiLabel => String::new(),
+        _ => format!(
+            r#""{label}":"{version}""#,
+            label = writ_guest_init::record::ISOLATION_ABI_LABEL,
+            version = writ_guest_init::record::ISOLATION_ABI_VERSION,
+        ),
+    };
+    fs::write(
+        dir.join("probe-helper-protocol.out"),
+        format!(
+            "{}\n",
+            crate::agent_vm_pf_helper_protocol::PfHelperProtocolDoc::with_version(helper_version)
+                .render()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("probe-preflight.out"),
+        format!(
+            "{}\n",
+            crate::agent_vm_pf_helper_protocol::PfHelperPreflightDoc::new(
+                crate::agent_vm_firewall::PfPreflightReport {
+                    pf_enabled: true,
+                    session_anchor: crate::agent_vm_firewall::SessionAnchorPlacement::First,
+                    pass_translation_rules: Vec::new(),
+                },
+                crate::agent_vm_pf_helper_policy::PfHelperPolicy::new(
+                    agent_vm_pool(),
+                    BrokerPortRange::new(49152, 65535).unwrap(),
+                ),
+            )
+            .render()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("probe-image-inspect.out"),
+        format!(
+            r#"[{{"config":{{"Labels":{{{labels}}}}},"descriptor":{{"digest":"{digest}"}}}}]"#,
+            digest = LOCKED_IMAGE_DIGEST,
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+# Logged *before* the sudo shift, so a line is the argv as invoked — which is
+# what the caller's own probe plan says it should be.
+printf '%s' "$*" | tr '\n' ' ' >> {args_log}
+printf '\n' >> {args_log}
+# `sudo` is this same script here, so an invocation whose first argument is
+# this script's own path is one: drop it and read the real command.
+[ "$1" = "$0" ] && shift
+# Only the admission probes behave as `host` says. Everything else — the
+# teardown commands a reconcile runs — succeeds quietly, so a test can tell a
+# host that refuses admission from one that cannot be cleaned up.
+case "$1" in
+  protocol-version|preflight|image|--version|-buildVersion) ;;
+  *) exit 0 ;;
+esac
+if [ "{host:?}" = Silent ]; then exit 3; fi
+case "$1" in
+  protocol-version) exec cat {root}/probe-helper-protocol.out ;;
+  preflight) exec cat {root}/probe-preflight.out ;;
+  image) exec cat {root}/probe-image-inspect.out ;;
+  --version) printf 'container CLI version 0.0.0 (build: synthetic, commit: 0000000)\n' ;;
+esac
+exit 0
+"#,
+        args_log = shell_quote_path(args_log),
+        root = shell_quote_path(dir),
+        host = host,
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}

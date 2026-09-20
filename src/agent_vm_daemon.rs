@@ -23,12 +23,14 @@ use crate::agent_vm_lifecycle::{
     AgentVmSessionManagerError, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError,
     AgentVmSessionStateStatus, AgentVmSessionStateStore, AgentVmToolPaths, BoundedOutput,
     BrokerPlacement, ConfiguredIpv6Profile, ContainerImage, HostIface, Ipv6IsolationMode,
-    Ipv6ProfileClosed, NetworkHealth, ProbeDebounce, ProbeObservation, ProcessInvocation,
-    ProcessInvocationError, claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
+    NetworkHealth, ProbeDebounce, ProbeObservation, ProcessInvocation, ProcessInvocationError,
+    claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
     complete_agent_vm_session_start, complete_locked_session_prefix, evaluate_host_path,
     host_interfaces, remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
-use crate::agent_vm_locked_admission::{AdmittedProfile, LockedV1Admission};
+use crate::agent_vm_locked_admission::{
+    AdmittedProfile, LockedV1Admission, LockedV1Refused, admit_on_this_host,
+};
 use crate::agent_vm_locked_session::{LockedStartError, run_locked_start};
 use writ_guest_init::handoff::OwnedDirectory;
 
@@ -276,6 +278,11 @@ pub struct AgentRunStarted {
 pub struct AcceptedAgentRun {
     session_id: SessionId,
     run_id: AgentRunId,
+    /// What this run's session may start as, decided before the run had a
+    /// name. Carried rather than asked again: deciding it reads six facts off
+    /// the host, and a second reading could disagree with the one the caller
+    /// was answered on.
+    admitted: AdmittedProfile,
     label: Option<String>,
     agent_kind: AgentKind,
     agent_model: String,
@@ -421,14 +428,15 @@ pub enum AgentVmDaemonError {
          clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
     )]
     AgentRunUnsupportedForVmBroker,
-    /// The configured `ipv6_mode` names a profile no new session may start
-    /// under. Sessions already running are untouched, and `writd` itself still
-    /// starts, so they can be stopped and reconciled.
+    /// No new session may start under the configured `ipv6_mode` on this
+    /// host. Sessions already running are untouched, and `writd` itself still
+    /// starts, so they can be stopped and reconciled — neither needs the
+    /// evidence, because a persisted record carries its own mode.
     ///
-    /// The wording lives on [`Ipv6ProfileClosed`], because the runner refuses
-    /// with the same sentence.
-    #[error(transparent)]
-    Ipv6ProfileClosed(#[from] Ipv6ProfileClosed),
+    /// The wording lives on [`LockedV1Refused`], because the runner comes
+    /// through the same door and refuses with the same sentence.
+    #[error("no new session may start under the configured IPv6 profile: {0}")]
+    Ipv6ProfileRefused(#[from] LockedV1Refused),
     /// `broker_placement = vm` has no IPv6 confinement, so no new session under
     /// it can be started.
     ///

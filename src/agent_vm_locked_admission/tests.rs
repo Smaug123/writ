@@ -21,9 +21,10 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::agent_vm_firewall::{PassTranslationRule, PfPreflightReport, SessionAnchorPlacement};
+use crate::agent_vm_lifecycle::Ipv6IsolationMode;
 use crate::agent_vm_pf_helper_policy::PfHelperPolicy;
 use crate::core::{AgentNetworkPool, BrokerPortRange};
-use crate::test_support::write_executable_script;
+use crate::test_support::{shell_quote_path, write_executable_script};
 
 /// A real `container image inspect` document, captured from Apple
 /// `container` 1.4.1 against the official guest image. The fixture is the
@@ -413,13 +414,171 @@ fn another_profile_is_refused_whatever_the_evidence_says() {
         .expect("the evidence is the admitting combination");
 }
 
-/// `admit` is untouched: the profile is still closed on the spelling alone,
-/// so nothing reaches a probe.
+/// Does `text` contain a `YYYY-MM-DD` anywhere?
+fn names_a_date(text: &str) -> bool {
+    text.as_bytes().windows(10).any(|window| {
+        window[..4].iter().all(u8::is_ascii_digit)
+            && window[4] == b'-'
+            && window[5..7].iter().all(u8::is_ascii_digit)
+            && window[7] == b'-'
+            && window[8..].iter().all(u8::is_ascii_digit)
+    })
+}
+
+/// Every entry the shipped allowlist ever gains names a proof run, with a
+/// date.
+///
+/// Vacuous while the list is empty, which is the point: it is the assertion
+/// that stops the list being filled in without one. The *field* is what makes
+/// the question unavoidable — an entry cannot be written without answering it
+/// — and this refuses the answers that dodge it: blank, or undated. A proof
+/// is a statement about a moment, so a record that does not say which moment
+/// is not a record.
 #[test]
-fn admit_still_refuses_the_locked_profile() {
+fn every_shipped_platform_names_a_dated_proof_run() {
+    for entry in SHIPPED_PROVEN_PLATFORMS {
+        assert!(
+            names_a_date(entry.proof_run),
+            "shipped platform {:?} names a proof run without a date ({:?}); a platform \
+             admitted on somebody's recollection of having tested it is what this list \
+             exists to prevent",
+            entry.container_cli,
+            entry.proof_run
+        );
+    }
+}
+
+/// The date check is not vacuous: it refuses the answers that dodge the
+/// question.
+///
+/// Held against the predicate directly, because the list it guards is empty —
+/// so without this the guard could be `true` and nothing would say so until
+/// the first platform was added, which is the moment it is needed.
+#[test]
+fn a_proof_run_that_names_no_date_is_refused() {
+    for dodge in [
+        "",
+        "   ",
+        "proven",
+        "see the plan",
+        "202-09-20",
+        "2026/09/20",
+    ] {
+        assert!(!names_a_date(dodge), "{dodge:?}");
+    }
+    for real in [
+        "2026-09-20, scripts/prove-locked-v1.sh on the build host",
+        "run 2026-10-01",
+    ] {
+        assert!(names_a_date(real), "{real:?}");
+    }
+}
+
+/// The whole path — probe, parse, decide — on a host whose facts a record
+/// names, and on the same host against the list writ actually ships.
+///
+/// The composition is what is new here: Stage D tested the decision over a
+/// grid of evidence and the gatherer over a grid of faults, and this is the
+/// one thing neither covered, that what the probes read is what the decision
+/// reads.
+#[tokio::test]
+async fn the_whole_path_admits_a_recorded_platform_and_refuses_an_unrecorded_one() {
+    let host = FakeHost::new(None);
+    let recorded =
+        ProvenPlatforms::new([
+            ProvenPlatform::parse(REAL_CLI_LINE, REAL_BUILD, REAL_DIGEST).unwrap(),
+        ]);
+
+    let admitted = admit_probing(
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+        &host.plan(),
+        &recorded,
+    )
+    .await
+    .expect("a host whose facts a record names admits");
+    // The digest the readback will accept comes from the probe, not from the
+    // configuration: this is the whole reason the admission travels with the
+    // decision.
     assert_eq!(
-        ConfiguredIpv6Profile::Ipv4OnlyLockedV1.admit(),
-        Err(crate::agent_vm_lifecycle::Ipv6ProfileClosed::NotImplemented)
+        admitted.locked().map(|admission| admission.image_digest()),
+        Some(&ImageDigest::parse(REAL_DIGEST).unwrap())
+    );
+    assert_eq!(admitted.ipv6_mode(), Ipv6IsolationMode::Ipv4OnlyLockedV1);
+
+    let refused = admit_probing(
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+        &host.plan(),
+        &ProvenPlatforms::shipped(),
+    )
+    .await
+    .expect_err("the shipped list records no platform yet");
+    assert_eq!(refused.fact(), LockedV1Fact::ContainerCli);
+}
+
+/// The path is exactly the gatherer followed by the decision, on a host that
+/// admits and on one that cannot be read at all.
+#[tokio::test]
+async fn the_path_is_the_gatherer_and_the_decision_and_nothing_else() {
+    let recorded =
+        ProvenPlatforms::new([
+            ProvenPlatform::parse(REAL_CLI_LINE, REAL_BUILD, REAL_DIGEST).unwrap(),
+        ]);
+    for fault in [None, Some((Probe::Preflight, Fault::ExitsNonZero))] {
+        let host = FakeHost::new(fault);
+        let plan = host.plan();
+        let separately = ConfiguredIpv6Profile::Ipv4OnlyLockedV1
+            .admit_locked(&gather_locked_v1_evidence(&plan).await, &recorded)
+            .map(AdmittedProfile::Ipv4OnlyLockedV1);
+        let together =
+            admit_probing(ConfiguredIpv6Profile::Ipv4OnlyLockedV1, &plan, &recorded).await;
+        assert_eq!(together, separately, "{fault:?}");
+    }
+}
+
+/// Deciding the other two profiles reads nothing off the host, so a refusal
+/// under them — and the early gate that asks before a session has an id —
+/// costs no subprocess at all.
+#[tokio::test]
+async fn the_profiles_that_are_decided_on_their_spelling_run_no_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran.log");
+    let tool = write_executable_script(
+        dir.path(),
+        "tool",
+        &format!(
+            "#!/bin/sh
+printf '%s\n' \"$*\" >> {log}
+exit 0
+",
+            log = shell_quote_path(&ran),
+        ),
+    );
+    let plan = LockedV1ProbePlan::new(
+        &AgentVmToolPaths::new(&tool, &tool, &tool),
+        &tool,
+        &ContainerImage::new("writ-agent-vm-guest:latest").unwrap(),
+    );
+
+    for (profile, expected) in [
+        (
+            ConfiguredIpv6Profile::DualStackRequired,
+            AdmittedProfile::DualStackRequired,
+        ),
+        (
+            ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
+            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
+        ),
+    ] {
+        assert_eq!(
+            admit_probing(profile, &plan, &ProvenPlatforms::shipped()).await,
+            Ok(expected),
+            "{profile:?}"
+        );
+    }
+    assert!(
+        !ran.exists(),
+        "no probe should have run: {:?}",
+        fs::read_to_string(&ran)
     );
 }
 

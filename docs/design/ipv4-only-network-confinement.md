@@ -543,12 +543,15 @@ the production privileged CLI.
 ## Persistence and compatibility
 
 `ipv6_mode` is parsed as `ConfiguredIpv6Profile`, and a running or persisted
-session carries an `Ipv6IsolationMode`; `ConfiguredIpv6Profile::admit` is the
-only way between them (#397). `ipv4_only_locked_v1` is recognised so a config
-naming it is refused for the right reason, and refused because layers 2 and 3
-do not exist. A `writd` older than #397 rejects the spelling as an unknown
-value, which is what makes rolling back fail closed rather than quietly running
-under another profile.
+session carries an `Ipv6IsolationMode`; `admit_on_this_host` is the only way
+between them (#397). `ipv4_only_locked_v1` now admits — but only on a platform
+the vertical proof has been run against, recorded in
+`ProvenPlatforms::shipped()` — where each entry carries, as a required field,
+the dated proof run that put it there. That list is empty, so a config naming
+the profile is still refused everywhere, now with the fact that was missing
+rather than with "not implemented". A `writd` older
+than #397 rejects the spelling as an unknown value, which is what makes
+rolling back fail closed rather than quietly running under another profile.
 
 The legacy `ipv4_only_no_guest_ipv6` profile **is not refused** and will not
 be while it is the strongest confinement available. Once `locked_v1` admits on

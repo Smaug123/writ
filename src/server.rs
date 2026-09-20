@@ -482,6 +482,11 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                             .expect("agent prompt byte limit fits in u64"),
                     "AgentPrompt validates prompt size before dispatch"
                 );
+                // What this run's session may start as, decided here because
+                // deciding it awaits five host probes and accepting
+                // deliberately awaits nothing. A refusal answers before the
+                // run has a name, which is where every refusable thing
+                // belongs.
                 // Accept and answer; the start is deferred to the socket loop,
                 // which begins it only once this reply is out. The client that
                 // sent this has its own deadline and writd never sees its EOF,
@@ -489,22 +494,32 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 // fail to name — and an unnamed live VM is findable only by
                 // listing. Deferring puts the naming first: writd starts nothing
                 // until it has told someone what it would be called.
-                match agent_vm.accept_agent_run_session(
-                    state,
-                    label,
-                    agent_kind,
-                    agent_model,
-                    workspace,
-                    prompt,
-                    // `StartAgentRun` has no `purpose` field, and is not
-                    // getting one speculatively: a run started this way is
-                    // permanently `purpose: None` on the audit row, which is
-                    // the truth about what the caller supplied.
-                    crate::agent_vm_daemon::AgentRunTags {
-                        correlation_id,
-                        purpose: None,
-                    },
-                ) {
+                //
+                // Both refusals below happen before the run has a name. The
+                // profile is decided here rather than inside `accept` because
+                // deciding it awaits five host probes, and accepting
+                // deliberately awaits nothing at all.
+                let accepted = match agent_vm.admitted_profile().await {
+                    Err(refused) => Err(refused),
+                    Ok(admitted) => agent_vm.accept_agent_run_session(
+                        state,
+                        admitted,
+                        label,
+                        agent_kind,
+                        agent_model,
+                        workspace,
+                        prompt,
+                        // `StartAgentRun` has no `purpose` field, and is not
+                        // getting one speculatively: a run started this way is
+                        // permanently `purpose: None` on the audit row, which
+                        // is the truth about what the caller supplied.
+                        crate::agent_vm_daemon::AgentRunTags {
+                            correlation_id,
+                            purpose: None,
+                        },
+                    ),
+                };
+                match accepted {
                     Ok(accepted) => {
                         let session_id = accepted.session_id();
                         let run_id = accepted.run_id();

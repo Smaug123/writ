@@ -4,6 +4,7 @@
 use super::test_support::*;
 use super::*;
 use crate::agent_vm_lifecycle::AgentVmSessionStateStatus;
+use crate::agent_vm_locked_admission::LockedV1ProbePlan;
 use crate::agent_vm_locked_lifecycle::{LockedLifecycle, LockedPhase};
 use crate::audit::{NixCacheAuditDecision, NixCacheAuditEntry, NixCacheAuditRoute};
 use crate::core::RequestId;
@@ -13,26 +14,30 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use writ_guest_init::handoff::OwnedDirectory;
 
-/// A closed profile refuses new sessions and leaves nothing behind.
+/// A profile this host has no proof record for refuses new sessions and
+/// leaves nothing behind but the probes it had to run to find out.
 ///
-/// `ipv4_only_locked_v1` is recognised so that a config naming it is refused
-/// for the right reason rather than read as a typo. The refusal arrives before
-/// the session has an id — and so before an audit row, a subprocess, or a state
-/// record — which is why the error is bare rather than wrapped in
-/// `StartFailed`: there is no session for it to name.
+/// The refusal arrives before the session has an id — and so before an audit
+/// row, a network, a VM, or a state record — which is why the error is bare
+/// rather than wrapped in `StartFailed`: there is no session for it to name.
+///
+/// Swept over hosts that refuse for different reasons, because the cost of a
+/// refusal has to be the same whichever fact refused it. The shipped
+/// allowlist is empty, so even the host whose every probe answers perfectly
+/// is refused — which is this stage's whole shipped behaviour.
 #[tokio::test]
-async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
-    for (profile, expected) in [(
-        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
-        Ipv6ProfileClosed::NotImplemented,
-    )] {
+async fn an_unproven_host_refuses_new_sessions_and_creates_nothing() {
+    for host in LockedProbeHost::ALL {
         let dir = tempfile::tempdir().unwrap();
         let args_log = dir.path().join("args.log");
-        let env_path_log = dir.path().join("env-path.log");
-        let env_log = dir.path().join("env.log");
-        let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
-        let (config, state_store) =
-            daemon_config_with_ipv6_profile(dir.path(), &fake_tool, profile);
+        let fake_tool = write_fake_locked_probe_tool(dir.path(), &args_log, host);
+        let (config, state_store) = daemon_config_with_ipv6_profile(
+            dir.path(),
+            &fake_tool,
+            ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+        );
+        let image = config.lifecycle.image.clone();
+        let tools = config.lifecycle.tools.clone();
         let daemon = AgentVmDaemon::new(config);
         let audit_db = dir.path().join("audit.db");
         let state = make_state_with_audit(AuditLog::open(&audit_db).unwrap());
@@ -40,7 +45,7 @@ async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
         let err = daemon
             .start_session(
                 Arc::clone(&state),
-                Some("closed".into()),
+                Some("unproven".into()),
                 Some(AgentKind::Claude),
                 Some("claude-test".into()),
                 None,
@@ -49,38 +54,39 @@ async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, AgentVmDaemonError::Ipv6ProfileClosed(closed) if closed == expected),
-            "start_session under {profile:?}: expected {expected:?}, got {err:?}"
+            matches!(err, AgentVmDaemonError::Ipv6ProfileRefused(_)),
+            "start_session on {host:?}: got {err:?}"
         );
 
-        // The agent-run route refuses the same way, and equally early.
+        // The agent-run route refuses the same way, and equally early: it
+        // cannot even be *accepted* without a decision, and there is none.
         let run_err = daemon
-            .accept_agent_run_session(
-                &state,
-                Some("closed run".into()),
-                AgentKind::Claude,
-                "claude-test".into(),
-                AgentVmWorkspaceBootstrap {
-                    repo: "owner/repo".parse().unwrap(),
-                    destination: None,
-                    warm: WorkspaceWarmMode::None,
-                },
-                crate::agent_run::AgentPrompt::new("do it"),
-                crate::agent_vm_daemon::AgentRunTags::default(),
-            )
-            .unwrap_err();
+            .admitted_profile()
+            .await
+            .expect_err("the agent-run route asks the same question");
         assert!(
-            matches!(run_err, AgentVmDaemonError::Ipv6ProfileClosed(closed) if closed == expected),
-            "accept_agent_run_session under {profile:?}: got {run_err:?}"
+            matches!(run_err, AgentVmDaemonError::Ipv6ProfileRefused(_)),
+            "the agent-run route on {host:?}: got {run_err:?}"
         );
 
-        assert!(
-            !args_log.exists(),
-            "{profile:?}: a refused start must run no subprocess"
-        );
+        // Nothing ran but the probes. Computed from the probe plan itself, so
+        // this says "only the probes" rather than "none of the commands I
+        // thought to list".
+        let plan = LockedV1ProbePlan::for_host(&tools, &image);
+        let probes: Vec<String> = plan
+            .probes()
+            .iter()
+            .map(|probe| probe.invocation.args_lossy().join(" "))
+            .collect();
+        for line in fs::read_to_string(&args_log).unwrap_or_default().lines() {
+            assert!(
+                probes.iter().any(|probe| probe == line),
+                "{host:?}: a refused start ran {line:?}, which is not one of the probes {probes:?}"
+            );
+        }
         assert!(
             state_store.load_all().unwrap().is_empty(),
-            "{profile:?}: a refused start must persist no session state"
+            "{host:?}: a refused start must persist no session state"
         );
         // No session was ever named, so none was opened in the audit log. Read
         // the table directly: the log has no "list every session" accessor, and
@@ -91,26 +97,30 @@ async fn a_closed_ipv6_profile_refuses_new_sessions_and_creates_nothing() {
             .unwrap();
         assert_eq!(
             sessions, 0,
-            "{profile:?}: a refused start must open no audit session"
+            "{host:?}: a refused start must open no audit session"
         );
     }
 }
 
-/// A `writd` configured with a closed profile still stops what is running.
+/// A `writd` whose configured profile this host refuses still stops what is
+/// running.
 ///
-/// This is why a closed profile has to be representable in the runtime config
-/// at all: an operator who edits `ipv6_mode` — or a `writd` whose admitted set
-/// narrows across an upgrade — must still be able to reconcile the sessions
-/// already running. The persisted record carries its own mode, the stop plan is
-/// derived from the record alone (`to_stop_plan` takes no config), and boot-time
-/// reconcile under the closed profile removes the session.
+/// This is why admission and recognition are separate questions: an operator
+/// who edits `ipv6_mode` — or a `writd` whose host stops satisfying the
+/// profile across an upgrade — must still be able to reconcile the sessions
+/// already running. The persisted record carries its own mode, the stop plan
+/// is derived from the record alone (`to_stop_plan` takes no config), and
+/// boot-time reconcile removes the session.
+///
+/// The probes are scripted to fail, which is the sharp version of the claim:
+/// reconcile does not merely tolerate a refusing host, it never asks. A
+/// daemon that gathered evidence on the way to a teardown would be one an
+/// unreadable host could not be cleaned up on.
 #[tokio::test]
-async fn a_daemon_under_a_closed_profile_still_reconciles_a_running_session() {
+async fn a_daemon_whose_host_refuses_its_profile_still_reconciles_a_running_session() {
     let dir = tempfile::tempdir().unwrap();
     let args_log = dir.path().join("args.log");
-    let env_path_log = dir.path().join("env-path.log");
-    let env_log = dir.path().join("env.log");
-    let fake_tool = write_fake_tool(dir.path(), &args_log, &env_path_log, &env_log);
+    let fake_tool = write_fake_locked_probe_tool(dir.path(), &args_log, LockedProbeHost::Silent);
     let (config, state_store) = daemon_config_with_ipv6_profile(
         dir.path(),
         &fake_tool,
@@ -137,6 +147,8 @@ async fn a_daemon_under_a_closed_profile_still_reconciles_a_running_session() {
             closed_at: None,
         })
         .unwrap();
+    let image = config.lifecycle.image.clone();
+    let tools = config.lifecycle.tools.clone();
     let daemon = AgentVmDaemon::new(config);
 
     let report = daemon.reconcile_persisted_sessions(&audit).await.unwrap();
@@ -148,6 +160,20 @@ async fn a_daemon_under_a_closed_profile_still_reconciles_a_running_session() {
         args_log.exists(),
         "reconcile tears the session down with real invocations"
     );
+    // And none of them was an admission probe: teardown asked the host
+    // nothing about whether a *new* session could start.
+    let plan = LockedV1ProbePlan::for_host(&tools, &image);
+    let probes: Vec<String> = plan
+        .probes()
+        .iter()
+        .map(|probe| probe.invocation.args_lossy().join(" "))
+        .collect();
+    for line in fs::read_to_string(&args_log).unwrap().lines() {
+        assert!(
+            !probes.iter().any(|probe| probe == line),
+            "reconcile ran the admission probe {line:?}"
+        );
+    }
 }
 
 /// Starts a VM-placement session past the admission gate.
@@ -2099,6 +2125,7 @@ async fn accepting_an_agent_run_names_it_without_starting_anything() {
     let accepted = daemon
         .accept_agent_run_session(
             &state,
+            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
             Some("named".into()),
             AgentKind::Claude,
             "claude-test".into(),
@@ -2174,6 +2201,7 @@ async fn stopping_an_accepted_run_before_it_starts_prevents_the_start() {
     let accepted = daemon
         .accept_agent_run_session(
             &state,
+            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
             Some("queued".into()),
             AgentKind::Claude,
             "claude-test".into(),
@@ -2414,6 +2442,7 @@ async fn dropping_an_accepted_run_gives_back_everything_it_took() {
     let accepted = daemon
         .accept_agent_run_session(
             &state,
+            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
             Some("abandoned".into()),
             AgentKind::Claude,
             "claude-test".into(),

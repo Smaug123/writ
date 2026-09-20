@@ -17,7 +17,6 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent_vm_locked_admission::AdmittedProfile;
 use crate::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
@@ -497,18 +496,20 @@ impl Ipv6IsolationMode {
 /// What an operator wrote in `ipv6_mode`, before anything decides whether a
 /// session may start under it.
 ///
-/// Deliberately a different type from [`Ipv6IsolationMode`]. The configured set
-/// is the larger one — it has to name profiles that exist only to be refused,
-/// so that the refusal can say *which* profile and why — while the active set
-/// names only what a session can actually be running under. Collapsing them
-/// would put a variant into the persisted state store that no session can ever
-/// be in, and every `match` on a running session's mode would have to invent an
-/// answer for it.
+/// Deliberately a different type from [`Ipv6IsolationMode`], and the two are
+/// now variant for variant the same set. What keeps them apart is not their
+/// size but their standing: this is what an operator *asked for*, and an
+/// [`Ipv6IsolationMode`] is proof that a session may run in it. The only way
+/// from one to the other is
+/// [`admit_on_this_host`](crate::agent_vm_locked_admission::admit_on_this_host),
+/// which for the locked profile is a question about the host — so a spelling
+/// in a config file cannot reach the code that builds a session without the
+/// host having answered it.
 ///
-/// Recognising a profile and admitting one are also different questions, and
-/// keeping them apart is what lets `writd` start at all under a closed profile:
-/// it has to, or the sessions already running under the legacy one could never
-/// be stopped or reconciled.
+/// That is also what lets `writd` start at all under a profile this host
+/// refuses: it has to, or the sessions already running could never be stopped
+/// or reconciled. Neither needs the evidence, because a persisted record
+/// carries its own mode.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfiguredIpv6Profile {
@@ -527,53 +528,21 @@ pub enum ConfiguredIpv6Profile {
     /// IPv6 denied inside the guest and — since the host PF backstop — blocked
     /// on the agent's bridge by an interface-scoped `inet6` deny.
     ///
-    /// The only profile that starts a session today, and the strongest IPv6
-    /// containment writ has: the interface scope holds against a root workload
-    /// that reassigns its source address, which a source-CIDR rule does not.
+    /// Admitted on any host: the containment is host PF plus an in-guest deny
+    /// the root workload can reverse, and nothing about the host changes
+    /// whether that is what the operator asked for.
     Ipv4OnlyNoGuestIpv6,
-    /// The intended successor, in which the guest cannot reverse the in-guest
-    /// deny at all. Recognised so that a config naming it is understood — and
-    /// refused for the right reason — rather than failing as a typo; closed
-    /// until it is built.
+    /// The successor, in which the guest cannot reverse the in-guest deny at
+    /// all: an initializer writes the sysctls and drops every capability
+    /// before the workload starts.
+    ///
+    /// The one profile whose admission is a claim about the *host*. It holds
+    /// only on a platform the vertical proof has been run against, so
+    /// admitting it means reading six facts off this host and finding them in
+    /// a proof record — see
+    /// [`admit_locked`](Self::admit_locked). The shipped record list is
+    /// empty, so it admits nowhere yet.
     Ipv4OnlyLockedV1,
-}
-
-/// Why no new session may start under a configured profile.
-///
-/// The one place the reason is worded: the daemon and the runner both surface
-/// this error as-is, so an operator reads the same sentence whichever front
-/// door refused them.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum Ipv6ProfileClosed {
-    /// The profile is named but not built.
-    #[error(
-        "the ipv4_only_locked_v1 IPv6 profile is not implemented: it is recognised so that a \
-         config naming it is refused for the right reason, but nothing yet stops the workload \
-         reversing the guest IPv6 deny. No session starts under it."
-    )]
-    NotImplemented,
-}
-
-impl ConfiguredIpv6Profile {
-    /// What a new session may start as under this profile.
-    ///
-    /// This is the only way to obtain an [`Ipv6IsolationMode`] from a
-    /// configuration, so a closed profile cannot reach the code that builds a
-    /// session: there is no mode for it to build one with.
-    ///
-    /// The answer is an [`AdmittedProfile`] rather than a bare mode because
-    /// the locked profile's start path needs the image digest the evidence
-    /// admitted, and that has to arrive with the decision rather than be
-    /// looked up again afterwards. The locked arm is still a refusal here:
-    /// Stage E2c-3c is where it starts gathering evidence and can construct
-    /// one.
-    pub fn admit(self) -> Result<AdmittedProfile, Ipv6ProfileClosed> {
-        match self {
-            Self::DualStackRequired => Ok(AdmittedProfile::DualStackRequired),
-            Self::Ipv4OnlyNoGuestIpv6 => Ok(AdmittedProfile::Ipv4OnlyNoGuestIpv6),
-            Self::Ipv4OnlyLockedV1 => Err(Ipv6ProfileClosed::NotImplemented),
-        }
-    }
 }
 
 /// Where the per-session vm_http broker runs.
@@ -1893,55 +1862,40 @@ mod network_inspection_tests;
 mod configured_profile_tests {
     use super::*;
 
-    /// Every profile is recognised, and each says for itself whether a session
-    /// may start under it.
+    /// A profile and the mode it admits to are spelled the same.
     ///
-    /// Exhaustive on purpose: a profile added later must decide here, rather
-    /// than inherit an answer.
+    /// The two types are now the same set, so what an operator wrote in
+    /// `ipv6_mode` is what a state record for that session says — and an
+    /// operator reading a record is reading their own word back. A pairing
+    /// that drifted would make the config and the record disagree about one
+    /// session while both remaining valid.
+    ///
+    /// The list is written out and its length checked, so a variant added to
+    /// either side has to be paired here rather than inherit an answer.
     #[test]
-    fn each_configured_profile_says_whether_a_session_may_start_under_it() {
-        for (profile, expected) in [
+    fn a_profile_and_the_mode_it_admits_to_are_spelled_the_same() {
+        let pairs = [
             (
                 ConfiguredIpv6Profile::DualStackRequired,
-                Ok(AdmittedProfile::DualStackRequired),
+                Ipv6IsolationMode::DualStackRequired,
             ),
             (
                 ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
-                Ok(AdmittedProfile::Ipv4OnlyNoGuestIpv6),
+                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
             ),
             (
                 ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
-                Err(Ipv6ProfileClosed::NotImplemented),
+                Ipv6IsolationMode::Ipv4OnlyLockedV1,
             ),
-        ] {
-            assert_eq!(profile.admit(), expected, "{profile:?}");
+        ];
+        assert_eq!(pairs.len(), Ipv6IsolationMode::ALL.len());
+        for (profile, mode) in pairs {
+            assert_eq!(
+                serde_json::to_string(&profile).unwrap(),
+                serde_json::to_string(&mode).unwrap(),
+                "{profile:?}"
+            );
         }
-    }
-
-    /// The configured set names a profile the active set does not, and must.
-    ///
-    /// `Ipv4OnlyLockedV1` has no active mode because no session runs in it. If
-    /// it were a variant of [`Ipv6IsolationMode`] instead, the state store
-    /// could hold a session in a mode no session can be in, and every match on
-    /// a running session's mode would have to invent an answer for it.
-    #[test]
-    fn the_active_set_holds_no_mode_that_no_session_can_be_in() {
-        let active: Vec<Ipv6IsolationMode> = [
-            ConfiguredIpv6Profile::DualStackRequired,
-            ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
-            ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
-        ]
-        .into_iter()
-        .filter_map(|profile| profile.admit().ok())
-        .map(|admitted| admitted.ipv6_mode())
-        .collect();
-        assert_eq!(
-            active,
-            vec![
-                Ipv6IsolationMode::DualStackRequired,
-                Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
-            ]
-        );
     }
 
     /// An older binary's spelling of the mode, which is the point of this
