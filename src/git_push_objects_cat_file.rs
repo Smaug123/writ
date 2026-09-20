@@ -297,7 +297,7 @@ impl GitObjectSource for CatFileObjectSource {
     async fn read_commit(&self, sha: &GitObjectId) -> Result<StagingCommit, GitObjectSourceError> {
         let raw = self.read_object_raw(sha, "commit").await?;
         parse_commit_object(&raw).map_err(|reason| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: reason.to_string(),
         })
     }
@@ -305,7 +305,7 @@ impl GitObjectSource for CatFileObjectSource {
     async fn read_tree(&self, sha: &GitObjectId) -> Result<StagingTree, GitObjectSourceError> {
         let raw = self.read_object_raw(sha, "tree").await?;
         parse_tree_object(&raw).map_err(|reason| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: reason.to_string(),
         })
     }
@@ -358,7 +358,7 @@ impl CatFileObjectSource {
                 kill_process_group(self.pgid, false)
                     .map_err(|source| GitObjectSourceError::Io { source })?;
                 Err(GitObjectSourceError::ReadTimedOut {
-                    sha: sha.as_str().to_string(),
+                    sha: sha.clone(),
                     timeout: self.read_timeout,
                 })
             }
@@ -423,26 +423,24 @@ async fn read_object_body(
     let _echoed_sha = fields
         .next()
         .ok_or_else(|| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: format!("empty cat-file response: {header:?}"),
         })?;
     let kind_field = fields
         .next()
         .ok_or_else(|| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: format!("cat-file response missing type field: {header:?}"),
         })?;
     // `missing` and `ambiguous` carry no payload, so we can
     // return immediately without disturbing the pipe framing.
     match kind_field {
         "missing" => {
-            return Err(GitObjectSourceError::NotFound {
-                sha: sha.as_str().to_string(),
-            });
+            return Err(GitObjectSourceError::NotFound { sha: sha.clone() });
         }
         "ambiguous" => {
             return Err(GitObjectSourceError::Malformed {
-                sha: sha.as_str().to_string(),
+                sha: sha.clone(),
                 reason: "cat-file reported the SHA as ambiguous".to_string(),
             });
         }
@@ -451,12 +449,12 @@ async fn read_object_body(
     let size_field = fields
         .next()
         .ok_or_else(|| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: format!("cat-file response missing size field: {header:?}"),
         })?;
     if fields.next().is_some() {
         return Err(GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: format!("cat-file response has trailing junk: {header:?}"),
         });
     }
@@ -467,7 +465,7 @@ async fn read_object_body(
         size_field
             .parse()
             .map_err(|err: ParseIntError| GitObjectSourceError::Malformed {
-                sha: sha.as_str().to_string(),
+                sha: sha.clone(),
                 reason: format!("cat-file size field {size_field:?} is not a u64: {err}"),
             })?;
     if declared_size > max_object_bytes {
@@ -481,7 +479,7 @@ async fn read_object_body(
         child.poisoned = true;
         kill_process_group(pgid, false).map_err(|source| GitObjectSourceError::Io { source })?;
         return Err(GitObjectSourceError::ObjectTooLarge {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             size: declared_size,
             max: max_object_bytes,
         });
@@ -493,7 +491,7 @@ async fn read_object_body(
     let size: usize = declared_size
         .try_into()
         .map_err(|_| GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: format!(
                 "cat-file size {declared_size} fits within the cap but not in usize on this host"
             ),
@@ -518,7 +516,7 @@ async fn read_object_body(
         .map_err(|source| GitObjectSourceError::Io { source })?;
     if trailing[0] != b'\n' {
         return Err(GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: format!(
                 "cat-file payload not LF-terminated: trailing byte 0x{:02x}",
                 trailing[0]
@@ -527,7 +525,7 @@ async fn read_object_body(
     }
     if kind_field != expected_type {
         return Err(GitObjectSourceError::Malformed {
-            sha: sha.as_str().to_string(),
+            sha: sha.clone(),
             reason: format!("expected `{expected_type}`, got `{kind_field}`"),
         });
     }
@@ -672,7 +670,7 @@ mod tests {
             .await
             .expect_err("missing should error");
         assert!(
-            matches!(err, GitObjectSourceError::NotFound { ref sha } if sha == missing.as_str()),
+            matches!(err, GitObjectSourceError::NotFound { ref sha } if *sha == missing),
             "got: {err:?}"
         );
 
@@ -801,7 +799,7 @@ mod tests {
             .expect_err("oversized declared size must be rejected pre-allocation");
         match err {
             GitObjectSourceError::ObjectTooLarge { ref sha, size, max } => {
-                assert_eq!(sha, target.as_str());
+                assert_eq!(*sha, target);
                 assert_eq!(size, 10_737_418_240);
                 assert_eq!(max, 1 << 20);
             }
@@ -864,7 +862,7 @@ mod tests {
             .expect_err("a wedged read must time out rather than hang");
         match err {
             GitObjectSourceError::ReadTimedOut { ref sha, timeout } => {
-                assert_eq!(sha, target.as_str());
+                assert_eq!(*sha, target);
                 assert_eq!(timeout, read_timeout);
             }
             other => panic!("expected ReadTimedOut, got: {other:?}"),

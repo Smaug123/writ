@@ -99,7 +99,10 @@ pub enum RunApproveError {
     /// `rev-list` and the wrong commit would be replayed; this gate
     /// (a post-unbundle `cat-file -t == commit` invariant) prevents that.
     #[error("bundle tip {sha} is not a commit object (actual type: {actual_type})")]
-    BundleTipNotACommit { sha: String, actual_type: String },
+    BundleTipNotACommit {
+        sha: GitObjectId,
+        actual_type: String,
+    },
     #[error("fast-forward planning against the staging repo failed: {0}")]
     Plan(#[from] FastForwardPlanError),
     #[error("could not open `git cat-file --batch` against the staging repo: {0}")]
@@ -758,7 +761,7 @@ async fn verify_bundle_tip_is_commit(
         Ok(())
     } else {
         Err(RunApproveError::BundleTipNotACommit {
-            sha: bundle_tip.as_str().to_string(),
+            sha: bundle_tip.clone(),
             actual_type: actual.to_string(),
         })
     }

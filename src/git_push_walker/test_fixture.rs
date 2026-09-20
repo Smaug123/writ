@@ -39,26 +39,20 @@ impl GitObjectSource for InMemoryGitObjectSource {
         self.commits
             .get(sha)
             .cloned()
-            .ok_or_else(|| GitObjectSourceError::NotFound {
-                sha: sha.as_str().to_string(),
-            })
+            .ok_or_else(|| GitObjectSourceError::NotFound { sha: sha.clone() })
     }
 
     async fn read_tree(&self, sha: &GitObjectId) -> Result<StagingTree, GitObjectSourceError> {
         self.trees
             .get(sha)
             .cloned()
-            .ok_or_else(|| GitObjectSourceError::NotFound {
-                sha: sha.as_str().to_string(),
-            })
+            .ok_or_else(|| GitObjectSourceError::NotFound { sha: sha.clone() })
     }
 
     async fn read_blob(&self, sha: &GitObjectId) -> Result<Vec<u8>, GitObjectSourceError> {
         self.blobs
             .get(sha)
             .cloned()
-            .ok_or_else(|| GitObjectSourceError::NotFound {
-                sha: sha.as_str().to_string(),
-            })
+            .ok_or_else(|| GitObjectSourceError::NotFound { sha: sha.clone() })
     }
 }

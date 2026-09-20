@@ -1160,7 +1160,7 @@ async fn run_approve_rejects_non_commit_bundle_tip() {
         matches!(
             err,
             RunApproveError::BundleTipNotACommit { ref sha, ref actual_type }
-                if sha == tag_sha.as_str() && actual_type == "tag"
+                if *sha == tag_sha && actual_type == "tag"
         ),
         "expected BundleTipNotACommit{{tag}}, got: {err:?}",
     );
