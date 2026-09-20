@@ -1362,11 +1362,21 @@ diagnosis of a *failed* positive control. Nothing grades on it, and a refusal
 to parse would be the wrong answer there — the question is where the packets
 went, not whether the anchor is well-formed.
 
-Three weakenings were injected and fail these tests: a missing rule read as a
-zero rise, a grader that sums every deny key rather than the family's, and an
-`Unmoved` that tolerates one stray frame. A fourth — ignoring the reloaded-
-anchor refusal — could not be written: `delta` returns a `Result` and `?` is
-the only way past it, so the refusal is structural rather than remembered.
+A review round found a third way for a missing rule to look like a satisfied
+one, and it is the same shape as the other two. A counter key is a label *and*
+an interface, and the grader matched on the label alone — so a rule carrying
+the interface-deny label but scoped to no interface counted as one. The helper
+never files that pairing (a subnet-scoped deny gets a different label), but
+the grader reads a *file*, and the wire format admits it: a document whose
+only rule of that label was unscoped would have satisfied `Unmoved` with no
+interface deny in it at all. Both halves of the key are matched now.
+
+Four weakenings were injected and fail these tests: a missing rule read as a
+zero rise, a rule scoped to no interface counted as an interface deny, a
+grader that sums every deny key rather than the family's, and an `Unmoved`
+that tolerates one stray frame. A fifth — ignoring the reloaded-anchor refusal
+— could not be written: `delta` returns a `Result` and `?` is the only way
+past it, so the refusal is structural rather than remembered.
 
 ---
 

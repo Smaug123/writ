@@ -92,6 +92,50 @@ fn a_family_the_anchor_does_not_deny_is_refused_rather_than_read_as_zero() {
     }
 }
 
+/// A rule carrying the interface-deny label but scoped to no interface is
+/// not an interface-scoped deny, and must not be counted as one.
+///
+/// The real helper cannot produce that pairing — it files a subnet-scoped
+/// deny under a different label — but the grader reads a *file*, and the wire
+/// format admits it. Counting it would let a document with no interface deny
+/// in it satisfy `Unmoved` perfectly, which is the one reading this grading
+/// exists to refuse.
+#[test]
+fn a_deny_scoped_to_no_interface_is_not_an_interface_deny() {
+    let unscoped = key(IPV6_IFACE_DENY_LABEL, None);
+    let only_unscoped = snapshot(&[(unscoped.clone(), 0)]);
+    assert_eq!(
+        grade_deny_window(
+            &only_unscoped,
+            &only_unscoped,
+            DeniedFamily::Ipv6,
+            DenyExpectation::Unmoved
+        ),
+        Err(DenyRefusal::NoSuchDeny {
+            family: DeniedFamily::Ipv6,
+            label: IPV6_IFACE_DENY_LABEL,
+        }),
+        "an unscoped rule is not the rule this window is about"
+    );
+
+    // And beside a real one, it contributes nothing to the reading.
+    let scoped = key(IPV6_IFACE_DENY_LABEL, Some("bridge100"));
+    let before = snapshot(&[(unscoped.clone(), 0), (scoped.clone(), 0)]);
+    let after = snapshot(&[(unscoped, 500), (scoped, 2)]);
+    assert_eq!(
+        grade_deny_window(
+            &before,
+            &after,
+            DeniedFamily::Ipv6,
+            DenyExpectation::RoseByAtLeast(2)
+        ),
+        Ok(DenyReading {
+            packets: 2,
+            rules: 1
+        })
+    );
+}
+
 /// Two readings of *different* anchors are not a measurement, and the typed
 /// read is what makes that sayable: the `awk` this replaces could only
 /// subtract two numbers and get a plausible one.

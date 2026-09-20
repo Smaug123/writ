@@ -20,7 +20,9 @@
 //!
 //! An anchor with no interface-scoped deny of the family under test counts
 //! nothing, and a rise of nothing satisfies [`DenyExpectation::Unmoved`]
-//! perfectly. That is the failure this grading exists to avoid, so the
+//! perfectly. So does an anchor whose only rule of that label is scoped to no
+//! interface — a pairing the helper never files, but one the wire format
+//! admits, and the grader reads a file. That is the failure this grading exists to avoid, so the
 //! absence of the rule is [`DenyRefusal::NoSuchDeny`] rather than a reading of
 //! zero — the same fail-closed move the `awk` made by dying unless at least
 //! one rule rendered with a counter.
@@ -128,7 +130,12 @@ pub fn grade_deny_window(
         rules: 0,
     };
     for (key, counters) in delta.iter() {
-        if key.label() != label {
+        // Both halves of the key, because either alone admits a rule this
+        // window is not about. The label alone would count a rule scoped to
+        // no interface — which the wire format allows even though the helper
+        // never files one that way — and a document carrying only that would
+        // then satisfy `Unmoved` with no interface deny in it at all.
+        if key.label() != label || key.interface().is_none() {
             continue;
         }
         observed.packets = observed.packets.saturating_add(counters.packets);
