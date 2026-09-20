@@ -765,6 +765,8 @@ mod process_runner {
             stream: &'static str,
             source: std::io::Error,
         },
+        #[error("cannot create the agent stream drain-stop pipe: {0}")]
+        DrainStopPipe(std::io::Error),
         #[error("cannot capture agent stream {path}: {source}")]
         StreamCapture {
             path: PathBuf,
@@ -906,23 +908,24 @@ mod process_runner {
             .expect("stderr was configured as piped before spawn");
         let max_stdout = plan.max_stream_capture_bytes;
         let max_stderr = plan.max_stream_capture_bytes;
-        // Shared with both capture threads and armed after the group sweep
-        // below. Until then it is empty, which means "drain for as long as it
-        // takes" — correct while the agent is legitimately still writing.
-        let drain_deadline = std::sync::Arc::new(DrainDeadline::default());
+        // Shared with both capture threads and signalled after the group sweep
+        // below. Until then it is unsignalled, which means "drain for as long
+        // as it takes" — correct while the agent is legitimately still writing.
+        let drain_stop =
+            std::sync::Arc::new(DrainStop::new().map_err(AgentProcessRunError::DrainStopPipe)?);
         let stdout_thread = spawn_capture_thread(
             "stdout",
             stdout,
             stdout_path.clone(),
             max_stdout,
-            std::sync::Arc::clone(&drain_deadline),
+            std::sync::Arc::clone(&drain_stop),
         )?;
         let stderr_thread = spawn_capture_thread(
             "stderr",
             stderr,
             stderr_path.clone(),
             max_stderr,
-            std::sync::Arc::clone(&drain_deadline),
+            std::sync::Arc::clone(&drain_stop),
         )?;
 
         let stdin = child
@@ -975,14 +978,31 @@ mod process_runner {
 
         // Every legitimate writer is now dead, so EOF is imminent — unless
         // something left the group and kept a write end, which `killpg` cannot
-        // reach. Arming the drain deadline here is what turns that from an
+        // reach. Arming the drain stop here is what turns that from an
         // unbounded hang into a bounded, *recorded* one: the captures get
         // `DRAIN_GRACE` to see EOF, and a stream that does not is closed and
         // flagged rather than waited on.
         //
         // After the sweep rather than before it, because before it a stream
         // still open is the ordinary case.
-        drain_deadline.set(std::time::Instant::now() + DRAIN_GRACE);
+        //
+        // On its own thread because the grace is a wall-clock wait and this
+        // thread has the joins below to get to. That thread is the only clock
+        // in the drain mechanism; everything else keys off the descriptor it
+        // closes.
+        let grace_thread = {
+            let drain_stop = std::sync::Arc::clone(&drain_stop);
+            thread::Builder::new()
+                .name("writ-agent-drain-stop".to_string())
+                .spawn(move || drain_stop.signal_after(DRAIN_GRACE))
+        };
+        // A grace period nobody will ever end is worse than none at all: the
+        // captures would wait on a signal that cannot arrive. So a thread that
+        // will not start means stopping now, which costs a run its grace and
+        // cannot cost it a hang.
+        if grace_thread.is_err() {
+            drain_stop.signal();
+        }
 
         // The sweep above is the last thing that needs the group addressable, so
         // the leader is released here — `child` had been holding it unreaped
@@ -1003,6 +1023,17 @@ mod process_runner {
         join_prompt_thread(prompt_thread)??;
         let stdout = join_capture_thread("stdout", stdout_thread)??;
         let stderr = join_capture_thread("stderr", stderr_thread)??;
+        // Both drains are done, so the grace period has nothing left to bound.
+        // Signalling releases the thread waiting it out — idempotent, and the
+        // ordinary case, since a run whose streams ended normally gets here
+        // well inside the grace. Its result is deliberately dropped: a failed
+        // `poll` there could only have stopped a drain that has already
+        // stopped, and failing a completed run on it would be reporting writ's
+        // bookkeeping as the agent's outcome.
+        drain_stop.signal();
+        if let Ok(grace_thread) = grace_thread {
+            let _ = grace_thread.join();
+        }
         let (status, exit_code) = match ended {
             AgentRunEnd::Exited(status) => (
                 if status.success() {
@@ -1281,7 +1312,7 @@ mod process_runner {
         reader: R,
         path: PathBuf,
         max_capture_bytes: u64,
-        deadline: std::sync::Arc<DrainDeadline>,
+        stop: std::sync::Arc<DrainStop>,
     ) -> Result<
         thread::JoinHandle<Result<AgentRunStreamCapture, AgentProcessRunError>>,
         AgentProcessRunError,
@@ -1289,11 +1320,11 @@ mod process_runner {
         thread::Builder::new()
             .name(format!("writ-agent-{stream}"))
             .spawn(move || {
-                capture_stream_to_deadline(
+                capture_stream_until_stopped(
                     reader,
                     path,
                     max_capture_bytes,
-                    &deadline,
+                    &stop,
                     DRAIN_POST_DEADLINE_ALLOWANCE,
                 )
             })
@@ -1319,10 +1350,6 @@ mod process_runner {
     /// bound at all, when it is exactly as vulnerable.
     const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// How long a capture waits in one `poll(2)` before re-reading the shared
-    /// deadline. Bounds how late it can notice a stop, nothing more.
-    const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-
     /// How much a capture may still read *after* its deadline has passed.
     ///
     /// The deadline stops writ **waiting** for more output, but bytes already
@@ -1342,30 +1369,130 @@ mod process_runner {
     /// exactly what it is.
     pub(super) const DRAIN_POST_DEADLINE_ALLOWANCE: u64 = 1024 * 1024;
 
-    /// When the capture threads should stop draining, set once by the thread
-    /// that swept the process group.
+    /// Tells the capture threads to stop draining — as something they can
+    /// *wait on*, not something they have to keep checking.
     ///
-    /// A shared cell rather than a value passed at spawn time because the
-    /// instant that matters is not known until the sweep happens, and the
-    /// threads are necessarily already running by then — they are what keeps the
-    /// agent from blocking on a full pipe.
-    #[derive(Debug, Default)]
-    pub(super) struct DrainDeadline(std::sync::Mutex<Option<std::time::Instant>>);
+    /// A pipe. Signalling writes a byte into it, and the readers, which poll
+    /// the read end alongside their own stream, see it become readable. That
+    /// keeps a clock out of the capture threads entirely: "has the drain been
+    /// stopped?" is a question about the state of a descriptor, where asking a
+    /// clock would make it a question about the wall clock *and* about how
+    /// promptly this thread was scheduled to ask. The one place a duration is
+    /// read is [`Self::signal_after`], on a thread of its own.
+    ///
+    /// Three properties come from a byte nobody reads. It is sticky, so a
+    /// reader that looks after the fact still sees it. Every poller sees it,
+    /// because nothing consumes it, so one signal serves both streams. And it
+    /// can be waited for in the same `poll(2)` as the data itself, so stopping
+    /// is immediate rather than as late as a polling interval, and a reader
+    /// with nothing to read costs nothing while it waits.
+    ///
+    /// **A byte rather than closing the write end.** Closing looks tidier and
+    /// is wrong here: a hangup appears only once *every* write end is closed,
+    /// and this process cannot promise it owns them all. `std::io::pipe` sets
+    /// `FD_CLOEXEC`, but that closes an inherited copy at the child's `exec`,
+    /// not at the `fork` — so a child being spawned by another thread, and
+    /// this daemon spawns plenty, holds a copy of the write end for the whole
+    /// of that window. A stop that waits on an unrelated process reaching its
+    /// `exec` is not a bound. A byte in the pipe is visible however many write
+    /// ends exist.
+    #[derive(Debug)]
+    pub(super) struct DrainStop {
+        /// Polled by the capture threads; never read from, so what is written
+        /// into it stays there to be seen.
+        read: std::io::PipeReader,
+        /// Behind a lock because signalling writes through it, and any thread
+        /// may signal.
+        write: std::sync::Mutex<std::io::PipeWriter>,
+    }
 
-    impl DrainDeadline {
-        fn get(&self) -> Option<std::time::Instant> {
-            *self.0.lock().expect("drain deadline mutex poisoned")
+    impl DrainStop {
+        pub(super) fn new() -> std::io::Result<Self> {
+            let (read, write) = std::io::pipe()?;
+            Ok(Self {
+                read,
+                write: std::sync::Mutex::new(write),
+            })
         }
 
-        /// Start the clock. Idempotent in effect: the sweep happens once, and a
-        /// second call would only move a deadline the readers may already have
-        /// acted on.
-        pub(super) fn set(&self, at: std::time::Instant) {
-            *self.0.lock().expect("drain deadline mutex poisoned") = Some(at);
+        /// Stop every drain sharing this signal.
+        ///
+        /// Idempotent in effect: the readers only ask whether the pipe has
+        /// anything in it, so a second byte says what the first did.
+        ///
+        /// A failed write is dropped rather than reported, because both ways
+        /// it can fail mean the signal has already arrived or can no longer
+        /// matter: a full pipe is one holding the bytes of a great many
+        /// earlier signals, and a broken one has no reader left to stop.
+        /// There is no third case while this struct owns the read end.
+        pub(super) fn signal(&self) {
+            use std::io::Write as _;
+            let _ = self
+                .write
+                .lock()
+                .expect("drain stop mutex poisoned")
+                .write(&[0]);
+        }
+
+        /// The descriptor a waiter polls. Readable once signalled.
+        fn fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd as _;
+            self.read.as_raw_fd()
+        }
+
+        /// Has it been signalled? Asks the descriptor, not the clock.
+        ///
+        /// Nothing but [`Self::signal`] ever writes here, so readable means
+        /// signalled. An interrupted `poll(2)` is retried rather than answered
+        /// "no": `EINTR` means the question was not asked, and a caller cannot
+        /// tell that "no" from the real one. Each turn is a zero-timeout
+        /// `poll`, so retrying cannot block.
+        fn signalled(&self) -> std::io::Result<bool> {
+            loop {
+                let mut pollfd = libc::pollfd {
+                    fd: self.fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
+                if ready >= 0 {
+                    return Ok(pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0);
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+
+        /// [`Self::signalled`], for the tests that assert a waiter is still
+        /// waiting. Observational: it reads a descriptor and changes nothing.
+        #[cfg(test)]
+        pub(super) fn signalled_for_test(&self) -> std::io::Result<bool> {
+            self.signalled()
+        }
+
+        /// Wait up to `after`, then signal.
+        ///
+        /// **The only clock in the drain mechanism**, and it is one line of it:
+        /// everything downstream keys off the descriptor this makes readable. Runs on
+        /// its own thread, and returns early if something else signalled first,
+        /// so a run whose streams end normally does not leave it sleeping.
+        ///
+        /// Signals on every exit, the failed wait included, and reports the
+        /// failure afterwards. Returning early instead would leave the captures
+        /// waiting on a signal nobody is left to send: the caller that would
+        /// otherwise send it is blocked joining those very threads, so the
+        /// deadlock has no way out. A wait that failed is a reason to stop
+        /// now — it is exactly the case where the grace cannot be bounded.
+        pub(super) fn signal_after(&self, after: std::time::Duration) -> std::io::Result<()> {
+            let waited = wait_readable_until(self.fd(), std::time::Instant::now() + after);
+            self.signal();
+            waited
         }
     }
 
-    /// Drain a pipe like [`capture_stream`], but stop once `deadline` says to.
+    /// Drain a pipe like [`capture_stream`], but stop once `stop` says to.
     ///
     /// The reason this cannot simply be `capture_stream` with a timeout wrapped
     /// around it: a blocking `read(2)` on a pipe nobody will ever close cannot be
@@ -1379,11 +1506,11 @@ mod process_runner {
     /// recorded, so the `byte_len` and `sha256_hex` in the audit row would
     /// describe something still growing. Here the file is closed and synced
     /// before the summary is built, so the row stays true of it forever.
-    pub(super) fn capture_stream_to_deadline<R: Read + std::os::fd::AsRawFd>(
+    pub(super) fn capture_stream_until_stopped<R: Read + std::os::fd::AsRawFd>(
         mut reader: R,
         path: PathBuf,
         max_capture_bytes: u64,
-        deadline: &DrainDeadline,
+        stop: &DrainStop,
         post_deadline_allowance: u64,
     ) -> Result<AgentRunStreamCapture, AgentProcessRunError> {
         let fd = reader.as_raw_fd();
@@ -1398,20 +1525,27 @@ mod process_runner {
         // holds — finite, and nobody's to steer — so the allowance stops
         // applying and the drain runs to EOF.
         let mut writer_gone = false;
+        // Latched: the signal is a hangup, which never un-happens, so once it
+        // is seen there is nothing left to ask.
+        let mut stopped = false;
         loop {
-            // **Read first; let the deadline stop only the waiting.**
+            // **Read first; let the stop signal end only the waiting.**
             //
-            // The tempting shape — check the deadline, then read — silently
-            // loses data. The grace is five seconds of wall clock, and a thread
-            // on a loaded host can be descheduled past it; waking to find the
-            // deadline gone and returning at once would discard bytes sitting
-            // readable in the pipe, and could step over an EOF already there. A
-            // complete run would then be recorded as cut short on nothing but
-            // scheduling luck. Reading first makes the flag a statement about
-            // the stream rather than about how promptly writ got scheduled.
-            let expired = deadline
-                .get()
-                .is_some_and(|at| std::time::Instant::now() >= at);
+            // The tempting shape — check for the stop, then read — silently
+            // loses data: returning the moment the signal arrives would discard
+            // bytes sitting readable in the pipe, and could step over an EOF
+            // already there, recording a complete run as cut short. Reading
+            // first makes the flag a statement about the stream rather than
+            // about when writ happened to look.
+            if !stopped {
+                stopped =
+                    stop.signalled()
+                        .map_err(|source| AgentProcessRunError::StreamCapture {
+                            path: accumulator.path.clone(),
+                            source,
+                        })?;
+            }
+            let expired = stopped;
             match reader.read(&mut buffer) {
                 Ok(0) => return accumulator.finish(StreamEnd::ReachedEof),
                 Ok(read) => {
@@ -1482,7 +1616,11 @@ mod process_runner {
                     if expired {
                         return accumulator.finish(StreamEnd::StoppedAtDeadline);
                     }
-                    if let Err(source) = wait_readable(fd, DRAIN_POLL_INTERVAL) {
+                    // Wait for *either*, with no timeout: there is nothing a
+                    // periodic wakeup could discover that this does not. The
+                    // loop re-reads either way, so a wakeup caused by the stop
+                    // still collects whatever arrived alongside it.
+                    if let Err(source) = wait_readable_or_stopped(fd, stop.fd()) {
                         return Err(AgentProcessRunError::StreamCapture {
                             path: accumulator.path.clone(),
                             source,
@@ -1527,30 +1665,86 @@ mod process_runner {
         Ok(pollfd.revents & libc::POLLHUP != 0)
     }
 
-    /// Wait for `fd` to be readable, for at most `timeout`. `Ok(false)` is "not
-    /// readable yet", which includes being interrupted by a signal.
-    fn wait_readable(
-        fd: std::os::fd::RawFd,
-        timeout: std::time::Duration,
-    ) -> std::io::Result<bool> {
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // Saturating rather than wrapping: a timeout longer than `c_int` would
-        // otherwise become a short or negative one, and negative means "block
-        // forever" — the single value this function must never pass.
-        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-        let ready = unsafe { libc::poll(&raw mut pollfd, 1, millis) };
+    /// Block until `data` has something to read or `stop` has hung up.
+    ///
+    /// No timeout. Both of the things worth waiting for are descriptors, so a
+    /// periodic wakeup could discover nothing this does not, and waking on a
+    /// timer to consult a clock would make "has the drain stopped?" a question
+    /// about scheduling. Returning on an interrupt is fine: the caller's loop
+    /// asks both questions again.
+    ///
+    /// `POLLHUP` needs no asking for; the kernel reports it in `revents`
+    /// whatever `events` requested, which is why `stop` is registered for
+    /// `POLLIN` it will never receive.
+    fn wait_readable_or_stopped(
+        data: std::os::fd::RawFd,
+        stop: std::os::fd::RawFd,
+    ) -> std::io::Result<()> {
+        let mut pollfds = [
+            libc::pollfd {
+                fd: data,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, -1) };
         if ready < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
+                return Ok(());
             }
             return Err(err);
         }
-        Ok(ready > 0)
+        Ok(())
+    }
+
+    /// Wait for `fd` to become readable, until `deadline`.
+    ///
+    /// The one call in this module that reads a clock. It is how the
+    /// stop-signal thread spends its grace period, and waiting on the
+    /// descriptor rather than sleeping is what lets it return at once when
+    /// something else signals first.
+    ///
+    /// A deadline rather than a duration because of the interrupt: `poll(2)` is
+    /// not restarted by `SA_RESTART`, so a handled signal — and this daemon
+    /// handles several — surfaces as `EINTR`. Resuming against the original
+    /// deadline means such a signal neither shortens the grace (cutting off
+    /// captures that were about to reach EOF) nor extends it (starting the
+    /// remaining wait over each time one arrives).
+    fn wait_readable_until(
+        fd: std::os::fd::RawFd,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<()> {
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Saturating rather than wrapping: a timeout longer than `c_int`
+            // would otherwise become a short or negative one, and negative
+            // means "block forever" — the single value this must never pass.
+            let millis = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            let ready = unsafe { libc::poll(&raw mut pollfd, 1, millis) };
+            if ready >= 0 {
+                // Either the signal arrived or the wait ran out; both are this
+                // thread's job done.
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
     }
 
     /// Put `fd` in non-blocking mode, preserving whatever else was set on it.
@@ -1722,7 +1916,7 @@ mod process_runner {
     /// Its contract is about bytes, not processes; pinning it through a shell
     /// script would mostly test the script.
     /// Used by the crate's tests to pin the byte-level contract over an
-    /// in-memory reader; the production drain is [`capture_stream_to_deadline`].
+    /// in-memory reader; the production drain is [`capture_stream_until_stopped`].
     #[cfg(test)]
     pub(super) fn capture_stream<R: Read>(
         mut reader: R,
@@ -3045,6 +3239,142 @@ mod tests {
     /// yields `WouldBlock` gaps, stops at the deadline for the *other* reason,
     /// and passes whether or not the allowance exists. Measured: with a `perl`
     /// flood, removing `DRAIN_POST_DEADLINE_ALLOWANCE` left the test green.
+    /// Signalling releases every waiter, not just the first.
+    ///
+    /// Two waiters because the production signal serves both capture threads.
+    /// The byte is never read, which is what makes one signal serve both: a
+    /// signal anybody consumed would release one of them and strand the
+    /// other.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn signalling_a_drain_stop_releases_every_waiter() {
+        let stop = std::sync::Arc::new(process_runner::DrainStop::new().expect("a stop pipe"));
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    // A grace far longer than this test may take, so returning
+                    // at all means the signal released it rather than the
+                    // clock running out.
+                    stop.signal_after(Duration::from_secs(3600))
+                })
+            })
+            .collect();
+
+        stop.signal();
+
+        for waiter in waiters {
+            waiter
+                .join()
+                .expect("the waiter thread does not panic")
+                .expect("waiting on the stop descriptor does not fail");
+        }
+    }
+
+    /// However the grace ends, it has signalled by the time it returns.
+    ///
+    /// The post-condition rather than the path: a `signal_after` that returned
+    /// without signalling would leave both captures waiting on a signal nobody
+    /// is left to send, because the caller that would otherwise send it is
+    /// blocked joining those very threads.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_grace_has_signalled_by_the_time_it_returns() {
+        let elapsed = process_runner::DrainStop::new().expect("a stop pipe");
+        elapsed
+            .signal_after(Duration::ZERO)
+            .expect("a grace that has already run out does not fail");
+        assert!(
+            elapsed
+                .signalled_for_test()
+                .expect("reading the stop descriptor"),
+            "a grace that ran out must have signalled"
+        );
+
+        let hung_up = process_runner::DrainStop::new().expect("a stop pipe");
+        hung_up.signal();
+        hung_up
+            .signal_after(Duration::from_secs(3600))
+            .expect("an already-signalled stop releases the waiter");
+        assert!(
+            hung_up
+                .signalled_for_test()
+                .expect("reading the stop descriptor"),
+            "a grace released by someone else must leave it signalled"
+        );
+    }
+
+    /// A signal that interrupts the grace thread's wait does not end the grace.
+    ///
+    /// `poll(2)` is not restarted by `SA_RESTART`, so a handled signal — and
+    /// this daemon handles several — surfaces as `EINTR`. Treating that as the
+    /// grace having elapsed would cut both captures off after microseconds,
+    /// reporting streams that were about to reach EOF as stopped at the
+    /// deadline.
+    ///
+    /// The signal is sent to the waiting thread by its own id rather than to
+    /// the process, because these tests run in parallel and a process-directed
+    /// signal could land in an unrelated one's syscall. Timing can make this
+    /// vacuous — if the thread has not reached its `poll` yet there is nothing
+    /// to interrupt — but it cannot make it wrong: the assertion is that the
+    /// stop is *not* signalled, which no amount of slowness produces.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn an_interrupted_grace_is_not_a_finished_grace() {
+        extern "C" fn handler(_signal: libc::c_int) {}
+        // SAFETY: the handler is async-signal-safe (it does nothing), and
+        // `SIGUSR2` is used by nothing else in this binary.
+        unsafe {
+            let handler: extern "C" fn(libc::c_int) = handler;
+            libc::signal(libc::SIGUSR2, handler as libc::sighandler_t);
+        }
+
+        let stop = std::sync::Arc::new(process_runner::DrainStop::new().expect("a stop pipe"));
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // SAFETY: `pthread_self` takes no arguments and cannot fail.
+                tid_tx.send(unsafe { libc::pthread_self() } as usize).ok();
+                // A grace far longer than this test, so ending early can only
+                // be the interrupt being mistaken for the deadline.
+                stop.signal_after(Duration::from_secs(3600))
+            })
+        };
+        let tid = tid_rx.recv().expect("the waiter reports its thread id") as libc::pthread_t;
+
+        for _ in 0..50 {
+            // SAFETY: `tid` names a thread this test started and has not
+            // joined, and `SIGUSR2` has the no-op handler installed above.
+            unsafe { libc::pthread_kill(tid, libc::SIGUSR2) };
+            assert!(
+                !stop
+                    .signalled_for_test()
+                    .expect("reading the stop descriptor"),
+                "an interrupted wait must not be read as the grace having elapsed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        stop.signal();
+        waiter
+            .join()
+            .expect("the waiter thread does not panic")
+            .expect("waiting on the stop descriptor does not fail");
+    }
+
+    /// Signalling is idempotent, and a stop signalled before anyone waits is
+    /// still seen: the hangup it is made of does not un-happen.
+    #[cfg(all(feature = "host", unix))]
+    #[test]
+    fn a_drain_stop_is_sticky_and_signalling_it_twice_is_harmless() {
+        let stop = process_runner::DrainStop::new().expect("a stop pipe");
+        stop.signal();
+        stop.signal();
+        stop.signal_after(Duration::from_secs(3600))
+            .expect("an already-signalled stop releases a waiter at once");
+    }
+
     /// `/dev/zero` is always readable and never ends, so it is the pathological
     /// case exactly, with no timing to get lucky with.
     #[cfg(all(feature = "host", unix))]
@@ -3053,15 +3383,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let zero = fs::File::open("/dev/zero").expect("/dev/zero opens");
 
-        let deadline = process_runner::DrainDeadline::default();
-        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+        // Signalled before the drain is entered, so the stop is a fact about
+        // the descriptor and not about a clock this test has to outrun.
+        let stop = process_runner::DrainStop::new().expect("a stop pipe");
+        stop.signal();
 
         let started = std::time::Instant::now();
-        let capture = process_runner::capture_stream_to_deadline(
+        let capture = process_runner::capture_stream_until_stopped(
             zero,
             dir.path().join("stdout.log"),
             4096,
-            &deadline,
+            &stop,
             process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
         )
         .expect("the drain succeeds");
@@ -3108,14 +3440,16 @@ mod tests {
         fs::write(&source_path, &source).unwrap();
         let handle = fs::File::open(&source_path).expect("source opens");
 
-        let deadline = process_runner::DrainDeadline::default();
-        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+        // Signalled before the drain is entered, so the stop is a fact about
+        // the descriptor and not about a clock this test has to outrun.
+        let stop = process_runner::DrainStop::new().expect("a stop pipe");
+        stop.signal();
 
-        let capture = process_runner::capture_stream_to_deadline(
+        let capture = process_runner::capture_stream_until_stopped(
             handle,
             dir.path().join("stdout.log"),
             u64::MAX,
-            &deadline,
+            &stop,
             process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
         )
         .expect("the drain succeeds");
@@ -3168,14 +3502,16 @@ mod tests {
         // the hangup is unambiguous rather than racing the reader.
         child.wait().expect("the writer exits");
 
-        let deadline = process_runner::DrainDeadline::default();
-        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+        // Signalled before the drain is entered, so the stop is a fact about
+        // the descriptor and not about a clock this test has to outrun.
+        let stop = process_runner::DrainStop::new().expect("a stop pipe");
+        stop.signal();
 
-        let capture = process_runner::capture_stream_to_deadline(
+        let capture = process_runner::capture_stream_until_stopped(
             stdout,
             dir.path().join("stdout.log"),
             u64::MAX,
-            &deadline,
+            &stop,
             // Far below the backlog: without the hangup check the drain would
             // stop here and call a finished stream a prefix.
             64,
@@ -3223,14 +3559,16 @@ mod tests {
         // bytes and the EOF are queued rather than racing the reader.
         child.wait().expect("the writer exits");
 
-        let deadline = process_runner::DrainDeadline::default();
-        deadline.set(std::time::Instant::now() - Duration::from_secs(60));
+        // Signalled before the drain is entered, so the stop is a fact about
+        // the descriptor and not about a clock this test has to outrun.
+        let stop = process_runner::DrainStop::new().expect("a stop pipe");
+        stop.signal();
 
-        let capture = process_runner::capture_stream_to_deadline(
+        let capture = process_runner::capture_stream_until_stopped(
             stdout,
             dir.path().join("stdout.log"),
             1024,
-            &deadline,
+            &stop,
             process_runner::DRAIN_POST_DEADLINE_ALLOWANCE,
         )
         .expect("the drain succeeds");
