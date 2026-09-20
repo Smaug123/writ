@@ -23,12 +23,14 @@ use crate::agent_vm_lifecycle::{
     AgentVmSessionManagerError, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError,
     AgentVmSessionStateStatus, AgentVmSessionStateStore, AgentVmToolPaths, BoundedOutput,
     BrokerPlacement, ConfiguredIpv6Profile, ContainerImage, HostIface, Ipv6IsolationMode,
-    Ipv6ProfileClosed, NetworkHealth, ProbeDebounce, ProbeObservation, ProcessInvocation,
-    ProcessInvocationError, claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
+    NetworkHealth, ProbeDebounce, ProbeObservation, ProcessInvocation, ProcessInvocationError,
+    claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
     complete_agent_vm_session_start, complete_locked_session_prefix, evaluate_host_path,
     host_interfaces, remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
-use crate::agent_vm_locked_admission::{AdmittedProfile, LockedV1Admission};
+use crate::agent_vm_locked_admission::{
+    AdmittedProfile, LockedV1Admission, LockedV1Refused, admit_on_this_host,
+};
 use crate::agent_vm_locked_session::{LockedStartError, run_locked_start};
 use writ_guest_init::handoff::OwnedDirectory;
 
@@ -225,6 +227,24 @@ pub struct AgentVmDaemon {
     /// [`complete_agent_vm_session_start`] runs unlocked so unrelated sessions
     /// can boot in parallel.
     subnet_allocation_lock: Mutex<()>,
+    /// Serialises admission gathering.
+    ///
+    /// Deciding the locked profile is five host probes, and they ask a
+    /// question about the *host* — every concurrent start would run them to
+    /// learn the same thing. Without this, the number of subprocesses writd
+    /// runs to refuse a start is the number of clients that can connect times
+    /// five. The agent-run route bounds that with its queue place; the raw
+    /// start route has no such bound before the decision, and the subnet lock
+    /// it does take comes after.
+    ///
+    /// The cost is that concurrent askers queue rather than share: the Nth
+    /// waits out N gatherings. That is the trade taken deliberately — handing
+    /// a waiter the answer gathered before it asked would admit a session on
+    /// evidence that predates the request, and this gate is the wrong place
+    /// to introduce staleness. Each gathering is bounded by its probes' own
+    /// deadlines, and every other profile takes this lock without holding it
+    /// across anything.
+    admission_lock: Mutex<()>,
     /// Per-session lifecycle locks keyed by [`SessionId`]. Start and stop of
     /// the *same* session serialise here; unrelated sessions don't. Entries
     /// are evicted once no other task holds a handle.
@@ -276,6 +296,11 @@ pub struct AgentRunStarted {
 pub struct AcceptedAgentRun {
     session_id: SessionId,
     run_id: AgentRunId,
+    /// What this run's session may start as, decided before the run had a
+    /// name. Carried rather than asked again: deciding it reads six facts off
+    /// the host, and a second reading could disagree with the one the caller
+    /// was answered on.
+    admitted: AdmittedProfile,
     label: Option<String>,
     agent_kind: AgentKind,
     agent_model: String,
@@ -421,14 +446,15 @@ pub enum AgentVmDaemonError {
          clone + nix-cache + proxies only, with no agent-run route. Use broker_placement = host."
     )]
     AgentRunUnsupportedForVmBroker,
-    /// The configured `ipv6_mode` names a profile no new session may start
-    /// under. Sessions already running are untouched, and `writd` itself still
-    /// starts, so they can be stopped and reconciled.
+    /// No new session may start under the configured `ipv6_mode` on this
+    /// host. Sessions already running are untouched, and `writd` itself still
+    /// starts, so they can be stopped and reconciled — neither needs the
+    /// evidence, because a persisted record carries its own mode.
     ///
-    /// The wording lives on [`Ipv6ProfileClosed`], because the runner refuses
-    /// with the same sentence.
-    #[error(transparent)]
-    Ipv6ProfileClosed(#[from] Ipv6ProfileClosed),
+    /// The wording lives on [`LockedV1Refused`], because the runner comes
+    /// through the same door and refuses with the same sentence.
+    #[error("no new session may start under the configured IPv6 profile: {0}")]
+    Ipv6ProfileRefused(#[from] LockedV1Refused),
     /// `broker_placement = vm` has no IPv6 confinement, so no new session under
     /// it can be started.
     ///

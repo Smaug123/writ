@@ -14,7 +14,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use writ_core::byte_size::ByteSize;
 
-use crate::agent_vm_locked_admission::{AdmittedProfile, LockedV1Admission, ProvenPlatform};
+use crate::agent_vm_locked_admission::{
+    AdmittedProfile, LockedV1Admission, LockedV1Fact, ProvenPlatform,
+};
 use crate::audit::AuditLog;
 use crate::core::{BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr};
 use crate::nix_binary_cache::NixTrustedPublicKeys;
@@ -29,6 +31,18 @@ pub(super) const SECOND_TEST_NIX_CACHE_PUBLIC_KEY: &str =
 
 pub(super) fn make_state() -> Arc<BrokerState<InMemorySecretStore>> {
     make_state_with_audit(AuditLog::open_in_memory().unwrap())
+}
+
+/// A broker state whose agent-run bounds are as small as they go: one
+/// running, one waiting.
+///
+/// For the tests about what happens to a request the bound refuses.
+pub(super) fn make_state_with_one_run_admitted() -> Arc<BrokerState<InMemorySecretStore>> {
+    let one = std::num::NonZeroUsize::new(1).unwrap();
+    let mut state = claude_broker_state("http://127.0.0.1", "o");
+    state.audit = Arc::new(AuditLog::open_in_memory().unwrap());
+    state.agent_run_slots = crate::server::AgentRunSlots::new(one, one).unwrap();
+    Arc::new(state)
 }
 
 pub(super) fn make_state_with_audit(audit: AuditLog) -> Arc<BrokerState<InMemorySecretStore>> {
@@ -492,6 +506,25 @@ pub(super) fn daemon_config_with_broker_placement(
     daemon_config_inner(dir, fake_tool, 252, 253, None, broker_placement)
 }
 
+/// A config under a chosen placement *and* profile, for the tests about which
+/// refusal an operator gets when both would refuse.
+pub(super) fn daemon_config_with_placement_and_profile(
+    dir: &Path,
+    fake_tool: &Path,
+    broker_placement: BrokerPlacement,
+    ipv6_profile: ConfiguredIpv6Profile,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_inner_with_profile(
+        dir,
+        fake_tool,
+        252,
+        253,
+        None,
+        broker_placement,
+        ipv6_profile,
+    )
+}
+
 /// A host-placement config under a chosen IPv6 profile, for the tests about
 /// which profiles admit a session.
 pub(super) fn daemon_config_with_ipv6_profile(
@@ -755,6 +788,168 @@ exit 0
         args_log = shell_quote_path(args_log),
         env_log = shell_quote_path(env_log),
         root = shell_quote_path(dir),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// A host the locked profile's admission probes read differently.
+///
+/// Every one of them refuses, because the shipped allowlist is empty — but
+/// they refuse over different facts, and the point of sweeping them is that
+/// what a refusal *costs* must not depend on which fact refused it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LockedProbeHost {
+    /// Every probe answers, and the platform is simply not in the record.
+    Unrecorded,
+    /// The PF helper is too old to bound this daemon.
+    OldHelper,
+    /// The guest image declares no isolation ABI.
+    ImageWithoutAbiLabel,
+    /// Nothing answers at all.
+    Silent,
+    /// Every probe answers, but slowly, and each one refuses to overlap with
+    /// another: if a second probe starts while one is in flight it records
+    /// the fact. For the test that writd gathers admission one at a time.
+    RefusesToOverlap,
+}
+
+impl LockedProbeHost {
+    /// The hosts the refusal sweep runs over. `RefusesToOverlap` is left out:
+    /// it is about concurrency, not about which fact refuses, and it sleeps.
+    pub(super) const ALL: [Self; 4] = [
+        Self::Unrecorded,
+        Self::OldHelper,
+        Self::ImageWithoutAbiLabel,
+        Self::Silent,
+    ];
+
+    /// Which fact this host's refusal is about.
+    ///
+    /// Asserted by the sweep, so a fixture that stopped producing the host it
+    /// names fails rather than quietly making two cases the same one.
+    pub(super) fn refused_over(self) -> LockedV1Fact {
+        match self {
+            // Every fact reads; the platform is simply not in the record, and
+            // the first level of the allowlist it leaves is the CLI.
+            Self::Unrecorded => LockedV1Fact::ContainerCli,
+            Self::OldHelper => LockedV1Fact::HelperProtocol,
+            Self::ImageWithoutAbiLabel => LockedV1Fact::ImageIsolationAbi,
+            // Nothing answers, so the first fact checked is the first that
+            // cannot be read.
+            Self::Silent => LockedV1Fact::HelperProtocol,
+            Self::RefusesToOverlap => LockedV1Fact::ContainerCli,
+        }
+    }
+}
+
+/// A fake `container` + `pf-helper` + `sudo` that answers the five admission
+/// probes as `host` would, and logs every argv it was given.
+///
+/// The log is what the "a refusal creates nothing" test reads: it has to
+/// contain the probes and nothing else.
+pub(super) fn write_fake_locked_probe_tool(
+    dir: &Path,
+    args_log: &Path,
+    host: LockedProbeHost,
+) -> PathBuf {
+    let path = dir.join("fake-locked-probe-tool");
+    let helper_version = match host {
+        LockedProbeHost::OldHelper => 1,
+        _ => crate::agent_vm_pf_helper_protocol::PF_HELPER_PROTOCOL_VERSION,
+    };
+    let labels = match host {
+        LockedProbeHost::ImageWithoutAbiLabel => String::new(),
+        _ => format!(
+            r#""{label}":"{version}""#,
+            label = writ_guest_init::record::ISOLATION_ABI_LABEL,
+            version = writ_guest_init::record::ISOLATION_ABI_VERSION,
+        ),
+    };
+    fs::write(
+        dir.join("probe-helper-protocol.out"),
+        format!(
+            "{}\n",
+            crate::agent_vm_pf_helper_protocol::PfHelperProtocolDoc::with_version(helper_version)
+                .render()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("probe-preflight.out"),
+        format!(
+            "{}\n",
+            crate::agent_vm_pf_helper_protocol::PfHelperPreflightDoc::new(
+                crate::agent_vm_firewall::PfPreflightReport {
+                    pf_enabled: true,
+                    session_anchor: crate::agent_vm_firewall::SessionAnchorPlacement::First,
+                    pass_translation_rules: Vec::new(),
+                },
+                crate::agent_vm_pf_helper_policy::PfHelperPolicy::new(
+                    agent_vm_pool(),
+                    BrokerPortRange::new(49152, 65535).unwrap(),
+                ),
+            )
+            .render()
+        ),
+    )
+    .unwrap();
+    // The shape `container image inspect` really prints, which is what
+    // `ImageInspection::parse` really requires: the digest under
+    // `configuration.descriptor`, and the labels three levels into the
+    // variant's config. A fixture that only *looked* plausible made two of
+    // these hosts refuse over the same fact, which is how a sweep over four
+    // hosts became a sweep over three.
+    fs::write(
+        dir.join("probe-image-inspect.out"),
+        format!(
+            r#"[{{"configuration":{{"descriptor":{{"digest":"{digest}"}},"name":"alpine:latest"}},
+                 "variants":[{{"config":{{"config":{{"Labels":{{{labels}}}}}}}}}]}}]"#,
+            digest = LOCKED_IMAGE_DIGEST,
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+# Logged *before* the sudo shift, so a line is the argv as invoked — which is
+# what the caller's own probe plan says it should be.
+printf '%s' "$*" | tr '\n' ' ' >> {args_log}
+printf '\n' >> {args_log}
+# `sudo` is this same script here, so an invocation whose first argument is
+# this script's own path is one: drop it and read the real command.
+[ "$1" = "$0" ] && shift
+# Only the admission probes behave as `host` says. Everything else — the
+# teardown commands a reconcile runs — succeeds quietly, so a test can tell a
+# host that refuses admission from one that cannot be cleaned up.
+case "$1" in
+  protocol-version|preflight|image|--version|-buildVersion) ;;
+  *) exit 0 ;;
+esac
+if [ "{host:?}" = Silent ]; then exit 3; fi
+if [ "{host:?}" = RefusesToOverlap ]; then
+  # Detected by the probe itself rather than timed by the test: if a second
+  # gathering is in flight, this file exists, and that is a fact about writd
+  # rather than about how fast this machine is. The sleep only makes the
+  # overlap likely when there is nothing stopping it.
+  if [ -e {root}/probing ]; then printf '%s\n' "$*" >> {root}/overlap.log; fi
+  : > {root}/probing
+  sleep 0.2
+  rm -f {root}/probing
+fi
+case "$1" in
+  protocol-version) exec cat {root}/probe-helper-protocol.out ;;
+  preflight) exec cat {root}/probe-preflight.out ;;
+  image) exec cat {root}/probe-image-inspect.out ;;
+  --version) printf 'container CLI version 0.0.0 (build: synthetic, commit: 0000000)\n' ;;
+esac
+exit 0
+"#,
+        args_log = shell_quote_path(args_log),
+        root = shell_quote_path(dir),
+        host = host,
     );
     fs::write(&path, script).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();

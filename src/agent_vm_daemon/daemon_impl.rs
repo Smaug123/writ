@@ -16,6 +16,7 @@ impl AgentVmDaemon {
             config,
             running: Mutex::new(HashMap::new()),
             subnet_allocation_lock: Mutex::new(()),
+            admission_lock: Mutex::new(()),
             session_locks: Mutex::new(HashMap::new()),
             accepted_agent_runs: Arc::new(AcceptedAgentRunRegistry::default()),
             network_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -84,13 +85,26 @@ impl AgentVmDaemon {
         &self.config
     }
 
-    /// What a new session may start as, or the reason none may.
+    /// What a new session may start as on this host, or the reason none may.
     ///
-    /// Pure, and cheap enough to ask again rather than thread onward: the
-    /// admission gates below consult it before a session has an identity, and
-    /// the start path consults it again when it needs the answer itself.
-    fn admitted_profile(&self) -> Result<AdmittedProfile, AgentVmDaemonError> {
-        Ok(self.config.lifecycle.ipv6_profile.admit()?)
+    /// No longer cheap, and no longer pure: deciding the locked profile means
+    /// reading six facts off this host, which is five probes. So it is asked
+    /// **once** per start and threaded onward, where before it was asked
+    /// again wherever the answer was wanted. A refusal still costs only those
+    /// probes — no network, no VM, no state record — which is what keeps it
+    /// safe to ask before the session has an identity.
+    pub async fn admitted_profile(&self) -> Result<AdmittedProfile, AgentVmDaemonError> {
+        // One gathering at a time: see `admission_lock`. Held across the
+        // probes, which is the whole point — for every profile but the locked
+        // one there are none, and the lock is taken and released without
+        // awaiting anything.
+        let _admission_guard = self.admission_lock.lock().await;
+        Ok(admit_on_this_host(
+            self.config.lifecycle.ipv6_profile,
+            &self.config.lifecycle.tools,
+            &self.config.lifecycle.image,
+        )
+        .await?)
     }
 
     pub async fn start_session<S: SecretStore + Send + Sync + 'static>(
@@ -114,7 +128,7 @@ impl AgentVmDaemon {
         if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
             return Err(AgentVmDaemonError::Ipv6ConfinementUnavailableForVmBroker);
         }
-        let admitted = self.admitted_profile()?;
+        let admitted = self.admitted_profile().await?;
 
         let session_id = SessionId::new();
         let session_lock = self.session_lock_handle(session_id).await;
@@ -163,13 +177,20 @@ impl AgentVmDaemon {
         outcome
     }
 
-    /// Accept an agent run: mint its ids, answer everything answerable without
-    /// waiting, and take a place in the queue.
+    /// Accept an agent run: answer everything answerable, take a place in the
+    /// queue, decide what it may start as, and mint its ids.
     ///
-    /// Deliberately not `async`. Nothing here awaits, so a caller can have the
-    /// run's ids without writd having done anything slow — which is the whole
-    /// contract `StartAgentRun` now offers, and a property worth being able to
-    /// read off the signature rather than trusting a comment.
+    /// The one thing it awaits is the admission decision, which for the locked
+    /// profile is five host probes. That used to be free, and this function
+    /// used to await nothing at all — but a decision that *is* work cannot be
+    /// made anywhere cheaper, and it belongs here rather than in the caller
+    /// for the reason every other refusal does: it has to happen inside the
+    /// queue bound. A request the bound refuses must not be able to make writd
+    /// run five subprocesses on its behalf first.
+    ///
+    /// What the old signature was protecting survives: writd still starts
+    /// nothing before the caller is told the run's name. Probing is what
+    /// decides whether there is a run to name.
     ///
     /// > An accepted run has been *named*, not started. Nothing is recorded
     /// > about it, no VM exists, and it holds no slot: only a place in the
@@ -191,7 +212,7 @@ impl AgentVmDaemon {
     /// [`AgentVmDaemon::complete_agent_run_session`] gives both back rather than
     /// leaving either behind.
     #[allow(clippy::too_many_arguments)]
-    pub fn accept_agent_run_session<S: SecretStore + Send + Sync + 'static>(
+    pub async fn accept_agent_run_session<S: SecretStore + Send + Sync + 'static>(
         &self,
         state: &BrokerState<S>,
         label: Option<String>,
@@ -202,14 +223,14 @@ impl AgentVmDaemon {
         tags: AgentRunTags,
     ) -> Result<AcceptedAgentRun, AgentVmDaemonError> {
         // Everything refusable is refused before the run has an identity, so a
-        // refusal names no session that never existed. Placement is asked first,
-        // because it is the more specific answer: a vm config under a closed
-        // profile would otherwise be told about the profile, when this route
-        // does not exist on the v1 broker VM under any profile.
+        // refusal names no session that never existed. Placement is the most
+        // specific answer and the cheapest, so it comes first: a vm config
+        // under a profile this host refuses would otherwise be told about the
+        // profile — and made to wait out its probes — when this route does not
+        // exist on the v1 broker VM under any profile.
         if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
             return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
         }
-        self.admitted_profile()?;
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
         // Everything that can refuse this request happens before the per-session
@@ -234,21 +255,34 @@ impl AgentVmDaemon {
             }
         })?;
 
-        // The last thing that can refuse this request, and the reason it happens
-        // here rather than alongside the wait it guards: past this line the run
-        // has a name, and a name its caller may already be acting on. So the
-        // admission bound is consulted synchronously, in the same breath as the
-        // malformed-request answers above — a run writd will not queue learns so
-        // now, before it is told what it would have been called.
+        // The bound, and the reason it is consulted here rather than alongside
+        // the wait it guards: past this line the run has a name, and a name its
+        // caller may already be acting on. So it is consulted in the same
+        // breath as the malformed-request answers above — a run writd will not
+        // queue learns so now, before it is told what it would have been
+        // called.
+        //
+        // It is also the last cheap thing, and everything after it is inside
+        // it. That ordering became load-bearing when admission started reading
+        // the host: `place` is held across the probes, so the number of
+        // requests that can have writd probing on their behalf at once is the
+        // number of runs it will admit, rather than the number of clients that
+        // can connect.
         let place = state
             .agent_run_slots
             .enqueue()
             .map_err(AgentVmDaemonError::AgentRunQueueFull)?;
 
+        // What this run's session may start as. Under the locked profile this
+        // is five host probes; under the others it is a match on the
+        // configured spelling and costs nothing.
+        let admitted = self.admitted_profile().await?;
+
         let registration = self.register_accepted_agent_run(session_id);
         Ok(AcceptedAgentRun {
             session_id,
             run_id,
+            admitted,
             label,
             agent_kind,
             agent_model,
@@ -292,6 +326,7 @@ impl AgentVmDaemon {
         let AcceptedAgentRun {
             session_id,
             run_id,
+            admitted,
             label,
             agent_kind,
             agent_model,
@@ -366,7 +401,7 @@ impl AgentVmDaemon {
                 self.start_session_after_audit_opened(
                     Arc::clone(&state),
                     session_id,
-                    self.admitted_profile()?,
+                    admitted,
                     Some(agent_kind),
                     Some(workspace),
                     guest_command,
@@ -414,15 +449,17 @@ impl AgentVmDaemon {
         prompt: AgentPrompt,
         tags: AgentRunTags,
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
-        let accepted = self.accept_agent_run_session(
-            &state,
-            label,
-            agent_kind,
-            agent_model,
-            workspace,
-            prompt,
-            tags,
-        )?;
+        let accepted = self
+            .accept_agent_run_session(
+                &state,
+                label,
+                agent_kind,
+                agent_model,
+                workspace,
+                prompt,
+                tags,
+            )
+            .await?;
         self.complete_agent_run_session(state, accepted).await
     }
 

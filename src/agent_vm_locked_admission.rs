@@ -2,15 +2,12 @@
 //! the *host* observes about its own platform, and the pure decision over
 //! them.
 //!
-//! Stage D of `docs/plans/2026-09-01-ipv4-only-locked-v1.md`, and deliberately
-//! inert: the profile stays closed. [`ConfiguredIpv6Profile::admit`] is
-//! unchanged and still refuses `Ipv4OnlyLockedV1`, nothing calls
-//! [`ConfiguredIpv6Profile::admit_locked`] yet, and
-//! [`crate::agent_vm_lifecycle::Ipv6IsolationMode`] gains no variant, so no
-//! session can be running in the mode and the state store cannot say one is.
-//! Opening the profile before the locked start path exists (Stage E2) would
-//! route a `locked_v1` session down the legacy root prelaunch, which is the
-//! one thing the profile promises not to do.
+//! Stages D and E2c-3c of `docs/plans/2026-09-01-ipv4-only-locked-v1.md`.
+//! [`admit_on_this_host`] is the one door both front doors come through, and
+//! the locked profile is the one arm of it that reads anything off the host.
+//! What keeps the profile shut today is not the code but the evidence:
+//! [`ProvenPlatforms::shipped`] is empty, so no host's facts are in the
+//! record and none admits.
 //!
 //! Why evidence at all: the design (`docs/design/ipv4-only-network-confinement.md`,
 //! "Persistence and compatibility") admits the profile on what the host *is*,
@@ -531,15 +528,34 @@ impl ProvenPlatform {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProvenPlatforms(Vec<ProvenPlatform>);
 
-/// The proof records shipped with this binary, as the literals a proof run
-/// writes down.
+/// One entry of the shipped allowlist: a platform, and where to read what was
+/// run on it.
+///
+/// The fourth field is the forcing function. A platform admitted on somebody's
+/// recollection of having tested it is exactly what this list exists to
+/// prevent, so "where is the proof?" is a field rather than a convention:
+/// there is no way to add a platform without being asked, at the point of
+/// adding, and `every_shipped_platform_names_a_proof_run` refuses an answer
+/// that does not name a date.
+struct ShippedPlatform {
+    container_cli: &'static str,
+    macos_build: &'static str,
+    image_digest: &'static str,
+    /// When the vertical proof was run on this platform, and where its record
+    /// is. Dated, because a proof is a statement about a moment: a platform
+    /// proven two years ago on an OS that has shipped forty updates since has
+    /// not been proven.
+    proof_run: &'static str,
+}
+
+/// The proof records shipped with this binary.
 ///
 /// Empty. Stage E3 adds the first entry in the same change that records its
 /// proof passing on that platform, so the code that *can* admit the profile
 /// lands before the profile admits anywhere — and a host that updates its OS,
 /// its runtime, or its guest image drops out of the list until the proof is
 /// re-run there.
-const SHIPPED_PROVEN_PLATFORMS: &[(&str, &str, &str)] = &[];
+const SHIPPED_PROVEN_PLATFORMS: &[ShippedPlatform] = &[];
 
 impl ProvenPlatforms {
     /// The shipped allowlist. Panics if a literal in
@@ -549,9 +565,24 @@ impl ProvenPlatforms {
         Self(
             SHIPPED_PROVEN_PLATFORMS
                 .iter()
-                .map(|(cli, build, digest)| {
-                    ProvenPlatform::parse(cli, build, digest).unwrap_or_else(|error| {
-                        panic!("shipped proof record ({cli:?}, {build:?}, {digest:?}): {error}")
+                .map(|entry| {
+                    ProvenPlatform::parse(
+                        entry.container_cli,
+                        entry.macos_build,
+                        entry.image_digest,
+                    )
+                    .unwrap_or_else(|error| {
+                        // Named by its proof run as well as its facts: a
+                        // literal that does not parse is a typo somebody made
+                        // while writing a record down, and the run is what
+                        // points at what it should have said.
+                        panic!(
+                            "shipped proof record from {}: ({:?}, {:?}, {:?}): {error}",
+                            entry.proof_run,
+                            entry.container_cli,
+                            entry.macos_build,
+                            entry.image_digest
+                        )
                     })
                 })
                 .collect(),
@@ -606,7 +637,7 @@ impl LockedV1Admission {
 
 /// What a new session may start as, once admission has decided.
 ///
-/// The answer to [`ConfiguredIpv6Profile::admit`], of which
+/// The answer [`admit_on_this_host`] gives, of which
 /// [`Ipv6IsolationMode`] is only the part a plan carries. The locked profile
 /// needs more than a mode to start under: its launch reads the created
 /// container back and refuses any image but the admitted one, so the digest
@@ -657,9 +688,11 @@ impl ConfiguredIpv6Profile {
     /// then the proof record — so a host with several problems is told about
     /// the most fundamental one.
     ///
-    /// This does not replace [`ConfiguredIpv6Profile::admit`], which still
-    /// refuses `Ipv4OnlyLockedV1` outright: until Stage E2 there is no locked
-    /// start path for an admission to lead to, and nothing calls this.
+    /// The pure half of [`admit_on_this_host`], which is this plus the
+    /// gathering. A caller with evidence in hand — a test sweeping the grid,
+    /// or a proof run — asks this directly; anything deciding for a *host*
+    /// goes through the door, so that what the probes read is what the
+    /// decision reads.
     pub fn admit_locked(
         self,
         evidence: &LockedV1RuntimeEvidence,
@@ -851,6 +884,62 @@ impl LockedV1ProbePlan {
             &mut self.macos_build,
         ]
     }
+}
+
+/// Decide what a new session may start as on this host, against `allowlist`.
+///
+/// **The one door.** Both front doors — the daemon and
+/// `writ-agent-vm-runner` — come through here, so a profile cannot be
+/// acquired through a door that asks a different question. Exhaustive on the
+/// configured profile, so a profile added later has to say here what deciding
+/// it costs.
+///
+/// Two of the three profiles are decided on their spelling and run nothing.
+/// The locked one is a claim about the host, so deciding it means going and
+/// looking: five probes, then [`ConfiguredIpv6Profile::admit_locked`] over
+/// what they observed. A refusal therefore runs those probes and nothing
+/// else — no network, no VM, no state record — which is what makes refusing
+/// cheap enough to do before a session has an identity.
+///
+/// The plan and the allowlist are parameters so a test can drive the whole
+/// path — probes, evidence, decision — against tools it controls and a record
+/// that names them. Production goes through [`admit_on_this_host`], which
+/// supplies the host's own plan and [`ProvenPlatforms::shipped`].
+pub async fn admit_probing(
+    profile: ConfiguredIpv6Profile,
+    plan: &LockedV1ProbePlan,
+    allowlist: &ProvenPlatforms,
+) -> Result<AdmittedProfile, LockedV1Refused> {
+    match profile {
+        ConfiguredIpv6Profile::DualStackRequired => Ok(AdmittedProfile::DualStackRequired),
+        ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6 => Ok(AdmittedProfile::Ipv4OnlyNoGuestIpv6),
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1 => {
+            let evidence = gather_locked_v1_evidence(plan).await;
+            Ok(AdmittedProfile::Ipv4OnlyLockedV1(
+                profile.admit_locked(&evidence, allowlist)?,
+            ))
+        }
+    }
+}
+
+/// [`admit_probing`] for this host, against the shipped allowlist.
+///
+/// What a daemon and the runner actually call. The shipped list is empty
+/// until a vertical proof run adds to it, so today this admits the locked
+/// profile on no host at all — the profile is open in the code and closed by
+/// the evidence, which is the state Stage E3 changes with a record of the
+/// proof passing.
+pub async fn admit_on_this_host(
+    profile: ConfiguredIpv6Profile,
+    tools: &AgentVmToolPaths,
+    image: &ContainerImage,
+) -> Result<AdmittedProfile, LockedV1Refused> {
+    admit_probing(
+        profile,
+        &LockedV1ProbePlan::for_host(tools, image),
+        &ProvenPlatforms::shipped(),
+    )
+    .await
 }
 
 // --- the gatherer -----------------------------------------------------------

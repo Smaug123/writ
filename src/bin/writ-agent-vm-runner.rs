@@ -13,6 +13,7 @@ use writ::agent_vm_lifecycle::{
     default_agent_vm_state_dir, start_agent_vm_session, start_managed_agent_vm_session,
     stop_agent_vm_session, stop_managed_agent_vm_session,
 };
+use writ::agent_vm_locked_admission::{LockedV1ProbePlan, admit_on_this_host};
 use writ::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use writ::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
@@ -218,14 +219,18 @@ impl From<BrokerPlacementArg> for BrokerPlacement {
     }
 }
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(e) = run().await {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// A single-threaded runtime, because the only thing awaited here is
+/// admission — five host probes, run one after another. The work this
+/// command exists to do stays synchronous.
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     writ::telemetry::init("warn")?;
     let cli = Cli::parse();
     let tools = AgentVmToolPaths::new(
@@ -236,11 +241,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.cmd {
         Cmd::Start(args) => {
-            let dry_run = args.dry_run;
-            let plan = build_start_plan(args, tools)?;
-            if dry_run {
-                print_start_invocations(&plan.start_invocations());
+            if args.dry_run {
+                // Before admission, not after: for one profile admission *is*
+                // five commands, and a dry run runs none.
+                print_start_dry_run(args, &tools).await?;
             } else {
+                let plan = build_start_plan(args, tools).await?;
                 // Ownership is guarded inside start_agent_vm_session itself: its
                 // ProbeNetworkAbsent / ProbeVmAbsent steps refuse to start (and
                 // later tear down) infrastructure this call did not create. This
@@ -264,12 +270,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::ManagedStart(args) => {
-            let dry_run = args.start.dry_run;
             let state_dir = args.state_dir;
-            let plan = build_start_plan(args.start, tools)?;
-            if dry_run {
-                print_start_invocations(&plan.start_invocations());
+            if args.start.dry_run {
+                print_start_dry_run(args.start, &tools).await?;
             } else {
+                let plan = build_start_plan(args.start, tools).await?;
                 let state_dir = resolve_state_dir(state_dir)?;
                 let store = AgentVmSessionStateStore::new(state_dir);
                 let state = start_managed_agent_vm_session(&store, &plan)?;
@@ -304,11 +309,47 @@ fn resolve_state_dir(state_dir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std:
     })
 }
 
-fn build_start_plan(
+/// Show what a start would run, without running any of it.
+///
+/// For a profile admission decides on its spelling, that is the start's own
+/// invocations, as it always was. For the locked profile it cannot be: the
+/// decision is five commands, and what follows them depends on their answers,
+/// so the preview is those commands. They are the honest answer — they are
+/// the first thing the real start would run, and the only part of it a dry
+/// run can know.
+async fn print_start_dry_run(
+    args: StartArgs,
+    tools: &AgentVmToolPaths,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = ConfiguredIpv6Profile::from(args.ipv6_mode);
+    if profile.is_decided_by_the_host() {
+        let image = ContainerImage::new(args.image)?;
+        let probes = LockedV1ProbePlan::for_host(tools, &image);
+        print_invocations(&probes.probes().map(|probe| probe.invocation.clone()));
+        return Ok(());
+    }
+    let plan = build_start_plan(args, tools.clone()).await?;
+    print_start_invocations(&plan.start_invocations());
+    Ok(())
+}
+
+async fn build_start_plan(
     args: StartArgs,
     tools: AgentVmToolPaths,
 ) -> Result<AgentVmSessionPlan, Box<dyn std::error::Error>> {
     let parsed = parse_session(&args.session)?;
+    let image = ContainerImage::new(args.image)?;
+    // The same door the daemon comes through, with the same allowlist, so
+    // this command cannot start a session on a host `writd` would refuse. It
+    // is the *whole* of the parity: there is one function, and both callers
+    // are it.
+    //
+    // Note that the storeless `start` refuses the locked profile regardless
+    // (it has no store to mint a release signal with). Parity here is about
+    // not acquiring a profile through a second front door, not about this
+    // path gaining a capability it structurally cannot have.
+    let admitted =
+        admit_on_this_host(ConfiguredIpv6Profile::from(args.ipv6_mode), &tools, &image).await?;
     let broker_ports = BrokerPorts::new(
         args.broker_ports
             .into_iter()
@@ -322,18 +363,11 @@ fn build_start_plan(
         args.session.subnet_index,
         broker_ports,
         broker_port_range,
-        // The same admission the daemon applies, for the same reason: this
-        // command starts a real session, and a profile no new session may run
-        // under must not acquire one through a second front door.
-        ConfiguredIpv6Profile::from(args.ipv6_mode)
-            .admit()
-            .map_err(|closed| closed.to_string())?
-            // A plan carries the mode; the rest of the decision (the locked
-            // profile's admitted image digest) is for the start path that can
-            // use it, and this one refuses that profile outright — it has no
-            // state store, so it could never release the guest.
-            .ipv6_mode(),
-        ContainerImage::new(args.image)?,
+        // A plan carries the mode; the rest of the decision — the locked
+        // profile's admitted image digest — is for a start path with a state
+        // store, which this is not.
+        admitted.ipv6_mode(),
+        image,
         args.guest_command,
         AgentVmResources::new(args.cpus, args.memory_mib)?,
         tools,
@@ -424,6 +458,8 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use writ::agent_vm_locked_admission::{LockedV1Fact, LockedV1Refused};
 
     #[test]
     fn stop_requires_explicit_ipv6_mode() {
@@ -479,22 +515,94 @@ mod tests {
         }
     }
 
+    /// Tool paths that cannot resolve to anything, absolute so no `PATH` on
+    /// any host can make them.
+    ///
+    /// Bare names would be resolved through `PATH`, which on a configured
+    /// development machine finds the real `container` and the real helper —
+    /// and then what the admission probes read is a fact about the machine
+    /// running the test. A required gate must not depend on that.
     fn tools() -> AgentVmToolPaths {
-        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo")
+        AgentVmToolPaths::new(
+            "/nonexistent/writ-test/container",
+            "/nonexistent/writ-test/writ-agent-vm-pf-helper",
+            "/nonexistent/writ-test/sudo",
+        )
     }
 
     /// This binary is a second front door onto the same machinery, and a
-    /// profile no new session may run under must not acquire one through it.
-    #[test]
-    fn starting_under_a_closed_profile_is_refused_here_too() {
+    /// profile this host has no proof record for must not acquire one
+    /// through it.
+    ///
+    /// Parity with the daemon is structural rather than asserted: there is
+    /// one `admit_on_this_host`, and both doors are it. What is asserted here
+    /// is that this door goes through it — the refusal is the one
+    /// `LockedV1Refused` words, not a sentence of this binary's own.
+    ///
+    /// The refusal is checked by its *type*, not by its wording: the claim is
+    /// that this door hands back what the shared one produced, and a
+    /// `LockedV1Refused` is that. Which fact it names depends on what the
+    /// host's tools do — see [`tools`], whose paths make sure that is not the
+    /// host's business either.
+    #[tokio::test]
+    async fn starting_under_an_unproven_profile_is_refused_here_too() {
         let err = build_start_plan(start_args("ipv4-only-locked-v1"), tools())
-            .expect_err("a closed profile must not start a session")
-            .to_string();
-        assert!(err.contains("not implemented"), "{err}");
+            .await
+            .expect_err("a profile with no proof record must not start a session");
+        let refused = err
+            .downcast::<LockedV1Refused>()
+            .expect("the runner refuses in the shared vocabulary, not one of its own");
+        assert_eq!(
+            refused.fact(),
+            LockedV1Fact::HelperProtocol,
+            "a helper that cannot be spawned is the first fact that cannot be read"
+        );
 
-        // The profiles that admit still do.
+        // The profiles decided on their spelling still admit, and reach no
+        // probe on the way.
         for mode in ["dual-stack-required", "ipv4-only-no-guest-ipv6"] {
-            build_start_plan(start_args(mode), tools()).unwrap_or_else(|e| panic!("{mode}: {e}"));
+            build_start_plan(start_args(mode), tools())
+                .await
+                .unwrap_or_else(|e| panic!("{mode}: {e}"));
+        }
+    }
+
+    /// `--dry-run` runs nothing — including the admission it would otherwise
+    /// have to run before it knew what to print.
+    ///
+    /// The flag's promise is that it prints commands instead of running them,
+    /// and for the locked profile the decision about whether there is a start
+    /// at all *is* five commands. So the preview is those commands, and the
+    /// test that matters is the negative one: the tools were never invoked.
+    #[tokio::test]
+    async fn a_dry_run_runs_nothing_whichever_profile_decides_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran.log");
+        let tool = dir.path().join("tool");
+        std::fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = AgentVmToolPaths::new(&tool, &tool, &tool);
+
+        for mode in [
+            "ipv4-only-locked-v1",
+            "ipv4-only-no-guest-ipv6",
+            "dual-stack-required",
+        ] {
+            print_start_dry_run(start_args(mode), &tools)
+                .await
+                .unwrap_or_else(|e| panic!("{mode}: {e}"));
+            assert!(
+                !ran.exists(),
+                "{mode}: a dry run must run nothing, and ran {:?}",
+                std::fs::read_to_string(&ran)
+            );
         }
     }
 

@@ -1726,13 +1726,26 @@ fn every_path_that_starts_an_agent_run_takes_a_slot() {
     );
 
     let daemon = include_str!("../agent_vm_daemon/daemon_impl.rs");
-    let accept = body_of(daemon, "pub fn accept_agent_run_session<");
+    let accept = body_of(daemon, "pub async fn accept_agent_run_session<");
     assert!(
         accept.contains(".enqueue()"),
         "every VM agent run is admitted here — `RunAgent`'s VM arm and \
          `StartAgentRun` both — so this is the one place that can bound them. It \
          is also the last place that can *refuse* one: past this point the run \
          has a name its caller may already be holding"
+    );
+    // And the bound is taken before the one expensive thing accepting does.
+    // Admission under the locked profile is five host probes, so a request the
+    // bound would refuse must not be able to make writd run them: the
+    // ordering is what keeps "how many runs writd will admit" and "how many
+    // requests can have it probing at once" the same number.
+    let bound = accept.find(".enqueue()").expect("checked above");
+    let admission = accept
+        .find("admitted_profile()")
+        .expect("accepting is where a run's profile is decided");
+    assert!(
+        bound < admission,
+        "the queue bound must be taken before the admission probes, not after"
     );
 }
 

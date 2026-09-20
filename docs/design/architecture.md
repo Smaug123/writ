@@ -1260,17 +1260,50 @@ already running are untouched; only new starts are refused.
 **Which IPv6 profile may start a session is a separate question from which a
 session can be running in**, and they are separate types: `ConfiguredIpv6Profile`
 is what an operator writes in `ipv6_mode`, `Ipv6IsolationMode` is what a running
-— and persisted — session is in, and `ConfiguredIpv6Profile::admit` is the only
-way between them. The configured set is the larger one, because it must name
-profiles that exist only to be refused; the active set names only what a session
-can be in, so no unreachable state is representable in the state store.
-`dual_stack_required` and `ipv4_only_no_guest_ipv6` admit; `ipv4_only_locked_v1`
-is recognised, so a config naming it is refused for the right reason rather than
-read as a typo, and refused because it is not built. Admission is enforced at
-each entry point (`start_session`, `accept_agent_run_session`,
-`writ-agent-vm-runner start`), before a session has an id and so before an audit
-row, a subprocess, or a state record; stop and persisted-state decoding stay
-permissive, so narrowing the admitted set can never strand a running session.
+— and persisted — session is in, and `admit_on_this_host` is the only way
+between them. The two sets are now variant for variant the same; what keeps
+them apart is standing, not size. A configured profile is a request, and an
+`Ipv6IsolationMode` is proof that a session may run in it.
+
+`dual_stack_required` and `ipv4_only_no_guest_ipv6` are decided on their
+spelling and read nothing off the host. `ipv4_only_locked_v1` is a claim about
+the *platform*, so deciding it means going and looking: five probes, then
+`admit_locked` over what they observed and `ProvenPlatforms::shipped()`. That
+list is empty, so today the profile is open in the code and admits nowhere. A
+shipped entry is not three facts but four: the fourth is the dated proof run
+that put it there, required by the type and checked for a date by a test, so a
+platform cannot be added without answering "where is the proof?" at the point
+of adding.
+
+The decision is asked **once** per start and threaded onward, because it is no
+longer free: five subprocesses, and two readings of a host could disagree.
+`AcceptedAgentRun` carries the `AdmittedProfile` decided when the run was
+accepted, and `accept_agent_run_session` is where that happens — after
+`enqueue`, so the probes run inside the pending-run bound rather than outside
+it. That ordering is what keeps "how many runs writd will admit" and "how many
+requests can have it probing at once" the same number; a guard test asserts
+it, beside the one saying this is the only place that enqueues.
+
+Concurrent starts do not multiply that work between them: the probes ask a
+question about the host, so an `admission_lock` serialises the gathering. The
+raw start route needs it most — it has no queue place, and its subnet lock
+comes after the decision. Waiters queue rather than being handed an answer
+gathered before they asked, which would admit a session on evidence predating
+the request.
+
+`--dry-run` cannot ask at all, since it must run nothing.
+`ConfiguredIpv6Profile::is_decided_by_the_host` is the pure question it asks
+instead: for the locked profile the runner prints the *probes*, which are the
+first thing a real start would run and the only part of it a dry run can
+know.
+
+Both front doors (`start_session` / `accept_agent_run_session`, and
+`writ-agent-vm-runner start`) come through the one function, so the runner
+cannot start a session on a host the daemon would refuse. A refusal costs the
+probes and nothing else — no network, no VM, no audit row, no state record —
+which is what keeps it safe to ask before a session has an id. Stop, reconcile
+and persisted-state decoding never ask at all: a record carries its own mode,
+so a host that has stopped satisfying its profile can still be cleaned up.
 
 `agent_vm_locked_lifecycle` holds the locked profile's start sequence as an
 ordered lifecycle, also built and tested but not wired. A live start would
@@ -1288,10 +1321,10 @@ cleanup-only. `ReleaseSignal` is the one effect the types order: only
 the daemon cannot send a signal it has not first written down. See §5.5 and
 Stage E1 of the plan.
 
-`Ipv6IsolationMode` has a third variant, `Ipv4OnlyLockedV1`. A session can be
-recorded in it (state schema v3 carries the spelling) but cannot reach it:
-`ConfiguredIpv6Profile::admit` still refuses the profile. What the variant
-buys is that every site dispatching on the mode answers for it — the
+`Ipv6IsolationMode` has a third variant, `Ipv4OnlyLockedV1`, and state schema
+v3 carries the spelling. Reaching it needs a host the proof record names, and
+the shipped record list is empty. Beyond that, what the variant buys is that
+every site dispatching on the mode answers for it — the
 `== Ipv4OnlyNoGuestIpv6` comparisons that would have handed a locked session
 the legacy answer are now predicates named for the question each asks
 (`requires_guest_command`, `has_firewall_ipv6_cidr`,
@@ -1423,17 +1456,22 @@ Apple `container` CLI version line, the macOS build), each of which may be
 probes under a byte cap and a deadline and cannot fail, only observe less; and
 `ConfiguredIpv6Profile::admit_locked` is the pure decision over the evidence
 and a `ProvenPlatforms` allowlist of (CLI, macOS build, image digest) records
-the vertical proof has been run against. The shipped allowlist is empty, so
-nothing admits; `admit` is unchanged and still refuses the profile outright,
-and `Ipv6IsolationMode` gains no variant, so no session can be persisted in a
-mode no start path exists for. See §5.5 and Stages D–E of the plan.
+the vertical proof has been run against — a whole record, not three
+independent pins, because two facts proven separately were never proven
+together.
+
+`admit_probing` is the shell around that pure core: gather, then decide.
+`admit_on_this_host` is `admit_probing` for this host against
+`ProvenPlatforms::shipped()`, and is what both front doors call. The shipped
+list is empty, so the profile admits on no host. See §5.5 and Stages D–E of
+the plan.
 
 There is deliberately **no admission check on the plan itself**. A plan carries
-an `Ipv6IsolationMode`, every mode admits, and the only closed profile has no
-mode to be built from — so a plan cannot represent a closed profile and a check
-there could never fire. The compiler enforces what the check would restate. A
-future closed profile that *does* get an active mode would break that, which is
-why `admit`'s test is exhaustive over the configured set.
+an `Ipv6IsolationMode`, and the only way to one is admission — so holding a
+plan already means the question was asked and answered, and a check there could
+only restate what the compiler has enforced. It would also be the wrong place
+to ask: admission for the locked profile is five subprocesses, and building a
+plan is pure.
 
 **Only `ipv4_only_no_guest_ipv6` actually starts a session on current Apple
 `container`.** `dual_stack_required` requires the session network to report

@@ -695,7 +695,7 @@ mutually exclusive and the locked profile takes the one whose completion it
 can observe, with host PF the backstop either way. A test asserts the kernel
 arg is absent, naming that reason.
 
-Six weakenings were injected and fail these tests: a readback that compares
+Nine weakenings were injected and fail these tests: a readback that compares
 the argv spelling of a capability, one that ignores the `/proc` relaxation,
 one that ignores PID 1's identity, one that ignores `useInit`, a launch that
 swaps the relaxation for the legacy kernel argument, and a launch that goes
@@ -1037,7 +1037,66 @@ is asserted — over the env file a real locked start produced, against
 `OwnedDirectory::ALL`. It fails without the fix and would catch the next path
 added to the prologue.
 
-Five weakenings were injected and fail these tests: a locked session wrapped
+A third round found the same mistake in its last hiding place. `--dry-run`
+promises to print commands rather than run them, and that promise held for
+free while admission was pure. It is not free now: a locked `start --dry-run`
+was running all five probes, the privileged helper among them, before the
+caller ever looked at the flag. A dry run for that profile therefore cannot
+reach a plan at all — what follows the probes depends on what they say — so it
+prints *the probes*, which is the honest preview and the only part of the
+start a dry run can know. `ConfiguredIpv6Profile::is_decided_by_the_host` is
+the pure question a caller that must run nothing asks first.
+
+A fourth round found the last one, and it is the most consequential. Deciding
+the profile had been hoisted out of `accept_agent_run_session` — that function
+is not `async` on purpose — which put the five probes *outside* the
+pending-run bound `enqueue` takes. Concurrent requests could therefore have
+writd probing on their behalf without limit: the bound went on bounding the
+runs writd remembers and stopped bounding the work it does per request.
+
+So admission moved back inside, after the bound, and `accept_agent_run_session`
+became `async`. What its old signature was protecting survives — writd still
+starts nothing before the caller is told the run's name — but the reason it
+awaited nothing has expired: a decision that *is* work cannot be made
+anywhere cheaper, and every other refusal in that function is ordered against
+the bound for exactly this reason. `place` is now held across the probes, so
+the number of requests that can have writd probing at once is the number of
+runs it will admit. The existing spawn-hygiene-style guard on that function
+gained the ordering as a second assertion, beside the one that says this is
+the only place that enqueues.
+
+A fifth round found the raw start route, which has no queue place to bound it
+with and takes its subnet lock only *after* the decision. The answer there is
+not another bound but not doing the work N times: the probes ask a question
+about the host, so concurrent starts were running five subprocesses each to
+learn the same thing. An `admission_lock` serialises the gathering. The trade
+is stated rather than assumed — a waiter queues instead of being handed the
+answer gathered before it asked, because admitting a session on evidence that
+predates the request is a staleness this gate should not take on.
+
+Its test detects the overlap *in the probe* rather than timing the loop: the
+fake writes a file while it runs and records any second probe that finds it
+there, so what the test observes is a fact about writd rather than about how
+fast the machine is.
+
+The same round found a fixture that was green for the wrong reason. The
+probe-host sweep's `container image inspect` output was a plausible-looking
+shape rather than the real one, so `ImageInspection::parse` refused it and two
+of the four hosts refused over the *same* fact — a sweep over four hosts that
+was really a sweep over three. The test had only asserted that something
+refused. It now asserts *which* fact each host's refusal is about, which is
+what makes the sweep a sweep.
+
+That is five places in this slice where a pure function becoming effectful
+broke something downstream, and the pattern is worth naming: every caller
+relying on admission being free had to be found, because none of them said so.
+The compiler found the ones the `async` boundary touched and a reviewer found
+the rest. A type that made "this is now work" visible to callers would have
+found them all; `async` was that type where a signature changed, and for the
+rest the cost was invisible because nothing about an ordering says what it is
+protecting.
+
+Six weakenings were injected and fail these tests: a locked session wrapped
 with the sentinel scripts, a release that accepts any listening broker, an
 `exec` anywhere in the locked path, a bootstrap reader that ends its wait on a
 `security-ready` line, and a locked guest left with the image's `HOME`.
@@ -1079,6 +1138,104 @@ structurally cannot have.
 - Stop and reconcile of a persisted locked session need no evidence: the
   persisted-session tests run under a daemon whose evidence gathering is
   scripted to fail.
+
+---
+
+**E2c-3c landed, and deleted a front door rather than adding a second.**
+
+`ConfiguredIpv6Profile::admit` is gone, and with it `Ipv6ProfileClosed`. There
+is one door, `admit_on_this_host`, and it is exhaustive on the configured
+profile: two profiles are decided on their spelling and read nothing off the
+host, the locked one gathers Stage D's six facts and asks `admit_locked` with
+`ProvenPlatforms::shipped()`. The daemon and `writ-agent-vm-runner` both call
+it, so parity is not something a test has to check — there is one function and
+both callers are it. What the runner's test checks is that it *is* that
+function: the refusal is the sentence `LockedV1Refused` words, not one of the
+runner's own.
+
+Deleting the pure `admit` was the whole point. A profile whose answer depends
+on the host cannot be decided by a pure function, and keeping one beside an
+evidence-taking one would have been exactly the second front door this stage
+exists to avoid.
+
+The cost of asking changed, and the code had to say so. Admission was free and
+asked wherever the answer was wanted; it is now five subprocesses, so it is
+asked once per start and threaded. `accept_agent_run_session` is deliberately
+not `async` — a caller gets its run's ids without writd awaiting anything —
+so it *takes* an `AdmittedProfile` rather than deciding one, and
+`AcceptedAgentRun` carries it to the start. Accepting a run therefore cannot
+happen without a decision having been made, and the decision the start uses is
+the one the caller was answered on.
+
+The two types stopped being different sizes. `ConfiguredIpv6Profile` and
+`Ipv6IsolationMode` are now variant for variant the same set, so the
+justification in their docs — "the configured set must name profiles that
+exist only to be refused" — was no longer true and was rewritten rather than
+left standing. What keeps them apart is standing, not size: one is a request,
+the other is proof a session may run in it. The test that asserted the
+configured set was larger is replaced by one asserting the two spell the same
+profile the same way, so an operator reading a state record reads their own
+word back.
+
+A shipped allowlist entry is now four fields, not three: the fourth is the
+dated proof run that put it there. The first attempt at this was a
+`docs/proven-platforms.md` the test `include_str!`d, and the Nix gate rejected
+it — the build's source filter excludes `docs/`, so the file was simply not
+there. That was the better answer arriving by the shorter road. A field cannot
+be forgotten the way a cross-file convention can: there is no way to write an
+entry without being asked where the proof is, and
+`every_shipped_platform_names_a_dated_proof_run` refuses an answer with no
+date in it, because a proof is a statement about a moment. Its own predicate
+is tested against the answers that dodge the question (blank, "proven", "see
+the plan"), since the list it guards is empty and would otherwise not say a
+word until the first platform was added — the moment it is needed.
+
+The refusal's cost is asserted against the probe plan rather than against a
+list of commands somebody thought to exclude: the daemon's fake logs every
+argv, and every line must be one of `LockedV1ProbePlan::for_host`'s. Swept over
+four hosts that refuse over different facts, because what a refusal costs must
+not depend on which fact refused it.
+
+Reconcile is the other half of that. Its test now runs under a host whose
+probes all fail *and* asserts no probe was run at all — not merely that
+teardown tolerated a refusing host, but that it never asked. A daemon that
+gathered evidence on the way to a teardown would be one an unreadable host
+could not be cleaned up on.
+
+One thing could not be weakened, which is worth recording as a success rather
+than a gap: `LockedV1Admission` has no public constructor, so an attempt to
+have the door return an admission carrying a digest other than the probed one
+does not compile.
+
+A review round caught two things, and the first was a self-inflicted ordering
+regression. `accept_agent_run_session` checks the broker placement first, and
+its comment says why — placement is the more specific answer, since the
+agent-run route does not exist on the v1 broker VM under any profile. Moving
+the profile decision *out* of that function inverted the order the comment
+describes: a vm-placement config would have waited out five probes to be told,
+in the wrong words, something that was true before they ran. The decision for
+this route is now `admitted_profile_for_agent_run`, which checks placement and
+then probes, and a test asserts a vm-placement agent run is refused with
+nothing in the tool log at all.
+
+The second is the test suite depending on the machine it runs on. The runner's
+admission test used bare tool names, which `PATH` resolves — so on a
+configured development host the probes found the *real* `container` and the
+real helper, and what the test observed became a fact about that host. Fixed
+twice over: the paths are absolute and unresolvable, and the assertion is on
+the refusal's *type* rather than its wording, because the claim is that this
+door hands back what the shared one produced. `build_start_plan` stopped
+stringifying the refusal so the test can say so by downcasting.
+
+Five weakenings were injected and fail these tests: an allowlist entry whose
+proof run names no date, a door that probes a host other than the one it was
+asked about, a door that probes for the profiles decided on their spelling, a
+reconcile that asks admission on its way to a teardown, an agent-run route
+that asks about the profile before the placement, a dry run that asks for a
+decision before it looks at the flag, an accept that probes before taking its
+place in the queue, a placement check moved after the probes, a daemon that
+gathers admission concurrently, and the fixture whose image-inspect document
+was the wrong shape.
 
 ---
 
