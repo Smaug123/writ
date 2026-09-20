@@ -25,6 +25,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
+use writ_core::core::SessionId;
 
 mod agent_run;
 mod agent_vm_network_health;
@@ -123,6 +124,23 @@ pub enum AuditError {
     /// failed relationship directly.
     #[error("invariant violated: {0}")]
     Invariant(&'static str),
+
+    /// A write named a session that was never opened.
+    ///
+    /// Separate variants rather than two spellings of [`Invariant`],
+    /// because callers branch on the difference: the VM-HTTP effect driver
+    /// answers an unknown session with `401` and a closed one with `410`,
+    /// and it used to reach that decision by comparing the message against
+    /// a literal defined in this crate. Both carry the session the guard
+    /// was asked about.
+    ///
+    /// [`Invariant`]: AuditError::Invariant
+    #[error("session {session_id} does not exist")]
+    SessionNotFound { session_id: SessionId },
+
+    /// A write named a session that has already been closed.
+    #[error("session {session_id} is closed")]
+    SessionClosed { session_id: SessionId },
 
     /// The schema refused a `git_push_resolution` INSERT because the push
     /// has a live approve attempt that is in flight or quarantined (see

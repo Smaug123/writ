@@ -947,7 +947,7 @@ CREATE TABLE scratch_outcome (
                 note: "x".into(),
             })
             .unwrap_err();
-        assert!(matches!(closed, AuditError::Invariant("session is closed")));
+        assert!(matches!(closed, AuditError::SessionClosed { .. }));
 
         let missing = log
             .begin_effect::<ScratchTable>(&ScratchRequest {
@@ -956,10 +956,7 @@ CREATE TABLE scratch_outcome (
                 note: "x".into(),
             })
             .unwrap_err();
-        assert!(matches!(
-            missing,
-            AuditError::Invariant("session does not exist")
-        ));
+        assert!(matches!(missing, AuditError::SessionNotFound { .. }));
         assert!(dump_request(&log).is_empty());
     }
 
@@ -1046,7 +1043,7 @@ CREATE TABLE scratch_outcome (
                 },
             )
             .unwrap_err();
-        assert!(matches!(closed, AuditError::Invariant("session is closed")));
+        assert!(matches!(closed, AuditError::SessionClosed { .. }));
         assert_eq!(
             dump_request(&log).len(),
             1,

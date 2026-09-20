@@ -36,12 +36,10 @@ pub(super) fn closed_session_response(
     respond: impl Fn(VmHttpStatus, &'static str) -> VmHttpResponse,
 ) -> Option<VmHttpResponse> {
     match err {
-        AuditError::Invariant("session does not exist") => {
+        AuditError::SessionNotFound { .. } => {
             Some(respond(VmHttpStatus::Unauthorized, "session is not active"))
         }
-        AuditError::Invariant("session is closed") => {
-            Some(respond(VmHttpStatus::Gone, "session is closed"))
-        }
+        AuditError::SessionClosed { .. } => Some(respond(VmHttpStatus::Gone, "session is closed")),
         _ => None,
     }
 }

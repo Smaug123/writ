@@ -15,7 +15,7 @@ fn git_push_request_requires_open_session_but_outcome_can_land_after_close() {
 
     let missing = log.record_git_push_request(&request).unwrap_err();
     assert!(
-        matches!(missing, AuditError::Invariant("session does not exist")),
+        matches!(missing, AuditError::SessionNotFound { .. }),
         "got: {missing:?}"
     );
 
@@ -27,7 +27,7 @@ fn git_push_request_requires_open_session_but_outcome_can_land_after_close() {
     let closed_request = sample_git_push_request_record(RequestId::new(), s.session_id);
     let closed = log.record_git_push_request(&closed_request).unwrap_err();
     assert!(
-        matches!(closed, AuditError::Invariant("session is closed")),
+        matches!(closed, AuditError::SessionClosed { .. }),
         "got: {closed:?}"
     );
 

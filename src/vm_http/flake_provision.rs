@@ -888,14 +888,15 @@ mod tests {
     /// endpoint's typed 500 envelope.
     #[test]
     fn begin_failures_map_sessions_to_client_errors_and_the_rest_to_the_typed_500() {
-        let unauthorized = FlakeProvisionEffect::begin_error_response(&AuditError::Invariant(
-            "session does not exist",
-        ))
-        .expect("an unknown session is a client error");
+        let session_id = SessionId::new();
+
+        let unauthorized =
+            FlakeProvisionEffect::begin_error_response(&AuditError::SessionNotFound { session_id })
+                .expect("an unknown session is a client error");
         assert_eq!(unauthorized.status, VmHttpStatus::Unauthorized);
 
         let gone =
-            FlakeProvisionEffect::begin_error_response(&AuditError::Invariant("session is closed"))
+            FlakeProvisionEffect::begin_error_response(&AuditError::SessionClosed { session_id })
                 .expect("a closed session is a client error");
         assert_eq!(gone.status, VmHttpStatus::Gone);
 
