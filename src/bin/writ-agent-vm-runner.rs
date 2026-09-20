@@ -324,9 +324,8 @@ async fn build_start_plan(
     // (it has no store to mint a release signal with). Parity here is about
     // not acquiring a profile through a second front door, not about this
     // path gaining a capability it structurally cannot have.
-    let admitted = admit_on_this_host(ConfiguredIpv6Profile::from(args.ipv6_mode), &tools, &image)
-        .await
-        .map_err(|refused| refused.to_string())?;
+    let admitted =
+        admit_on_this_host(ConfiguredIpv6Profile::from(args.ipv6_mode), &tools, &image).await?;
     let broker_ports = BrokerPorts::new(
         args.broker_ports
             .into_iter()
@@ -435,6 +434,7 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::*;
+    use writ::agent_vm_locked_admission::{LockedV1Fact, LockedV1Refused};
 
     #[test]
     fn stop_requires_explicit_ipv6_mode() {
@@ -490,8 +490,19 @@ mod tests {
         }
     }
 
+    /// Tool paths that cannot resolve to anything, absolute so no `PATH` on
+    /// any host can make them.
+    ///
+    /// Bare names would be resolved through `PATH`, which on a configured
+    /// development machine finds the real `container` and the real helper —
+    /// and then what the admission probes read is a fact about the machine
+    /// running the test. A required gate must not depend on that.
     fn tools() -> AgentVmToolPaths {
-        AgentVmToolPaths::new("container", "writ-agent-vm-pf-helper", "sudo")
+        AgentVmToolPaths::new(
+            "/nonexistent/writ-test/container",
+            "/nonexistent/writ-test/writ-agent-vm-pf-helper",
+            "/nonexistent/writ-test/sudo",
+        )
     }
 
     /// This binary is a second front door onto the same machinery, and a
@@ -503,19 +514,23 @@ mod tests {
     /// is that this door goes through it — the refusal is the one
     /// `LockedV1Refused` words, not a sentence of this binary's own.
     ///
-    /// The tool paths are bare names, so the probes fail to spawn and the
-    /// refusal is about the first fact that could not be read. That is the
-    /// honest answer on a machine with no Apple `container`, which is where
-    /// this test runs.
+    /// The refusal is checked by its *type*, not by its wording: the claim is
+    /// that this door hands back what the shared one produced, and a
+    /// `LockedV1Refused` is that. Which fact it names depends on what the
+    /// host's tools do — see [`tools`], whose paths make sure that is not the
+    /// host's business either.
     #[tokio::test]
     async fn starting_under_an_unproven_profile_is_refused_here_too() {
         let err = build_start_plan(start_args("ipv4-only-locked-v1"), tools())
             .await
-            .expect_err("a profile with no proof record must not start a session")
-            .to_string();
-        assert!(
-            err.contains("PF helper's protocol version could not be read"),
-            "{err}"
+            .expect_err("a profile with no proof record must not start a session");
+        let refused = err
+            .downcast::<LockedV1Refused>()
+            .expect("the runner refuses in the shared vocabulary, not one of its own");
+        assert_eq!(
+            refused.fact(),
+            LockedV1Fact::HelperProtocol,
+            "a helper that cannot be spawned is the first fact that cannot be read"
         );
 
         // The profiles decided on their spelling still admit, and reach no

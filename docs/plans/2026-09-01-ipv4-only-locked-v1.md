@@ -1148,10 +1148,31 @@ than a gap: `LockedV1Admission` has no public constructor, so an attempt to
 have the door return an admission carrying a digest other than the probed one
 does not compile.
 
-Four weakenings were injected and fail these tests: an allowlist entry with no
-row in the record, a door that probes a host other than the one it was asked
-about, a door that probes for the profiles decided on their spelling, and a
-reconcile that asks admission on its way to a teardown.
+A review round caught two things, and the first was a self-inflicted ordering
+regression. `accept_agent_run_session` checks the broker placement first, and
+its comment says why — placement is the more specific answer, since the
+agent-run route does not exist on the v1 broker VM under any profile. Moving
+the profile decision *out* of that function inverted the order the comment
+describes: a vm-placement config would have waited out five probes to be told,
+in the wrong words, something that was true before they ran. The decision for
+this route is now `admitted_profile_for_agent_run`, which checks placement and
+then probes, and a test asserts a vm-placement agent run is refused with
+nothing in the tool log at all.
+
+The second is the test suite depending on the machine it runs on. The runner's
+admission test used bare tool names, which `PATH` resolves — so on a
+configured development host the probes found the *real* `container` and the
+real helper, and what the test observed became a fact about that host. Fixed
+twice over: the paths are absolute and unresolvable, and the assertion is on
+the refusal's *type* rather than its wording, because the claim is that this
+door hands back what the shared one produced. `build_start_plan` stopped
+stringifying the refusal so the test can say so by downcasting.
+
+Five weakenings were injected and fail these tests: an allowlist entry whose
+proof run names no date, a door that probes a host other than the one it was
+asked about, a door that probes for the profiles decided on their spelling, a
+reconcile that asks admission on its way to a teardown, and an agent-run route
+that asks about the profile before the placement.
 
 ---
 

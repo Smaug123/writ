@@ -492,6 +492,25 @@ pub(super) fn daemon_config_with_broker_placement(
     daemon_config_inner(dir, fake_tool, 252, 253, None, broker_placement)
 }
 
+/// A config under a chosen placement *and* profile, for the tests about which
+/// refusal an operator gets when both would refuse.
+pub(super) fn daemon_config_with_placement_and_profile(
+    dir: &Path,
+    fake_tool: &Path,
+    broker_placement: BrokerPlacement,
+    ipv6_profile: ConfiguredIpv6Profile,
+) -> (AgentVmDaemonRuntimeConfig, AgentVmSessionStateStore) {
+    daemon_config_inner_with_profile(
+        dir,
+        fake_tool,
+        252,
+        253,
+        None,
+        broker_placement,
+        ipv6_profile,
+    )
+}
+
 /// A host-placement config under a chosen IPv6 profile, for the tests about
 /// which profiles admit a session.
 pub(super) fn daemon_config_with_ipv6_profile(

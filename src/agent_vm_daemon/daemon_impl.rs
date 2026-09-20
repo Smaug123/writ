@@ -92,6 +92,24 @@ impl AgentVmDaemon {
     /// again wherever the answer was wanted. A refusal still costs only those
     /// probes — no network, no VM, no state record — which is what keeps it
     /// safe to ask before the session has an identity.
+    /// [`Self::admitted_profile`] for the agent-run route, which one
+    /// placement cannot serve at all.
+    ///
+    /// Placement first, and the ordering matters more than it did: it is the
+    /// more specific answer — this route does not exist on the v1 broker VM
+    /// under any profile — and, now that deciding a profile reads the host, it
+    /// is also the free one. A vm-placement config asked the other way round
+    /// waits out five probes to be told something that was true before they
+    /// ran, in the wrong words.
+    pub async fn admitted_profile_for_agent_run(
+        &self,
+    ) -> Result<AdmittedProfile, AgentVmDaemonError> {
+        if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
+            return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
+        }
+        self.admitted_profile().await
+    }
+
     pub async fn admitted_profile(&self) -> Result<AdmittedProfile, AgentVmDaemonError> {
         Ok(admit_on_this_host(
             self.config.lifecycle.ipv6_profile,
@@ -433,7 +451,7 @@ impl AgentVmDaemon {
     ) -> Result<AgentRunStarted, AgentVmDaemonError> {
         let accepted = self.accept_agent_run_session(
             &state,
-            self.admitted_profile().await?,
+            self.admitted_profile_for_agent_run().await?,
             label,
             agent_kind,
             agent_model,

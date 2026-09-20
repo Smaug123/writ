@@ -3041,3 +3041,53 @@ async fn no_other_profile_is_handed_a_home() {
         "a root workload keeps the image's HOME: {env}"
     );
 }
+
+/// A placement that cannot serve an agent run is refused before the host is
+/// asked about the profile.
+///
+/// Placement is the more specific answer — this route does not exist on the
+/// v1 broker VM under any profile — and, since admission started reading the
+/// host, it is also the free one. Asking about the profile first would make an
+/// operator wait out five probes to be told something that was true before
+/// they ran, and told it in the wrong words.
+#[tokio::test]
+async fn vm_placement_refuses_an_agent_run_before_probing_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let fake_tool =
+        write_fake_locked_probe_tool(dir.path(), &args_log, LockedProbeHost::Unrecorded);
+    let (config, _state_store) = daemon_config_with_placement_and_profile(
+        dir.path(),
+        &fake_tool,
+        BrokerPlacement::Vm,
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+    );
+    let daemon = AgentVmDaemon::new(config);
+    let state = make_state_with_audit(AuditLog::open(dir.path().join("audit.db")).unwrap());
+
+    let err = daemon
+        .start_agent_run_session(
+            Arc::clone(&state),
+            Some("run".into()),
+            AgentKind::Claude,
+            "claude-test".into(),
+            AgentVmWorkspaceBootstrap {
+                repo: "owner/repo".parse().unwrap(),
+                destination: None,
+                warm: WorkspaceWarmMode::None,
+            },
+            crate::agent_run::AgentPrompt::new("do it"),
+            crate::agent_vm_daemon::AgentRunTags::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AgentVmDaemonError::AgentRunUnsupportedForVmBroker),
+        "the placement is the answer, not the profile: got {err:?}"
+    );
+    assert!(
+        !args_log.exists(),
+        "nothing should have been run: {:?}",
+        fs::read_to_string(&args_log)
+    );
+}

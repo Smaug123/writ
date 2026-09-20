@@ -498,8 +498,10 @@ pub async fn dispatch_message_with_agent_vm<S: SecretStore + Send + Sync + 'stat
                 // Both refusals below happen before the run has a name. The
                 // profile is decided here rather than inside `accept` because
                 // deciding it awaits five host probes, and accepting
-                // deliberately awaits nothing at all.
-                let accepted = match agent_vm.admitted_profile().await {
+                // deliberately awaits nothing at all — and the placement,
+                // which this route may not have at all, is checked before
+                // those probes rather than after them.
+                let accepted = match agent_vm.admitted_profile_for_agent_run().await {
                     Err(refused) => Err(refused),
                     Ok(admitted) => agent_vm.accept_agent_run_session(
                         state,
