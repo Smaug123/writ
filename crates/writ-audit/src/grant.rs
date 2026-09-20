@@ -1503,7 +1503,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, AuditError::Invariant("session is closed")),
+            matches!(err, AuditError::SessionClosed { .. }),
             "got: {err:?}"
         );
     }
@@ -1532,7 +1532,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, AuditError::Invariant("session is closed")),
+            matches!(err, AuditError::SessionClosed { .. }),
             "got: {err:?}"
         );
     }
@@ -1640,7 +1640,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, AuditError::Invariant("session does not exist")),
+            matches!(err, AuditError::SessionNotFound { .. }),
             "got: {err:?}"
         );
     }

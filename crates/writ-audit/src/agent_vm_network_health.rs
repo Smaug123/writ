@@ -104,9 +104,15 @@ mod tests {
         let err = log
             .record_agent_vm_network_health_event(&sample(s.session_id))
             .unwrap_err();
+        // The refusal comes from the SQL trigger, not the DAO's own
+        // `check_session_open` guard (which would be `SessionClosed`), so
+        // the message really is SQLite's and a substring is all there is.
+        let AuditError::Sqlite(e) = err else {
+            panic!("expected the requires_open_session trigger to fire, got: {err:?}");
+        };
         assert!(
-            format!("{err}").contains("session is closed"),
-            "expected the requires_open_session trigger to fire, got: {err}"
+            e.to_string().to_lowercase().contains("session is closed"),
+            "expected the trigger's message, got: {e}"
         );
     }
 

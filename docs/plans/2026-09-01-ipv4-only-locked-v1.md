@@ -527,6 +527,21 @@ the runner cannot start a locked session on a host the daemon would refuse.
 Nothing here is a proof. It is the daemon doing the locked sequence under the
 fake tool, with every step's failure leaving the workload unreleased.
 
+This stage is built in three branches. The observers come first and the
+profile opens last, so no commit leaves `Ipv6IsolationMode::Ipv4OnlyLockedV1`
+representable without a start path behind it:
+
+- **E2a**, the host's read side of the guest record channel: the bounded
+  `container logs` read, the scan that decides what a log reports, and the
+  release gate's precondition. No caller; the profile stays closed.
+- **E2b**, the locked start's invocations as data: the `container run` argv
+  carrying B1's capability profile and the image's digest, and the
+  `container kill --signal USR1` that E1's `ReleaseSignal` wraps. Still no
+  caller.
+- **E2c**, the daemon's locked start sequence driving E1's typestates through
+  E2a and E2b, the post-release migration off `container exec`, and the
+  profile opening on an empty host-placement pin list, in one change.
+
 **Correctness oracle:**
 - Fake-tool daemon tests: the recorded `container run` argv contains exactly
   the B1 profile and names the image by the digest that was inspected, never
@@ -556,6 +571,55 @@ fake tool, with every step's failure leaving the workload unreleased.
 - Stop and reconcile of a persisted `Ipv4OnlyLockedV1` session need no
   evidence: the persisted-session tests run under a daemon whose evidence
   gathering is scripted to fail.
+
+---
+
+**E2a landed.** `agent_vm_guest_log` reads the channel and `agent_vm_probe`
+holds the bounded-run policy it shares with Stage D's evidence gatherer, which
+now goes through it rather than keeping a second copy.
+
+Two decisions are worth the reviewer's attention. The read is plain
+`container logs <vm>`: `-n` keeps the *last* n lines, so a guest that flooded
+its log could push the record out of the window and be read as silent, where
+reading it all and refusing the overrun fails closed instead. And a line
+wearing the record prefix that does not parse is refused rather than skipped,
+because the prefix is the initializer's — a line carrying it that the host
+cannot read is a disagreement about the handoff contract, not noise.
+
+The ABI check is here as well as in Stage D's admission, and they check
+different things: D reads the label an *image* stamps, this reads what the
+*running* initializer announced. Both compile from one file in
+`crates/writ-guest-init`, which is what makes a disagreement between them
+worth refusing.
+
+One bound is a judgement rather than a measurement. A read that the release
+budget (rather than its own deadline) cut short reports `Silent`, not a tool
+timeout: with no time left the host cannot tell a wedged `container logs` from
+a guest that had not spoken yet, so it makes the weaker claim. A wedged tool
+with budget to spare still reports the timeout, and a test pins the
+distinction.
+
+`overall_timeout` is the whole wait, not the wait plus one poll interval: the
+sleep between reads is capped by what is left, the same way each read is. That
+cap is a pure function (`next_poll_sleep`) with a property over every
+combination of interval, budget and elapsed time, because the first two
+attempts to test it by *timing the loop* measured process spawn latency
+instead — one passed under the weakening it was written for, and the other
+failed the full suite on a budget that a cold spawn exhausted. A bound that
+can be stated purely should not be tested against a clock.
+
+Four weakenings were injected and fail these tests: a scan that skips a
+malformed prefixed line, one that takes the first of two records, a wait that
+releases on any announced ABI, and a `next_poll_sleep` that ignores the
+remaining budget.
+
+A record must begin its line, because accepting one embedded in a longer line
+hands the framing to whoever wrote it. That rests on `container logs`
+returning the guest's stdio lines undecorated, which was measured rather than
+assumed: on Apple `container` 1.4.1 (macOS 25G72), a container whose command
+`printf`s one line yields exactly those bytes and a bare newline — no
+timestamp, no prefix, no carriage return — and the kernel's messages are on
+`--boot`, where the record never appears.
 
 ---
 

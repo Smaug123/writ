@@ -781,10 +781,7 @@ mod tests {
         let err = log
             .record_agent_vm_workspace_bootstrap(&record)
             .unwrap_err();
-        assert!(matches!(
-            err,
-            AuditError::Invariant("session does not exist")
-        ));
+        assert!(matches!(err, AuditError::SessionNotFound { .. }));
 
         log.open_session(&s).unwrap();
         log.close_session(s.session_id, UnixMillis::from_millis(1_700_000_200))
@@ -792,7 +789,7 @@ mod tests {
         let err = log
             .record_agent_vm_workspace_bootstrap(&record)
             .unwrap_err();
-        assert!(matches!(err, AuditError::Invariant("session is closed")));
+        assert!(matches!(err, AuditError::SessionClosed { .. }));
     }
 
     #[test]
@@ -871,10 +868,7 @@ mod tests {
         };
 
         let err = log.record_agent_run(&record).unwrap_err();
-        assert!(matches!(
-            err,
-            AuditError::Invariant("session does not exist")
-        ));
+        assert!(matches!(err, AuditError::SessionNotFound { .. }));
 
         log.open_session(&s).unwrap();
         log.record_agent_run(&record).unwrap();
@@ -912,7 +906,7 @@ mod tests {
             ..record
         };
         let err = log.record_agent_run(&closed_run).unwrap_err();
-        assert!(matches!(err, AuditError::Invariant("session is closed")));
+        assert!(matches!(err, AuditError::SessionClosed { .. }));
     }
 
     #[test]

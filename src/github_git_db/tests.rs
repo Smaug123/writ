@@ -913,8 +913,8 @@ async fn create_commit_rejects_signed_commit_github_reports_unverified() {
         .expect_err("an unverified signed commit must not be returned as a success");
     match err {
         GitDataError::UnverifiedSignedCommit { sha, reason } => {
-            assert_eq!(sha, returned.as_str());
-            assert_eq!(reason, "unknown_key");
+            assert_eq!(sha, returned);
+            assert_eq!(reason.as_deref(), Some("unknown_key"));
         }
         other => panic!("expected UnverifiedSignedCommit, got {other:?}"),
     }
@@ -953,7 +953,7 @@ async fn create_commit_rejects_signed_commit_with_no_verification_object() {
         .await
         .expect_err("a signed commit with no verification verdict must not succeed");
     assert!(
-        matches!(err, GitDataError::MissingVerification { ref sha } if sha == returned.as_str()),
+        matches!(err, GitDataError::MissingVerification { ref sha } if *sha == returned),
         "expected MissingVerification, got {err:?}",
     );
 }

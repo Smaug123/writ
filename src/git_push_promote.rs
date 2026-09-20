@@ -1819,7 +1819,12 @@ mod tests {
         .await
         .expect_err("an unverified commit must abort the promote, not publish");
         assert!(
-            format!("{err:?}").contains("UnverifiedSignedCommit"),
+            matches!(
+                err,
+                PromoteError::Prepare(ExecuteError::Replay(ReplayError::GitDb(
+                    GitDataError::UnverifiedSignedCommit { .. }
+                )))
+            ),
             "the failure must name the unverified commit so an operator can act on it: {err:?}",
         );
     }

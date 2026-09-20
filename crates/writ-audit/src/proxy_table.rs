@@ -559,7 +559,7 @@ END;
             )
             .unwrap_err();
         assert!(
-            matches!(err, AuditError::Invariant("session is closed")),
+            matches!(err, AuditError::SessionClosed { .. }),
             "got: {err:?}"
         );
         assert!(
