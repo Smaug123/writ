@@ -10,7 +10,7 @@ use crate::core::RequestId;
 use crate::vm_git::{DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode};
 use proptest::prelude::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A closed profile refuses new sessions and leaves nothing behind.
 ///
@@ -190,7 +190,7 @@ where
             // dual-stack, so passing that would build a combination the config
             // layer forbids and would stop covering the ipv4-only guest setup
             // this placement depends on.
-            Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            AdmittedProfile::Ipv4OnlyNoGuestIpv6,
             agent_kind,
             None,
             vec!["sleep".into(), "600".into()],
@@ -2708,5 +2708,237 @@ async fn reconcile_treats_release_attempted_exactly_as_workload_released() {
         invocations_for(LockedPhase::ReleaseAttempted).await,
         invocations_for(LockedPhase::WorkloadReleased).await,
         "a session found at the gate is torn down exactly as one found past it"
+    );
+}
+
+// --- the locked profile -----------------------------------------------------
+
+/// A locked daemon whose fake tools answer a whole locked session.
+struct LockedHarness {
+    dir: tempfile::TempDir,
+    args_log: PathBuf,
+    env_log: PathBuf,
+    session_id: SessionId,
+    state_store: AgentVmSessionStateStore,
+    daemon: AgentVmDaemon,
+}
+
+impl LockedHarness {
+    fn new(guest: LockedGuest) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let args_log = dir.path().join("args.log");
+        let env_log = dir.path().join("env.log");
+        // The fixture's `pf-helper install` report names the session, so the
+        // session id has to exist before the tool is written.
+        let session_id = SessionId::new();
+        let fake_tool = write_fake_locked_tool(dir.path(), &args_log, &env_log, session_id, guest);
+        let (config, state_store) = daemon_config_with_ipv6_profile(
+            dir.path(),
+            &fake_tool,
+            ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+        );
+        Self {
+            dir,
+            args_log,
+            env_log,
+            session_id,
+            state_store,
+            daemon: AgentVmDaemon::new(config),
+        }
+    }
+
+    /// Run a start under this harness's own session id, which is the one the
+    /// fixture's `pf-helper install` report names.
+    ///
+    /// `ConfiguredIpv6Profile::admit` still refuses the locked profile —
+    /// Stage E2c-3c is what opens it — so the public entry point cannot reach
+    /// the arm these tests are about. They supply the decision the gate would
+    /// have made and cover what a locked session *does*, not whether one may
+    /// start.
+    async fn start_admitting<S>(
+        &self,
+        state: &Arc<BrokerState<S>>,
+        admitted: AdmittedProfile,
+    ) -> Result<AgentVmStarted, AgentVmDaemonError>
+    where
+        S: crate::secret::SecretStore + Send + Sync + 'static,
+    {
+        state
+            .audit
+            .open_session(&crate::core::SessionRecord {
+                session_id: self.session_id,
+                label: Some("locked".to_string()),
+                agent_kind: None,
+                agent_model: None,
+                opened_at: UnixMillis::now(),
+                closed_at: None,
+            })
+            .unwrap();
+        self.daemon
+            .start_session_after_audit_opened(
+                Arc::clone(state),
+                self.session_id,
+                admitted,
+                None,
+                None,
+                vec!["sleep".into(), "600".into()],
+                None,
+                None,
+            )
+            .await
+    }
+
+    /// The common case: start under an admission for the image the fixture
+    /// serves.
+    async fn start<S>(
+        &self,
+        state: &Arc<BrokerState<S>>,
+    ) -> Result<AgentVmStarted, AgentVmDaemonError>
+    where
+        S: crate::secret::SecretStore + Send + Sync + 'static,
+    {
+        self.start_admitting(state, locked_admission(LOCKED_IMAGE_DIGEST))
+            .await
+    }
+
+    /// The first word of every invocation the tools were given, in order.
+    fn steps(&self) -> Vec<String> {
+        fs::read_to_string(&self.args_log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.split_whitespace().next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    fn argv(&self) -> String {
+        fs::read_to_string(&self.args_log).unwrap_or_default()
+    }
+}
+
+/// The oracle Stage E2c-3b exists for: a locked session runs end to end and
+/// the host never creates a process inside the guest.
+///
+/// `exec` is asserted absent from the *whole* tool log, not merely from the
+/// part after the release. The release is where an exec would be most
+/// obviously wrong, but layer 2's promise is about the container's whole life.
+#[tokio::test]
+async fn a_locked_session_starts_without_ever_execing_into_the_guest() {
+    let harness = LockedHarness::new(LockedGuest::BootstrapsCleanly);
+    let state = make_state();
+    let started = harness.start(&state).await.expect("the locked start runs");
+
+    assert_eq!(started.session_id(), harness.session_id);
+    let steps = harness.steps();
+    assert!(
+        !steps.iter().any(|step| step == "exec"),
+        "a locked session must run no container exec: {steps:?}"
+    );
+    // The locked sequence, in order. The trailing `logs` is the whole point
+    // of this stage: the post-release wait is another read of the same
+    // channel, where every other profile would exec into the guest to poll a
+    // sentinel file.
+    let locked: Vec<&str> = steps
+        .iter()
+        .map(String::as_str)
+        .filter(|step| matches!(*step, "create" | "inspect" | "start" | "logs" | "kill"))
+        .collect();
+    assert_eq!(
+        locked,
+        ["create", "inspect", "start", "logs", "kill", "logs"]
+    );
+    assert_eq!(
+        harness
+            .state_store
+            .load(harness.session_id)
+            .unwrap()
+            .locked_phase(),
+        Some(LockedPhase::WorkloadReleased)
+    );
+}
+
+/// The guest's environment reaches a locked session the same way it reaches
+/// any other: an `--env-file` the create reads and nothing persists.
+#[tokio::test]
+async fn a_locked_session_is_handed_its_broker_environment() {
+    let harness = LockedHarness::new(LockedGuest::BootstrapsCleanly);
+    let state = make_state();
+    let started = harness.start(&state).await.unwrap();
+
+    let env = fs::read_to_string(&harness.env_log).unwrap();
+    assert!(
+        env.contains(&format!(
+            "{AGENT_VM_BROKER_URL_ENV}={}",
+            started.broker_url()
+        )),
+        "{env}"
+    );
+    assert!(
+        env.contains(&format!("{AGENT_VM_BROKER_TOKEN_ENV}=writ-vm-")),
+        "{env}"
+    );
+    let state_json = fs::read_to_string(
+        harness
+            .dir
+            .path()
+            .join("state")
+            .join(format!("{}.json", harness.session_id)),
+    )
+    .unwrap();
+    assert!(!state_json.contains("writ-vm-"), "{state_json}");
+}
+
+/// A locked guest reports its bootstrap on the log channel, and a failure
+/// there fails the start with the guest's own bounded reason.
+#[tokio::test]
+async fn a_locked_bootstrap_failure_is_surfaced_and_the_session_is_torn_down() {
+    let harness = LockedHarness::new(LockedGuest::ReportsBootstrapFailure);
+    let state = make_state();
+    let error = harness
+        .start(&state)
+        .await
+        .expect_err("the guest reported a failed bootstrap");
+
+    match &error {
+        AgentVmDaemonError::WorkspaceBootstrapFailed { message } => assert!(
+            message.contains("writ-vm workspace init failed with exit 1"),
+            "{message}"
+        ),
+        other => panic!("expected a reported bootstrap failure, got {other}"),
+    }
+    assert!(
+        harness.state_store.load(harness.session_id).is_err(),
+        "a failed bootstrap tears the session down"
+    );
+    assert!(
+        !harness.steps().iter().any(|step| step == "exec"),
+        "not even the failure path execs: {:?}",
+        harness.steps()
+    );
+}
+
+/// The readback is the guarantee, so an image the evidence did not admit
+/// stops the start before the guest is released.
+#[tokio::test]
+async fn a_locked_start_against_an_unadmitted_image_never_releases_the_guest() {
+    let harness = LockedHarness::new(LockedGuest::BootstrapsCleanly);
+    let state = make_state();
+    let error = harness
+        .start_admitting(
+            &state,
+            locked_admission(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        )
+        .await
+        .expect_err("the readback refuses an image nothing admitted");
+
+    assert!(
+        matches!(error, AgentVmDaemonError::LockedStartFailed { .. }),
+        "{error}"
+    );
+    let argv = harness.argv();
+    assert!(
+        !argv.contains("kill --signal"),
+        "the workload must not be released: {argv}"
     );
 }

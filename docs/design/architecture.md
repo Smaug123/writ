@@ -1319,8 +1319,8 @@ touching the sentinel files the daemon polls over `container exec`;
 shared script, so the legacy profile's scripts are byte-identical to before.
 
 `agent_vm_locked_session::run_locked_start` is the interpreter for that
-sequence, built and tested but with no caller (admission still refuses the
-profile). It advances E1's typestates and the persisted record together:
+sequence, and the daemon's start arm is its caller. It advances E1's
+typestates and the persisted record together:
 `NetworkValidated` once the shared prefix has run, `AgentVmStarted` after
 create → readback → start, `FinalFirewallInstalled` from the helper's own
 install report (refused unless it reached `reresolve`), `GuestSecurityLocked`
@@ -1334,8 +1334,7 @@ onwards — a `kill` that failed, and a final write that failed after a `kill`
 that succeeded — which report that the workload may be running rather than
 that it stayed put.
 
-`agent_vm_locked_start` is the locked profile's launch and its readback,
-built and tested but with no caller.
+`agent_vm_locked_start` is the locked profile's launch and its readback.
 `AgentVmSessionPlan::locked_create_vm_invocation` emits a `container create`:
 the shared `base_container_argv`, Stage B1's capability profile, a
 `--read-only-path NONE` plus give-back that relaxes exactly `/proc/sys`, the
@@ -1361,7 +1360,7 @@ because it removes the very sysctl the handoff requires. See §5.5 and Stage
 E2b of the plan.
 
 `agent_vm_guest_log` is the host's read side of a locked guest's one-way
-record channel, built and tested but with no caller. `scan_guest_log` decides
+record channel. `scan_guest_log` decides
 what one bounded `container logs` read reports — nothing yet, the
 initializer's `security-ready` record, or its `handoff-failed` one — and
 refuses everything else: a line wearing the record prefix that does not parse,
@@ -1370,9 +1369,40 @@ read to a deadline and yields the `GuestFacts` Stage E1's
 `guest_security_locked` takes, only for a lone ready record naming the ABI
 this host implements. The read is plain `container logs <vm>`, because `-n`
 keeps the last n lines and a flooding guest could push the record out of that
-window. `agent_vm_probe` holds the bounded-run policy the channel shares with
-the admission gatherer below: one supervised process group, one byte cap, one
-deadline. See §5.5 and Stage E2 of the plan.
+window. `GuestBootstrapChannel` is the post-release wait, a separate type over
+the same command with bounds of its own — a wider byte cap, a slower poll, and
+the twenty minutes a Nix warm can take — so neither wait can perform the
+other's read or spend the other's budget. `agent_vm_probe` holds the
+bounded-run policy both channels share with the admission gatherer below: one
+supervised process group, one byte cap, one deadline. See §5.5 and Stage E2 of
+the plan.
+
+**The daemon's start arm dispatches on the admitted profile.** A locked plan
+claims its record, runs the shared prefix
+(`complete_locked_session_prefix`, which is `start_steps` under the same
+rollback rule the legacy completion uses), spawns the broker, and hands off to
+`run_locked_start`; every other mode runs the whole legacy step machine and is
+untouched. The order is forced by what the release means: it is how a locked
+guest learns the broker exists, since this profile has no broker-ready file to
+wait on. `run_locked_start` therefore takes a `vm_http::BrokerListening`,
+which only `RunningVmHttpSession` produces and only `spawn` produces one of —
+the same move `ReleaseSignal` makes for the record — and it refuses a proof
+naming a port its own plan does not advertise. After the release the daemon
+waits on `GuestBootstrapChannel` rather than polling sentinel files over
+`container exec`, so a locked session has no `exec` in its life at all, which
+a fake-tool daemon test asserts over the whole invocation log. A bootstrap
+success gates nothing that carries authority — the workload runs as PID 1's
+UID by then and can print whatever it likes — and a workspace guard enumerates
+the outcome's readers so a grant, proxy or staged push that began keying off
+it would fail the build.
+
+The decision the arm dispatches on is `AdmittedProfile`, which mirrors
+`Ipv6IsolationMode` variant for variant and carries the `LockedV1Admission`
+on the locked one. The digest has to travel with the decision because the
+readback accepts no other image, and pairing a mode with an optional
+admission would let a locked decision exist without its evidence. `admit`
+returns one; it still refuses the locked profile, so nothing constructs that
+variant yet.
 
 `agent_vm_locked_admission` holds what the locked profile's admission *will*
 be, built and tested but not wired: `LockedV1RuntimeEvidence` is six facts the

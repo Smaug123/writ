@@ -120,6 +120,11 @@ impl AgentVmSessionPlan {
         &self.names
     }
 
+    /// The broker ports this session's guest is pointed at.
+    pub fn broker_ports(&self) -> &BrokerPorts {
+        &self.broker_ports
+    }
+
     pub fn broker_urls(&self) -> Vec<BrokerUrl> {
         self.broker_ports
             .as_slice()

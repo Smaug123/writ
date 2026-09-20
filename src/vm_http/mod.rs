@@ -177,6 +177,44 @@ pub struct RunningVmHttpSession {
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
+/// Proof that a session's broker is up and naming the port it answers on.
+///
+/// The only constructor is [`RunningVmHttpSession::listening`], and the only
+/// way to a [`RunningVmHttpSession`] is [`PreparedVmHttpSession::spawn`], so
+/// the value cannot be produced by a caller that has not started the broker.
+///
+/// It exists because the locked profile has no broker-ready file: being
+/// released *is* how a locked guest learns the broker exists, so a release
+/// ordered before the broker is up gives the guest an egress gate whose
+/// positive control has nothing to connect to. A doc comment saying "release
+/// last" is the shape Stage E1 refused for the release signal, and this is
+/// the same move — the ordering is a value the earlier step produces.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BrokerListening {
+    broker_port: BrokerPort,
+}
+
+impl BrokerListening {
+    /// Claim a broker is listening without having started one.
+    ///
+    /// `#[cfg(test)]`, so it is not a hole in the guarantee: production code
+    /// cannot name it, and a test of the locked start need not stand a broker
+    /// up to reach the code under test.
+    #[cfg(test)]
+    pub(crate) fn claimed_for_test(broker_port: BrokerPort) -> Self {
+        Self { broker_port }
+    }
+
+    /// The port the broker this proof is about answers on.
+    ///
+    /// Carried so a holder's claim is about one session's broker rather than
+    /// "some broker somewhere": the locked start checks it against the port
+    /// its own plan advertises to the guest.
+    pub fn broker_port(&self) -> BrokerPort {
+        self.broker_port
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VmHttpAuthorization {
     Allow,
@@ -578,6 +616,14 @@ impl<S: SecretStore + Send + Sync + 'static> PreparedVmHttpSession<S> {
 impl RunningVmHttpSession {
     pub fn broker_port(&self) -> BrokerPort {
         self.broker_port
+    }
+
+    /// Say that this broker is accepting, in a form another step can take as
+    /// a precondition. See [`BrokerListening`].
+    pub fn listening(&self) -> BrokerListening {
+        BrokerListening {
+            broker_port: self.broker_port,
+        }
     }
 
     pub fn bearer_token(&self) -> &VmHttpBearerToken {

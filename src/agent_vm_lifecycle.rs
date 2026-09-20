@@ -17,6 +17,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::agent_vm_locked_admission::AdmittedProfile;
 use crate::broker_vm::{BrokerVmNames, broker_vm_removal_invocations};
 use crate::core::{
     AgentNetwork, AgentNetworkPool, AgentVmConfigError, BrokerPortRange, BrokerPorts, Ipv4Cidr,
@@ -539,15 +540,22 @@ pub enum Ipv6ProfileClosed {
 }
 
 impl ConfiguredIpv6Profile {
-    /// The active mode a new session may start in under this profile.
+    /// What a new session may start as under this profile.
     ///
     /// This is the only way to obtain an [`Ipv6IsolationMode`] from a
     /// configuration, so a closed profile cannot reach the code that builds a
     /// session: there is no mode for it to build one with.
-    pub fn admit(self) -> Result<Ipv6IsolationMode, Ipv6ProfileClosed> {
+    ///
+    /// The answer is an [`AdmittedProfile`] rather than a bare mode because
+    /// the locked profile's start path needs the image digest the evidence
+    /// admitted, and that has to arrive with the decision rather than be
+    /// looked up again afterwards. The locked arm is still a refusal here:
+    /// Stage E2c-3c is where it starts gathering evidence and can construct
+    /// one.
+    pub fn admit(self) -> Result<AdmittedProfile, Ipv6ProfileClosed> {
         match self {
-            Self::DualStackRequired => Ok(Ipv6IsolationMode::DualStackRequired),
-            Self::Ipv4OnlyNoGuestIpv6 => Ok(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6),
+            Self::DualStackRequired => Ok(AdmittedProfile::DualStackRequired),
+            Self::Ipv4OnlyNoGuestIpv6 => Ok(AdmittedProfile::Ipv4OnlyNoGuestIpv6),
             Self::Ipv4OnlyLockedV1 => Err(Ipv6ProfileClosed::NotImplemented),
         }
     }
@@ -784,6 +792,12 @@ pub enum AgentVmLifecycleRunError {
          its release signal is minted by the state store, which this start path has none of"
     )]
     LockedProfileNeedsAStateStore,
+    /// The locked prefix was handed a plan that is not a locked one. The two
+    /// entry points are not interchangeable: this one stops at the bootstrap
+    /// anchor and leaves a session with no VM, which for any other mode is a
+    /// half-started session rather than a step.
+    #[error("the locked start prefix was given a {mode:?} plan, which it does not start")]
+    NotALockedProfile { mode: Ipv6IsolationMode },
     #[error(transparent)]
     Start(Box<StartFailure>),
     #[error("start failed: {original}; cleanup also failed: {cleanup}")]
@@ -1407,6 +1421,33 @@ pub fn start_agent_vm_session(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLi
     if !plan.ipv6_mode().startable_without_a_state_store() {
         return Err(AgentVmLifecycleRunError::LockedProfileNeedsAStateStore);
     }
+    run_start_steps(plan)
+}
+
+/// Run a locked session's start as far as this step machine goes.
+///
+/// [`AgentVmSessionPlan::start_steps`] stops a locked plan after the network
+/// is created, inspected and validated and the bootstrap anchor is loaded, so
+/// this is exactly that prefix; the rest is
+/// [`AgentVmSessionPlan::locked_start_sequence`], which the daemon interprets
+/// against a state store.
+///
+/// Split from [`start_agent_vm_session`] rather than sharing an entry point
+/// because the two mean different things to a caller. That one starts a
+/// session; this one gets a locked session as far as a VM that has not been
+/// created yet, and leaves the caller owing the rest. Handing it a plan in any
+/// other mode is that mistake made the other way round — a session started and
+/// abandoned before its VM — so it is refused.
+fn start_locked_session_prefix(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLifecycleRunError> {
+    let mode = plan.ipv6_mode();
+    if mode != Ipv6IsolationMode::Ipv4OnlyLockedV1 {
+        return Err(AgentVmLifecycleRunError::NotALockedProfile { mode });
+    }
+    run_start_steps(plan)
+}
+
+/// Run each step the plan describes, cleaning up after the first failure.
+fn run_start_steps(plan: &AgentVmSessionPlan) -> Result<(), AgentVmLifecycleRunError> {
     for step in plan.start_steps() {
         if let Err((failure, outcome)) = run_start_step(plan, &step) {
             return fail_after_cleanup(failure, plan, outcome);
@@ -1577,23 +1618,55 @@ pub fn complete_agent_vm_session_start(
     plan: &AgentVmSessionPlan,
     starting: AgentVmSessionState,
 ) -> Result<AgentVmSessionState, AgentVmSessionManagerError> {
-    if let Err(start) = start_agent_vm_session(plan) {
-        if start_failure_left_dirty_infrastructure(&start) {
-            return Err(start.into());
-        }
-        return match store.remove(plan.session_id()) {
-            Ok(()) => Err(start.into()),
-            Err(state) => Err(AgentVmSessionManagerError::StartStateCleanup {
-                start: Box::new(start),
-                state: Box::new(state),
-            }),
-        };
-    }
+    run_start_rolling_back_the_claim(store, plan, start_agent_vm_session)?;
     store.mark_running(&starting).map_err(|state| {
         AgentVmSessionManagerError::RunningStateUpdateAfterStart {
             state: Box::new(state),
         }
     })
+}
+
+/// Run the shared prefix of a locked session whose subnet has already been
+/// claimed, under the same rollback rule as
+/// [`complete_agent_vm_session_start`].
+///
+/// There is no promotion at the end: a locked session's record advances by
+/// phase rather than by status, and it is still at
+/// [`LockedPhase::Claimed`](crate::agent_vm_locked_lifecycle::LockedPhase::Claimed)
+/// when this returns. What comes next is
+/// [`run_locked_start`](crate::agent_vm_locked_session::run_locked_start),
+/// which the caller owes the session — and which it may not run until the
+/// broker is listening.
+pub fn complete_locked_session_prefix(
+    store: &AgentVmSessionStateStore,
+    plan: &AgentVmSessionPlan,
+) -> Result<(), AgentVmSessionManagerError> {
+    run_start_rolling_back_the_claim(store, plan, start_locked_session_prefix)
+}
+
+/// Run `start`, and on a failure that left no infrastructure behind, remove
+/// the claimed record too.
+///
+/// A start that failed *dirty* keeps its record: the record is the teardown
+/// obligation, and removing it would orphan whatever the failed cleanup left.
+fn run_start_rolling_back_the_claim(
+    store: &AgentVmSessionStateStore,
+    plan: &AgentVmSessionPlan,
+    start: impl FnOnce(&AgentVmSessionPlan) -> Result<(), AgentVmLifecycleRunError>,
+) -> Result<(), AgentVmSessionManagerError> {
+    let Err(start) = start(plan) else {
+        return Ok(());
+    };
+    if start_failure_left_dirty_infrastructure(&start) {
+        return Err(start.into());
+    }
+    match store.remove(plan.session_id()) {
+        Ok(()) => Err(start.into()),
+        Err(state) => Err(AgentVmSessionManagerError::StartStateCleanup {
+            start: Box::new(start),
+            state: Box::new(state),
+        }),
+    }
 }
 
 fn start_failure_left_dirty_infrastructure(error: &AgentVmLifecycleRunError) -> bool {
@@ -1815,11 +1888,11 @@ mod configured_profile_tests {
         for (profile, expected) in [
             (
                 ConfiguredIpv6Profile::DualStackRequired,
-                Ok(Ipv6IsolationMode::DualStackRequired),
+                Ok(AdmittedProfile::DualStackRequired),
             ),
             (
                 ConfiguredIpv6Profile::Ipv4OnlyNoGuestIpv6,
-                Ok(Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6),
+                Ok(AdmittedProfile::Ipv4OnlyNoGuestIpv6),
             ),
             (
                 ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
@@ -1845,6 +1918,7 @@ mod configured_profile_tests {
         ]
         .into_iter()
         .filter_map(|profile| profile.admit().ok())
+        .map(|admitted| admitted.ipv6_mode())
         .collect();
         assert_eq!(
             active,

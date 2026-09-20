@@ -17,6 +17,7 @@ use crate::vm_git::{
 };
 
 use super::AgentVmDaemonError;
+use crate::agent_vm_lifecycle::Ipv6IsolationMode;
 
 // The two guest setup scripts share a nix.conf / netrc prologue that is
 // byte-identical save for three points: the workspace script parses
@@ -377,18 +378,26 @@ pub(super) fn nix_conf_prologue_script_for_test() -> String {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum BootstrapSignals {
     SentinelFiles,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Stage E2c-3b gives this its production caller; until then the \
-                      locked scripts exist only to be tested against the legacy ones"
-        )
-    )]
     LogRecords,
 }
 
 impl BootstrapSignals {
+    /// Which channel a session under `mode` reports its bootstrap outcome on.
+    ///
+    /// The locked profile's is the log, because reading a sentinel file means
+    /// a `container exec` into a guest that is running repository-controlled
+    /// code by then, which is the move layer 2 exists to avoid. Every other
+    /// mode keeps the files: there is nothing wrong with them where the host
+    /// may still exec.
+    pub(super) fn for_mode(mode: Ipv6IsolationMode) -> Self {
+        match mode {
+            Ipv6IsolationMode::DualStackRequired | Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 => {
+                Self::SentinelFiles
+            }
+            Ipv6IsolationMode::Ipv4OnlyLockedV1 => Self::LogRecords,
+        }
+    }
+
     /// How this profile learns the broker is up, before the gate's positive
     /// control depends on it. Empty for the log records: the release is that
     /// signal, and there is no file to wait for.
@@ -470,10 +479,16 @@ fn build_guest_nix_setup_script(
     script
 }
 
-/// The non-workspace guest setup script: configure the nix cache, run the
+/// The non-workspace guest setup script under the sentinel-file signalling
+/// every mode but the locked one uses: configure the nix cache, run the
 /// egress gate, then `exec` the wrapped guest command. Does not enable flakes.
 /// Creates the `/run/writ-agent-vm` runtime dir the gate and the broker-ready
 /// signal need.
+///
+/// Production goes through [`wrap_guest_command`], which picks the signalling
+/// from the session's mode; this names one of the two so a test can speak
+/// about it.
+#[cfg(test)]
 pub(super) fn nix_setup_script() -> String {
     nix_setup_script_with_signals(BootstrapSignals::SentinelFiles)
 }
@@ -488,9 +503,11 @@ pub(super) fn nix_setup_script_with_signals(signals: BootstrapSignals) -> String
     )
 }
 
-/// The workspace guest setup script: the shared nix prologue (with flakes
-/// and the `/run/writ-agent-vm` runtime dir), the egress gate, the workspace
-/// init, then the agent run.
+/// The workspace guest setup script under sentinel-file signalling: the
+/// shared nix prologue (with flakes and the `/run/writ-agent-vm` runtime dir),
+/// the egress gate, the workspace init, then the agent run. See
+/// [`nix_setup_script`] on why this is test-only.
+#[cfg(test)]
 pub(super) fn workspace_bootstrap_script() -> String {
     workspace_bootstrap_script_with_signals(BootstrapSignals::SentinelFiles)
 }
@@ -505,19 +522,31 @@ pub(super) fn workspace_bootstrap_script_with_signals(signals: BootstrapSignals)
     )
 }
 
+/// Wrap a guest command in the setup script its session's mode calls for.
+///
+/// The mode decides the signalling scheme rather than the caller choosing
+/// one, so a locked session cannot be started with scripts that write
+/// sentinel files the host will never come back to read.
 pub(super) fn wrap_guest_command(
+    mode: Ipv6IsolationMode,
     workspace: Option<&AgentVmWorkspaceBootstrap>,
     guest_command: Vec<String>,
 ) -> Result<Vec<String>, AgentVmDaemonError> {
+    let signals = BootstrapSignals::for_mode(mode);
     match workspace {
-        Some(workspace) => wrap_guest_command_with_workspace_bootstrap(workspace, guest_command),
-        None => Ok(wrap_guest_command_with_nix_setup(guest_command)),
+        Some(workspace) => {
+            wrap_guest_command_with_workspace_bootstrap(signals, workspace, guest_command)
+        }
+        None => Ok(wrap_guest_command_with_nix_setup(signals, guest_command)),
     }
 }
 
-fn wrap_guest_command_with_nix_setup(guest_command: Vec<String>) -> Vec<String> {
+fn wrap_guest_command_with_nix_setup(
+    signals: BootstrapSignals,
+    guest_command: Vec<String>,
+) -> Vec<String> {
     shell_wrapped_command(
-        &nix_setup_script(),
+        &nix_setup_script_with_signals(signals),
         "writ-agent-vm-nix-setup",
         std::iter::empty::<String>(),
         guest_command,
@@ -525,6 +554,7 @@ fn wrap_guest_command_with_nix_setup(guest_command: Vec<String>) -> Vec<String> 
 }
 
 pub(super) fn wrap_guest_command_with_workspace_bootstrap(
+    signals: BootstrapSignals,
     workspace: &AgentVmWorkspaceBootstrap,
     guest_command: Vec<String>,
 ) -> Result<Vec<String>, AgentVmDaemonError> {
@@ -534,7 +564,7 @@ pub(super) fn wrap_guest_command_with_workspace_bootstrap(
         .map(str::to_owned)
         .ok_or_else(|| AgentVmDaemonError::NonUtf8WorkspaceDestination(destination.clone()))?;
     Ok(shell_wrapped_command(
-        &workspace_bootstrap_script(),
+        &workspace_bootstrap_script_with_signals(signals),
         "writ-agent-vm-workspace-bootstrap",
         [
             workspace.repo.to_string(),
@@ -648,7 +678,7 @@ mod spec {
         fn nix_setup_wrapper_preserves_guest_command_argv(
             guest_command in prop::collection::vec(any::<String>(), 1..16),
         ) {
-            let wrapped = wrap_guest_command_with_nix_setup(guest_command.clone());
+            let wrapped = wrap_guest_command_with_nix_setup(BootstrapSignals::SentinelFiles, guest_command.clone());
             prop_assert_eq!(&wrapped[..4], &[
                 "sh".to_string(),
                 "-c".to_string(),
@@ -672,7 +702,7 @@ mod spec {
                 destination: Some(PathBuf::from("/workspace/repo")),
                 warm,
             };
-            let wrapped = wrap_guest_command_with_workspace_bootstrap(&workspace, guest_command.clone()).unwrap();
+            let wrapped = wrap_guest_command_with_workspace_bootstrap(BootstrapSignals::SentinelFiles, &workspace, guest_command.clone()).unwrap();
             prop_assert_eq!(&wrapped[..4], &[
                 "sh".to_string(),
                 "-c".to_string(),

@@ -761,3 +761,46 @@ fn enclosing_fn(text: &str, at: usize) -> Option<&str> {
     let name_len = text[start..].find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
     Some(&text[start..start + name_len])
 }
+
+/// A locked guest's bootstrap outcome reaches an operator and nothing else.
+///
+/// It is printed after the release by code running as the same UID as PID 1,
+/// which can print whatever it likes, so a forged `ok` must buy nothing: it
+/// ends a wait and is reported. The enumeration is the check — the two names
+/// that carry the outcome may appear only where it is read and where it is
+/// turned into a start's success or failure, so a grant, a proxy, or a staged
+/// push that began keying off it would show up here as a new file.
+///
+/// What this does not catch is the outcome being laundered through some
+/// third value before reaching an authority path. Nothing does that today,
+/// and the shape that would make it impossible — an outcome type the
+/// authority paths cannot name at all — is not worth building for a value
+/// with one consumer.
+#[test]
+fn nothing_with_authority_reads_the_guests_bootstrap_outcome() {
+    let hits = offenders(
+        &["GuestBootstrapRecord", "await_bootstrap"],
+        &[
+            // Defines the vocabulary and the wait.
+            "src/agent_vm_guest_log.rs",
+            "src/agent_vm_guest_log/tests.rs",
+            // The daemon's start arm: the one consumer, which turns the
+            // outcome into "this session started" or an operator-facing
+            // failure. Its parent module carries the import.
+            "src/agent_vm_daemon/daemon_impl.rs",
+            "src/agent_vm_daemon.rs",
+            // Runs the guest's own failure emitter under `/bin/sh` and holds
+            // what it prints to the host's parser, which is the opposite
+            // direction: it checks the guest can be *read*, not that it is
+            // believed.
+            "src/agent_vm_daemon/guest_command_tests.rs",
+        ],
+    );
+    assert!(
+        hits.is_empty(),
+        "a locked guest's bootstrap outcome is untrusted: it may end the start's wait and be \
+         reported, and nothing that mints, proxies, or stages on a session's behalf may consult \
+         it.\n  {}",
+        hits.join("\n  ")
+    );
+}

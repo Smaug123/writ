@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
 
 use crate::agent_run::{AgentPrompt, AgentRunId};
+use crate::agent_vm_guest_log::{
+    ChannelWaitError, GuestBootstrapChannel, GuestBootstrapRecord, GuestLogChannel,
+};
 use crate::agent_vm_lifecycle::{
     AgentVmGuestEnvVar, AgentVmLifecycleConfigError, AgentVmNames, AgentVmResources,
     AgentVmSessionManagerError, AgentVmSessionPlan, AgentVmSessionState, AgentVmSessionStateError,
@@ -22,9 +25,11 @@ use crate::agent_vm_lifecycle::{
     BrokerPlacement, ConfiguredIpv6Profile, ContainerImage, HostIface, Ipv6IsolationMode,
     Ipv6ProfileClosed, NetworkHealth, ProbeDebounce, ProbeObservation, ProcessInvocation,
     ProcessInvocationError, claim_agent_vm_session_subnet, cleanup_managed_agent_vm_session,
-    complete_agent_vm_session_start, evaluate_host_path, host_interfaces,
-    remove_managed_agent_vm_session_state, start_agent_vm_session,
+    complete_agent_vm_session_start, complete_locked_session_prefix, evaluate_host_path,
+    host_interfaces, remove_managed_agent_vm_session_state, start_agent_vm_session,
 };
+use crate::agent_vm_locked_admission::{AdmittedProfile, LockedV1Admission};
+use crate::agent_vm_locked_session::{LockedStartError, run_locked_start};
 use crate::audit::{
     AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog, NixCacheAuditEntry,
     NixCacheAuditRoute,
@@ -45,9 +50,10 @@ use crate::secret::SecretStore;
 use crate::server::BrokerState;
 use crate::vm_git::AgentVmWorkspaceBootstrap;
 use crate::vm_http::{
-    RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX, VM_NIX_PREWARM_PATH_PREFIX,
-    VmHttpAgentRunService, VmHttpBearerToken, VmHttpGitPushService, VmHttpRuntimeConfig,
-    VmHttpRuntimeError, VmHttpRuntimeShutdownError, prepare_vm_http_session_with_agent_runs,
+    BrokerListening, RunningVmHttpSession, VM_NIX_BASIC_LOGIN, VM_NIX_CACHE_PATH_PREFIX,
+    VM_NIX_PREWARM_PATH_PREFIX, VmHttpAgentRunService, VmHttpBearerToken, VmHttpGitPushService,
+    VmHttpRuntimeConfig, VmHttpRuntimeError, VmHttpRuntimeShutdownError,
+    prepare_vm_http_session_with_agent_runs,
 };
 
 pub use crate::vm_git::{
@@ -521,6 +527,23 @@ pub enum AgentVmDaemonError {
     WorkspaceBootstrapOutputTooLarge { step: &'static str, limit: usize },
     #[error("agent VM workspace bootstrap failed: {message}")]
     WorkspaceBootstrapFailed { message: String },
+    /// The locked start did not reach a released workload. The session's
+    /// record says how far it got, and
+    /// [`LockedStartError::workload_may_be_running`] says whether the guest
+    /// was let go before the failure — either way the caller tears the
+    /// session down.
+    #[error("agent VM locked start failed: {source}")]
+    LockedStartFailed {
+        #[source]
+        source: Box<LockedStartError>,
+    },
+    /// The released guest's bootstrap channel could not be read at all — a
+    /// flood past the cap, a wedged `container logs`, or a log carrying more
+    /// than one record. Distinct from a guest that *reported* a failure,
+    /// which is [`Self::WorkspaceBootstrapFailed`] whichever channel carried
+    /// it.
+    #[error("agent VM locked bootstrap channel could not be read: {0}")]
+    LockedBootstrapUnread(String),
     #[error("agent VM workspace bootstrap timed out after {timeout:?}")]
     WorkspaceBootstrapTimedOut { timeout: Duration },
     #[error(
