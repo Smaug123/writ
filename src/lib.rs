@@ -13,6 +13,8 @@ pub mod agent_vm_daemon;
 #[cfg(feature = "host")]
 pub mod agent_vm_firewall;
 #[cfg(feature = "host")]
+pub mod agent_vm_guest_log;
+#[cfg(feature = "host")]
 pub mod agent_vm_lifecycle;
 #[cfg(feature = "host")]
 pub mod agent_vm_locked_admission;
@@ -22,6 +24,8 @@ pub mod agent_vm_locked_lifecycle;
 pub mod agent_vm_pf_helper_policy;
 #[cfg(feature = "host")]
 pub mod agent_vm_pf_helper_protocol;
+#[cfg(feature = "host")]
+pub mod agent_vm_probe;
 #[cfg(feature = "host")]
 pub use writ_audit as audit;
 #[cfg(feature = "host")]
