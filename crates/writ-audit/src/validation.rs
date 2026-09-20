@@ -27,8 +27,8 @@ pub(super) fn check_session_open(
         )
         .optional()?;
     match session_closed_at {
-        None => Err(AuditError::Invariant("session does not exist")),
-        Some(Some(_)) => Err(AuditError::Invariant("session is closed")),
+        None => Err(AuditError::SessionNotFound { session_id }),
+        Some(Some(_)) => Err(AuditError::SessionClosed { session_id }),
         Some(None) => Ok(()),
     }
 }
@@ -114,9 +114,10 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// The guard classifies the three session states: an open session is
-        /// `Ok`, a closed one is `Invariant("session is closed")`, and an id that
-        /// was never opened is `Invariant("session does not exist")`. Every
-        /// two-phase writer relies on this trichotomy.
+        /// `Ok`, a closed one is [`AuditError::SessionClosed`], and an id that
+        /// was never opened is [`AuditError::SessionNotFound`]. Each error
+        /// names the session it was asked about. Every two-phase writer relies
+        /// on this trichotomy.
         #[test]
         fn check_session_open_classifies_open_closed_and_missing(
             close: bool,
@@ -128,9 +129,13 @@ mod tests {
 
             // An id that was never opened: "does not exist" (a fresh random id
             // cannot collide with the sample session).
-            let missing = log.with_conn(|c| check_session_open(c, SessionId::new()));
+            let absent_id = SessionId::new();
+            let missing = log.with_conn(|c| check_session_open(c, absent_id));
             prop_assert!(
-                matches!(missing, Err(AuditError::Invariant("session does not exist"))),
+                matches!(
+                    missing,
+                    Err(AuditError::SessionNotFound { session_id }) if session_id == absent_id
+                ),
                 "got: {missing:?}"
             );
 
@@ -139,7 +144,10 @@ mod tests {
                     .unwrap();
                 let closed = log.with_conn(|c| check_session_open(c, s.session_id));
                 prop_assert!(
-                    matches!(closed, Err(AuditError::Invariant("session is closed"))),
+                    matches!(
+                        closed,
+                        Err(AuditError::SessionClosed { session_id }) if session_id == s.session_id
+                    ),
                     "got: {closed:?}"
                 );
             } else {
