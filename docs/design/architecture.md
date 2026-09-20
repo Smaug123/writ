@@ -1396,6 +1396,16 @@ UID by then and can print whatever it likes — and a workspace guard enumerates
 the outcome's readers so a grant, proxy or staged push that began keying off
 it would fail the build.
 
+A locked session is also told where its home is. Its workload runs as
+1000:1000, while the image's `HOME` is root's, mode 0700 — and the guest setup
+script runs under `set -eu` and writes to `$HOME/.claude` before it can report
+anything, so an unwritable home is a container that dies without a record and
+a host that waits out the whole bootstrap budget. The daemon sets `HOME` to
+`OwnedDirectory::Home`'s official-image path, which is the constant the
+initializer's own interpreter maps that directory onto, so the host cannot
+name a home the handoff did not chown. No other mode sets it; they run as
+root, whose home the image's value already is.
+
 The decision the arm dispatches on is `AdmittedProfile`, which mirrors
 `Ipv6IsolationMode` variant for variant and carries the `LockedV1Admission`
 on the locked one. The digest has to travel with the decision because the

@@ -11,6 +11,7 @@ use crate::vm_git::{DEFAULT_WORKSPACE_BRANCH, WorkspaceWarmMode};
 use proptest::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
+use writ_guest_init::handoff::OwnedDirectory;
 
 /// A closed profile refuses new sessions and leaves nothing behind.
 ///
@@ -2940,5 +2941,74 @@ async fn a_locked_start_against_an_unadmitted_image_never_releases_the_guest() {
     assert!(
         !argv.contains("kill --signal"),
         "the workload must not be released: {argv}"
+    );
+}
+
+/// A locked guest's setup script runs under `set -eu` as the fixed
+/// unprivileged identity, so the first directory it cannot write to kills it
+/// before it has reported anything — and the host then waits out the whole
+/// bootstrap budget on a container that is already gone.
+///
+/// Every directory the script writes to before its first outcome must
+/// therefore be one the initializer chowned to that identity. `HOME` is the
+/// one the image gets wrong for this profile: the image's own is root's, mode
+/// 0700, which the locked workload cannot write to at all.
+#[tokio::test]
+async fn every_directory_a_locked_guest_writes_to_is_one_the_handoff_owns() {
+    let harness = LockedHarness::new(LockedGuest::BootstrapsCleanly);
+    let state = make_state();
+    harness.start(&state).await.unwrap();
+
+    let raw = fs::read_to_string(&harness.env_log).unwrap();
+    let env: std::collections::HashMap<&str, &str> = raw
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let owned: Vec<&str> = OwnedDirectory::ALL
+        .iter()
+        .map(|dir| dir.official_image_path())
+        .collect();
+    for var in ["HOME", AGENT_VM_NIX_NETRC_ENV, AGENT_VM_NIX_CONF_DIR_ENV] {
+        let written = env
+            .get(var)
+            .unwrap_or_else(|| panic!("a locked session should be handed {var}: {raw}"));
+        assert!(
+            owned
+                .iter()
+                .any(|dir| written == dir || written.starts_with(&format!("{dir}/"))),
+            "{var}={written} is not under a directory the handoff chowns ({owned:?})"
+        );
+    }
+}
+
+/// And only the locked profile is told where its home is. Every other mode
+/// runs as root, whose home is what the image already says; overriding it
+/// would point a root workload at a directory nothing prepared for it.
+#[tokio::test]
+async fn no_other_profile_is_handed_a_home() {
+    let Harness {
+        // Bound so the fixture's tempdir outlives the start.
+        dir: _dir,
+        env_log,
+        daemon,
+        ..
+    } = Harness::new();
+    let state = make_state();
+    daemon
+        .start_session(
+            Arc::clone(&state),
+            None,
+            None,
+            None,
+            None,
+            vec!["sleep".into(), "600".into()],
+        )
+        .await
+        .unwrap();
+
+    let env = fs::read_to_string(&env_log).unwrap();
+    assert!(
+        !env.lines().any(|line| line.starts_with("HOME=")),
+        "a root workload keeps the image's HOME: {env}"
     );
 }

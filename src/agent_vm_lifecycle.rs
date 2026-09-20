@@ -466,6 +466,21 @@ impl Ipv6IsolationMode {
         }
     }
 
+    /// Whether the workload runs as the fixed unprivileged identity rather
+    /// than as root.
+    ///
+    /// Only the locked profile does: its initializer drops to 1000:1000
+    /// before the workload starts, and cannot give it back. That changes what
+    /// the guest can write — the image's own `HOME` is root's, mode 0700 —
+    /// so the host has to point the workload at the home the initializer
+    /// chowned.
+    pub fn runs_as_the_locked_identity(self) -> bool {
+        match self {
+            Self::DualStackRequired | Self::Ipv4OnlyNoGuestIpv6 => false,
+            Self::Ipv4OnlyLockedV1 => true,
+        }
+    }
+
     /// Whether a session under this mode can be started without a state
     /// store.
     ///

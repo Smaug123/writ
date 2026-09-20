@@ -30,6 +30,8 @@ use crate::agent_vm_lifecycle::{
 };
 use crate::agent_vm_locked_admission::{AdmittedProfile, LockedV1Admission};
 use crate::agent_vm_locked_session::{LockedStartError, run_locked_start};
+use writ_guest_init::handoff::OwnedDirectory;
+
 use crate::audit::{
     AgentRunAuditRecord, AgentVmNetworkHealthEventRecord, AuditError, AuditLog, NixCacheAuditEntry,
     NixCacheAuditRoute,
@@ -81,6 +83,12 @@ pub const AGENT_VM_NIX_CACHE_URL_ENV: &str = "WRIT_NIX_CACHE_URL";
 /// substituter, exactly as before. Same env-var name the guest reads as
 /// [`crate::vm_git::VM_NIX_PREWARM_URL_ENV`] — this is the host-facing alias.
 pub use crate::vm_git::VM_NIX_PREWARM_URL_ENV as AGENT_VM_NIX_PREWARM_URL_ENV;
+/// The guest's home directory.
+///
+/// Set only for the locked profile, whose workload is not root; see
+/// [`Ipv6IsolationMode::runs_as_the_locked_identity`]. Every other mode takes
+/// the image's own value.
+pub const AGENT_VM_HOME_ENV: &str = "HOME";
 pub const AGENT_VM_NIX_BASIC_LOGIN_ENV: &str = "WRIT_NIX_BASIC_LOGIN";
 pub const AGENT_VM_NIX_NETRC_ENV: &str = "WRIT_NIX_NETRC";
 pub const AGENT_VM_NIX_NETRC_PATH: &str = "/run/writ-agent-vm/netrc";

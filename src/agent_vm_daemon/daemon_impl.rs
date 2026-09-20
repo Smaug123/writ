@@ -1182,6 +1182,21 @@ impl AgentVmDaemon {
             AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV,
             require_no_ipv6,
         )?);
+        // A locked workload runs as 1000:1000, and the image's `HOME` is
+        // root's — mode 0700, which that identity cannot write to. The guest
+        // setup script runs under `set -eu` and writes to `$HOME/.claude`
+        // before it can report anything, so an unwritable home is a container
+        // that dies silently and a host that waits out the whole bootstrap
+        // budget. Point it at the home the initializer chowned, named from
+        // the same constant the initializer maps `OwnedDirectory::Home` onto.
+        // Every other mode runs as root, whose home the image's `HOME`
+        // already is.
+        if ipv6_mode.runs_as_the_locked_identity() {
+            guest_env.push(AgentVmGuestEnvVar::new(
+                AGENT_VM_HOME_ENV,
+                OwnedDirectory::Home.official_image_path(),
+            )?);
+        }
         // Advertise the strict pre-warm-only substituter exactly when the broker
         // actually serves it: its presence pins the devShell warm to the broker's
         // /v1/nix/prewarm so the warm is provably served offline from the

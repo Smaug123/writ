@@ -1020,10 +1020,27 @@ began consulting it fails the build. What the guard cannot see is the outcome
 laundered through a third value; nothing does that, and the shape that would
 make it impossible is not worth building for a value with one consumer.
 
-Four weakenings were injected and fail these tests: a locked session wrapped
+A review round found the one thing none of that would have caught, because it
+is about the *guest*: wiring the arm up made the locked profile reachable
+against the official image for the first time, and that image's `HOME` is
+`/root`, mode 0700. The locked workload is 1000:1000, and the setup script
+runs under `set -eu` and writes `$HOME/.claude` before it can report anything
+— so the container would have died with no record and the host would have
+waited out the full twenty minutes. The daemon now sets `HOME` for this
+profile alone, from `OwnedDirectory::Home`'s official-image path, which is
+hoisted into the shared crate so the initializer's interpreter and the host
+read one constant.
+
+The test for it is not "HOME is set". Every directory the script writes to
+before its first outcome has to be one the handoff chowned, and that is what
+is asserted — over the env file a real locked start produced, against
+`OwnedDirectory::ALL`. It fails without the fix and would catch the next path
+added to the prologue.
+
+Five weakenings were injected and fail these tests: a locked session wrapped
 with the sentinel scripts, a release that accepts any listening broker, an
-`exec` anywhere in the locked path, and a bootstrap reader that ends its wait
-on a `security-ready` line.
+`exec` anywhere in the locked path, a bootstrap reader that ends its wait on a
+`security-ready` line, and a locked guest left with the image's `HOME`.
 
 ---
 

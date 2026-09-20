@@ -182,15 +182,15 @@ mod linux {
     /// without changing what is guarded. The identity handoff itself has no
     /// such knob.
     fn owned_directory_path(dir: OwnedDirectory) -> PathBuf {
-        let (var, default) = match dir {
-            OwnedDirectory::Runtime => ("WRIT_GUEST_INIT_RUNTIME_DIR", "/run/writ-agent-vm"),
-            OwnedDirectory::Home => ("WRIT_GUEST_INIT_HOME_DIR", "/home/writ"),
-            OwnedDirectory::Workspace => ("WRIT_GUEST_INIT_WORKSPACE_DIR", "/workspace"),
-            OwnedDirectory::NixStore => ("WRIT_GUEST_INIT_NIX_STORE_DIR", "/nix"),
+        let var = match dir {
+            OwnedDirectory::Runtime => "WRIT_GUEST_INIT_RUNTIME_DIR",
+            OwnedDirectory::Home => "WRIT_GUEST_INIT_HOME_DIR",
+            OwnedDirectory::Workspace => "WRIT_GUEST_INIT_WORKSPACE_DIR",
+            OwnedDirectory::NixStore => "WRIT_GUEST_INIT_NIX_STORE_DIR",
         };
         std::env::var_os(var)
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(default))
+            .unwrap_or_else(|| PathBuf::from(dir.official_image_path()))
     }
 
     /// Perform one handoff step. Returns a human reason on failure; the caller
