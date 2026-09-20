@@ -265,10 +265,16 @@ pub enum GitDataError {
     /// it as an error strands the commit as an unreferenced object in
     /// the repo instead (harmless; GitHub garbage-collects it).
     #[error(
-        "GitHub created signed commit {sha} but reported it as unverified (reason: {reason}); \
-         refusing to publish an unverified commit"
+        "GitHub created signed commit {sha} but reported it as unverified (reason: {}); \
+         refusing to publish an unverified commit",
+        .reason.as_deref().unwrap_or("none given")
     )]
-    UnverifiedSignedCommit { sha: String, reason: String },
+    UnverifiedSignedCommit {
+        sha: GitObjectId,
+        /// GitHub's own word for why, when it gave one. `None` means
+        /// it reported the signature unverified without saying why.
+        reason: Option<String>,
+    },
     /// A [`CommitRequest`] carried a `signature` and GitHub's response
     /// omitted the `verification` object entirely.
     ///
@@ -282,7 +288,7 @@ pub enum GitDataError {
         "GitHub's response for signed commit {sha} carried no `verification` object, so the \
          Verified guarantee cannot be confirmed; refusing to publish"
     )]
-    MissingVerification { sha: String },
+    MissingVerification { sha: GitObjectId },
 }
 
 /// One row in a tree being uploaded to GitHub. The kind constrains

@@ -767,8 +767,8 @@ async fn replay_reports_unmapped_parent_without_uploading_commit() {
             bundle_sha,
             parent_sha,
         } => {
-            assert_eq!(bundle_sha, commit_bundle.as_str());
-            assert_eq!(parent_sha, orphan_parent.as_str());
+            assert_eq!(bundle_sha, commit_bundle);
+            assert_eq!(parent_sha, orphan_parent);
         }
         other => panic!("expected UnmappedParent, got {other:?}"),
     }

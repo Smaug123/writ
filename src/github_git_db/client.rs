@@ -211,13 +211,13 @@ impl GitDataClient {
                     reason,
                 }) => {
                     return Err(GitDataError::UnverifiedSignedCommit {
-                        sha: parsed.sha.as_str().to_string(),
-                        reason: reason.unwrap_or_else(|| "<no reason given>".to_string()),
+                        sha: parsed.sha.clone(),
+                        reason,
                     });
                 }
                 None => {
                     return Err(GitDataError::MissingVerification {
-                        sha: parsed.sha.as_str().to_string(),
+                        sha: parsed.sha.clone(),
                     });
                 }
             }
