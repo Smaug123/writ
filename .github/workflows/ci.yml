@@ -37,9 +37,19 @@ jobs:
     # devshell's toolchain has to be on PATH for the step itself. The cargo
     # invocations below still run under `nix develop` for the rest of the
     # shell's environment; this only lets the cache action see rustc.
+    #
+    # Only the Nix store entries are exported. `nix develop` inherits the
+    # runner's PATH, and the runner's own rustup shim directory
+    # (/home/runner/.cargo/bin) sorts ahead of the toolchain the devshell
+    # brings, so exporting that PATH verbatim left rust-cache keying on the
+    # runner's rustc (1.98.1) rather than ours (1.96.1). The grep drops the
+    # shim from the exported block; the runner's PATH is still appended after
+    # it, so nothing is lost. An empty grep fails the step, which is what we
+    # want if this assumption ever stops holding.
     - name: Expose the devshell toolchain to later steps
       run: |
-        nix develop --command sh -c 'printf "%s\n" "$PATH" | tr ":" "\n"' >> "$GITHUB_PATH"
+        nix develop --command sh -c 'printf "%s\n" "$PATH" | tr ":" "\n"' \
+          | grep '^/nix/store/' >> "$GITHUB_PATH"
 
     # Restores ~/.cargo (registry, git checkouts) and target/ from the last run
     # with the same Cargo.lock and toolchain. Without it every run compiles all
