@@ -327,7 +327,12 @@ fn build_start_plan(
         // under must not acquire one through a second front door.
         ConfiguredIpv6Profile::from(args.ipv6_mode)
             .admit()
-            .map_err(|closed| closed.to_string())?,
+            .map_err(|closed| closed.to_string())?
+            // A plan carries the mode; the rest of the decision (the locked
+            // profile's admitted image digest) is for the start path that can
+            // use it, and this one refuses that profile outright — it has no
+            // state store, so it could never release the guest.
+            .ipv6_mode(),
         ContainerImage::new(args.image)?,
         args.guest_command,
         AgentVmResources::new(args.cpus, args.memory_mib)?,

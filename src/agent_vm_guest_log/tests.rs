@@ -236,20 +236,25 @@ proptest! {
     /// never exceeds the poll interval. Stated over every combination of the
     /// three, because it is the whole of "`overall_timeout` bounds the wait"
     /// and it is pure — timing the real loop would measure spawn latency.
+    ///
+    /// Held against [`ChannelWait`] itself, which is what both channels wait
+    /// on, so neither can acquire a bound the other does not have.
     #[test]
     fn next_poll_sleep_never_outlasts_the_budget(
         poll_ms in 0u64..100_000,
         budget_ms in 0u64..100_000,
         elapsed_ms in 0u64..100_000,
     ) {
-        let channel = GuestLogChannel::new(Path::new("/nonexistent"), "vm")
-            .with_wait_bounds_for_test(
-                Duration::from_millis(poll_ms),
-                Duration::from_millis(budget_ms),
-            );
+        let wait = ChannelWait::reading(
+            Path::new("/nonexistent"),
+            "vm",
+            GUEST_LOG_MAX_BYTES,
+            Duration::from_millis(poll_ms),
+            Duration::from_millis(budget_ms),
+        );
         let left = Duration::from_millis(budget_ms)
             .saturating_sub(Duration::from_millis(elapsed_ms));
-        let sleep = channel.next_poll_sleep(Duration::from_millis(elapsed_ms));
+        let sleep = wait.next_poll_sleep(Duration::from_millis(elapsed_ms));
         prop_assert!(sleep <= left, "{sleep:?} > {left:?} left");
         prop_assert!(sleep <= Duration::from_millis(poll_ms));
     }
@@ -307,6 +312,13 @@ fi
     /// out a deliberate hang.
     fn channel(&self) -> GuestLogChannel {
         GuestLogChannel::new(&self.root().join("container"), "writ-agent-vm-test")
+            .with_wait_bounds_for_test(Duration::from_millis(5), Duration::from_secs(60))
+    }
+
+    /// The post-release channel against the same fake, under the same
+    /// test-sized waiting bounds and for the same reason.
+    fn bootstrap_channel(&self) -> GuestBootstrapChannel {
+        GuestBootstrapChannel::new(&self.root().join("container"), "writ-agent-vm-test")
             .with_wait_bounds_for_test(Duration::from_millis(5), Duration::from_secs(60))
     }
 
@@ -586,4 +598,114 @@ fn an_over_long_bootstrap_record_is_refused() {
             ..
         })
     ));
+}
+
+// --- the post-release wait --------------------------------------------------
+
+/// The post-release read is the same command as the pre-release one: the
+/// channel is one log, and only its reader and its bounds differ.
+#[test]
+fn the_post_release_read_is_the_same_command() {
+    let channel = GuestBootstrapChannel::new(Path::new("/usr/local/bin/container"), "vm-abc");
+    assert_eq!(
+        channel.probe().invocation.args_lossy(),
+        vec!["logs".to_string(), "vm-abc".to_string()]
+    );
+    assert_eq!(channel.probe().byte_cap, GUEST_BOOTSTRAP_LOG_MAX_BYTES);
+}
+
+#[tokio::test]
+async fn a_bootstrap_ok_record_ends_the_wait() {
+    let fake = FakeContainer::printing(&format!(
+        "{}\nnix output\n{}\n",
+        ready_line(),
+        GuestBootstrapRecord::Ok.render()
+    ));
+    assert_eq!(
+        fake.bootstrap_channel().await_bootstrap().await,
+        Ok(GuestBootstrapRecord::Ok)
+    );
+}
+
+/// A failure is an outcome the wait *ends* on, not an error: the host reports
+/// the guest's reason rather than the guest's log being unreadable.
+#[tokio::test]
+async fn a_bootstrap_failure_ends_the_wait_with_its_reason() {
+    let record = GuestBootstrapRecord::Failed {
+        message: BoundedMessage::parse("writ-vm workspace init failed with exit 1").unwrap(),
+    };
+    let fake = FakeContainer::printing(&format!("{}\n", record.render()));
+    assert_eq!(fake.bootstrap_channel().await_bootstrap().await, Ok(record));
+}
+
+/// The two vocabularies cannot be mistaken for one another *through the
+/// wait*, not merely in the scan. A workload that prints the initializer's
+/// record — which it can, being the same UID as PID 1 by then — does not end
+/// the post-release wait, and neither does the real pre-release record that
+/// is still sitting in the log.
+#[tokio::test]
+async fn no_security_ready_record_ends_the_post_release_wait() {
+    for log in [
+        format!("{}\n", ready_line()),
+        format!("{}\n{}\n", ready_line(), ready_line()),
+        format!("noise\n{}\ntrailing\n", ready_line()),
+    ] {
+        let fake = FakeContainer::printing(&log);
+        let channel = fake
+            .bootstrap_channel()
+            .with_wait_bounds_for_test(Duration::from_millis(5), Duration::from_millis(120));
+        assert!(
+            matches!(
+                channel.await_bootstrap().await,
+                Err(ChannelWaitError::Silent { .. })
+            ),
+            "{log:?} should not end the bootstrap wait"
+        );
+    }
+}
+
+/// Two bootstrap records are refused through the wait as well as in the
+/// scan: each writer on this channel reports once, so a second is something
+/// else writing.
+#[tokio::test]
+async fn a_repeated_bootstrap_record_stops_the_wait() {
+    let fake = FakeContainer::printing(&format!(
+        "{}\n{}\n",
+        GuestBootstrapRecord::Ok.render(),
+        GuestBootstrapRecord::Ok.render()
+    ));
+    assert!(matches!(
+        fake.bootstrap_channel().await_bootstrap().await,
+        Err(ChannelWaitError::Unreadable(GuestLogScanError::Repeated {
+            count: 2
+        }))
+    ));
+}
+
+/// A guest that floods the post-release channel is refused rather than read
+/// in part: a truncated log could be missing the record that would have
+/// refused.
+#[tokio::test]
+async fn a_flooded_post_release_channel_is_refused() {
+    let fake = FakeContainer::new(
+        "printf '%s\\n' 'writ-agent-vm-bootstrap ok'\nexec dd if=/dev/zero bs=65536 count=64 2>/dev/null",
+    );
+    assert_eq!(
+        fake.bootstrap_channel().await_bootstrap().await,
+        Err(ChannelWaitError::Unread(ProbeRunFailure::OutputTooLarge))
+    );
+}
+
+/// A guest that never reports is a timeout, not a hang.
+#[tokio::test]
+async fn a_silent_post_release_channel_times_out() {
+    let timeout = Duration::from_millis(120);
+    let fake = FakeContainer::printing("still warming\n");
+    let channel = fake
+        .bootstrap_channel()
+        .with_wait_bounds_for_test(Duration::from_millis(5), timeout);
+    assert_eq!(
+        channel.await_bootstrap().await,
+        Err(ChannelWaitError::Silent { timeout })
+    );
 }

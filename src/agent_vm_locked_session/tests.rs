@@ -26,6 +26,7 @@ use crate::core::{
     AgentNetworkPool, BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr, SessionId,
 };
 use crate::test_support::{shell_quote_path, write_executable_script};
+use crate::vm_http::BrokerListening;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use writ_guest_init::record::SECURITY_READY_LINE;
 
@@ -33,6 +34,12 @@ const IMAGE_DIGEST: &str =
     "sha256:226205c93c1bc4148f691c0162118b39d8fca907691e9fc620bddce2dec6567e";
 const OTHER_DIGEST: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The port this session's guest is pointed at, and so the one a broker must
+/// be listening on for the release to mean anything.
+fn broker_port() -> BrokerPort {
+    BrokerPort::new(51375).unwrap()
+}
 
 fn session_id() -> SessionId {
     SessionId::from_uuid(uuid::Uuid::from_u128(
@@ -215,7 +222,7 @@ exit 0
             )
             .unwrap(),
             7,
-            BrokerPorts::new([BrokerPort::new(51375).unwrap()]).unwrap(),
+            BrokerPorts::new([broker_port()]).unwrap(),
             BrokerPortRange::new(49152, 65535).unwrap(),
             Ipv6IsolationMode::Ipv4OnlyLockedV1,
             BrokerPlacement::Host,
@@ -253,6 +260,7 @@ exit 0
             claimed,
             &admitted(),
             &channel,
+            BrokerListening::claimed_for_test(broker_port()),
         )
         .await
     }
@@ -508,4 +516,41 @@ async fn an_install_that_floods_is_refused_rather_than_read_in_part() {
     );
     assert_eq!(harness.phase(), Some(LockedPhase::AgentVmStarted));
     assert!(!harness.steps().contains(&"kill".to_string()));
+}
+
+/// The release is how a locked guest learns its broker exists, so the proof
+/// that one is listening has to be about *this* session's broker. A proof for
+/// another port refuses before anything is created.
+#[tokio::test]
+async fn a_broker_on_another_port_is_not_this_sessions_broker() {
+    let harness = Harness::new(Fault::None);
+    let claimed = harness.store.create_starting(&harness.plan).unwrap();
+    let channel = GuestLogChannel::new(harness.tools.container(), harness.plan.names().vm());
+    let elsewhere = BrokerPort::new(51376).unwrap();
+    let error = run_locked_start(
+        &harness.store,
+        &harness.plan,
+        &harness.tools,
+        claimed,
+        &admitted(),
+        &channel,
+        BrokerListening::claimed_for_test(elsewhere),
+    )
+    .await
+    .expect_err("a broker on another port is not this session's");
+
+    assert!(
+        matches!(
+            error,
+            LockedStartError::BrokerIsNotThisSessions { listening } if listening == elsewhere.get()
+        ),
+        "{error}"
+    );
+    assert!(!error.workload_may_be_running());
+    assert!(
+        harness.steps().is_empty(),
+        "nothing should have been run: {:?}",
+        harness.steps()
+    );
+    assert_eq!(harness.phase(), Some(LockedPhase::Claimed));
 }

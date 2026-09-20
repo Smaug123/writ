@@ -84,12 +84,12 @@ impl AgentVmDaemon {
         &self.config
     }
 
-    /// The active IPv6 mode a new session may start in, or the reason none may.
+    /// What a new session may start as, or the reason none may.
     ///
     /// Pure, and cheap enough to ask again rather than thread onward: the
     /// admission gates below consult it before a session has an identity, and
-    /// the start path consults it again when it needs the mode itself.
-    fn admitted_ipv6_mode(&self) -> Result<Ipv6IsolationMode, AgentVmDaemonError> {
+    /// the start path consults it again when it needs the answer itself.
+    fn admitted_profile(&self) -> Result<AdmittedProfile, AgentVmDaemonError> {
         Ok(self.config.lifecycle.ipv6_profile.admit()?)
     }
 
@@ -114,7 +114,7 @@ impl AgentVmDaemon {
         if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
             return Err(AgentVmDaemonError::Ipv6ConfinementUnavailableForVmBroker);
         }
-        let ipv6_mode = self.admitted_ipv6_mode()?;
+        let admitted = self.admitted_profile()?;
 
         let session_id = SessionId::new();
         let session_lock = self.session_lock_handle(session_id).await;
@@ -137,7 +137,7 @@ impl AgentVmDaemon {
                 self.start_session_after_audit_opened(
                     Arc::clone(&state),
                     session_id,
-                    ipv6_mode,
+                    admitted,
                     agent_kind,
                     workspace,
                     guest_command,
@@ -209,7 +209,7 @@ impl AgentVmDaemon {
         if let BrokerPlacement::Vm = self.config.lifecycle.broker_placement {
             return Err(AgentVmDaemonError::AgentRunUnsupportedForVmBroker);
         }
-        self.admitted_ipv6_mode()?;
+        self.admitted_profile()?;
         let session_id = SessionId::new();
         let run_id = AgentRunId::new();
         // Everything that can refuse this request happens before the per-session
@@ -366,7 +366,7 @@ impl AgentVmDaemon {
                 self.start_session_after_audit_opened(
                     Arc::clone(&state),
                     session_id,
-                    self.admitted_ipv6_mode()?,
+                    self.admitted_profile()?,
                     Some(agent_kind),
                     Some(workspace),
                     guest_command,
@@ -732,6 +732,71 @@ impl AgentVmDaemon {
             Ok(_) => Ok(true),
             Err(AgentVmSessionStateError::NotFound { .. }) => Ok(false),
             Err(other) => Err(AgentVmDaemonError::Manager(other.into())),
+        }
+    }
+
+    /// Start a locked session's VM, release it, and wait for what it reports.
+    ///
+    /// The shared prefix has run and the broker is listening, which is what
+    /// `broker` is: the release is how a locked guest learns the broker
+    /// exists, because this profile has no broker-ready file for it to wait
+    /// on. What is left is [`run_locked_start`]'s sequence — create, read
+    /// back, start, install the attached anchor, wait for `security-ready`,
+    /// record, release — and then the post-release wait, which here is
+    /// another read of the guest's log rather than a `container exec`. A
+    /// locked session therefore has no `exec` in its life at all.
+    ///
+    /// The two waits are two channels because they have two standings. The
+    /// first reads a log with one trusted writer for the fact that gates the
+    /// release; the second reads a log that repository-controlled code is
+    /// writing to, for an outcome that ends this wait and reaches an operator
+    /// and does nothing else.
+    async fn run_locked_session(
+        &self,
+        plan: &AgentVmSessionPlan,
+        claimed: AgentVmSessionState,
+        admission: &LockedV1Admission,
+        broker: BrokerListening,
+    ) -> Result<(), AgentVmDaemonError> {
+        let store = self.config.lifecycle.state_store.clone();
+        let tools = self.config.lifecycle.tools.clone();
+        let vm_name = plan.names().vm();
+        run_locked_start(
+            &store,
+            plan,
+            &tools,
+            claimed,
+            admission.image_digest(),
+            &GuestLogChannel::new(tools.container(), vm_name),
+            broker,
+        )
+        .await
+        .map_err(|source| AgentVmDaemonError::LockedStartFailed {
+            source: Box::new(source),
+        })?;
+
+        let bootstrap = GuestBootstrapChannel::new(tools.container(), vm_name);
+        match bootstrap.await_bootstrap().await {
+            Ok(GuestBootstrapRecord::Ok) => Ok(()),
+            Ok(GuestBootstrapRecord::Failed { message }) => {
+                let message = message.as_str();
+                Err(AgentVmDaemonError::WorkspaceBootstrapFailed {
+                    message: if message.is_empty() {
+                        "guest did not report a failure message".into()
+                    } else {
+                        // Already one line, control-free and bounded: the
+                        // record would not have parsed otherwise, so there is
+                        // nothing left for the host to scrub.
+                        message.to_string()
+                    },
+                })
+            }
+            Err(ChannelWaitError::Silent { timeout }) => {
+                Err(AgentVmDaemonError::WorkspaceBootstrapTimedOut { timeout })
+            }
+            Err(unread) => Err(AgentVmDaemonError::LockedBootstrapUnread(
+                unread.to_string(),
+            )),
         }
     }
 
@@ -1117,6 +1182,21 @@ impl AgentVmDaemon {
             AGENT_VM_EGRESS_GATE_REQUIRE_NO_IPV6_ENV,
             require_no_ipv6,
         )?);
+        // A locked workload runs as 1000:1000, and the image's `HOME` is
+        // root's — mode 0700, which that identity cannot write to. The guest
+        // setup script runs under `set -eu` and writes to `$HOME/.claude`
+        // before it can report anything, so an unwritable home is a container
+        // that dies silently and a host that waits out the whole bootstrap
+        // budget. Point it at the home the initializer chowned, named from
+        // the same constant the initializer maps `OwnedDirectory::Home` onto.
+        // Every other mode runs as root, whose home the image's `HOME`
+        // already is.
+        if ipv6_mode.runs_as_the_locked_identity() {
+            guest_env.push(AgentVmGuestEnvVar::new(
+                AGENT_VM_HOME_ENV,
+                OwnedDirectory::Home.official_image_path(),
+            )?);
+        }
         // Advertise the strict pre-warm-only substituter exactly when the broker
         // actually serves it: its presence pins the devShell warm to the broker's
         // /v1/nix/prewarm so the warm is provably served offline from the
@@ -1146,11 +1226,13 @@ impl AgentVmDaemon {
         &self,
         state: Arc<BrokerState<S>>,
         session_id: SessionId,
-        // The mode this session runs in, which only
+        // What this session starts as, which only
         // [`ConfiguredIpv6Profile::admit`] produces. Threaded in rather than
         // looked up here, so a session cannot be built under a profile no
-        // session may start under: there is no mode to build it with.
-        ipv6_mode: Ipv6IsolationMode,
+        // session may start under: there is no decision to build it with. For
+        // the locked profile the decision also carries the admitted image
+        // digest, which is the only thing the readback will accept.
+        admitted: AdmittedProfile,
         agent_kind: Option<AgentKind>,
         workspace: Option<AgentVmWorkspaceBootstrap>,
         guest_command: Vec<String>,
@@ -1160,6 +1242,7 @@ impl AgentVmDaemon {
         // session that is not an agent run does not consume an agent-run slot.
         run_slot: Option<crate::server::AgentRunSlot>,
     ) -> Result<AgentVmStarted, AgentVmDaemonError> {
+        let ipv6_mode = admitted.ipv6_mode();
         // Broker placement seam (see docs/vmnet-accept-bug-and-broker-vm-plan.md):
         // the host path runs an in-process broker; the vm path runs the broker in a
         // dedicated VM, working around the macOS vmnet accept() defect. The vm arm
@@ -1230,7 +1313,7 @@ impl AgentVmDaemon {
                 &broker_url,
                 prepared.bearer_token().as_str(),
             )?;
-            let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
+            let guest_command = wrap_guest_command(ipv6_mode, workspace.as_ref(), guest_command)?;
             let plan = self.build_agent_plan(
                 session_id,
                 ipv6_mode,
@@ -1250,12 +1333,38 @@ impl AgentVmDaemon {
 
         let store = self.config.lifecycle.state_store.clone();
         let plan_for_start = plan.clone();
-        tokio::task::spawn_blocking(move || {
-            complete_agent_vm_session_start(&store, &plan_for_start, starting)
-        })
-        .await??;
+        // Where the two profiles part. A legacy start runs its whole step
+        // machine here and has a running VM at the end of it; a locked start
+        // runs only the shared prefix — network, validation, bootstrap anchor
+        // — because everything after it must happen with the broker already
+        // listening, and the broker is spawned below. What survives the match
+        // is what the locked tail needs: its evidence, and its claimed record.
+        let locked_start = match admitted.locked() {
+            None => {
+                tokio::task::spawn_blocking(move || {
+                    complete_agent_vm_session_start(&store, &plan_for_start, starting)
+                })
+                .await??;
+                None
+            }
+            Some(admission) => {
+                tokio::task::spawn_blocking(move || {
+                    complete_locked_session_prefix(&store, &plan_for_start)
+                })
+                .await??;
+                Some((admission.clone(), starting))
+            }
+        };
 
+        // Both arms have installed PF for this broker port by now, which is
+        // what `spawn` requires: the locked prefix loads the *bootstrap*
+        // anchor, whose allow rule already names the port, and the attached
+        // anchor that replaces it later is built from the same ports.
         let running = prepared.spawn();
+        // Taken before the handle is moved into the map: this is the proof the
+        // locked start takes that the broker is up, and only a spawned broker
+        // makes one.
+        let broker = running.listening();
         self.running.lock().await.insert(
             session_id,
             RunningAgentVm {
@@ -1266,14 +1375,23 @@ impl AgentVmDaemon {
         // Start the host-side network-health monitor (idempotent). Lazy here
         // because it needs the audit handle, which arrives with the request.
         self.ensure_network_health_monitor(Arc::clone(&state.audit));
-        // Release broker-ready and wait for the guest's bootstrap sentinels for
-        // EVERY session: both guest scripts run the egress gate and signal
-        // bootstrap-ok/failed, so a gate failure (or workspace-init failure) is
-        // surfaced before we report the session started.
-        if let Err(mut err) = self
-            .release_and_wait_for_workspace_bootstrap(plan.names().vm())
-            .await
-        {
+        // Every session waits for the guest to report its bootstrap outcome
+        // before being called started: both guest scripts run the egress gate
+        // and report the same two outcomes, so a gate failure (or a
+        // workspace-init failure) is surfaced here rather than returned as a
+        // VM that is about to kill itself. What differs is the channel — and,
+        // for the locked profile, that the VM's own start is still ahead of it.
+        let bootstrap = match locked_start {
+            None => {
+                self.release_and_wait_for_workspace_bootstrap(plan.names().vm())
+                    .await
+            }
+            Some((admission, claimed)) => {
+                self.run_locked_session(&plan, claimed, &admission, broker)
+                    .await
+            }
+        };
+        if let Err(mut err) = bootstrap {
             self.annotate_workspace_bootstrap_error_with_prewarm_audit(
                 state.audit.as_ref(),
                 session_id,
@@ -1375,7 +1493,7 @@ impl AgentVmDaemon {
         // distinct IP, so the same port is reusable across sessions).
         let broker_port = self.config.vm_http.broker_port_range().min();
         let broker_ports = BrokerPorts::new([broker_port])?;
-        let guest_command = wrap_guest_command(workspace.as_ref(), guest_command)?;
+        let guest_command = wrap_guest_command(ipv6_mode, workspace.as_ref(), guest_command)?;
 
         // Reserve the subnet atomically (choose + claim under the lock). The
         // persisted record carries no guest env, so the claim plan uses an empty

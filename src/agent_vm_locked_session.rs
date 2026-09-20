@@ -7,9 +7,11 @@
 //! ([`crate::agent_vm_locked_start`]) and the guest's record channel
 //! ([`crate::agent_vm_guest_log`]). This is what walks them.
 //!
-//! Still unreachable in production: `ConfiguredIpv6Profile::admit` refuses the
-//! profile, so nothing builds a locked plan to hand to
-//! [`run_locked_start`]. Stage E2c-3 opens that door.
+//! Stage E2c-3b gave it its caller: the daemon's start arm dispatches on the
+//! admitted profile, runs the shared prefix, spawns the broker and hands off
+//! here. What is still shut is admission — `ConfiguredIpv6Profile::admit`
+//! refuses the locked profile, so no configuration produces the decision that
+//! arm matches on. Stage E2c-3c opens that door.
 //!
 //! # Why it is not the legacy interpreter
 //!
@@ -70,6 +72,7 @@ use crate::agent_vm_pf_helper_protocol::{
     PF_HELPER_INSTALL_REPORT_MAX_BYTES, PfHelperInstallReportDoc,
 };
 use crate::agent_vm_probe::{BoundedProbe, ProbeRunFailure, run_bounded_probe};
+use crate::vm_http::BrokerListening;
 use std::time::Duration;
 
 /// How long any one `container` command in the sequence may take.
@@ -131,6 +134,11 @@ pub enum LockedStartError {
     /// running: see [`LockedPhase::workload_may_be_running`](crate::agent_vm_locked_lifecycle::LockedPhase::workload_may_be_running).
     #[error("the release signal was recorded but not confirmed sent: {source}")]
     ReleaseUnconfirmed { source: ProbeRunFailure },
+    /// The broker that is up is not the one this session's guest was pointed
+    /// at. Nothing has been created that the caller did not already own, and
+    /// the guest is still parked.
+    #[error("the listening broker is on port {listening}, not a port this session advertises")]
+    BrokerIsNotThisSessions { listening: u16 },
 }
 
 impl LockedStartError {
@@ -153,7 +161,8 @@ impl LockedStartError {
             | Self::FirewallIncomplete { .. }
             | Self::GuestNotReady(_)
             | Self::GuestEnvironmentUnwritten(_)
-            | Self::PhaseNotRecorded(_) => false,
+            | Self::PhaseNotRecorded(_)
+            | Self::BrokerIsNotThisSessions { .. } => false,
         }
     }
 }
@@ -169,6 +178,15 @@ impl LockedStartError {
 /// waits under are the caller's to state: a daemon uses
 /// [`GuestLogChannel::new`]'s, which are sized for a VM boot.
 ///
+/// `broker` is the proof that this session's broker is accepting, which only
+/// spawning it produces. The release is how a locked guest learns the broker
+/// exists — this profile has no broker-ready file for it to wait on — so a
+/// release ordered before the broker is up leaves the guest's egress gate
+/// with nothing to make its positive control against. Stage E2c-2 left that
+/// to a doc comment; here it is a value the caller cannot have without having
+/// brought it about, and the port it names is checked against the one this
+/// plan advertises to the guest, so it cannot be another session's.
+///
 /// On success the record says [`LockedPhase::WorkloadReleased`](crate::agent_vm_locked_lifecycle::LockedPhase::WorkloadReleased) and the guest
 /// is running its own command. On failure the record says how far it got and
 /// the caller cleans up; [`LockedStartError::workload_may_be_running`] says
@@ -180,7 +198,14 @@ pub async fn run_locked_start(
     state: AgentVmSessionState,
     admitted_image: &ImageDigest,
     guest_channel: &GuestLogChannel,
+    broker: BrokerListening,
 ) -> Result<AgentVmSessionState, LockedStartError> {
+    let listening = broker.broker_port();
+    if !plan.broker_ports().as_slice().contains(&listening) {
+        return Err(LockedStartError::BrokerIsNotThisSessions {
+            listening: listening.get(),
+        });
+    }
     // Written before the sequence is built, because the create's `--env-file`
     // names it, and dropped as soon as the create has read it — the same
     // lifetime the legacy launch gives it.

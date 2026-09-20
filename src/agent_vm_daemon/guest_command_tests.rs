@@ -375,8 +375,12 @@ fn workspace_bootstrap_rejects_non_utf8_destination() {
         warm: WorkspaceWarmMode::None,
     };
 
-    let err =
-        wrap_guest_command_with_workspace_bootstrap(&workspace, vec!["true".into()]).unwrap_err();
+    let err = wrap_guest_command_with_workspace_bootstrap(
+        BootstrapSignals::SentinelFiles,
+        &workspace,
+        vec!["true".into()],
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
@@ -612,4 +616,40 @@ fn a_long_bootstrap_failure_keeps_the_error_at_its_end() {
             GuestBootstrapRecord::Failed { .. }
         ))
     ));
+}
+
+/// The session's mode decides which channel its scripts report on, so a
+/// locked session cannot be started with scripts that write sentinel files
+/// the host will never come back to read — nor a legacy one with records
+/// nobody reads.
+///
+/// Asserted through [`wrap_guest_command`], the production entry point,
+/// rather than against the selector, so what is checked is the script a
+/// session would actually be given.
+#[test]
+fn the_mode_decides_which_channel_a_session_reports_on() {
+    for mode in Ipv6IsolationMode::ALL {
+        let locked = mode == Ipv6IsolationMode::Ipv4OnlyLockedV1;
+        let script = wrap_guest_command(mode, None, vec!["true".into()])
+            .unwrap()
+            .join("\n");
+        assert_eq!(
+            script.contains(crate::agent_vm_guest_log::BOOTSTRAP_RECORD_PREFIX),
+            locked,
+            "{mode:?} should{} report through records",
+            if locked { "" } else { " not" }
+        );
+        assert_eq!(
+            script.contains("touch /run/writ-agent-vm/bootstrap-ok"),
+            !locked,
+            "{mode:?} should{} write the sentinel files",
+            if locked { " not" } else { "" }
+        );
+        assert_eq!(
+            script.contains("/run/writ-agent-vm/broker-ready"),
+            !locked,
+            "{mode:?} should{} wait for a broker-ready file",
+            if locked { " not" } else { "" }
+        );
+    }
 }

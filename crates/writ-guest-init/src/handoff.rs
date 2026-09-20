@@ -155,6 +155,22 @@ pub enum OwnedDirectory {
 
 impl OwnedDirectory {
     pub const ALL: [Self; 4] = [Self::Runtime, Self::Home, Self::Workspace, Self::NixStore];
+
+    /// Where the official image puts this directory.
+    ///
+    /// Here rather than in the interpreter because the host reads it too: a
+    /// locked workload runs as the fixed identity, so the host has to tell it
+    /// where its home is, and a host naming a different home would hand the
+    /// workload a directory the handoff never chowned. One source, so the two
+    /// cannot disagree.
+    pub fn official_image_path(self) -> &'static str {
+        match self {
+            Self::Runtime => "/run/writ-agent-vm",
+            Self::Home => "/home/writ",
+            Self::Workspace => "/workspace",
+            Self::NixStore => "/nix",
+        }
+    }
 }
 
 /// One step of the handoff. The interpreter performs them in order and stops

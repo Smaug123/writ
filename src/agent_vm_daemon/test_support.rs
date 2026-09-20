@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use writ_core::byte_size::ByteSize;
 
+use crate::agent_vm_locked_admission::{AdmittedProfile, LockedV1Admission, ProvenPlatform};
 use crate::audit::AuditLog;
 use crate::core::{BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr};
 use crate::nix_binary_cache::NixTrustedPublicKeys;
@@ -618,4 +619,146 @@ pub(super) fn occupy_subnet(store: &AgentVmSessionStateStore, index: u16) {
     )
     .unwrap();
     store.create_starting(&plan).unwrap();
+}
+
+// --- the locked profile -----------------------------------------------------
+
+/// The digest the locked fixture's `container inspect` reports, and the one
+/// [`locked_admission`] admits. Any other and the readback refuses the start.
+pub(super) const LOCKED_IMAGE_DIGEST: &str =
+    "sha256:226205c93c1bc4148f691c0162118b39d8fca907691e9fc620bddce2dec6567e";
+
+/// An admission for the image the locked fixture serves.
+///
+/// Built through [`ProvenPlatform::parse`], so the three facts are the ones
+/// the real probes would have produced; what it skips is the gathering, which
+/// Stage E2c-3c wires up and Stage D already tests over the whole grid.
+pub(super) fn locked_admission(image_digest: &str) -> AdmittedProfile {
+    AdmittedProfile::Ipv4OnlyLockedV1(LockedV1Admission::claimed_for_test(
+        ProvenPlatform::parse(
+            "container CLI version 0.0.0 (build: synthetic, commit: 0000000)",
+            "0Z0",
+            image_digest,
+        )
+        .unwrap(),
+    ))
+}
+
+/// What the locked readback sees: a container matching the locked launch.
+fn locked_inspect_doc(digest: &str) -> String {
+    serde_json::json!([{
+        "configuration": {
+            "image": {"descriptor": {"digest": digest}, "reference": "alpine:latest"},
+            "capAdd": ["CAP_CHOWN", "CAP_SETGID", "CAP_SETUID", "CAP_SETPCAP", "CAP_NET_ADMIN"],
+            "capDrop": ["ALL"],
+            "readonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq"],
+            "useInit": false,
+            "initProcess": {
+                "executable": "/sbin/writ-agent-vm-guest-init",
+                "user": {"id": {"uid": 0, "gid": 0}}
+            }
+        }
+    }])
+    .to_string()
+}
+
+/// A `pf-helper install` report that completed every phase, for the session
+/// the locked start installs its attached anchor for.
+fn locked_install_report(session_id: SessionId) -> String {
+    format!(
+        r#"{{"protocol":"{name}","version":{version},"anchor":"writ/session/{session_id}","interfaces":["bridge100","vmenet0"],"phase":"reresolve"}}"#,
+        name = crate::agent_vm_pf_helper_protocol::PF_HELPER_PROTOCOL_NAME,
+        version = crate::agent_vm_pf_helper_protocol::PF_HELPER_PROTOCOL_VERSION,
+    )
+}
+
+/// How the locked fixture's guest behaves once it is released.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LockedGuest {
+    /// Reports a successful bootstrap.
+    BootstrapsCleanly,
+    /// Reports a bounded failure reason, the way the locked scripts' failure
+    /// emitter does.
+    ReportsBootstrapFailure,
+}
+
+/// A fake `container` + `pf-helper` + `sudo` for a whole locked session.
+///
+/// One script in all three roles, because [`daemon_config`] gives the daemon
+/// one tool path for all three. It is stateful in one respect that matters:
+/// the guest's log gains its bootstrap record only after the release, so a
+/// host that read the post-release channel early would find nothing, and one
+/// that released before installing the anchor would be visible in the order
+/// of the argv log.
+///
+/// It answers no `exec`, deliberately. A locked session must never run one,
+/// and a fixture that quietly served them would let that regress unseen.
+pub(super) fn write_fake_locked_tool(
+    dir: &Path,
+    args_log: &Path,
+    env_log: &Path,
+    session_id: SessionId,
+    guest: LockedGuest,
+) -> PathBuf {
+    let path = dir.join("fake-locked-tool");
+    fs::write(
+        dir.join("locked-inspect.json"),
+        locked_inspect_doc(LOCKED_IMAGE_DIGEST),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("locked-report.json"),
+        locked_install_report(session_id),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("locked-ready.txt"),
+        format!("{}\n", writ_guest_init::record::SECURITY_READY_LINE),
+    )
+    .unwrap();
+    let bootstrap = match guest {
+        LockedGuest::BootstrapsCleanly => "writ-agent-vm-bootstrap ok".to_string(),
+        LockedGuest::ReportsBootstrapFailure => {
+            "writ-agent-vm-bootstrap failed writ-vm workspace init failed with exit 1".to_string()
+        }
+    };
+    fs::write(dir.join("locked-bootstrap.txt"), format!("{bootstrap}\n")).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+# `sudo` is this same script here, so an invocation whose first argument is
+# this script's own path is one: drop it and read the real command.
+[ "$1" = "$0" ] && shift
+# One line per invocation, whatever the arguments contain: the create is
+# handed a whole shell script, and a log that let its lines through would put
+# words from the guest's own script where a test looks for subcommands.
+printf '%s' "$*" | tr '\n' ' ' >> {args_log}
+printf '\n' >> {args_log}
+case "$1" in
+  network)
+    if [ "$2" = "inspect" ]; then
+      printf '%s\n' 'ipv4Subnet: 192.168.252.0/24' 'ipv4Gateway: 192.168.252.1'
+    fi ;;
+  install) cat {root}/locked-report.json ;;
+  create)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--env-file" ]; then cat "$2" > {env_log}; fi
+      shift
+    done ;;
+  inspect) cat {root}/locked-inspect.json ;;
+  logs)
+    cat {root}/locked-ready.txt
+    if [ -f {root}/released ]; then cat {root}/locked-bootstrap.txt; fi ;;
+  kill) : > {root}/released ;;
+esac
+exit 0
+"#,
+        args_log = shell_quote_path(args_log),
+        env_log = shell_quote_path(env_log),
+        root = shell_quote_path(dir),
+    );
+    fs::write(&path, script).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }

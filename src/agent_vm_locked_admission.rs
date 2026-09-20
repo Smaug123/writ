@@ -47,7 +47,7 @@ use writ_guest_init::record::{ISOLATION_ABI_LABEL, ISOLATION_ABI_VERSION};
 
 use crate::agent_vm_firewall::PfPreflightUnclean;
 use crate::agent_vm_lifecycle::{
-    AgentVmToolPaths, ConfiguredIpv6Profile, ContainerImage, ProcessInvocation,
+    AgentVmToolPaths, ConfiguredIpv6Profile, ContainerImage, Ipv6IsolationMode, ProcessInvocation,
 };
 use crate::agent_vm_probe::{BoundedProbe, ProbeRunFailure, run_bounded_probe};
 
@@ -581,6 +581,19 @@ pub struct LockedV1Admission {
 }
 
 impl LockedV1Admission {
+    /// Claim an admission for a platform without gathering the evidence for
+    /// it.
+    ///
+    /// `#[cfg(test)]`, so the production guarantee is intact: nothing outside
+    /// a test build can name this, and [`ConfiguredIpv6Profile::admit_locked`]
+    /// remains the only way to a `LockedV1Admission`. It exists so the tests
+    /// of what a locked session *does* need not first stand up six host
+    /// probes' worth of fixtures to reach the code under test.
+    #[cfg(test)]
+    pub(crate) fn claimed_for_test(platform: ProvenPlatform) -> Self {
+        Self { platform }
+    }
+
     pub fn platform(&self) -> &ProvenPlatform {
         &self.platform
     }
@@ -588,6 +601,48 @@ impl LockedV1Admission {
     /// The digest of the image this admission is for.
     pub fn image_digest(&self) -> &ImageDigest {
         self.platform.image_digest()
+    }
+}
+
+/// What a new session may start as, once admission has decided.
+///
+/// The answer to [`ConfiguredIpv6Profile::admit`], of which
+/// [`Ipv6IsolationMode`] is only the part a plan carries. The locked profile
+/// needs more than a mode to start under: its launch reads the created
+/// container back and refuses any image but the admitted one, so the digest
+/// that was admitted has to travel with the decision. Keeping it inside the
+/// variant is what stops a locked session being started against an image no
+/// evidence named — there is no second way to name one.
+///
+/// This mirrors [`Ipv6IsolationMode`] variant for variant rather than pairing
+/// a mode with an optional admission, so a locked decision without its
+/// evidence, or a legacy decision carrying some, cannot be written down.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdmittedProfile {
+    DualStackRequired,
+    Ipv4OnlyNoGuestIpv6,
+    Ipv4OnlyLockedV1(LockedV1Admission),
+}
+
+impl AdmittedProfile {
+    /// The mode a plan built under this decision carries.
+    pub fn ipv6_mode(&self) -> Ipv6IsolationMode {
+        match self {
+            Self::DualStackRequired => Ipv6IsolationMode::DualStackRequired,
+            Self::Ipv4OnlyNoGuestIpv6 => Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6,
+            Self::Ipv4OnlyLockedV1(_) => Ipv6IsolationMode::Ipv4OnlyLockedV1,
+        }
+    }
+
+    /// The evidence this session starts under, for the locked profile alone.
+    ///
+    /// The start path dispatches on this rather than on the mode, so the arm
+    /// that runs the locked sequence is the arm that holds the admission.
+    pub fn locked(&self) -> Option<&LockedV1Admission> {
+        match self {
+            Self::DualStackRequired | Self::Ipv4OnlyNoGuestIpv6 => None,
+            Self::Ipv4OnlyLockedV1(admission) => Some(admission),
+        }
     }
 }
 

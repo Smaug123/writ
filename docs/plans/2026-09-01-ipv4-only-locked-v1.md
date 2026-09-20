@@ -966,6 +966,84 @@ polling files over `container exec`. At that point a locked session has no
 
 ---
 
+**E2c-3b landed.** The daemon's start arm dispatches on the decision rather
+than on the mode. `ConfiguredIpv6Profile::admit` now answers with an
+`AdmittedProfile`, which mirrors `Ipv6IsolationMode` variant for variant and
+carries the `LockedV1Admission` on the locked one — the readback accepts no
+image but the admitted digest, so the digest has to arrive *with* the
+decision, and pairing a mode with an optional admission would make a locked
+decision without its evidence representable. `admit` still refuses the locked
+profile, so nothing constructs that variant outside a test; that is E2c-3c's
+line to change, and it changes one `match` arm.
+
+Broker readiness is `vm_http::BrokerListening`. Only `RunningVmHttpSession`
+produces one and only `spawn` produces one of those, so `run_locked_start`
+cannot be called before the broker is up. It carries the port, and the start
+refuses a proof naming a port its own plan does not advertise — which turns
+the token from a ceremony into a check: "a broker is up" would have been
+satisfied by *any* session's broker.
+
+That ordering forced the arm's shape. A locked start runs only the shared
+prefix here, because everything after it must happen with the broker
+listening; `complete_locked_session_prefix` is that, under the same rollback
+rule the legacy completion uses (a start that failed clean loses its claimed
+record; one that failed dirty keeps it, because the record is the teardown
+obligation). Spawning the broker earlier than the legacy arm does is safe, and
+for a reason worth stating: the only guest process at that point is the
+initializer, parked in `sigwait`, and the bootstrap anchor already allows the
+broker port, which is what `spawn`'s own precondition asks for.
+
+The post-release wait is `GuestBootstrapChannel`, a separate type from
+`GuestLogChannel` over the same command. Not a second method, because the two
+waits share only the command: one reads a log with a single trusted writer for
+the fact that gates the release, under a cap sized for one record and a
+hundred and twenty seconds; the other reads a log the released workload is
+writing to, for an outcome carrying no authority, under the megabyte cap the
+sentinel path already applies to a guest read and the twenty minutes a Nix
+warm can take. Two types means neither can perform the other's wait, and the
+one thing they do share — the bounded poll, including `next_poll_sleep` and
+its property — is written once.
+
+A locked session therefore has no `container exec` in its life at all, which a
+fake-tool daemon test asserts over the *whole* invocation log rather than the
+part after the release. Writing that test found a trap worth naming: the
+`container create` argv contains the entire guest script, so a fixture logging
+`"$*"` verbatim puts the script's own words where the test looks for
+subcommands. The locked fixture flattens each invocation to one line.
+
+"A bootstrap success gates nothing carrying authority" is a workspace guard
+that enumerates the readers of `GuestBootstrapRecord` and `await_bootstrap`:
+the module that defines them, the daemon arm that turns the outcome into a
+started session or an operator-facing failure, and the test that holds the
+guest's own emitter to the host's parser. A grant, proxy or staged push that
+began consulting it fails the build. What the guard cannot see is the outcome
+laundered through a third value; nothing does that, and the shape that would
+make it impossible is not worth building for a value with one consumer.
+
+A review round found the one thing none of that would have caught, because it
+is about the *guest*: wiring the arm up made the locked profile reachable
+against the official image for the first time, and that image's `HOME` is
+`/root`, mode 0700. The locked workload is 1000:1000, and the setup script
+runs under `set -eu` and writes `$HOME/.claude` before it can report anything
+— so the container would have died with no record and the host would have
+waited out the full twenty minutes. The daemon now sets `HOME` for this
+profile alone, from `OwnedDirectory::Home`'s official-image path, which is
+hoisted into the shared crate so the initializer's interpreter and the host
+read one constant.
+
+The test for it is not "HOME is set". Every directory the script writes to
+before its first outcome has to be one the handoff chowned, and that is what
+is asserted — over the env file a real locked start produced, against
+`OwnedDirectory::ALL`. It fails without the fix and would catch the next path
+added to the prologue.
+
+Five weakenings were injected and fail these tests: a locked session wrapped
+with the sentinel scripts, a release that accepts any listening broker, an
+`exec` anywhere in the locked path, a bootstrap reader that ends its wait on a
+`security-ready` line, and a locked guest left with the image's `HOME`.
+
+---
+
 ### Stage E2c-3c: the profile opens
 
 **Dependencies:** E2c-3b.
