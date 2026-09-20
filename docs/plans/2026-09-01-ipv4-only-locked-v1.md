@@ -544,8 +544,10 @@ representable without a start path behind it:
 
 **Correctness oracle:**
 - Fake-tool daemon tests: the recorded `container run` argv contains exactly
-  the B1 profile and names the image by the digest that was inspected, never
-  by tag; `USR1` is sent iff the ready record was observed, the broker
+  the B1 profile, and the started VM is *read back* and found to carry the
+  digest that was inspected (see E2b's note: naming a local image by digest is
+  not possible on this runtime, so the guarantee is taken by readback);
+  `USR1` is sent iff the ready record was observed, the broker
   is ready, and the deny readback succeeded; a missing, malformed, duplicated,
   or over-long ready record, a `logs` timeout, or a helper readback failure
   each leave the session in a phase before `ReleaseAttempted` and trigger
@@ -620,6 +622,78 @@ assumed: on Apple `container` 1.4.1 (macOS 25G72), a container whose command
 `printf`s one line yields exactly those bytes and a bare newline — no
 timestamp, no prefix, no carriage return — and the kernel's messages are on
 `--boot`, where the record never appears.
+
+---
+
+**E2b landed, with two measured departures from this plan.**
+
+`agent_vm_locked_start` holds the readback and the launch's locked-only
+pieces; `AgentVmSessionPlan::locked_start_vm_invocation` assembles the argv
+from the same `base_run_argv` the legacy launch uses.
+
+**The image cannot be named by digest.** Apple `container` 1.4.1 resolves a
+`name@sha256:…` reference against the registry — `container run
+writ-agent-vm-guest@sha256:…` fails with a 401 from `registry-1.docker.io` —
+and the guest image is built locally and pushed nowhere; a bare digest or
+image id is refused outright ("cannot specify 64 byte hex string as
+reference"). Only a tag names a local image. So the guarantee is taken the
+other way round, the way Stage C2 takes it for PF: name the tag, then read the
+container back with `container inspect` and refuse to go on unless it carries
+the admitted digest.
+
+The readback has to happen **before the container runs**, so the locked launch
+is `container create` then `container start`, not `container run`. `create`
+resolves the tag and records the resolved digest, capability set, `/proc`
+relaxation and first process while the container is still `stopped`, and a
+review round caught the first draft getting this wrong: it used `run` and
+argued the window was harmless because PID 1 would be the initializer waiting
+for release. That reasoning is circular. If the tag were repointed between
+admission and launch, the replacement image's PID 1 is whatever its author
+chose, need not wait for anything, and would already be running behind only
+the bootstrap firewall. `container inspect` reports `image.descriptor.digest`,
+`capAdd`, `capDrop`, `readonlyPaths` and `initProcess`, so the readback checks
+the image, the capability set, the `/proc` relaxation, and that PID 1 is the
+initializer running as root. That is stronger than the reference would have
+been: a reference says what was asked for, the readback says what the runtime
+built, which is where a flag that was accepted and ignored would show up. The
+window it leaves is empty — PID 1 is the initializer and has published no
+`security-ready`, so nothing repository-controlled has run.
+
+Two things the readback caught immediately. `container inspect` spells
+capabilities `CAP_CHOWN` where `--cap-add` spells them `CHOWN`, so a readback
+that compared the strings it sent would have passed on any container. And
+`useInit` has to be part of the verdict: the runtime's own init process
+becomes PID 1 and the configured executable its *child*, so every claim about
+"PID 1" — including the release gate's later read of `/proc/1/status` — would
+be about the wrong process.
+
+**The locked launch must relax `/proc/sys`, and must not use the kernel-line
+IPv6 disable.** vminit mounts `/proc/bus`, `/proc/fs`, `/proc/irq` and
+`/proc/sys` read-only, and the B1 handoff *must* write `disable_ipv6`
+(`Ipv6Sysctl::must_exist` makes a missing one a handoff failure, because the
+verification step relies on it). Measured: the write fails with `EROFS` even
+holding `CAP_NET_ADMIN`, so under the defaults the locked handoff cannot
+complete at all. `--read-only-path` is additive except for `NONE`, which
+clears the defaults, so the launch clears them and gives back all but
+`/proc/sys` — measured to leave `/proc/sys` writable and `/proc/irq` still
+refused. The relaxation is spent inside the trusted window: PID 1 writes the
+sysctls, drops every capability, and becomes 1000:1000, after which the
+workload can no more write them than under the default mount. The path list is
+version-specific, which is safe because Stage D pins the CLI version as a
+whole record.
+
+The legacy profile's `--kernel-arg ipv6.disable=1` is therefore *excluded*
+here: it removes `/proc/sys/net/ipv6` entirely, which is exactly the
+`disable_ipv6` the handoff requires to exist. The two enforcements are
+mutually exclusive and the locked profile takes the one whose completion it
+can observe, with host PF the backstop either way. A test asserts the kernel
+arg is absent, naming that reason.
+
+Six weakenings were injected and fail these tests: a readback that compares
+the argv spelling of a capability, one that ignores the `/proc` relaxation,
+one that ignores PID 1's identity, one that ignores `useInit`, a launch that
+swaps the relaxation for the legacy kernel argument, and a launch that goes
+back to a single `container run`.
 
 ---
 

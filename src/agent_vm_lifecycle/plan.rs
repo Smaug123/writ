@@ -9,6 +9,8 @@
 //! `agent_vm_lifecycle.rs` to keep that file readable; behaviour is unchanged.
 
 use super::*;
+use crate::agent_vm_locked_start::{GUEST_INIT_PATH, locked_readonly_path_argv};
+use writ_guest_init::capability_argv::locked_capability_argv_profile;
 
 impl AgentVmSessionPlan {
     #[allow(clippy::too_many_arguments)]
@@ -411,9 +413,17 @@ impl AgentVmSessionPlan {
         }
     }
 
-    fn start_vm_invocation_with_env_file(&self, env_file: Option<&Path>) -> ProcessInvocation {
+    /// The argv every container-creating invocation this planner emits begins
+    /// with: the session's identity, its network, its resources, and the
+    /// per-session tmpfs state. Everything after it is the profile's business.
+    ///
+    /// `subcommand` is `run` for the legacy launch, which creates and starts
+    /// in one step, and `create` for the locked one, which does not start
+    /// until its configuration has been read back. Only `run` detaches;
+    /// `create` starts nothing to detach from.
+    fn base_container_argv(&self, subcommand: &str, detach: bool) -> Vec<String> {
         let mut args = vec![
-            "run".to_string(),
+            subcommand.to_string(),
             "--name".to_string(),
             self.names.vm.clone(),
             "--label".to_string(),
@@ -424,11 +434,61 @@ impl AgentVmSessionPlan {
             self.resources.cpus.to_string(),
             "--memory".to_string(),
             format!("{}m", self.resources.memory_mib),
-            "-d".to_string(),
         ];
+        if detach {
+            args.push("-d".to_string());
+        }
         for mount in AGENT_VM_TMPFS_MOUNTS {
             args.extend(["--tmpfs".to_string(), (*mount).to_string()]);
         }
+        args
+    }
+
+    /// The `container create` that builds a locked-profile agent VM without
+    /// starting it.
+    ///
+    /// Stage E2b; nothing selects it until [`Ipv6IsolationMode`] gains the
+    /// locked variant in Stage E2c. Three things distinguish it from the
+    /// legacy launch, all of them explained in
+    /// [`crate::agent_vm_locked_start`]: Stage B1's capability profile, a
+    /// `/proc` relaxation that gives back every runtime default except
+    /// `/proc/sys`, and the guest initializer named as the container command
+    /// so the image's own entrypoint is left alone.
+    ///
+    /// **Create, verify, then start.** The image is named by *tag*, because
+    /// Apple `container` cannot address a local image by digest — so the
+    /// admitted digest is established by reading the container back with
+    /// [`LockedContainerShape`](crate::agent_vm_locked_start::LockedContainerShape).
+    /// `create` resolves the tag and records the resolved digest without
+    /// running anything, so the readback happens while the container is still
+    /// `stopped`. Doing this with `run` would execute a replaced image's PID 1
+    /// before its digest could be rejected, and that PID 1 need not be an
+    /// initializer that waits to be released.
+    pub fn locked_create_vm_invocation(&self, env_file: Option<&Path>) -> ProcessInvocation {
+        let mut args = self.base_container_argv("create", false);
+        args.extend(locked_capability_argv_profile());
+        args.extend(locked_readonly_path_argv());
+        if let Some(env_file) = env_file {
+            args.extend(["--env-file".to_string(), env_file.display().to_string()]);
+        }
+        args.push(self.image.as_str().to_string());
+        args.push(GUEST_INIT_PATH.to_string());
+        args.extend(self.guest_command.iter().cloned());
+        ProcessInvocation::new(self.tools.container.clone(), args)
+    }
+
+    /// `container start <vm>` — run a locked VM that has already been created
+    /// and read back. Detached: `--attach` is what would hold the daemon to
+    /// the guest's streams, and the record channel is `container logs`.
+    pub fn locked_start_vm_invocation(&self) -> ProcessInvocation {
+        ProcessInvocation::new(
+            self.tools.container.clone(),
+            ["start".to_string(), self.names.vm.clone()],
+        )
+    }
+
+    fn start_vm_invocation_with_env_file(&self, env_file: Option<&Path>) -> ProcessInvocation {
+        let mut args = self.base_container_argv("run", true);
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             args.extend(IPV4_ONLY_CAPABILITY_ARGV.map(str::to_string));
             args.extend(IPV4_ONLY_KERNEL_ARGV.map(str::to_string));
