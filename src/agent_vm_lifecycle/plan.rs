@@ -173,6 +173,16 @@ impl AgentVmSessionPlan {
         steps.push(AgentVmStartStep::ProbeVmAbsent(
             self.stop_plan().vm_presence_probe(),
         ));
+        if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyLockedV1 {
+            // The locked profile's VM steps are not these. From here on it
+            // creates, reads back, and starts a container rather than running
+            // one, and its tail waits on a guest record and a signal the state
+            // store mints — none of which this step machine's interpreter can
+            // carry out. `locked_start_sequence` is the rest, and the daemon
+            // interprets it. Returning the prefix rather than a legacy
+            // `StartVm` is what keeps a dry run of a locked plan honest.
+            return steps;
+        }
         steps.push(AgentVmStartStep::StartVm(self.start_vm_invocation()));
         if self.ipv6_mode == Ipv6IsolationMode::Ipv4OnlyNoGuestIpv6 {
             // Host-side backstop first: the VM's bridge now exists, so replace
@@ -500,6 +510,22 @@ impl AgentVmSessionPlan {
             self.tools.container.clone(),
             ["inspect".to_string(), self.names.vm.clone()],
         )
+    }
+
+    /// Materialise this session's guest environment as a private file, or
+    /// `None` when there is none to write.
+    ///
+    /// The file is 0600 and deleted when the returned value drops, so a
+    /// caller holds it exactly as long as the command that reads it — see
+    /// [`Self::run_start_vm_invocation`], which does the same for the legacy
+    /// launch.
+    pub(crate) fn create_guest_env_file(
+        &self,
+    ) -> Result<Option<TempGuestEnvFile>, GuestEnvironmentError> {
+        if self.guest_env.is_empty() {
+            return Ok(None);
+        }
+        TempGuestEnvFile::create(&self.guest_env).map(Some)
     }
 
     /// The locked profile's start, after the shared network and bootstrap-PF

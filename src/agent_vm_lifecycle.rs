@@ -1149,12 +1149,12 @@ impl AgentVmGuestEnvVar {
     }
 }
 
-struct TempGuestEnvFile {
+pub(crate) struct TempGuestEnvFile {
     path: PathBuf,
 }
 
 impl TempGuestEnvFile {
-    fn create(vars: &[AgentVmGuestEnvVar]) -> Result<Self, GuestEnvironmentError> {
+    pub(crate) fn create(vars: &[AgentVmGuestEnvVar]) -> Result<Self, GuestEnvironmentError> {
         let path = std::env::temp_dir().join(format!("writ-agent-vm-env-{}", Uuid::new_v4()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -1188,7 +1188,7 @@ impl TempGuestEnvFile {
         Ok(Self { path })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
