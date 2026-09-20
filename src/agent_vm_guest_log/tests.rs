@@ -487,3 +487,103 @@ async fn a_log_that_says_two_things_stops_the_wait() {
         ))
     );
 }
+
+// --- the post-release vocabulary --------------------------------------------
+
+fn any_bootstrap_record() -> impl Strategy<Value = GuestBootstrapRecord> {
+    prop_oneof![
+        Just(GuestBootstrapRecord::Ok),
+        any_message().prop_map(|message| GuestBootstrapRecord::Failed { message }),
+    ]
+}
+
+proptest! {
+    /// A bootstrap record alone on a line reads back as itself, through any
+    /// surrounding output — and the surrounding output of a *released* guest
+    /// is whatever the workload cares to print.
+    #[test]
+    fn a_bootstrap_record_is_read_back_through_any_noise(
+        record in any_bootstrap_record(),
+        noise in prop::collection::vec(any_noise_line(), 0..6),
+        position in 0usize..8,
+    ) {
+        let text = log_with(&noise, &record.render(), position);
+        prop_assert_eq!(
+            scan_bootstrap_log(&text),
+            Ok(GuestBootstrapReport::Finished(record))
+        );
+    }
+
+    /// An initializer record is never a bootstrap outcome, wherever it sits.
+    ///
+    /// This is the separation the two prefixes exist for. A released workload
+    /// runs as the same UID as PID 1 and can print a `security-ready` line
+    /// whenever it likes; the bootstrap reader must not see it as anything.
+    #[test]
+    fn a_security_ready_record_is_never_a_bootstrap_outcome(
+        record in any_record(),
+        noise in prop::collection::vec(any_noise_line(), 0..6),
+        position in 0usize..8,
+    ) {
+        let text = log_with(&noise, &record.render(), position);
+        prop_assert_eq!(scan_bootstrap_log(&text), Ok(GuestBootstrapReport::Pending));
+    }
+
+    /// And the converse: a bootstrap record is never a handoff report, so a
+    /// bootstrap line appearing in the pre-release window cannot release
+    /// anything.
+    #[test]
+    fn a_bootstrap_record_is_never_a_handoff_report(record in any_bootstrap_record()) {
+        prop_assert_eq!(scan_guest_log(&record.render()), Ok(GuestHandoffReport::Silent));
+    }
+
+    /// Two bootstrap records are refused, as two initializer records are: the
+    /// guest reports its outcome once.
+    #[test]
+    fn two_bootstrap_records_are_refused(
+        first in any_bootstrap_record(),
+        second in any_bootstrap_record(),
+    ) {
+        let text = format!("{}\n{}", first.render(), second.render());
+        prop_assert_eq!(
+            scan_bootstrap_log(&text),
+            Err(GuestLogScanError::Repeated { count: 2 })
+        );
+    }
+}
+
+/// A line wearing the bootstrap prefix that is not a record is refused, not
+/// skipped — the same rule the initializer's vocabulary follows.
+#[test]
+fn a_prefixed_line_that_is_not_a_bootstrap_record_is_refused() {
+    for line in [
+        format!("{BOOTSTRAP_RECORD_PREFIX} sideways"),
+        format!("{BOOTSTRAP_RECORD_PREFIX} ok and more"),
+        BOOTSTRAP_RECORD_PREFIX.to_string(),
+    ] {
+        assert!(
+            matches!(
+                scan_bootstrap_log(&line),
+                Err(GuestLogScanError::Malformed { .. })
+            ),
+            "{line:?}"
+        );
+    }
+}
+
+/// An over-long bootstrap record is refused at the bound rather than read in
+/// part, so a workload cannot make an operator read an unbounded reason.
+#[test]
+fn an_over_long_bootstrap_record_is_refused() {
+    let padded = format!(
+        "{BOOTSTRAP_RECORD_PREFIX} failed {}",
+        "x".repeat(BOOTSTRAP_RECORD_MAX_BYTES)
+    );
+    assert!(matches!(
+        scan_bootstrap_log(&padded),
+        Err(GuestLogScanError::Malformed {
+            source: BootstrapRecordParseError::TooLong { .. },
+            ..
+        })
+    ));
+}

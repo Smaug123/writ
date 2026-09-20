@@ -66,7 +66,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use writ_guest_init::record::{
-    BoundedMessage, GuestInitRecord, ISOLATION_ABI_VERSION, RECORD_PREFIX, RecordParseError,
+    BoundedMessage, BoundedMessageError, GuestInitRecord, ISOLATION_ABI_VERSION, RECORD_PREFIX,
+    RecordParseError,
 };
 
 use crate::agent_vm_lifecycle::ProcessInvocation;
@@ -120,18 +121,55 @@ pub enum GuestHandoffReport {
     },
 }
 
-/// Why a log does not say one thing about the handoff.
+/// Why a log does not say one thing.
+///
+/// Generic over the parse error because the channel carries two vocabularies
+/// with two parsers, while the *shape* of the refusal is the same for both.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum GuestLogScanError {
+pub enum GuestLogScanError<E: std::error::Error> {
     /// A line carries the record prefix but is not a record this host reads.
     #[error("log line {line} carries the record prefix but is not a record: {source}")]
-    Malformed {
-        line: usize,
-        source: RecordParseError,
-    },
-    /// More than one record. The initializer emits exactly one.
-    #[error("the log carries {count} records; a correct initializer emits one")]
+    Malformed { line: usize, source: E },
+    /// More than one record. Each writer on this channel emits at most one.
+    #[error("the log carries {count} records; at most one is expected")]
     Repeated { count: usize },
+}
+
+/// The at-most-one record carrying `prefix`, parsed by `parse`.
+///
+/// Shared by both vocabularies, and the whole of what they have in common.
+/// One trailing carriage return per line is dropped first: whether the
+/// container's stdout is a pipe or a terminal is the runtime's business rather
+/// than a fact about the record, and a stripped `\r` cannot turn one record
+/// into another. A record must *begin* its line — see the module docs for the
+/// measurement behind that.
+///
+/// Lines are parsed as they are found, so the first thing wrong with a log in
+/// reading order is the thing reported: a malformed line before a second
+/// record is a malformed line, not a count.
+fn sole_record<T, E: std::error::Error>(
+    text: &str,
+    prefix: &str,
+    parse: impl Fn(&str) -> Result<T, E>,
+) -> Result<Option<T>, GuestLogScanError<E>> {
+    let mut found = None;
+    let mut count = 0usize;
+    for (index, raw) in text.split('\n').enumerate() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if !line.starts_with(prefix) {
+            continue;
+        }
+        let record = parse(line).map_err(|source| GuestLogScanError::Malformed {
+            line: index + 1,
+            source,
+        })?;
+        count += 1;
+        found.get_or_insert(record);
+    }
+    if count > 1 {
+        return Err(GuestLogScanError::Repeated { count });
+    }
+    Ok(found)
 }
 
 /// Read a chunk of `container logs` output as the initializer's report.
@@ -141,25 +179,10 @@ pub enum GuestLogScanError {
 /// return per line is dropped first: whether the container's stdout is a pipe
 /// or a terminal is the runtime's business rather than a fact about the
 /// record, and a stripped `\r` cannot turn one record into another.
-pub fn scan_guest_log(text: &str) -> Result<GuestHandoffReport, GuestLogScanError> {
-    let mut found: Option<GuestInitRecord> = None;
-    let mut count = 0usize;
-    for (index, raw) in text.split('\n').enumerate() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if !line.starts_with(RECORD_PREFIX) {
-            continue;
-        }
-        let record =
-            GuestInitRecord::parse(line).map_err(|source| GuestLogScanError::Malformed {
-                line: index + 1,
-                source,
-            })?;
-        count += 1;
-        found.get_or_insert(record);
-    }
-    if count > 1 {
-        return Err(GuestLogScanError::Repeated { count });
-    }
+pub fn scan_guest_log(
+    text: &str,
+) -> Result<GuestHandoffReport, GuestLogScanError<RecordParseError>> {
+    let found = sole_record(text, RECORD_PREFIX, GuestInitRecord::parse)?;
     Ok(match found {
         None => GuestHandoffReport::Silent,
         Some(GuestInitRecord::SecurityReady { abi }) => {
@@ -173,6 +196,131 @@ pub fn scan_guest_log(text: &str) -> Result<GuestHandoffReport, GuestLogScanErro
             message,
         },
     })
+}
+
+// --- the post-release vocabulary --------------------------------------------
+
+/// The prefix a workspace-bootstrap record carries.
+///
+/// Deliberately **not** [`RECORD_PREFIX`]. The two vocabularies share a
+/// channel and nothing else: the initializer's record is published before any
+/// repository-controlled code exists and gates the release, while a bootstrap
+/// record is printed *after* release by code running as the same UID as PID 1,
+/// which can print whatever it likes.
+///
+/// Separate prefixes make that separation structural rather than a rule
+/// someone remembers. A workload printing a `security-ready` line is not
+/// making a claim the bootstrap reader will look at, and a bootstrap record
+/// appearing in the pre-release window is not something the release gate will
+/// look at either — neither reader can see the other's vocabulary at all.
+pub const BOOTSTRAP_RECORD_PREFIX: &str = "writ-agent-vm-bootstrap";
+
+/// The most bytes a rendered bootstrap record may occupy.
+///
+/// The reason is bounded by `BoundedMessage`, exactly as the guest's failure
+/// file is today, so migrating to this channel does not widen what an operator
+/// can be made to read.
+pub const BOOTSTRAP_RECORD_MAX_BYTES: usize = 512;
+
+const BOOTSTRAP_TAG_OK: &str = "ok";
+const BOOTSTRAP_TAG_FAILED: &str = "failed";
+
+/// What the guest's bootstrap said about itself.
+///
+/// Untrusted by construction. It ends a wait, it is reported to an operator,
+/// and it carries no authority: a forged success harms only the agent that
+/// forged it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuestBootstrapRecord {
+    /// The workspace bootstrap and the egress gate both passed, and the guest
+    /// command is running.
+    Ok,
+    /// Something before the guest command failed, with a bounded reason.
+    Failed { message: BoundedMessage },
+}
+
+/// Why a line is not a [`GuestBootstrapRecord`].
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BootstrapRecordParseError {
+    #[error("input contains a newline; a record is a single line")]
+    ContainsNewline,
+    #[error("input is {len} bytes, over the {BOOTSTRAP_RECORD_MAX_BYTES}-byte bound")]
+    TooLong { len: usize },
+    #[error("line does not begin with the bootstrap prefix {BOOTSTRAP_RECORD_PREFIX:?}")]
+    MissingPrefix,
+    #[error("unknown bootstrap tag {0:?}")]
+    UnknownTag(String),
+    #[error("the ok record has trailing data: {0:?}")]
+    TrailingData(String),
+    #[error("the failure reason is not a bounded message: {0}")]
+    BadReason(#[from] BoundedMessageError),
+}
+
+impl GuestBootstrapRecord {
+    /// The record as one line, without a trailing newline.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Ok => format!("{BOOTSTRAP_RECORD_PREFIX} {BOOTSTRAP_TAG_OK}"),
+            Self::Failed { message } => format!(
+                "{BOOTSTRAP_RECORD_PREFIX} {BOOTSTRAP_TAG_FAILED} {}",
+                message.as_str()
+            ),
+        }
+    }
+
+    /// Parse one line, accepting nothing that is not exactly a rendered
+    /// record.
+    pub fn parse(line: &str) -> Result<Self, BootstrapRecordParseError> {
+        use BootstrapRecordParseError::*;
+        if line.contains('\n') {
+            return Err(ContainsNewline);
+        }
+        if line.len() > BOOTSTRAP_RECORD_MAX_BYTES {
+            return Err(TooLong { len: line.len() });
+        }
+        let rest = line
+            .strip_prefix(BOOTSTRAP_RECORD_PREFIX)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .ok_or(MissingPrefix)?;
+        let (tag, body) = match rest.split_once(' ') {
+            Some((tag, body)) => (tag, Some(body)),
+            None => (rest, None),
+        };
+        match (tag, body) {
+            (BOOTSTRAP_TAG_OK, None) => Ok(Self::Ok),
+            (BOOTSTRAP_TAG_OK, Some(rest)) => Err(TrailingData(rest.to_string())),
+            // The reason is the rest of the line, so an empty one is a record
+            // with an empty reason rather than a malformed record.
+            (BOOTSTRAP_TAG_FAILED, body) => Ok(Self::Failed {
+                message: BoundedMessage::parse(body.unwrap_or(""))?,
+            }),
+            (other, _) => Err(UnknownTag(other.to_string())),
+        }
+    }
+}
+
+/// What one bounded read of the post-release channel reports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuestBootstrapReport {
+    /// The guest has printed no bootstrap record yet.
+    Pending,
+    Finished(GuestBootstrapRecord),
+}
+
+/// Read a chunk of `container logs` output as the guest's bootstrap outcome.
+///
+/// Sees only [`BOOTSTRAP_RECORD_PREFIX`] lines, so an initializer record —
+/// including one a released workload printed itself — is not a bootstrap
+/// outcome and is skipped like any other output.
+pub fn scan_bootstrap_log(
+    text: &str,
+) -> Result<GuestBootstrapReport, GuestLogScanError<BootstrapRecordParseError>> {
+    Ok(
+        match sole_record(text, BOOTSTRAP_RECORD_PREFIX, GuestBootstrapRecord::parse)? {
+            None => GuestBootstrapReport::Pending,
+            Some(record) => GuestBootstrapReport::Finished(record),
+        },
+    )
 }
 
 // --- the bounded reader -----------------------------------------------------
@@ -189,7 +337,7 @@ pub enum SecurityReadyError {
     Unread(ProbeRunFailure),
     /// The log was read, and does not say one thing.
     #[error("the guest's log does not say one thing: {0}")]
-    Unreadable(#[from] GuestLogScanError),
+    Unreadable(#[from] GuestLogScanError<RecordParseError>),
     /// The initializer reported a failed handoff step. The workload never
     /// started, so there is nothing to release.
     #[error("the guest initializer failed at handoff step {step_index}: {message}")]

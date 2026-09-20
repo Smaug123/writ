@@ -140,11 +140,23 @@ shift 3
 
 "#;
 
-/// Shared by BOTH guest scripts: wait for the broker, then run the
-/// egress-isolation gate, routing a failure through the daemon-polled
-/// bootstrap-failed sentinel (both scripts surface failures identically). Runs
-/// in the trusted window — after broker-ready, before any repo/agent/guest
-/// command — so on failure neither workload starts.
+/// The broker-ready wait, for the profiles that need one.
+///
+/// The sentinel-file profiles learn the broker is up by the daemon touching
+/// this path over `container exec`. The locked profile has no such moment:
+/// being released *is* the signal, because the daemon does not send `USR1`
+/// until its broker is listening. A locked script including this wait would
+/// block forever on a file nothing creates.
+const GUEST_BROKER_READY_WAIT: &str = r#"
+while [ ! -f /run/writ-agent-vm/broker-ready ]; do
+  sleep 0.2
+done
+"#;
+
+/// Shared by every guest script: the egress-isolation gate, routing a failure
+/// to whichever bootstrap outcome channel the profile uses. Runs in the
+/// trusted window — before any repo/agent/guest command — so on failure no
+/// workload starts.
 ///
 /// Adversarially confirm the no-egress invariant: the guest must reach the
 /// broker (positive control — proves the probe itself works, so a failed
@@ -153,11 +165,7 @@ shift 3
 /// any global-scope IPv6 address (a SLAAC'd ULA from a host RA included; see
 /// #218), or an unreachable broker aborts. Pure bash /dev/tcp + coreutils
 /// timeout + iproute2; raw IPs, so it probes L3/L4 egress without DNS.
-const GUEST_BROKER_READY_AND_EGRESS_GATE: &str = r#"
-while [ ! -f /run/writ-agent-vm/broker-ready ]; do
-  sleep 0.2
-done
-
+const GUEST_EGRESS_GATE: &str = r#"
 egress_gate() {
   _auth="${WRIT_NIX_CACHE_URL#*://}"
   _hostport="${_auth%%/*}"
@@ -186,10 +194,10 @@ egress_gate() {
     } 2>/dev/null 3<>"/dev/udp/$1/53"
   }
   # Positive control: the broker must be reachable, else a failed external probe
-  # cannot be attributed to isolation. broker-ready was just signalled, but
-  # tolerate a slow first accept with a short retry — a false abort here would
-  # refuse a perfectly isolated VM. Generous per-try timeout for the same
-  # reason.
+  # cannot be attributed to isolation. The host has said the broker is up by
+  # this point, but tolerate a slow first accept with a short retry — a false
+  # abort here would refuse a perfectly isolated VM. Generous per-try timeout
+  # for the same reason.
   _n=0
   until _connect 5 "$_bhost" "$_bport"; do
     _n=$((_n + 1))
@@ -238,17 +246,16 @@ egress_gate() {
   return 0
 }
 
-# Run the gate; on failure route the reason through the daemon-polled
-# bootstrap-failed sentinel and stay alive so the daemon reads it before
-# teardown. Shared by both scripts (the daemon waits on the same sentinels for
-# both), so every session surfaces a gate failure identically rather than
-# returning a "started" VM that the gate then kills.
+# Run the gate; on failure route the reason to wherever this profile reports
+# its bootstrap outcome and stay alive so the host reads it before teardown.
+# Shared by every script, so a gate failure is surfaced identically rather
+# than returning a "started" VM that the gate then kills.
 if ! egress_gate 2>/run/writ-agent-vm/egress-gate.stderr; then
   set +e
   {
     printf 'egress isolation gate failed; refusing to run the guest command\n'
     cat /run/writ-agent-vm/egress-gate.stderr
-  } > /run/writ-agent-vm/bootstrap-failed
+  } @WRIT_BOOTSTRAP_FAIL_SINK@
   set -e
   while :; do sleep 3600; done
 fi
@@ -263,7 +270,7 @@ rm -f /run/writ-agent-vm/egress-gate.stderr
 /// gate failure is surfaced through bootstrap-failed rather than a silently
 /// dead VM. The daemon owns teardown via the stop API.
 const GUEST_NIX_SETUP_TAIL: &str = r#"
-touch /run/writ-agent-vm/bootstrap-ok
+@WRIT_BOOTSTRAP_OK@
 set +e
 "$@"
 set -e
@@ -288,9 +295,9 @@ if [ "$code" -ne 0 ]; then
       printf '%s\n' 'stderr:'
       cat /run/writ-agent-vm/bootstrap.stderr
     fi
-  } > /run/writ-agent-vm/bootstrap-failed
+  } @WRIT_BOOTSTRAP_FAIL_SINK@
   set -e
-  # Stay alive so the daemon can inspect bootstrap-failed before the lifecycle
+  # Stay alive so the host can read the failure before the lifecycle
   # cleanup path tears the VM down. Exiting here races the daemon's poller.
   while :; do sleep 3600; done
 fi
@@ -299,14 +306,14 @@ rm -f /run/writ-agent-vm/bootstrap.stdout /run/writ-agent-vm/bootstrap.stderr
 if ! cd "$destination"; then
   set +e
   printf 'workspace destination disappeared before agent exec: %s\n' "$destination" \
-    > /run/writ-agent-vm/bootstrap-failed
+    @WRIT_BOOTSTRAP_FAIL_SINK@
   set -e
   while :; do sleep 3600; done
 fi
-touch /run/writ-agent-vm/bootstrap-ok
+@WRIT_BOOTSTRAP_OK@
 # Run the agent as a child rather than exec-ing it, so the container outlives
 # the agent. Otherwise an agent that finishes (or crashes) within the
-# daemon's poll interval can race the bootstrap-ok signal: the next poll
+# host's read can race the success signal: the next look
 # would see a dying container instead of the ok file. The daemon owns
 # teardown via the stop API.
 set +e
@@ -355,19 +362,111 @@ pub(super) fn nix_conf_prologue_script_for_test() -> String {
 /// Assemble a guest setup script from the shared nix prologue, the egress gate
 /// (shared by both scripts), and the per-script `tail`. See [`nix_setup_script`]
 /// and [`workspace_bootstrap_script`].
+/// How a guest script reports its bootstrap outcome.
+///
+/// The two are the same information down two channels with different
+/// standing, and the scripts differ in nothing else. The legacy one writes
+/// sentinel files that the daemon polls with `container exec`; the locked one
+/// prints one bounded record per outcome to PID 1's stdout, because layer 2
+/// forbids the host creating a process inside a locked guest once untrusted
+/// code has started.
+///
+/// Substituted into the shared script fragments rather than duplicating them,
+/// so [`BootstrapSignals::SentinelFiles`] reproduces today's scripts byte for
+/// byte.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum BootstrapSignals {
+    SentinelFiles,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Stage E2c-3b gives this its production caller; until then the \
+                      locked scripts exist only to be tested against the legacy ones"
+        )
+    )]
+    LogRecords,
+}
+
+impl BootstrapSignals {
+    /// How this profile learns the broker is up, before the gate's positive
+    /// control depends on it. Empty for the log records: the release is that
+    /// signal, and there is no file to wait for.
+    pub(super) fn broker_ready_wait(self) -> &'static str {
+        match self {
+            Self::SentinelFiles => GUEST_BROKER_READY_WAIT,
+            Self::LogRecords => "",
+        }
+    }
+
+    /// Shell run before anything else, defining whatever the outcome
+    /// statements need. Empty for the sentinel files, which need nothing.
+    pub(super) fn prelude(self) -> &'static str {
+        match self {
+            Self::SentinelFiles => "",
+            // The reason arrives on stdin and leaves as one bounded, single-line,
+            // control-free record — the same bound the failure file has today.
+            //
+            // `LC_ALL=C tr -c` maps every byte that is not ASCII alphanumeric,
+            // punctuation or space to a space. That collapses newlines (so the
+            // record stays one line), removes control bytes (so the host's
+            // `BoundedMessage` accepts it), and leaves only single-byte
+            // characters — which is what makes the `cut -c` bound a *byte*
+            // bound, and so keeps a multibyte character from being split into
+            // something that grows when the host decodes it.
+            Self::LogRecords => {
+                r#"
+_writ_bootstrap_failed() {
+  _reason=$(LC_ALL=C tr -c '[:alnum:][:punct:] ' ' ' | LC_ALL=C tr -s ' ' | tail -c 380)
+  printf 'writ-agent-vm-bootstrap failed %s
+' "$_reason"
+}
+"#
+            }
+        }
+    }
+
+    /// The statement that reports a successful bootstrap.
+    pub(super) fn ok(self) -> &'static str {
+        match self {
+            Self::SentinelFiles => "touch /run/writ-agent-vm/bootstrap-ok",
+            Self::LogRecords => "printf '%s\n' 'writ-agent-vm-bootstrap ok'",
+        }
+    }
+
+    /// The suffix that sends a failure reason where the host will read it: a
+    /// redirect for the file, a pipe for the record.
+    pub(super) fn fail_sink(self) -> &'static str {
+        match self {
+            Self::SentinelFiles => "> /run/writ-agent-vm/bootstrap-failed",
+            Self::LogRecords => "| _writ_bootstrap_failed",
+        }
+    }
+
+    /// Fill the outcome statements into one script fragment.
+    fn fill(self, fragment: &str) -> String {
+        fragment
+            .replace("@WRIT_BOOTSTRAP_OK@", self.ok())
+            .replace("@WRIT_BOOTSTRAP_FAIL_SINK@", self.fail_sink())
+    }
+}
+
 fn build_guest_nix_setup_script(
     positional: &str,
     mkdir_line: &str,
     features_line: &str,
     tail: &str,
+    signals: BootstrapSignals,
 ) -> String {
     let mut script = nix_conf_prologue(positional, mkdir_line, features_line);
-    // Both scripts gate on egress isolation in the same trusted window, with
-    // identical failure handling, so the broker-ready wait + gate + its
-    // bootstrap-failed routing are shared here; each tail picks up after a
-    // passed gate.
-    script.push_str(GUEST_BROKER_READY_AND_EGRESS_GATE);
-    script.push_str(tail);
+    script.push_str(signals.prelude());
+    script.push_str(signals.broker_ready_wait());
+    // Every script gates on egress isolation in the same trusted window with
+    // identical failure handling, so the gate and its failure routing are
+    // shared here; each tail picks up after a passed gate. Only where the
+    // outcome is *reported* differs, which is what `signals` fills in.
+    script.push_str(&signals.fill(GUEST_EGRESS_GATE));
+    script.push_str(&signals.fill(tail));
     script
 }
 
@@ -376,11 +475,16 @@ fn build_guest_nix_setup_script(
 /// Creates the `/run/writ-agent-vm` runtime dir the gate and the broker-ready
 /// signal need.
 pub(super) fn nix_setup_script() -> String {
+    nix_setup_script_with_signals(BootstrapSignals::SentinelFiles)
+}
+
+pub(super) fn nix_setup_script_with_signals(signals: BootstrapSignals) -> String {
     build_guest_nix_setup_script(
         "",
         r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm"#,
         r#"  printf 'experimental-features = nix-command\n'"#,
         GUEST_NIX_SETUP_TAIL,
+        signals,
     )
 }
 
@@ -388,11 +492,16 @@ pub(super) fn nix_setup_script() -> String {
 /// and the `/run/writ-agent-vm` runtime dir), the egress gate, the workspace
 /// init, then the agent run.
 pub(super) fn workspace_bootstrap_script() -> String {
+    workspace_bootstrap_script_with_signals(BootstrapSignals::SentinelFiles)
+}
+
+pub(super) fn workspace_bootstrap_script_with_signals(signals: BootstrapSignals) -> String {
     build_guest_nix_setup_script(
         GUEST_WORKSPACE_POSITIONAL,
         r#"mkdir -p "$netrc_dir" "$NIX_CONF_DIR" /run/writ-agent-vm"#,
         r#"  printf 'experimental-features = nix-command flakes\n'"#,
         GUEST_WORKSPACE_BOOTSTRAP_TAIL,
+        signals,
     )
 }
 

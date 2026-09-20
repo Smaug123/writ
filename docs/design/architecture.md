@@ -1307,6 +1307,17 @@ firewall → await `security-ready` → release), rather than more variants on
 `AgentVmStartStep`: that enum's interpreter is synchronous and store-less, and
 the locked tail is neither. Each step names the `LockedPhase` it establishes.
 
+`agent_vm_guest_log` also carries the *post-release* vocabulary:
+`GuestBootstrapRecord` (`ok`, or `failed` with a bounded reason) under its own
+`writ-agent-vm-bootstrap` prefix, and `scan_bootstrap_log` to read it. The
+separate prefix is the point — neither reader can see the other's vocabulary,
+so a released workload printing a `security-ready` line is not making a claim
+the host will act on, and a bootstrap line in the pre-release window cannot
+release anything. The locked guest scripts print these records instead of
+touching the sentinel files the daemon polls over `container exec`;
+`BootstrapSignals` substitutes the two outcome statements into the otherwise
+shared script, so the legacy profile's scripts are byte-identical to before.
+
 `agent_vm_locked_session::run_locked_start` is the interpreter for that
 sequence, built and tested but with no caller (admission still refuses the
 profile). It advances E1's typestates and the persisted record together:
