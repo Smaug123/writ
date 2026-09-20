@@ -1311,6 +1311,46 @@ fn materialize_request(work: &Path) -> BrokerVmSessionRequest {
     }
 }
 
+/// Each host directory on the request reaches its own guest target, with
+/// the secret store read-only and the other two writable.
+///
+/// `sample_plan` pins the same mapping, but it calls `BrokerVmPlan::new`
+/// itself, so it can only be wrong in the same way the test author was.
+/// This drives the production path, where the request's field names
+/// (`secrets_dir`) and the constructor's (`secret_store_dir`) differ.
+#[test]
+fn materialize_maps_each_host_dir_to_its_own_guest_mount() {
+    let (_host_dir, host) = host_store_with(&[
+        ("claude-pk", "PEM-DATA"),
+        ("anthropic-api-key", "sk-abc"),
+        ("codex-pk", "other"),
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let request = materialize_request(work.path());
+    let bearer = VmHttpBearerToken::generate();
+
+    let plan =
+        materialize_broker_vm_session(&request, &materialize_host_config_json(), &bearer, &host)
+            .unwrap();
+    let args = plan.run_invocation().args_lossy();
+
+    for (source, target, readonly) in [
+        (&request.staging_dir, BROKER_VM_SESSION_DIR, false),
+        (&request.secrets_dir, BROKER_VM_SECRETS_DIR, true),
+        (&request.audit_dir, BROKER_VM_AUDIT_DIR, false),
+    ] {
+        let expected = format!(
+            "type=virtiofs,source={},target={target}{}",
+            source.display(),
+            if readonly { ",readonly" } else { "" },
+        );
+        assert!(
+            args.contains(&expected),
+            "expected mount {expected:?} in {args:?}"
+        );
+    }
+}
+
 #[test]
 fn materialize_mounts_the_host_prewarm_dir_when_configured() {
     // A host config that sets nix_prewarm_cache_dir at an EXISTING dir must
