@@ -164,13 +164,17 @@ pub trait GitObjectSource {
 #[derive(Debug, thiserror::Error)]
 pub enum GitObjectSourceError {
     #[error("object {sha} not found in staging repo")]
-    NotFound { sha: String },
+    NotFound { sha: GitObjectId },
     #[error("object {sha} is malformed: {reason}")]
-    Malformed { sha: String, reason: String },
+    Malformed { sha: GitObjectId, reason: String },
     #[error(
         "object {sha} reports size {size} bytes which exceeds the configured per-object limit of {max} bytes"
     )]
-    ObjectTooLarge { sha: String, size: u64, max: u64 },
+    ObjectTooLarge {
+        sha: GitObjectId,
+        size: u64,
+        max: u64,
+    },
     #[error("git object source has been poisoned by an earlier failure and is no longer usable")]
     Poisoned,
     /// Reading object `sha` did not complete within the per-object
@@ -180,7 +184,7 @@ pub enum GitObjectSourceError {
     /// like every other variant this is surfaced before any ref-moving
     /// call, so the caller can treat it as retryable.
     #[error("reading object {sha} timed out after {timeout:?}")]
-    ReadTimedOut { sha: String, timeout: Duration },
+    ReadTimedOut { sha: GitObjectId, timeout: Duration },
     #[error("object access failed: {source}")]
     Io {
         #[source]
@@ -261,8 +265,8 @@ pub enum ReplayError {
          (not in the seed map, not earlier in the topo-sorted commit list)"
     )]
     UnmappedParent {
-        bundle_sha: String,
-        parent_sha: String,
+        bundle_sha: GitObjectId,
+        parent_sha: GitObjectId,
     },
     /// Signing the canonical bytes of a commit that the walker
     /// already built failed. Surfaces only when `replay_commits` was
@@ -278,7 +282,7 @@ pub enum ReplayError {
     /// failure surfaces with context rather than panicking.
     #[error("signing replayed commit {bundle_sha} failed: {source}")]
     Sign {
-        bundle_sha: String,
+        bundle_sha: GitObjectId,
         #[source]
         source: CommitSignError,
     },
@@ -376,8 +380,8 @@ async fn replay_one_commit<S: GitObjectSource>(
             map.commit(parent)
                 .cloned()
                 .ok_or_else(|| ReplayError::UnmappedParent {
-                    bundle_sha: bundle_sha.as_str().to_string(),
-                    parent_sha: parent.as_str().to_string(),
+                    bundle_sha: bundle_sha.clone(),
+                    parent_sha: parent.clone(),
                 })?;
         parents.push(app_parent);
     }
@@ -394,7 +398,7 @@ async fn replay_one_commit<S: GitObjectSource>(
             };
             Some(
                 sign_commit_for_github(key, &input).map_err(|source| ReplayError::Sign {
-                    bundle_sha: bundle_sha.as_str().to_string(),
+                    bundle_sha: bundle_sha.clone(),
                     source,
                 })?,
             )
@@ -554,17 +558,12 @@ pub enum FastForwardPlan {
     AlreadyAtExpected { tip: GitObjectId },
 }
 
-#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum FastForwardPlanError {
     /// The `git rev-list` subprocess itself failed (unknown SHA,
     /// missing staging repo, IO error, exit-status non-zero).
-    ///
-    /// Stringified rather than carrying the underlying
-    /// `CleanGitError`: the clean-git module is `pub(crate)` and
-    /// publishing one of its variants here would force the entire
-    /// hardening helper out into the public surface.
     #[error("`git rev-list` failed: {0}")]
-    Git(String),
+    Git(#[from] CleanGitError),
     #[error(
         "`git rev-list --boundary` emitted a line that does not parse as a commit SHA: \
          {line:?} ({reason})"
@@ -631,12 +630,6 @@ pub enum FastForwardPlanError {
          too many commits to replay and the walk was refused"
     )]
     RevListOutputTooLarge { cap: usize },
-}
-
-impl From<CleanGitError> for FastForwardPlanError {
-    fn from(err: CleanGitError) -> Self {
-        FastForwardPlanError::Git(err.to_string())
-    }
 }
 
 /// Plan the per-commit walk for a fast-forward push by shelling out
