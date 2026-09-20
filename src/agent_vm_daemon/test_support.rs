@@ -14,7 +14,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use writ_core::byte_size::ByteSize;
 
-use crate::agent_vm_locked_admission::{AdmittedProfile, LockedV1Admission, ProvenPlatform};
+use crate::agent_vm_locked_admission::{
+    AdmittedProfile, LockedV1Admission, LockedV1Fact, ProvenPlatform,
+};
 use crate::audit::AuditLog;
 use crate::core::{BrokerPort, BrokerPortRange, BrokerPorts, Ipv4Cidr, Ipv6Cidr};
 use crate::nix_binary_cache::NixTrustedPublicKeys;
@@ -809,15 +811,39 @@ pub(super) enum LockedProbeHost {
     ImageWithoutAbiLabel,
     /// Nothing answers at all.
     Silent,
+    /// Every probe answers, but slowly, and each one refuses to overlap with
+    /// another: if a second probe starts while one is in flight it records
+    /// the fact. For the test that writd gathers admission one at a time.
+    RefusesToOverlap,
 }
 
 impl LockedProbeHost {
+    /// The hosts the refusal sweep runs over. `RefusesToOverlap` is left out:
+    /// it is about concurrency, not about which fact refuses, and it sleeps.
     pub(super) const ALL: [Self; 4] = [
         Self::Unrecorded,
         Self::OldHelper,
         Self::ImageWithoutAbiLabel,
         Self::Silent,
     ];
+
+    /// Which fact this host's refusal is about.
+    ///
+    /// Asserted by the sweep, so a fixture that stopped producing the host it
+    /// names fails rather than quietly making two cases the same one.
+    pub(super) fn refused_over(self) -> LockedV1Fact {
+        match self {
+            // Every fact reads; the platform is simply not in the record, and
+            // the first level of the allowlist it leaves is the CLI.
+            Self::Unrecorded => LockedV1Fact::ContainerCli,
+            Self::OldHelper => LockedV1Fact::HelperProtocol,
+            Self::ImageWithoutAbiLabel => LockedV1Fact::ImageIsolationAbi,
+            // Nothing answers, so the first fact checked is the first that
+            // cannot be read.
+            Self::Silent => LockedV1Fact::HelperProtocol,
+            Self::RefusesToOverlap => LockedV1Fact::ContainerCli,
+        }
+    }
 }
 
 /// A fake `container` + `pf-helper` + `sudo` that answers the five admission
@@ -871,10 +897,17 @@ pub(super) fn write_fake_locked_probe_tool(
         ),
     )
     .unwrap();
+    // The shape `container image inspect` really prints, which is what
+    // `ImageInspection::parse` really requires: the digest under
+    // `configuration.descriptor`, and the labels three levels into the
+    // variant's config. A fixture that only *looked* plausible made two of
+    // these hosts refuse over the same fact, which is how a sweep over four
+    // hosts became a sweep over three.
     fs::write(
         dir.join("probe-image-inspect.out"),
         format!(
-            r#"[{{"config":{{"Labels":{{{labels}}}}},"descriptor":{{"digest":"{digest}"}}}}]"#,
+            r#"[{{"configuration":{{"descriptor":{{"digest":"{digest}"}},"name":"alpine:latest"}},
+                 "variants":[{{"config":{{"config":{{"Labels":{{{labels}}}}}}}}}]}}]"#,
             digest = LOCKED_IMAGE_DIGEST,
         ),
     )
@@ -896,6 +929,16 @@ case "$1" in
   *) exit 0 ;;
 esac
 if [ "{host:?}" = Silent ]; then exit 3; fi
+if [ "{host:?}" = RefusesToOverlap ]; then
+  # Detected by the probe itself rather than timed by the test: if a second
+  # gathering is in flight, this file exists, and that is a fact about writd
+  # rather than about how fast this machine is. The sleep only makes the
+  # overlap likely when there is nothing stopping it.
+  if [ -e {root}/probing ]; then printf '%s\n' "$*" >> {root}/overlap.log; fi
+  : > {root}/probing
+  sleep 0.2
+  rm -f {root}/probing
+fi
 case "$1" in
   protocol-version) exec cat {root}/probe-helper-protocol.out ;;
   preflight) exec cat {root}/probe-preflight.out ;;

@@ -1284,6 +1284,13 @@ it. That ordering is what keeps "how many runs writd will admit" and "how many
 requests can have it probing at once" the same number; a guard test asserts
 it, beside the one saying this is the only place that enqueues.
 
+Concurrent starts do not multiply that work between them: the probes ask a
+question about the host, so an `admission_lock` serialises the gathering. The
+raw start route needs it most — it has no queue place, and its subnet lock
+comes after the decision. Waiters queue rather than being handed an answer
+gathered before they asked, which would admit a session on evidence predating
+the request.
+
 `--dry-run` cannot ask at all, since it must run nothing.
 `ConfiguredIpv6Profile::is_decided_by_the_host` is the pure question it asks
 instead: for the locked profile the runner prints the *probes*, which are the

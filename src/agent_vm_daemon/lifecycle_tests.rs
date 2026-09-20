@@ -53,10 +53,20 @@ async fn an_unproven_host_refuses_new_sessions_and_creates_nothing() {
             )
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, AgentVmDaemonError::Ipv6ProfileRefused(_)),
-            "start_session on {host:?}: got {err:?}"
-        );
+        // Which fact refused, not merely that something did: a sweep whose
+        // cases all refuse over the same fact is one case wearing four names,
+        // and would not notice a fixture that stopped producing the host it
+        // claims to.
+        match &err {
+            AgentVmDaemonError::Ipv6ProfileRefused(refused) => {
+                assert_eq!(
+                    refused.fact(),
+                    host.refused_over(),
+                    "on {host:?}: {refused}"
+                );
+            }
+            other => panic!("start_session on {host:?}: got {other:?}"),
+        }
 
         // The agent-run route refuses the same way, and equally early: it
         // cannot even be *accepted* without a decision, and there is none.
@@ -3143,5 +3153,64 @@ async fn a_run_the_queue_bound_refuses_runs_no_probe() {
         !args_log.exists(),
         "a run the bound refused must have run no probe: {:?}",
         fs::read_to_string(&args_log)
+    );
+}
+
+/// Concurrent starts do not multiply the host work between them.
+///
+/// Deciding the locked profile asks the *host* five questions, and every
+/// concurrent start would ask them to learn the same thing. Unchecked, the
+/// number of subprocesses writd runs to refuse a start is the number of
+/// clients that can connect times five — and the raw start route has no queue
+/// place to bound it with, its subnet lock coming after the decision.
+///
+/// The overlap is detected by the probe itself, not timed by the test: the
+/// fake writes a file while it is running and records any second probe that
+/// finds it there. With the lock, that file can never be found, whatever the
+/// scheduling; the sleep inside the probe only makes the overlap likely when
+/// nothing is stopping it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_starts_gather_admission_one_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let args_log = dir.path().join("args.log");
+    let fake_tool =
+        write_fake_locked_probe_tool(dir.path(), &args_log, LockedProbeHost::RefusesToOverlap);
+    let (config, _state_store) = daemon_config_with_ipv6_profile(
+        dir.path(),
+        &fake_tool,
+        ConfiguredIpv6Profile::Ipv4OnlyLockedV1,
+    );
+    let daemon = Arc::new(AgentVmDaemon::new(config));
+    let state = make_state();
+
+    let starts = (0..4).map(|n| {
+        let daemon = Arc::clone(&daemon);
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            daemon
+                .start_session(
+                    state,
+                    Some(format!("concurrent {n}")),
+                    Some(AgentKind::Claude),
+                    Some("claude-test".into()),
+                    None,
+                    vec!["sleep".into(), "600".into()],
+                )
+                .await
+        })
+    });
+    for start in futures_util::future::join_all(starts).await {
+        let err = start.unwrap().expect_err("this host is in no proof record");
+        assert!(
+            matches!(err, AgentVmDaemonError::Ipv6ProfileRefused(_)),
+            "{err:?}"
+        );
+    }
+
+    let overlap = dir.path().join("overlap.log");
+    assert!(
+        !overlap.exists(),
+        "writd gathered admission concurrently: {:?}",
+        fs::read_to_string(&overlap)
     );
 }

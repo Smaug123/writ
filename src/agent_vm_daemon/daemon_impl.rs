@@ -16,6 +16,7 @@ impl AgentVmDaemon {
             config,
             running: Mutex::new(HashMap::new()),
             subnet_allocation_lock: Mutex::new(()),
+            admission_lock: Mutex::new(()),
             session_locks: Mutex::new(HashMap::new()),
             accepted_agent_runs: Arc::new(AcceptedAgentRunRegistry::default()),
             network_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -93,6 +94,11 @@ impl AgentVmDaemon {
     /// probes — no network, no VM, no state record — which is what keeps it
     /// safe to ask before the session has an identity.
     pub async fn admitted_profile(&self) -> Result<AdmittedProfile, AgentVmDaemonError> {
+        // One gathering at a time: see `admission_lock`. Held across the
+        // probes, which is the whole point — for every profile but the locked
+        // one there are none, and the lock is taken and released without
+        // awaiting anything.
+        let _admission_guard = self.admission_lock.lock().await;
         Ok(admit_on_this_host(
             self.config.lifecycle.ipv6_profile,
             &self.config.lifecycle.tools,

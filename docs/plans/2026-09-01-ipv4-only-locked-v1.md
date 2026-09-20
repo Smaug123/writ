@@ -695,7 +695,7 @@ mutually exclusive and the locked profile takes the one whose completion it
 can observe, with host PF the backstop either way. A test asserts the kernel
 arg is absent, naming that reason.
 
-Eight weakenings were injected and fail these tests: a readback that compares
+Nine weakenings were injected and fail these tests: a readback that compares
 the argv spelling of a capability, one that ignores the `/proc` relaxation,
 one that ignores PID 1's identity, one that ignores `useInit`, a launch that
 swaps the relaxation for the legacy kernel argument, and a launch that goes
@@ -1065,14 +1065,36 @@ runs it will admit. The existing spawn-hygiene-style guard on that function
 gained the ordering as a second assertion, beside the one that says this is
 the only place that enqueues.
 
-That is four places in this slice where a pure function becoming effectful
+A fifth round found the raw start route, which has no queue place to bound it
+with and takes its subnet lock only *after* the decision. The answer there is
+not another bound but not doing the work N times: the probes ask a question
+about the host, so concurrent starts were running five subprocesses each to
+learn the same thing. An `admission_lock` serialises the gathering. The trade
+is stated rather than assumed — a waiter queues instead of being handed the
+answer gathered before it asked, because admitting a session on evidence that
+predates the request is a staleness this gate should not take on.
+
+Its test detects the overlap *in the probe* rather than timing the loop: the
+fake writes a file while it runs and records any second probe that finds it
+there, so what the test observes is a fact about writd rather than about how
+fast the machine is.
+
+The same round found a fixture that was green for the wrong reason. The
+probe-host sweep's `container image inspect` output was a plausible-looking
+shape rather than the real one, so `ImageInspection::parse` refused it and two
+of the four hosts refused over the *same* fact — a sweep over four hosts that
+was really a sweep over three. The test had only asserted that something
+refused. It now asserts *which* fact each host's refusal is about, which is
+what makes the sweep a sweep.
+
+That is five places in this slice where a pure function becoming effectful
 broke something downstream, and the pattern is worth naming: every caller
 relying on admission being free had to be found, because none of them said so.
-The compiler found two of them — the ones the `async` boundary touched — and a
-reviewer found the other four. A type that made "this is now work" visible to
-callers would have found them all; `async` was that type for two of the four,
-and for the rest the cost was invisible because nothing about an ordering says
-what it is protecting.
+The compiler found the ones the `async` boundary touched and a reviewer found
+the rest. A type that made "this is now work" visible to callers would have
+found them all; `async` was that type where a signature changed, and for the
+rest the cost was invisible because nothing about an ordering says what it is
+protecting.
 
 Six weakenings were injected and fail these tests: a locked session wrapped
 with the sentinel scripts, a release that accepts any listening broker, an
@@ -1211,7 +1233,9 @@ asked about, a door that probes for the profiles decided on their spelling, a
 reconcile that asks admission on its way to a teardown, an agent-run route
 that asks about the profile before the placement, a dry run that asks for a
 decision before it looks at the flag, an accept that probes before taking its
-place in the queue, and a placement check moved after the probes.
+place in the queue, a placement check moved after the probes, a daemon that
+gathers admission concurrently, and the fixture whose image-inspect document
+was the wrong shape.
 
 ---
 
