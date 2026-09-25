@@ -162,12 +162,12 @@ impl Withheld for SessionVerdict {
 #[derive(Clone, Debug)]
 pub struct GuestReport {
     captures: BTreeMap<GuestSlot, Claim<RawCapture>>,
-    /// The slots whose answer reached [`GUEST_CAPTURE_LIMIT`]. The host
-    /// measured this itself — it is the length of what it kept, not anything
-    /// the guest said about its answer — and an answer that reached the bound
-    /// is one whose end the host never saw, which could contradict every line
-    /// it did.
-    reached_bound: BTreeSet<GuestSlot>,
+    /// The slots whose answer the host did not read whole: it reached
+    /// [`GUEST_CAPTURE_LIMIT`], or it is not UTF-8. The host measured both
+    /// itself, on the bytes it kept — nothing the guest said about its answer
+    /// — and either way there is a part of the answer no parser saw, which
+    /// could contradict every line it did.
+    unread_whole: BTreeSet<GuestSlot>,
 }
 
 /// Why a directory of captures is not a report.
@@ -198,14 +198,14 @@ impl GuestReport {
             .into_iter()
             .map(|slot| (slot, capture(slot)))
             .collect();
-        let reached_bound = captures
+        let unread_whole = captures
             .iter()
             .filter(|(_, claim)| claim.captured_bytes() >= GUEST_CAPTURE_LIMIT)
             .map(|(slot, _)| *slot)
             .collect();
         Self {
             captures,
-            reached_bound,
+            unread_whole,
         }
     }
 
@@ -227,7 +227,7 @@ impl GuestReport {
             }
         }
         let mut captures = BTreeMap::new();
-        let mut reached_bound = BTreeSet::new();
+        let mut unread_whole = BTreeSet::new();
         for slot in GuestSlot::ALL {
             let path = dir.join(format!("{}.txt", slot.name()));
             let file = match std::fs::File::open(&path) {
@@ -241,15 +241,24 @@ impl GuestReport {
             file.take(GUEST_CAPTURE_LIMIT as u64)
                 .read_to_end(&mut bytes)
                 .map_err(|e| read_error(&path, e))?;
-            // Measured on the bytes, before the lossy decode below can change
-            // their length.
+            // Measured on the bytes, before any decode can change their
+            // length.
             if bytes.len() >= GUEST_CAPTURE_LIMIT {
-                reached_bound.insert(slot);
+                unread_whole.insert(slot);
             }
-            // Lossy on purpose: the guest's bytes are not the host's to
-            // refuse, and a replacement character fails every parser's
-            // grammar, which is the doubt a garbled answer deserves.
-            let text = String::from_utf8_lossy(&bytes);
+            let text = match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) => {
+                    // Not refused — the guest's bytes are not the host's to
+                    // refuse — but not read whole either: a lossy decode
+                    // turns each bad byte into three, so an answer under the
+                    // bound on disk can overrun it decoded, and the cut would
+                    // drop a tail nothing measured. Kept lossily, for the
+                    // appendix.
+                    unread_whole.insert(slot);
+                    String::from_utf8_lossy(error.as_bytes()).into_owned()
+                }
+            };
             captures.insert(
                 slot,
                 Claim::asserted(RawCapture::capture(&text, GUEST_CAPTURE_LIMIT)),
@@ -257,7 +266,7 @@ impl GuestReport {
         }
         Ok(Self {
             captures,
-            reached_bound,
+            unread_whole,
         })
     }
 
@@ -268,11 +277,11 @@ impl GuestReport {
     }
 
     /// Whether this slot's answer gives the host reason to withdraw its
-    /// conclusion: its parser doubts it, or it reached the bound. The second
-    /// is checked apart from the first because no parser can see what was
-    /// cut, and several read only the lines they need.
+    /// conclusion: its parser doubts it, or the host did not read it whole.
+    /// The second is checked apart from the first because no parser can see
+    /// what was cut, and several read only the lines they need.
     pub fn doubt(&self, slot: GuestSlot) -> Doubt {
-        let cut = if self.reached_bound.contains(&slot) {
+        let cut = if self.unread_whole.contains(&slot) {
             Doubt::raised()
         } else {
             Doubt::none()

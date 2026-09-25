@@ -514,3 +514,42 @@ fn an_answer_that_reaches_the_bound_is_doubt_whatever_its_prefix_says() {
         SessionVerdict::Proven
     );
 }
+
+/// An answer that is not UTF-8 is not one the host read whole. Lossy decoding
+/// turns each bad byte into a three-byte replacement character, so an answer
+/// well under the bound on disk can overrun it once decoded, and the cut then
+/// drops a tail the byte count never saw: here, the set holding `NET_RAW`.
+#[test]
+fn an_answer_that_is_not_utf8_is_doubt_even_under_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    for slot in GuestSlot::ALL {
+        std::fs::write(
+            dir.path().join(format!("{}.txt", slot.name())),
+            honest(slot),
+        )
+        .unwrap();
+    }
+    let mut status = HONEST_STATUS.as_bytes().to_vec();
+    status.extend(std::iter::repeat_n(0xff_u8, 23_000));
+    status.extend_from_slice(b"\nCapBnd:\t00000000a80425fb\n");
+    assert!(status.len() < GUEST_CAPTURE_LIMIT);
+    std::fs::write(dir.path().join("pid1-status.txt"), &status).unwrap();
+    let graded = grade_guest_report(
+        SessionVerdict::Proven,
+        &GuestReport::read_dir(dir.path()).unwrap(),
+    );
+    assert_eq!(graded.doubted_by, vec![GuestSlot::Pid1Status]);
+
+    // One bad byte in an otherwise passing answer is doubt too.
+    std::fs::write(
+        dir.path().join("pid1-status.txt"),
+        honest(GuestSlot::Pid1Status),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("release-marker.txt"), b"released\xff\n").unwrap();
+    let graded = grade_guest_report(
+        SessionVerdict::Proven,
+        &GuestReport::read_dir(dir.path()).unwrap(),
+    );
+    assert_eq!(graded.doubted_by, vec![GuestSlot::ReleaseMarker]);
+}

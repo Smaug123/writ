@@ -1496,7 +1496,10 @@ pass, each reproduced before it was fixed:
 - **A truncated answer.** An answer that reached the capture bound was
   parsed from its retained prefix, and several parsers read only the lines
   they need, so a contradiction past the cut went unseen. Reaching the bound,
-  as the host measured it on the bytes it kept, is now doubt in itself.
+  as the host measured it on the bytes it kept, is now doubt in itself. So is
+  an answer that is not UTF-8 (a second round's find): a lossy decode turns
+  each bad byte into three, so an answer under the bound on disk overran it
+  decoded, and the cut dropped a tail the byte count never saw.
 
 **A finding for E3c and E3e.** The E3 oracles above say that under the legacy
 profile "the root guest can re-enable IPv6, so the deny counters must rise".
