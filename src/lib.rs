@@ -8,6 +8,9 @@
 pub use writ_agent_run as agent_run;
 #[cfg(feature = "host")]
 pub mod agent_run_envelope;
+// Deliberately ungated: the guest attack binary (plan Stage E3d) is built with
+// no host features, and constructs the claims that the host proof discharges.
+pub mod agent_vm_claim;
 #[cfg(feature = "host")]
 pub mod agent_vm_daemon;
 #[cfg(feature = "host")]

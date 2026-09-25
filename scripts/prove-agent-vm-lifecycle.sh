@@ -12,8 +12,8 @@ Requires:
   - root privileges through sudo for pfctl
   - a top-level PF rule in /etc/pf.conf: anchor "writ/session/*"
   - python3, curl, cargo or nix, and an Alpine-compatible image with sh, ip,
-    wget, and nslookup (the IPv6 backstop assertion sends a real IPv6 TCP
-    probe with wget and grades it on the host's PF deny counter; the released
+    wget, and nslookup (the IPv4 probes are graded on the host's PF deny
+    counters and listener logs, never on what the guest says; the released
     workload holds no CAP_NET_RAW, so a raw-socket tool such as busybox ping
     cannot be the sender)
   - a python3 that the macOS Application Firewall allows incoming connections
@@ -85,8 +85,18 @@ dump_pf_diagnostics() {
   printf '[prove-lifecycle] diagnostics: ifconfig (bridge and vmenet)\n' >&2
   ifconfig 2>/dev/null | grep -A12 -E '^(bridge|vmenet)[0-9]+:' >&2 || true
   if [[ -n "${VM_NAME:-}" ]]; then
-    printf '[prove-lifecycle] diagnostics: guest ip addr / route / neigh\n' >&2
+    printf '[prove-lifecycle] diagnostics: guest ip addr / route / neigh (guest-reported)\n' >&2
     container exec "$VM_NAME" sh -lc 'ip -4 addr; ip -4 route; ip neigh' >&2 2>/dev/null || true
+  fi
+  # The guest's answers so far, as claims: shell-escaped, so an answer cannot
+  # print a line that reads like this harness's own.
+  if [[ -d "${GUEST_DIR:-}" ]]; then
+    local answer
+    for answer in "$GUEST_DIR"/*.txt; do
+      [[ -e "$answer" ]] || continue
+      printf '[prove-lifecycle] diagnostics: guest answered %s: %q\n' \
+        "$(basename "$answer" .txt)" "$(cat "$answer")" >&2
+    done
   fi
 }
 
@@ -116,6 +126,11 @@ VM_NAME="writ-agent-vm-${SESSION_ID}"
 PF_ANCHOR="writ/session/${SESSION_ID}"
 BROKER_DIR="${TMP_DIR}/broker"
 FORBIDDEN_DIR="${TMP_DIR}/forbidden"
+# One file per question the guest is asked, read only by the grader.
+GUEST_DIR="${TMP_DIR}/guest-report"
+# writ::agent_vm_proof::guest::GUEST_CAPTURE_LIMIT: the grader reads no more,
+# and an answer this long is one whose end the host never saw.
+GUEST_CAPTURE_LIMIT=65536
 START_OUTPUT="${TMP_DIR}/runner-start.txt"
 RUNNER=""
 HELPER=""
@@ -238,11 +253,16 @@ pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
 
+# `http.server` that also logs every accept (scripts/lib/accept-logging-http-server.py):
+# a connection closed without a request leaves no line in plain `http.server`'s
+# log, and the forbidden listener's silence is graded on that log. Both
+# listeners run it, so the positive control exercises the same tool the
+# negative relies on.
 start_http_server() {
   local dir="$1"
   local port="$2"
   local log_file="$3"
-  python3 -m http.server "$port" --bind 0.0.0.0 --directory "$dir" \
+  python3 "${ROOT_DIR}/scripts/lib/accept-logging-http-server.py" "$port" "$dir" \
     >"$log_file" 2>&1 &
   echo "$!"
 }
@@ -267,147 +287,93 @@ wait_for_host_http() {
   die "${label} listener did not start on port ${port}"
 }
 
-guest() {
-  container exec "$VM_NAME" sh -lc "$1"
+# The guest is the party under test, so this harness never reads what it says
+# (plan Stage E3b; evidence protocol rule 2). There are exactly two ways in:
+#
+#   guest_report <slot> <command>  asks one question and captures the answer,
+#                                  unread, for `writ-agent-vm-proof guest-report`,
+#                                  which holds it as a claim that can withdraw
+#                                  the verdict and never reach one.
+#   guest_act <label> <command>    commands the guest to do something; its exit
+#                                  status is logged and ignored (rule 3).
+#
+# Neither returns anything the shell could branch on, and a test in
+# src/agent_vm_proof/guest/tests.rs fails if anything else here execs into the
+# guest, or if a slot asked here is not one the grader parses.
+guest_report() {
+  local slot="$1"
+  local command="$2"
+  container exec "$VM_NAME" sh -lc "$command" 2>&1 \
+    | head -c "$GUEST_CAPTURE_LIMIT" >"${GUEST_DIR}/${slot}.txt" || true
+  log "asked the guest ${slot}; its answer is a claim, graded at the end"
 }
 
-expect_guest_success() {
+guest_act() {
   local label="$1"
   local command="$2"
-  log "assert: ${label}"
-  if guest "$command"; then
-    log "pass: ${label}"
-  else
-    die "expected success: ${label}"
-  fi
+  local status=0
+  container exec "$VM_NAME" sh -lc "$command" >/dev/null 2>&1 || status=$?
+  log "commanded the guest: ${label} (exit ${status}, ignored)"
 }
 
-expect_guest_blocked() {
-  local label="$1"
-  local command="$2"
-  log "assert: ${label}"
-  set +e
-  guest "$command"
-  local status=$?
-  set -e
-  if [[ "$status" -eq 0 ]]; then
-    die "expected block/failure but probe succeeded: ${label}"
-  fi
-  log "pass: ${label}"
+# A guest command that fetches one URL and prints `exit <n>` then the body,
+# the shape the grader's fetch slots read.
+fetch_command() {
+  local url="$1"
+  printf '%s' "body=\"\$(wget -q -T 3 -O - '${url}' 2>&1)\"; echo \"exit \$?\"; printf '%s\\n' \"\$body\""
 }
 
-wait_for_released_guest_command() {
-  log "assert: released guest command is running"
-  for _ in {1..50}; do
-    if guest 'test "$(cat /tmp/writ-agent-vm-released 2>/dev/null)" = lifecycle-released' \
-      >/dev/null 2>&1; then
-      log "pass: released guest command is running"
-      return
-    fi
-    sleep 0.1
-  done
-  die "released guest command did not write its marker"
+# The guest's IPv6 posture, in the grammar `parse_ipv6_posture` reads: whether
+# the kernel's IPv6 sysctl tree exists, then each read's exit status and every
+# line it printed. Under `ipv6.disable=1` both reads exit 0 and print nothing
+# (measured on Apple container 1.4.1 with alpine:latest).
+# shellcheck disable=SC2016 # expanded by the guest's shell, not this one
+IPV6_POSTURE_COMMAND='
+  if [ -e /proc/sys/net/ipv6 ]; then echo "sysctl present"; else echo "sysctl absent"; fi
+  addrs="$(ip -6 -o addr show scope global 2>&1)"; echo "addr-exit $?"
+  [ -z "$addrs" ] || printf "%s\n" "$addrs" | sed "s/^/addr /"
+  routes="$(ip -6 route show default 2>&1)"; echo "route-exit $?"
+  [ -z "$routes" ] || printf "%s\n" "$routes" | sed "s/^/route /"
+'
+
+# What the released workload says about itself: that it is running, that it is
+# PID 1, what capabilities PID 1 holds, which probe tools it has, and its IPv6
+# posture. All of it is the guest's account, so none of it can pass the proof:
+# a guest that reports holding NET_RAW, lacking a tool, or holding a routable
+# IPv6 address fails it, and a guest that reports none of those has proved
+# nothing. The capability sets are decoded by the grader, all five of them —
+# a capability merely permitted, or still in the bounding set for a
+# file-capability binary to pick up on exec, is authority the workload can
+# still reach.
+ask_guest_about_its_posture() {
+  # Polled in the guest, so the harness does not branch on the answer.
+  # shellcheck disable=SC2016 # expanded by the guest's shell, not this one
+  guest_report release-marker '
+    for _ in $(seq 1 50); do
+      if [ "$(cat /tmp/writ-agent-vm-released 2>/dev/null)" = lifecycle-released ]; then
+        echo released; exit 0
+      fi
+      sleep 0.1
+    done
+    echo absent'
+  # The released command is a `while :; do sleep; done` loop, not a bare
+  # `sleep`, so BusyBox ash does not tail-exec it away and PID 1's cmdline
+  # keeps the marker (capabilities survive any exec regardless, so
+  # /proc/1/status is the workload's posture either way).
+  guest_report pid1-cmdline 'tr "\0" " " </proc/1/cmdline'
+  guest_report pid1-status 'cat /proc/1/status'
+  # BusyBox's `command -v` reports only its first argument, so ask per tool.
+  # shellcheck disable=SC2016 # expanded by the guest's shell, not this one
+  guest_report probe-tools 'for tool in ip wget nslookup; do command -v "$tool" >/dev/null 2>&1 && echo "$tool"; done'
+  guest_report ipv6-at-start "$IPV6_POSTURE_COMMAND"
 }
 
-guest_ipv4_addr() {
-  guest "ip -4 -o addr show scope global | awk '{print \$4}' | head -n 1 | cut -d/ -f1"
-}
-
-# Linux capability bit numbers (include/uapi/linux/capability.h).
-CAP_NET_ADMIN_BIT=12
-CAP_NET_RAW_BIT=13
-
-# rc 0 iff bit $2 is set in the hex capability mask $1 as /proc/<pid>/status
-# renders it. Decoded here in bash (64-bit arithmetic), not in the guest's
-# 32-bit busybox ash.
-cap_mask_has_bit() {
-  local mask="$1"
-  local bit="$2"
-  [[ "$mask" =~ ^[0-9a-fA-F]{1,16}$ ]] || die "malformed capability mask: '${mask}'"
-  (( (0x$mask >> bit) & 1 ))
-}
-
-# The decoder's own positive control, so the assertion below cannot pass
-# because the decoder reads every mask as empty. Apple `container`'s documented
-# default set (AUDIT_WRITE CHOWN DAC_OVERRIDE FOWNER FSETID KILL MKNOD
-# NET_BIND_SERVICE NET_RAW SETFCAP SETGID SETPCAP SETUID SYS_CHROOT) renders as
-# this mask: it holds NET_RAW and CHOWN and not NET_ADMIN.
-assert_capability_decoder_works() {
-  local default_set=00000000a80425fb
-  if ! cap_mask_has_bit "$default_set" "$CAP_NET_RAW_BIT"; then
-    die "capability decoder self-test: NET_RAW not found in ${default_set}"
-  fi
-  if ! cap_mask_has_bit "$default_set" 0; then
-    die "capability decoder self-test: CHOWN not found in ${default_set}"
-  fi
-  if cap_mask_has_bit "$default_set" "$CAP_NET_ADMIN_BIT"; then
-    die "capability decoder self-test: NET_ADMIN found in ${default_set}"
-  fi
-}
-
-# The released workload is PID 1 (the IPv4-only prelaunch gate `exec`s the
-# guest command once released), so its capability sets are /proc/1/status's.
-# Every one of the five sets is checked: a capability that is merely not
-# effective — still permitted, or still in the bounding set for a re-exec of a
-# file-capability binary to pick up — must fail too.
-assert_released_workload_lacks_net_admin_and_net_raw() {
-  log "assert: released workload holds neither NET_ADMIN nor NET_RAW in any capability set"
-  assert_capability_decoder_works
-  # Positive control on the target: PID 1 must be the released guest command,
-  # not the prelaunch gate or an init shim, or the masks describe the wrong
-  # process. The released command is a `while :; do sleep; done` loop, not a
-  # bare `sleep`, precisely so BusyBox ash does not tail-exec it away and
-  # PID 1's cmdline keeps the marker (capabilities are preserved across any
-  # exec regardless, so /proc/1/status is the workload's posture either way).
-  guest 'tr "\0" " " </proc/1/cmdline | grep -q lifecycle-released' \
-    || die "guest PID 1 is not the released guest command"
-  local status
-  status="$(guest 'cat /proc/1/status')" || die "could not read /proc/1/status in the guest"
-  local seen=0
-  local name mask
-  while read -r name mask; do
-    case "$name" in
-      CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:) ;;
-      *) continue ;;
-    esac
-    seen=$((seen + 1))
-    if cap_mask_has_bit "$mask" "$CAP_NET_ADMIN_BIT"; then
-      die "released workload holds NET_ADMIN in ${name} ${mask}"
-    fi
-    if cap_mask_has_bit "$mask" "$CAP_NET_RAW_BIT"; then
-      die "released workload holds NET_RAW in ${name} ${mask} (the IPv4-only launch must pass --cap-drop NET_RAW)"
-    fi
-    log "  ${name} ${mask}: no NET_ADMIN, no NET_RAW"
-  done <<<"$status"
-  [[ "$seen" -eq 5 ]] || die "expected 5 capability sets in /proc/1/status, decoded ${seen}"
-  log "pass: released workload holds neither NET_ADMIN nor NET_RAW in any capability set"
-}
-
-assert_guest_has_no_routable_ipv6() {
-  log "assert: guest has no routable IPv6 address or default route"
-  set +e
-  guest '
-    if ! command -v ip >/dev/null 2>&1; then exit 77; fi
-    addrs="$(ip -6 -o addr show scope global)" || exit 1
-    if [ -n "$addrs" ]; then
-      printf "%s\n" "$addrs"
-      exit 1
-    fi
-    routes="$(ip -6 route show default)" || exit 1
-    if [ -n "$routes" ]; then
-      printf "%s\n" "$routes"
-      exit 1
-    fi
-  '
-  local status=$?
-  set -e
-  if [[ "$status" -eq 77 ]]; then
-    die "guest lacks ip command for IPv6 posture assertion"
-  fi
-  if [[ "$status" -ne 0 ]]; then
-    die "guest has routable IPv6 posture or the IPv6 probe failed"
-  fi
-  log "pass: guest has no routable IPv6 address or default route"
+# The guest's address, as the container runtime allocated it: a host-held
+# fact, where the guest's own `ip addr` would be a claim.
+guest_ipv4_from_runtime() {
+  local inspect
+  inspect="$(container inspect "$VM_NAME")" || die "could not inspect ${VM_NAME}"
+  printf '%s' "$inspect" | "$GRADER" guest-address --network "$NETWORK_NAME"
 }
 
 # The attached anchor: once the VM's bridge and members exist, every rule of
@@ -541,10 +507,20 @@ assert_broker_reachable() {
   deny_before="$(pf_iface_deny_packets inet)"
   pass_before="$(pf_broker_pass_counters)"
   log "assert: ${label}"
-  if guest "wget -q -T 3 -O - '$BROKER_URL' | grep -q '^broker-ok$'"; then
-    log "pass: ${label}"
+  guest_report broker-fetch "$(fetch_command "$BROKER_URL")"
+  # Graded on the broker listener's own access log, not on what the guest
+  # says it fetched: the log is the host's, and the guest's account is only a
+  # claim, which can withdraw this pass at the end but never supply it.
+  # http.server logs the line before it writes the body, and its stderr is
+  # line-buffered, so the line is on disk by the time the guest's fetch
+  # returns.
+  local served
+  if served="$("$GRADER" listener-log --log "${TMP_DIR}/broker.log" \
+      --served-to "$GUEST_IPV4" --path /broker.txt 2>&1)"; then
+    log "pass: ${label}: ${served}"
     return
   fi
+  log "the broker listener did not log the guest's request: ${served}"
   local deny_after pass_after
   deny_after="$(pf_iface_deny_packets inet)"
   pass_after="$(pf_broker_pass_counters)"
@@ -632,84 +608,135 @@ read_session_counters_into() {
     || die "could not read this session's PF counters for ${PF_ANCHOR}"
 }
 
+# Whether the session anchor's interface-scoped IPv4 deny counted at least one
+# packet between two readings. The reading and the grading are both the
+# helper's and the grader's, not this script's: `sudo <helper> counters` prints
+# one session anchor's labelled rules as a typed document, and
+# `writ-agent-vm-proof deny-window` decides what two of them mean. What that
+# buys over scraping `pfctl -vsr` is what the typed read can refuse: two
+# documents whose key sets differ, or whose counters fell, are readings of an
+# anchor that was reloaded in between, and their difference is not a
+# measurement.
+grade_ipv4_deny_rose() {
+  local what="$1"
+  local before="$2"
+  local after="$3"
+  local graded
+  graded="$("$GRADER" deny-window \
+    --before "$before" --after "$after" \
+    --family ipv4 --rose-by-at-least 1 2>&1)" \
+    || die "the host IPv4 interface deny did not count the guest's probe of ${what}: ${graded}"
+  log "pass: the guest's probe of ${what} was denied by the host: ${graded}"
+}
+
 # The interface-scoped IPv4 deny is live on the guest's actual path: a TCP
 # connect from the guest to a host port that is not the broker's must be
-# blocked by that rule and counted by it. The guest's exit code is not the
-# oracle (see assert_guest_ipv6_disable_is_irreversible); the host's deny-rule
-# packet counter is. This exercises the same rule a forged-source frame would
-# hit, but with an in-subnet source: the released workload holds neither
-# NET_RAW nor NET_ADMIN (asserted above), so it cannot forge a source at all,
-# and the forged-source measurement is a separate probe container's job (the
-# plan's "Beyond E3", question 4). What this proves is that the rule counted
-# in the readback is the rule deciding the guest's frames.
-#
-# The reading and the grading are both the helper's and the grader's, not this
-# script's: `sudo <helper> counters` prints one session anchor's labelled rules
-# as a typed document, and `writ-agent-vm-proof deny-window` decides what two
-# of them mean. What that buys over the `awk` it replaces is what the typed
-# read can refuse: two documents whose key sets differ, or whose counters
-# fell, are readings of an anchor that was reloaded in between, and their
-# difference is not a measurement. Scraped text could only ever subtract two
-# numbers and get a plausible one.
+# blocked by that rule and counted by it, and the listener on that port must
+# log no contact from the session subnet. Both are the host's; the guest's own
+# account of its fetch is a claim, graded at the end. This exercises the same
+# rule a forged-source frame would hit, but with an in-subnet source: the
+# forged-source measurement is a separate probe container's job (the plan's
+# "Beyond E3", question 4). What this proves is that the rule counted in the
+# readback is the rule deciding the guest's frames.
 assert_forbidden_ipv4_egress_counted() {
   local before="${TMP_DIR}/counters-before-forbidden.json"
   local after="${TMP_DIR}/counters-after-forbidden.json"
   read_session_counters_into "$before"
   log "probing a forbidden host port"
-  expect_guest_blocked \
-    "VM cannot reach forbidden host port" \
-    "wget -q -T 3 -O - '$FORBIDDEN_URL'"
+  guest_report forbidden-fetch "$(fetch_command "$FORBIDDEN_URL")"
   read_session_counters_into "$after"
-  local graded
-  graded="$("$GRADER" deny-window \
-    --before "$before" --after "$after" \
-    --family ipv4 --rose-by-at-least 1 2>&1)" \
-    || die "the host IPv4 interface deny did not count the guest's probe: ${graded}"
-  log "pass: ${graded}"
+  grade_ipv4_deny_rose "a forbidden host port" "$before" "$after"
+  local silence
+  silence="$("$GRADER" listener-log --log "${TMP_DIR}/forbidden.log" \
+    --silent-to "$IPV4_CIDR" 2>&1)" \
+    || die "the forbidden host listener was reached from the session subnet: ${silence}"
+  log "pass: ${silence}"
 }
 
-assert_guest_ipv6_disable_is_irreversible() {
-  log "assert: a root guest cannot re-enable IPv6 (kernel ipv6.disable=1)"
-  # The Ipv4OnlyNoGuestIpv6 launch disables IPv6 on the guest kernel boot line
-  # (`--kernel-arg ipv6.disable=1`), so the P1 attack — a root guest writing
-  # `disable_ipv6=0`, re-soliciting a vmnet RA and reacquiring a ULA — is not
-  # merely blocked at the host but impossible in the guest: there is no IPv6
-  # stack and no `/proc/sys/net/ipv6` to write. Prove that by running the exact
-  # re-enable sequence a malicious root would, then requiring that nothing came
-  # back.
-  guest '
+# Direct internet and direct DNS, each in its own counted window. A guest on
+# the session's internal network has a default route via the host bridge
+# (measured on Apple container 1.4.1), so each probe's first frame arrives on
+# an interface the anchor is scoped to, and the deny must count it. Until
+# Stage E3b these legs were graded on the guest's own exit status, which a
+# compromised guest sets to whatever passes.
+#
+# What the host can say here is narrower than the leg's name, and the summary
+# says only that: the interface-scoped IPv4 deny counted the guest's frames in
+# a window in which it was commanded to reach 1.1.1.1. The counter is not
+# per destination, so a guest that sent something else instead — another
+# blocked port — satisfies it too. Destination-specific evidence is the
+# observation rig's (plan Stage E3c; evidence protocol rule 4, a nonce in the
+# experiment's own PF labels). The forbidden-port leg above *is* specific, by
+# its listener; these two are the same rule exercised on the internet path.
+assert_direct_ipv4_egress_denied() {
+  local before="${TMP_DIR}/counters-before-internet.json"
+  local after="${TMP_DIR}/counters-after-internet.json"
+  read_session_counters_into "$before"
+  guest_report internet-fetch "$(fetch_command "http://1.1.1.1/")"
+  read_session_counters_into "$after"
+  grade_ipv4_deny_rose "the window commanding an HTTP fetch of 1.1.1.1" "$before" "$after"
+
+  before="${TMP_DIR}/counters-before-dns.json"
+  after="${TMP_DIR}/counters-after-dns.json"
+  read_session_counters_into "$before"
+  guest_report dns-lookup 'nslookup github.com 1.1.1.1 >/dev/null 2>&1; echo "exit $?"'
+  read_session_counters_into "$after"
+  grade_ipv4_deny_rose "the window commanding a DNS lookup against 1.1.1.1" "$before" "$after"
+}
+
+# The P1 attack — a root guest writing `disable_ipv6=0`, re-soliciting a vmnet
+# RA and reacquiring a ULA — run as a command, and the guest then asked what
+# came of it. The Ipv4OnlyNoGuestIpv6 launch disables IPv6 on the guest kernel
+# boot line (`--kernel-arg ipv6.disable=1`), so a passing run has no IPv6 stack
+# and no `/proc/sys/net/ipv6` to write, and says so.
+#
+# What the guest says is a claim: an answer showing an IPv6 stack, address, or
+# route fails the proof, and an answer showing none proves nothing. The host's
+# own evidence that no IPv6 frame left — the interface-scoped `inet6` deny
+# counter across a host-timed window, against a positive control that can
+# emit IPv6 — is the observation rig's (plan Stage E3c), because this
+# session's workload can no longer emit IPv6 at all.
+attempt_ipv6_reenable() {
+  # shellcheck disable=SC2016 # expanded by the guest's shell, not this one
+  guest_act "a root re-enable of IPv6 and an RA re-solicit" '
     for s in all default eth0; do
       printf 0 > /proc/sys/net/ipv6/conf/$s/disable_ipv6 2>/dev/null || true
       printf 2 > /proc/sys/net/ipv6/conf/$s/accept_ra 2>/dev/null || true
     done
     ip link set eth0 down 2>/dev/null || true
     ip link set eth0 up 2>/dev/null || true
-  ' || true
+  '
   sleep 4
-  log "guest IPv6 state after attempting re-enable:"
-  guest 'ip -6 -o addr show 2>&1; ip -6 route show 2>&1; ls -d /proc/sys/net/ipv6 2>&1' || true
-  # Positive proof the stack is gone, not merely that an RA has not arrived yet:
-  # the kernel's IPv6 sysctl tree is absent. If it is present, the boot argument
-  # did not take, so IPv6 is NOT irreversibly disabled and this must fail rather
-  # than trust an empty `ip -6` snapshot.
-  if guest 'test -e /proc/sys/net/ipv6'; then
-    die "guest /proc/sys/net/ipv6 exists after re-enable attempt: the ipv6.disable=1 boot argument did not take, so IPv6 is not irreversibly disabled"
+  guest_report ipv6-after-reenable "$IPV6_POSTURE_COMMAND"
+}
+
+# Every guest answer, applied to the verdict of the host-graded legs above.
+# Each of those dies on failure, so reaching here means the host's verdict is
+# a pass; this is where the guest's answers may withdraw it, and the only
+# place anything in this harness reads them.
+grade_guest_answers() {
+  log "grading the guest's answers: each can withdraw the verdict, none can reach it"
+  local args=(guest-report --dir "$GUEST_DIR")
+  # Under the waiver the guest's account of its broker fetch is a failure by
+  # construction, so it is named as waived: the grader then says whether that
+  # is the *only* answer withdrawing the verdict (exit 3) or not (exit 1; 2 is
+  # a usage error). The verdict is withdrawn either way; the run exits non-zero
+  # either way.
+  if (( BROKER_REACH_WAIVED == 1 )); then
+    args+=(--waived broker-fetch)
   fi
-  # And no address or route may have appeared despite the re-enable attempt.
-  local addrs routes
-  addrs="$(guest 'ip -6 -o addr show scope global 2>/dev/null' | tr -d '[:space:]')"
-  routes="$(guest 'ip -6 route show default 2>/dev/null' | tr -d '[:space:]')"
-  if [ -n "$addrs" ] || [ -n "$routes" ]; then
-    die "guest acquired IPv6 after a root re-enable attempt (addr='${addrs}' route='${routes}'); the kernel-line disable is not irreversible"
+  local graded status=0
+  graded="$("$GRADER" "${args[@]}" 2>&1)" || status=$?
+  local line
+  while IFS= read -r line; do
+    log "  ${line}"
+  done <<<"$graded"
+  if (( status == 3 && BROKER_REACH_WAIVED == 1 )); then
+    return
   fi
-  # The host PF interface-scoped `block ... inet6 all` deny is still installed
-  # (assert_pf_anchor_is_interface_scoped checks its presence) as defence in
-  # depth against a guest-kernel compromise. Exercising its counter with a live
-  # IPv6 frame now requires a separate IPv6-enabled probe container, because
-  # this session's workload can no longer emit IPv6 at all; that live-fire test
-  # is the vertical proof's job (docs/plans/2026-09-01-ipv4-only-locked-v1.md,
-  # Stage E3), not this host-placement smoke proof.
-  log "pass: a root guest holds no IPv6 address or route after a re-enable attempt, and /proc/sys/net/ipv6 is absent"
+  if (( status != 0 )); then
+    die "the guest's answers withdraw the host-graded verdict (see above)"
+  fi
 }
 
 assert_pf_anchor_empty() {
@@ -784,7 +811,7 @@ IPV4_CIDR="$(cidr_alloc_subnet "$IPV4_POOL" 24 "$SUBNET_INDEX")"
 IPV6_CIDR="$(cidr_alloc_subnet "$IPV6_POOL" 64 "$SUBNET_INDEX")"
 IPV4_GATEWAY="$(cidr_gateway "$IPV4_CIDR")"
 
-mkdir -p "$BROKER_DIR" "$FORBIDDEN_DIR"
+mkdir -p "$BROKER_DIR" "$FORBIDDEN_DIR" "$GUEST_DIR"
 printf 'broker-ok\n' >"${BROKER_DIR}/broker.txt"
 printf 'forbidden-open\n' >"${FORBIDDEN_DIR}/forbidden.txt"
 
@@ -855,30 +882,21 @@ grep -Fxq "vm=${VM_NAME}" "$START_OUTPUT" || die "runner did not print expected 
 grep -Fxq "broker_url=http://${IPV4_GATEWAY}:${BROKER_PORT}/" "$START_OUTPUT" || \
   die "runner did not print expected broker URL"
 
-wait_for_released_guest_command
-
 # The IPv4-only launch drops CAP_NET_RAW (the default set never holds
 # CAP_NET_ADMIN): without either, the workload cannot forge an out-of-subnet
 # IPv4 source. The attached anchor below would block such a frame anyway (its
 # rules are interface-scoped, not source-scoped); the capability drop is the
-# sender-side half of the same boundary.
-assert_released_workload_lacks_net_admin_and_net_raw
-
-expect_guest_success \
-  "guest has required probe tools" \
-  'command -v ip >/dev/null && command -v wget >/dev/null && command -v nslookup >/dev/null'
-
-assert_guest_has_no_routable_ipv6
+# sender-side half of the same boundary. What the workload holds is asked here
+# and graded at the end, as a claim that can only fail the proof.
+ask_guest_about_its_posture
 
 # The attached anchor must be on the agent VM's bridge and members before the
 # guest command was ever released.
 assert_pf_anchor_is_interface_scoped
 
-GUEST_IPV4="$(guest_ipv4_addr)"
-if [[ -z "$GUEST_IPV4" ]]; then
-  die "could not determine guest IPv4 address"
-fi
-log "guest IPv4 address is ${GUEST_IPV4}"
+GUEST_IPV4="$(guest_ipv4_from_runtime)" \
+  || die "could not read the guest's address on ${NETWORK_NAME} from the container runtime"
+log "guest IPv4 address, as the container runtime allocated it, is ${GUEST_IPV4}"
 
 BROKER_URL="http://${IPV4_GATEWAY}:${BROKER_PORT}/broker.txt"
 FORBIDDEN_URL="http://${IPV4_GATEWAY}:${FORBIDDEN_PORT}/forbidden.txt"
@@ -887,18 +905,12 @@ assert_broker_reachable
 
 assert_forbidden_ipv4_egress_counted
 
-expect_guest_blocked \
-  "VM cannot reach direct IPv4 internet" \
-  "wget -q -T 3 -O - 'http://1.1.1.1/'"
+assert_direct_ipv4_egress_denied
 
-expect_guest_blocked \
-  "VM cannot reach direct external DNS" \
-  "nslookup github.com 1.1.1.1 >/dev/null"
+# Adversarial: the exact P1 — a root guest re-enabling IPv6 post-release.
+attempt_ipv6_reenable
 
-# Adversarial: closes the exact P1 — a root guest re-enabling IPv6 post-release.
-# The kernel-line disable makes that re-enable impossible in the guest, so this
-# asserts irreversibility; the host PF IPv6 deny remains as defence in depth.
-assert_guest_ipv6_disable_is_irreversible
+grade_guest_answers
 
 log "stopping session through lifecycle runner"
 "$RUNNER" \
@@ -918,8 +930,13 @@ assert_no_pf_state_for_guest
 
 cleanup
 trap - EXIT INT TERM
+# What the host established, and what it did not. The guest's answers appear
+# only as "raised no doubt": a guest that says it holds no NET_RAW, or has no
+# IPv6, has proved neither, and this summary does not say it has.
+HOST_PROVEN="session anchor interface-scoped, forbidden host port denied and counted by the IPv4 interface deny with its listener silent, the IPv4 deny counting the guest's frames in the windows commanding direct internet and DNS (not per destination: plan Stage E3c), and runner cleanup verified"
+GUEST_UNDOUBTED="no guest answer doubts it (capabilities, probe tools, IPv6 posture before and after a root re-enable attempt: guest-reported, so never proof); the host's own IPv6 evidence is plan Stage E3c's"
 if (( BROKER_REACH_WAIVED == 1 )); then
-  log "runner lifecycle proof INCOMPLETE for ${IPV4_CIDR}: the positive control (broker reachable) was waived under WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1 because a host socket filter blocked this proof's broker listener; every other leg passed: workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"
+  log "runner lifecycle proof INCOMPLETE for ${IPV4_CIDR}: the positive control (broker reachable) was waived under WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1 because a host socket filter blocked this proof's broker listener; host-graded: ${HOST_PROVEN}; ${GUEST_UNDOUBTED}"
   exit 2
 fi
-log "runner lifecycle proof succeeded for ${IPV4_CIDR}; workload holds neither NET_ADMIN nor NET_RAW, session anchor interface-scoped, broker reachable, forbidden host port blocked and counted by the IPv4 interface deny, IPv6 posture proven, the guest kernel disable of IPv6 is irreversible from a root guest, and runner cleanup verified"
+log "runner lifecycle proof succeeded for ${IPV4_CIDR}; host-graded: broker served the guest (its listener's log), ${HOST_PROVEN}; ${GUEST_UNDOUBTED}"

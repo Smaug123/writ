@@ -26,6 +26,15 @@
 //! absence of the rule is [`DenyRefusal::NoSuchDeny`] rather than a reading of
 //! zero — the same fail-closed move the `awk` made by dying unless at least
 //! one rule rendered with a counter.
+//!
+//! # The other two halves
+//!
+//! [`listener`] grades the other host-owned fact the proof reads, the access
+//! logs of the listeners the host runs. [`guest`] holds what the guest said, as
+//! claims that can withdraw a verdict and never reach one (Stage E3b).
+
+pub mod guest;
+pub mod listener;
 
 use writ_core::core::{
     IPV4_IFACE_DENY_LABEL, IPV6_IFACE_DENY_LABEL, PfCounterDeltaError, PfCounterSnapshot,

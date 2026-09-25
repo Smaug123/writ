@@ -33,7 +33,13 @@
             || rel == "crates"
             || lib.hasPrefix "crates/" rel
             || rel == "tests"
-            || lib.hasPrefix "tests/" rel;
+            || lib.hasPrefix "tests/" rel
+            # The vertical proof's grader tests read the harness they grade
+            # for (`include_str!`), to hold its guest questions to the slots
+            # the grader parses. Only that one script: the others change the
+            # Rust derivation's hash for nothing.
+            || rel == "scripts"
+            || rel == "scripts/prove-agent-vm-lifecycle.sh";
         };
 
       # Every Rust build here is two derivations: the dependency graph, keyed

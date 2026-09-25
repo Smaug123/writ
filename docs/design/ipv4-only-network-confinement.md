@@ -410,9 +410,11 @@ The rules are:
    appendix. Not a generic transcript table, and not a plan language: there is
    one experiment per placement, and it is written out step by step.
 
-The parked `Claim<T>` taint type (`ipv4-lock/02-claim`) is the right shape for
-rule 2's "explicit doubt" and should be adopted when a host consumer exists,
-which is the vertical proof in plan stage E and not before.
+Rule 2's "explicit doubt" is the `Claim<T>` taint type (`src/agent_vm_claim.rs`),
+whose first consumer is the vertical proof's guest report
+(`src/agent_vm_proof/guest.rs`, plan Stage E3b): every answer the proof
+harness gets from the guest is captured unread and held as a claim, and the
+only thing a claim can do to the verdict is withdraw it.
 
 ## Lifecycle model
 
