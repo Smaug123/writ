@@ -189,20 +189,40 @@ pub enum GuestReportError {
 }
 
 impl GuestReport {
-    /// A report from a capture per slot.
+    /// A report from the bytes of each slot's answer, exactly as the guest
+    /// sent them.
     ///
     /// Takes a function rather than a map so that totality is the caller's
-    /// obligation by construction: there is no slot it can leave out.
-    pub fn new(mut capture: impl FnMut(GuestSlot) -> Claim<RawCapture>) -> Self {
-        let captures: BTreeMap<GuestSlot, Claim<RawCapture>> = GuestSlot::ALL
-            .into_iter()
-            .map(|slot| (slot, capture(slot)))
-            .collect();
-        let unread_whole = captures
-            .iter()
-            .filter(|(_, claim)| claim.captured_bytes() >= GUEST_CAPTURE_LIMIT)
-            .map(|(slot, _)| *slot)
-            .collect();
+    /// obligation by construction: there is no slot it can leave out. And it
+    /// takes bytes rather than claims because whether the host read an answer
+    /// whole is a fact about those bytes — their length and whether they
+    /// decode — which is gone once they have been decoded and cut: a cut
+    /// that falls inside a multibyte character keeps fewer bytes than the
+    /// bound, and a lossy decode of invalid bytes keeps more.
+    pub fn from_answers(mut answer: impl FnMut(GuestSlot) -> Vec<u8>) -> Self {
+        let mut captures = BTreeMap::new();
+        let mut unread_whole = BTreeSet::new();
+        for slot in GuestSlot::ALL {
+            let mut bytes = answer(slot);
+            if bytes.len() >= GUEST_CAPTURE_LIMIT {
+                unread_whole.insert(slot);
+                bytes.truncate(GUEST_CAPTURE_LIMIT);
+            }
+            let text = match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) => {
+                    // Not refused — the guest's bytes are not the host's to
+                    // refuse — but not read whole either. Kept lossily, for
+                    // the appendix.
+                    unread_whole.insert(slot);
+                    String::from_utf8_lossy(error.as_bytes()).into_owned()
+                }
+            };
+            captures.insert(
+                slot,
+                Claim::asserted(RawCapture::capture(&text, GUEST_CAPTURE_LIMIT)),
+            );
+        }
         Self {
             captures,
             unread_whole,
@@ -210,7 +230,8 @@ impl GuestReport {
     }
 
     /// Reads the harness's capture directory: exactly one `<slot>.txt` per
-    /// slot, each read to at most [`GUEST_CAPTURE_LIMIT`] bytes.
+    /// slot, each read to at most [`GUEST_CAPTURE_LIMIT`] bytes, which the
+    /// harness has already cut it to.
     pub fn read_dir(dir: &Path) -> Result<Self, GuestReportError> {
         let read_error = |path: &Path, source| GuestReportError::Read {
             path: path.display().to_string(),
@@ -226,8 +247,7 @@ impl GuestReport {
                 return Err(GuestReportError::Unknown(name));
             }
         }
-        let mut captures = BTreeMap::new();
-        let mut unread_whole = BTreeSet::new();
+        let mut answers = BTreeMap::new();
         for slot in GuestSlot::ALL {
             let path = dir.join(format!("{}.txt", slot.name()));
             let file = match std::fs::File::open(&path) {
@@ -241,37 +261,17 @@ impl GuestReport {
             file.take(GUEST_CAPTURE_LIMIT as u64)
                 .read_to_end(&mut bytes)
                 .map_err(|e| read_error(&path, e))?;
-            // Measured on the bytes, before any decode can change their
-            // length.
-            if bytes.len() >= GUEST_CAPTURE_LIMIT {
-                unread_whole.insert(slot);
-            }
-            let text = match String::from_utf8(bytes) {
-                Ok(text) => text,
-                Err(error) => {
-                    // Not refused — the guest's bytes are not the host's to
-                    // refuse — but not read whole either: a lossy decode
-                    // turns each bad byte into three, so an answer under the
-                    // bound on disk can overrun it decoded, and the cut would
-                    // drop a tail nothing measured. Kept lossily, for the
-                    // appendix.
-                    unread_whole.insert(slot);
-                    String::from_utf8_lossy(error.as_bytes()).into_owned()
-                }
-            };
-            captures.insert(
-                slot,
-                Claim::asserted(RawCapture::capture(&text, GUEST_CAPTURE_LIMIT)),
-            );
+            answers.insert(slot, bytes);
         }
-        Ok(Self {
-            captures,
-            unread_whole,
-        })
+        Ok(Self::from_answers(|slot| {
+            answers
+                .remove(&slot)
+                .expect("every slot's answer was read above")
+        }))
     }
 
-    /// One slot's capture. Every slot has one: [`GuestReport::new`] and
-    /// [`GuestReport::read_dir`] are the only constructors, and both are total.
+    /// One slot's capture. Every slot has one: [`GuestReport::from_answers`]
+    /// is total, and [`GuestReport::read_dir`] builds through it.
     pub fn claim(&self, slot: GuestSlot) -> &Claim<RawCapture> {
         &self.captures[&slot]
     }

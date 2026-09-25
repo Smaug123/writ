@@ -43,16 +43,16 @@ const HONEST_STATUS: &str = "Name:\tsh\nUmask:\t0022\nState:\tS (sleeping)\nPid:
 CapInh:\t0000000000000000\nCapPrm:\t00000000a80405fb\nCapEff:\t00000000a80405fb\n\
 CapBnd:\t00000000a80405fb\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\n";
 
-fn capture(text: &str) -> Claim<RawCapture> {
-    Claim::asserted(RawCapture::capture(text, GUEST_CAPTURE_LIMIT))
-}
-
 fn honest_report() -> GuestReport {
-    GuestReport::new(|slot| capture(honest(slot)))
+    GuestReport::from_answers(|slot| honest(slot).as_bytes().to_vec())
 }
 
 fn report_with(slot: GuestSlot, text: &str) -> GuestReport {
-    GuestReport::new(|each| capture(if each == slot { text } else { honest(each) }))
+    GuestReport::from_answers(|each| {
+        if each == slot { text } else { honest(each) }
+            .as_bytes()
+            .to_vec()
+    })
 }
 
 /// The positive control for everything below: a run that passes raises no
@@ -288,9 +288,9 @@ fn arbitrary_report() -> impl Strategy<Value = GuestReport> {
             Just(honest(slot).to_string()),
         ]
     };
-    GuestSlot::ALL
-        .map(one)
-        .prop_map(|texts| GuestReport::new(|slot| capture(&texts[slot as usize])))
+    GuestSlot::ALL.map(one).prop_map(|texts| {
+        GuestReport::from_answers(|slot| texts[slot as usize].clone().into_bytes())
+    })
 }
 
 proptest! {
@@ -552,4 +552,43 @@ fn an_answer_that_is_not_utf8_is_doubt_even_under_the_bound() {
         &GuestReport::read_dir(dir.path()).unwrap(),
     );
     assert_eq!(graded.doubted_by, vec![GuestSlot::ReleaseMarker]);
+}
+
+/// Truncation is measured on what the guest sent, not on what was kept. A
+/// cut that falls inside a multibyte character keeps *fewer* bytes than the
+/// bound, so the retained length alone would call the answer whole.
+#[test]
+fn an_answer_cut_inside_a_character_is_still_one_the_host_did_not_read_whole() {
+    let mut status = HONEST_STATUS.to_string();
+    while status.len() < GUEST_CAPTURE_LIMIT - 1 {
+        status.push('x');
+    }
+    status.truncate(GUEST_CAPTURE_LIMIT - 1);
+    status.push_str("é\nCapBnd:\t00000000a80425fb\n");
+    let graded = grade_guest_report(
+        SessionVerdict::Proven,
+        &report_with(GuestSlot::Pid1Status, &status),
+    );
+    assert_eq!(graded.doubted_by, vec![GuestSlot::Pid1Status]);
+}
+
+proptest! {
+    /// Around the bound, an otherwise passing answer is doubted exactly when
+    /// the bytes the guest sent reach it — whatever characters straddle the
+    /// cut, and however many bytes each of them is.
+    #[test]
+    fn doubt_at_the_bound_is_decided_by_the_bytes_sent(
+        pad in (GUEST_CAPTURE_LIMIT - 8 - HONEST_STATUS.len())..(GUEST_CAPTURE_LIMIT + 8 - HONEST_STATUS.len()),
+        tail in "[xé𝄞]{0,3}",
+    ) {
+        let answer = format!("{HONEST_STATUS}{}{tail}", "x".repeat(pad));
+        let graded = grade_guest_report(
+            SessionVerdict::Proven,
+            &report_with(GuestSlot::Pid1Status, &answer),
+        );
+        prop_assert_eq!(
+            graded.doubted_by.contains(&GuestSlot::Pid1Status),
+            answer.len() >= GUEST_CAPTURE_LIMIT
+        );
+    }
 }

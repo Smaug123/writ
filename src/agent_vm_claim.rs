@@ -7,7 +7,8 @@
 //! guest-computed summary and treating it as evidence — so the distinction is
 //! tracked in the types here rather than in the care of whoever edits the
 //! grading code next. Its first consumer is the vertical proof's guest report
-//! ([`crate::agent_vm_proof::guest`]).
+//! (`agent_vm_proof::guest`, host-only, so named here rather than linked: this
+//! module is built without the host feature too).
 //!
 //! [`Claim`] has no accessor. A claim leaves this module by four doors, each
 //! named for what it licenses:
@@ -292,9 +293,9 @@ pub struct Doubt(bool);
 /// distinguished variant has no such eliminator — mapping it back to a
 /// conclusion takes an explicit match, which is a thing a reviewer can see.
 ///
-/// The one real member is the vertical proof's
-/// [`SessionVerdict`](crate::agent_vm_proof::guest::SessionVerdict); the other
-/// is the shape the tests use.
+/// The one real member is the vertical proof's `SessionVerdict`
+/// (`agent_vm_proof::guest`, host-only); the other is the shape the tests
+/// use.
 pub trait Withheld: sealed::WithheldSealed {
     /// The value that stands for "the host has no conclusion here".
     fn withheld() -> Self;
