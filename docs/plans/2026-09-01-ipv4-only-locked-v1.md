@@ -1245,65 +1245,102 @@ was the wrong shape.
 
 **Implements:** Proof obligations 1 and 2; Evidence protocol rules 1–6.
 
-Evolve `scripts/prove-agent-vm-lifecycle.sh`, and the small Rust it shells to,
-so that grading uses only host-owned facts: a host-minted nonce, a host
-listener on the bridge's ULA and link-local addresses expecting that nonce, the
-labelled deny counter delta from C3 across a host-timed window of two RA
-intervals, and a positive control in the same run: a root guest from the proof
-image on a network the proof creates itself, with no anchor, reaching an
-identical listener. The proof runs twice, once per profile, because the two
-have different expected counters: under the legacy profile the root guest can
-re-enable IPv6, so the deny counters must rise; under the locked profile it
-cannot, so they must stay at zero. The guest attack binary is told the targets
-and its output is attached as diagnostics. This is where `ipv4-lock/02-claim`'s `Claim<T>` gets its first
-consumer: guest-reported facts arrive as claims, and the grader cannot read
-them without unwrapping into the diagnostics appendix. Keep the attack set to
-what the design lists (sysctl, rtnetlink, raw socket, namespace, proc alias,
-setuid, file capability, child process); do not build a schedule language.
+*Revised 2026-09-25: the proof is of the locked profile only.* The legacy
+profiles are on their way out, and E3 no longer proves them; see "Stage E3,
+revised" below for why, and for what that changed. What follows is the
+revised statement.
+
+Prove, on a real host, that a locked session started by writd's own start
+path is confined, grading only on host-owned facts, and record that host in
+the allowlist. Two kinds of evidence, for two kinds of claim:
+
+- **IPv6 is refused structurally, not by a counter.** The locked guest's
+  trusted initializer writes `disable_ipv6`, then drops to UID 1000 with every
+  capability set empty and `NoNewPrivs` before release; nothing the released
+  workload holds can re-enable a stack or emit a frame the stack will not
+  send. The evidence for that is the host's own read of PID 1's status
+  *before* release, matching B1's `LockedAwaitingRelease`, with the image's
+  rootfs scan (no setuid or setgid file) standing behind it. The host PF IPv6
+  deny stays installed and is checked by readback, as defence in depth against
+  a guest-kernel compromise; it is not live-fired.
+- **IPv4 is confined by PF, so it is graded on PF and on listeners.** The
+  positive control is the session reaching its own broker, graded on writd's
+  audit rows for it; the negative is a forbidden host port, graded on the
+  interface-scoped IPv4 deny counting the probe and the forbidden listener
+  logging no contact from the session subnet.
+
+Guest-reported facts arrive as claims (E3b's `GuestReport`), and can withdraw
+the verdict but never reach one.
 
 **Correctness oracle:**
-- On hardware, legacy profile: the positive control reaches its listener; the
-  protected session's listener accepts nothing and its deny counters rose by
-  at least the commanded probe count.
-- On hardware, locked profile: the positive control reaches its listener; the
-  protected session's listener accepts nothing and its deny counters are
-  zero; the pre-release `/proc/<pid>/status` read matches B1's
-  awaiting-release acceptance type (`LockedAwaitingRelease`). The change that records this passing is the change that adds the
-  host's (CLI, macOS build, image digest) record to the host-placement
-  allowlist; the allowlist test asserts every entry names a proof record.
+- On hardware: the pre-release status read matches `LockedAwaitingRelease`;
+  the positive control reaches the broker; the forbidden port's probe is
+  denied and counted, and its listener logs nothing from the subnet; the
+  attached anchor reads back interface-scoped with its IPv6 deny present; and
+  no guest answer withdraws the verdict. The change that records this passing
+  is the change that adds the host's (CLI, macOS build, image digest, dated
+  proof run) record to the host-placement allowlist.
 - The proof fails, each with a distinct message, when the positive control
-  does not reach its listener (observer broken), when the listener tool is
-  missing, when the legacy run's RA route never returns, and when a locked
-  run's counter is non-zero.
-- Under the locked image, the attack binary's own diagnostics show each
-  attack failing at the syscall as UID 1000, and the host verdict is
-  unchanged with those diagnostics deleted.
+  does not reach the broker, when the listener tool is missing, when the
+  pre-release read does not match, and when the image the handoff test ran is
+  not the digest being recorded.
 
 ---
 
 ## Stage E3, in five parts
 
-E3 is one stage in the design and five in the doing, because "grade on
-host-owned facts" is four separable changes to the harness and a run on
-hardware, and only the last of them needs a Mac with `container` on it. The
-order is forced the usual way: the grader is what the rig feeds, the rig is
-what the attack binary exercises, and the record can only be written by a run
-that passed.
+E3 is one stage in the design and five in the doing. E3a and E3b, below, are
+the grading: counters read as typed documents, and guest answers held as
+claims. Both landed as first written. E3c–E3e were revised after them, and the
+revision is recorded next.
 
 What exists already, and is not rebuilt here: Stage C3's `PfCounterSnapshot`,
 its `delta`, and the helper's `counters` command, which reads one anchor's
-labelled rules as a typed document. What does *not* exist is a consumer: the
-harness still scrapes `pfctl -vsr` with `awk` of its own, which is the thing
-E3's evidence rules are about.
+labelled rules as a typed document.
 
-One thing the survey settled. The session anchor's `pass` rules are
-deliberately unlabelled, so they carry no counter key and the typed document
-covers the **denies** only. That is the right shape for this stage rather than
-a gap to close: the denies are what the two profiles disagree about, and the
-positive control is graded by a host listener seeing a host-minted nonce, not
-by a pass counter. The harness keeps its ad-hoc read of the pass counters
-where it already uses them — diagnosing a failed positive control — and
-nothing grades on them.
+The session anchor's `pass` rules are deliberately unlabelled, so they carry
+no counter key and the typed document covers the **denies** only. That is the
+right shape rather than a gap to close: the positive control is graded on
+something that names the session (writd's audit rows, or a listener's log),
+not by a pass counter. The legacy harness keeps its ad-hoc read of the pass
+counters where it already uses them — diagnosing a failed positive control —
+and nothing grades on them.
+
+### Stage E3, revised: the locked profile only
+
+Three facts, found while E3b was in review, changed what E3c–E3e are.
+
+1. **Neither profile's workload can emit IPv6.** The original oracle said the
+   legacy profile's deny counters "must rise" because a root guest could
+   re-enable IPv6. Since #415 the legacy launch disables IPv6 on the kernel
+   line, and the locked one drops every capability before release, so a
+   counter that rises needs a separately launched IPv6-capable sender. The
+   decision (2026-09-25) is not to build one: a structural reason the host
+   has evidence for is enough, and the IPv6 deny stays as readback-checked
+   defence in depth. That removes the IPv6 listeners, the positive control
+   container, and the window of two RA intervals.
+2. **A locked session has no `container exec` in its life** (E2c-3b). So the
+   E3b harness's `guest_report`, which is an exec, cannot reach one. What a
+   locked workload says reaches the host on its stdout, through
+   `container logs`, and it is read from there into the same `GuestReport`.
+   The pre-release status read — the one host read of the guest that *is*
+   evidence — is an exec before release, which the profile permits while only
+   trusted code runs. writd deliberately does not make it (it would put an
+   exec in production's path), but `official_image_handoff` already does,
+   under Apple `container`, against the official image. The proof runs that
+   test on the proof host, against the digest being recorded.
+3. **Nothing can admit a locked session on a host that is not on the
+   allowlist, and the allowlist can only be written by a proof that ran one.**
+   The circle is broken at compile time: a `proof-candidate` cargo feature,
+   off in every shipped build, under which writd admits one candidate
+   (CLI, macOS build, image digest) that the operator names, in addition to
+   the shipped list. Every other admission gate still applies.
+
+The legacy lifecycle harness keeps its E3b shape and is not extended; it goes
+when the legacy profiles do. E3d's attack binary is dropped: its output could
+only ever be diagnostics, the argument it would have illustrated rests on the
+pre-release posture and the rootfs scan, and a few attempts in the proof
+workload's shell serve as diagnostics.
 
 ---
 
@@ -1521,57 +1558,86 @@ IPv6 deny counter is expected to stay at zero, and "rose by at least the
 commanded probe count" needs a sender that *can* emit IPv6 on the protected
 session's network: a separately launched probe container attached there
 without the kernel argument, not the workload. E3c has to decide that before
-its oracle can be written.
+its oracle can be written. (Decided: see "Stage E3, revised" above — no
+counters, since the reason is structural.)
 
 ---
 
-### Stage E3c: the observation rig
+### Stage E3c: the proof-candidate admission
 
 **Dependencies:** E3b.
 
-**Implements:** Proof obligation 1; evidence protocol rules 5–6.
+**Implements:** the way out of the allowlist's circle, and nothing a shipped
+binary can reach.
 
-The host mints a nonce, serves it from listeners bound to the bridge's ULA and
-link-local addresses, and measures the deny delta across a window of two RA
-intervals that the *host* times. The positive control runs in the same
-invocation: a root guest from the proof image, on a network the proof creates
-itself with no anchor on it, reaching an identical listener. Without it, a
-protected session that reaches nothing proves only that the harness is broken.
+A `proof-candidate` cargo feature on the `writ` crate, in no default and in no
+Nix package. Under it, writd's config may name one candidate
+`(container CLI, macOS build, image digest)`, and `admit_on_this_host` asks
+`admit_locked` with the shipped list *plus* that candidate. Every other gate
+(helper protocol version, PF preflight, ABI label) is unchanged, and so is the
+matching: the candidate admits only when the probes read exactly its three
+facts.
+
+The admission says which list admitted it. `LockedV1Admission` carries its
+basis (`Shipped { proof_run }` or `ProofCandidate`), writd records the basis
+on the session's audit row and state record, and a candidate admission is
+loud in writd's log. A session admitted as a candidate is therefore never
+mistakable, afterwards, for one admitted on a proof.
 
 **Correctness oracle:**
-- On hardware: the positive control reaches its listener and the protected
-  session's listeners accept nothing.
-- Distinct failures, each with its own message, for: the positive control not
-  reaching its listener, the listener tool missing, and the legacy run's RA
-  route never returning.
-- The window is host-timed, asserted by the grader refusing a window shorter
-  than two RA intervals — a bound that is pure and tested here, not timed on
-  hardware.
+- Without the feature, the candidate does not exist: the config field does
+  not parse and the code path does not compile (a `compile_fail` doctest, or
+  a build of the default features that names the field and fails).
+- With it, D's admission sweep is repeated with the candidate in place of the
+  shipped list: it admits exactly where the shipped list would have admitted
+  a matching entry, and refuses on every other fact for the same reason.
+- A candidate admission is recorded as one: the audit row and state record
+  name the basis, and a test asserts no shipped admission ever carries the
+  candidate basis.
+- The shipped builds do not have it: the Nix package's writd reports its
+  enabled features and CI's Nix build job asserts `proof-candidate` is not
+  among them.
 
 ---
 
-### Stage E3d: the attack binary
+### Stage E3d: the locked proof harness
 
 **Dependencies:** E3c.
 
-**Implements:** Proof obligation 2.
+**Implements:** Proof obligation 1 for the locked profile; evidence protocol
+rules 1, 2, 5, and 6.
 
-A guest-side binary attempting the eight attacks the design lists — sysctl,
-rtnetlink, raw socket, namespace, proc alias, setuid, file capability, child
-process — told its targets, reporting each outcome. Not a schedule language:
-eight attempts and eight results.
+A locked mode of `scripts/prove-agent-vm-daemon.sh`, which already builds and
+loads the official image, fakes GitHub, the Git origin and the Nix cache, and
+starts a session through `writ agent-vm start`. In locked mode it:
 
-Its output is diagnostics, never evidence. That is what E3b's shape is for,
-and the oracle below is the one that proves it.
+1. builds writd with `proof-candidate`, and names the host's probed triple as
+   the candidate, with the image digest it just built;
+2. runs `official_image_handoff` under Apple `container` against that image,
+   having checked the image reference resolves to that digest (a local image
+   cannot be run by digest) — the pre-release status read is that test's;
+3. starts a locked session with a proof workload: a shell script, since the
+   production image has `bash`, `ip` and `curl` and the proof may not add to
+   it, which prints prefixed answer lines to stdout — its own
+   `/proc/self/status`, its IPv6 posture, a broker request, a forbidden-port
+   fetch, and a few re-enable attempts as diagnostics;
+4. grades the host legs: the attached anchor's readback, the positive control
+   on writd's audit rows for the session's broker request, and the forbidden
+   port on a deny window and the accept-logging listener's silence;
+5. reads the workload's answers from `container logs`, bounded as
+   `GuestBootstrapChannel` bounds its read, into a `GuestReport` whose slots
+   are the locked workload's, and grades them last, as doubts.
 
 **Correctness oracle:**
-- Under the locked image, each attack fails at the syscall as UID 1000, and
-  the binary says which syscall and which errno.
-- **The host verdict is unchanged with the diagnostics deleted.** This is the
-  load-bearing one: it is what makes the attack binary an explanation rather
-  than a source of truth.
-- The binary compiles for the guest target and is absent from the production
-  image, asserted by the image's own rootfs scan.
+- The locked `GuestReport` slots are held to the proof workload's printed
+  prefixes by the same kind of scan E3b holds the legacy harness to, and the
+  report's parsers are property-tested against their grammars.
+- Every leg's refusal is distinct, and each is exercised off hardware where
+  it can be (the graders are pure; the harness's pure helpers are in
+  `scripts/test-proof-helpers.sh`).
+- The harness refuses to start unless writd reports the candidate basis for
+  the session — a proof that ran on the shipped list would be proving a
+  platform already recorded.
 
 ---
 
@@ -1581,24 +1647,20 @@ and the oracle below is the one that proves it.
 
 **Implements:** the proof.
 
-Run the harness on hardware, twice, once per profile. Then — in the same
-change — add the host's `(CLI, macOS build, image digest)` record to
-`SHIPPED_PROVEN_PLATFORMS`, with the dated proof run E2c-3c made a required
-field.
+Run the locked mode of the harness on this Mac. Then, in the same change, add
+the host's `(CLI, macOS build, image digest)` to `SHIPPED_PROVEN_PLATFORMS`
+with the dated proof run E2c-3c made a required field.
 
 **This slice cannot be done without the hardware**, which is the point: the
 allowlist entry is the claim that the proof passed *there*, and nothing else
 in this plan can make it true.
 
 **Correctness oracle:**
-- Legacy profile: positive control reaches its listener; the protected
-  session's listener accepts nothing; deny counters rose by at least the
-  commanded probe count.
-- Locked profile: positive control reaches its listener; the protected
-  session's listener accepts nothing; deny counters are zero; the pre-release
-  `/proc/<pid>/status` read matches B1's `LockedAwaitingRelease`.
-- The profile admits on that host afterwards, and on no other — the allowlist
-  is three facts about one machine.
+- The run passes every leg E3's oracle lists.
+- Afterwards, the default-feature writd admits the locked profile on this
+  host and on no other: the allowlist is three facts about one machine. And
+  in that same decision the legacy profiles close on this host (invariant 9,
+  E2's admission).
 
 ---
 
@@ -1614,8 +1676,13 @@ worse, one that can be satisfied by the wrong implementation. Four rounds of
 review on an earlier draft of this plan found a new such contradiction every
 round; each was real, and each was in a stage past this line.
 
-E3's proof is where the answers get recorded, as pinned facts about the
-(CLI, macOS build) it ran on. The questions, and what each one decides:
+E3's proof was to be where the answers got recorded, as pinned facts about
+the (CLI, macOS build) it ran on. As revised (locked profile only, no
+IPv6-capable sender), it records question 5 and nothing else; questions 2–4
+each need a sender E3 no longer builds, so they become their own measurement
+when vm placement is next planned, and question 1 was measured on 2026-09-12
+for the vm-placement plan (#414): the bridge appears with the first VM. The questions, and what each one
+decides:
 
 1. **When does the host bridge exist, and when do members attach?** The
    helper derives interfaces from the gateway, so an interface-scoped
