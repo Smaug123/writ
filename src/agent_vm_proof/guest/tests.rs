@@ -457,3 +457,60 @@ fn the_harness_and_the_grader_bound_answers_alike() {
         "{bound}"
     );
 }
+
+/// An answer that reaches the bound is one whose end the host never saw, and
+/// what it did not see could contradict what it did: five clean capability
+/// sets, padding, then a set holding `NET_RAW` past the cut. Reaching the
+/// bound is doubt in itself, whatever the prefix parses to.
+#[test]
+fn an_answer_that_reaches_the_bound_is_doubt_whatever_its_prefix_says() {
+    let mut status = HONEST_STATUS.to_string();
+    while status.len() < GUEST_CAPTURE_LIMIT {
+        status.push_str("Padding:\t0\n");
+    }
+    status.push_str("CapBnd:\t00000000a80425fb\n");
+    // The retained prefix alone parses clean: the contradiction is past the cut.
+    assert!(holds_no_network_authority(&status[..GUEST_CAPTURE_LIMIT]));
+
+    // Through the constructor the tests use.
+    let graded = grade_guest_report(
+        SessionVerdict::Proven,
+        &report_with(GuestSlot::Pid1Status, &status),
+    );
+    assert_eq!(graded.doubted_by, vec![GuestSlot::Pid1Status]);
+
+    // And through the directory the harness writes, where `head -c` has
+    // already cut the answer at exactly the bound.
+    let dir = tempfile::tempdir().unwrap();
+    for slot in GuestSlot::ALL {
+        std::fs::write(
+            dir.path().join(format!("{}.txt", slot.name())),
+            honest(slot),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        dir.path().join("pid1-status.txt"),
+        &status.as_bytes()[..GUEST_CAPTURE_LIMIT],
+    )
+    .unwrap();
+    let graded = grade_guest_report(
+        SessionVerdict::Proven,
+        &GuestReport::read_dir(dir.path()).unwrap(),
+    );
+    assert_eq!(graded.doubted_by, vec![GuestSlot::Pid1Status]);
+
+    // One byte short of the bound is an answer the host saw whole.
+    let whole = format!(
+        "{HONEST_STATUS}{}",
+        "x".repeat(GUEST_CAPTURE_LIMIT - 1 - HONEST_STATUS.len())
+    );
+    assert_eq!(
+        grade_guest_report(
+            SessionVerdict::Proven,
+            &report_with(GuestSlot::Pid1Status, &whole)
+        )
+        .verdict,
+        SessionVerdict::Proven
+    );
+}

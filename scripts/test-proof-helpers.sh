@@ -273,5 +273,52 @@ check 'no firewall tool: unattributed' \
   "$(writ_classify_offloopback_failure 'no firewall tool at /usr/libexec/ApplicationFirewall/socketfilterfw (not macOS?)')"
 check 'empty verdict: unattributed' unattributed "$(writ_classify_offloopback_failure '')"
 
+printf 'accept-logging-http-server.py\n'
+
+# The proof grades a listener's silence on its log. Plain `http.server` writes
+# nothing for a connection that is accepted and closed without a request, so a
+# forbidden port reached that way would read as silent. The proof's listener
+# logs every accept before it reads a byte; this runs it on loopback and checks
+# that a silent connection leaves exactly one `accept` line, and that a served
+# request still leaves the access line the grader parses.
+LISTENER="${ROOT_DIR}/scripts/lib/accept-logging-http-server.py"
+listener_dir="$(mktemp -d "${TMPDIR:-/tmp}/writ-accept-listener.XXXXXX")"
+printf 'listener-ok\n' >"${listener_dir}/probe.txt"
+listener_port="$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()')"
+python3 "$LISTENER" "$listener_port" "$listener_dir" >"${listener_dir}/log" 2>&1 &
+listener_pid=$!
+# shellcheck disable=SC2064  # the values are wanted as they are now
+trap "kill ${listener_pid} 2>/dev/null; rm -rf -- '${listener_dir}'" EXIT
+
+accept_lines() {
+  grep -c "^accept 127\.0\.0\.1 [0-9]*$" "${listener_dir}/log" || true
+}
+
+served=""
+for _ in {1..50}; do
+  served="$(curl --silent --fail --noproxy '*' --max-time 1 \
+    "http://127.0.0.1:${listener_port}/probe.txt" 2>/dev/null || true)"
+  [[ "$served" == listener-ok ]] && break
+  sleep 0.1
+done
+check "the listener serves its directory" listener-ok "$served"
+check "a served request leaves an access line" 1 \
+  "$(grep -c '^127\.0\.0\.1 - - \[.*\] "GET /probe.txt HTTP/1.1" 200 -$' "${listener_dir}/log" || true)"
+
+before="$(accept_lines)"
+python3 -c "import socket; socket.create_connection(('127.0.0.1', ${listener_port})).close()"
+after="$before"
+for _ in {1..20}; do
+  after="$(accept_lines)"
+  (( after > before )) && break
+  sleep 0.1
+done
+check "a connection closed without a request is still logged, once" \
+  "$(( before + 1 ))" "$after"
+
 printf '\n%d check(s), %d failure(s)\n' "$CHECKS" "$FAILURES"
 (( FAILURES == 0 )) || exit 1

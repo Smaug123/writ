@@ -1445,7 +1445,8 @@ being claimed:
   by `writ-agent-vm-proof listener-log`: a well-formed `GET /broker.txt` line
   answered 200 to the guest's address. The forbidden listener's log is graded
   the other way, fail-closed: any address of the session subnet anywhere in
-  it, including a traceback's `request from (…)`, is contact.
+  it, including an `accept` line or a traceback's `request from (…)`, is
+  contact.
 - **Direct internet and DNS** were graded only on the guest failing. Each is
   now its own counted window on the IPv4 interface deny, which is sound
   because a guest on an `--internal` network does get a default route via the
@@ -1476,6 +1477,26 @@ outside the two helpers, a slot asked twice, a slot the grader lacks, and the
 capture bound drifting between the script and the grader.
 
 The script change itself runs only on hardware, and E3e exercises it.
+
+A review round found three more ways for the new host evidence to read as a
+pass, each reproduced before it was fixed:
+
+- **A forged status.** `http.server` logs the request line verbatim, quotes
+  included, so a guest sending `GET /broker.txt HTTP/1.1" 200 -` got a 400
+  logged *after* its own `200`, and a parser reading from the front took the
+  guest's. The status is now read from the end of the line, where only the
+  listener writes, and the request must be exactly a GET of the path.
+- **An accept with no request.** Plain `http.server` writes nothing at all
+  for a connection accepted and closed without a request, so the forbidden
+  listener's silence was not a witness. Both listeners now run
+  `scripts/lib/accept-logging-http-server.py`, which is `http.server` plus an
+  `accept <peer> <port>` line written before the request is read.
+  `scripts/test-proof-helpers.sh` runs it on loopback and fails against plain
+  `http.server`.
+- **A truncated answer.** An answer that reached the capture bound was
+  parsed from its retained prefix, and several parsers read only the lines
+  they need, so a contradiction past the cut went unseen. Reaching the bound,
+  as the host measured it on the bytes it kept, is now doubt in itself.
 
 **A finding for E3c and E3e.** The E3 oracles above say that under the legacy
 profile "the root guest can re-enable IPv6, so the deny counters must rise".

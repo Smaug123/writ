@@ -34,7 +34,7 @@
 //! field to add as a bare value, and a new variant does not compile until
 //! [`GuestSlot::doubt`] says how the host reads it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::Path;
 
@@ -42,8 +42,8 @@ use crate::agent_vm_claim::{Claim, Doubt, RawCapture, Withheld};
 
 /// The most the harness keeps of any one guest answer, in bytes. The harness
 /// truncates at the same bound (`head -c`), and a capture that reaches it is a
-/// capture the host did not see all of, which the parsers' exact grammars
-/// then refuse.
+/// capture the host did not see all of, which is doubt in itself
+/// ([`GuestReport::doubt`]): the parsers cannot see what was cut.
 pub const GUEST_CAPTURE_LIMIT: usize = 64 * 1024;
 
 /// One question the proof asks the guest.
@@ -160,7 +160,15 @@ impl Withheld for SessionVerdict {
 
 /// Everything the guest said, one capture per slot.
 #[derive(Clone, Debug)]
-pub struct GuestReport(BTreeMap<GuestSlot, Claim<RawCapture>>);
+pub struct GuestReport {
+    captures: BTreeMap<GuestSlot, Claim<RawCapture>>,
+    /// The slots whose answer reached [`GUEST_CAPTURE_LIMIT`]. The host
+    /// measured this itself — it is the length of what it kept, not anything
+    /// the guest said about its answer — and an answer that reached the bound
+    /// is one whose end the host never saw, which could contradict every line
+    /// it did.
+    reached_bound: BTreeSet<GuestSlot>,
+}
 
 /// Why a directory of captures is not a report.
 #[derive(Debug, thiserror::Error)]
@@ -186,12 +194,19 @@ impl GuestReport {
     /// Takes a function rather than a map so that totality is the caller's
     /// obligation by construction: there is no slot it can leave out.
     pub fn new(mut capture: impl FnMut(GuestSlot) -> Claim<RawCapture>) -> Self {
-        Self(
-            GuestSlot::ALL
-                .into_iter()
-                .map(|slot| (slot, capture(slot)))
-                .collect(),
-        )
+        let captures: BTreeMap<GuestSlot, Claim<RawCapture>> = GuestSlot::ALL
+            .into_iter()
+            .map(|slot| (slot, capture(slot)))
+            .collect();
+        let reached_bound = captures
+            .iter()
+            .filter(|(_, claim)| claim.captured_bytes() >= GUEST_CAPTURE_LIMIT)
+            .map(|(slot, _)| *slot)
+            .collect();
+        Self {
+            captures,
+            reached_bound,
+        }
     }
 
     /// Reads the harness's capture directory: exactly one `<slot>.txt` per
@@ -212,6 +227,7 @@ impl GuestReport {
             }
         }
         let mut captures = BTreeMap::new();
+        let mut reached_bound = BTreeSet::new();
         for slot in GuestSlot::ALL {
             let path = dir.join(format!("{}.txt", slot.name()));
             let file = match std::fs::File::open(&path) {
@@ -225,6 +241,11 @@ impl GuestReport {
             file.take(GUEST_CAPTURE_LIMIT as u64)
                 .read_to_end(&mut bytes)
                 .map_err(|e| read_error(&path, e))?;
+            // Measured on the bytes, before the lossy decode below can change
+            // their length.
+            if bytes.len() >= GUEST_CAPTURE_LIMIT {
+                reached_bound.insert(slot);
+            }
             // Lossy on purpose: the guest's bytes are not the host's to
             // refuse, and a replacement character fails every parser's
             // grammar, which is the doubt a garbled answer deserves.
@@ -234,13 +255,29 @@ impl GuestReport {
                 Claim::asserted(RawCapture::capture(&text, GUEST_CAPTURE_LIMIT)),
             );
         }
-        Ok(Self(captures))
+        Ok(Self {
+            captures,
+            reached_bound,
+        })
     }
 
     /// One slot's capture. Every slot has one: [`GuestReport::new`] and
     /// [`GuestReport::read_dir`] are the only constructors, and both are total.
     pub fn claim(&self, slot: GuestSlot) -> &Claim<RawCapture> {
-        &self.0[&slot]
+        &self.captures[&slot]
+    }
+
+    /// Whether this slot's answer gives the host reason to withdraw its
+    /// conclusion: its parser doubts it, or it reached the bound. The second
+    /// is checked apart from the first because no parser can see what was
+    /// cut, and several read only the lines they need.
+    pub fn doubt(&self, slot: GuestSlot) -> Doubt {
+        let cut = if self.reached_bound.contains(&slot) {
+            Doubt::raised()
+        } else {
+            Doubt::none()
+        };
+        slot.doubt(self.claim(slot)).or(cut)
     }
 }
 
@@ -256,7 +293,7 @@ pub struct GuestGrading {
 
 /// Apply the guest's doubts to the conclusion the host reached for itself.
 pub fn grade_guest_report(host: SessionVerdict, report: &GuestReport) -> GuestGrading {
-    let doubts = GuestSlot::ALL.map(|slot| (slot, slot.doubt(report.claim(slot))));
+    let doubts = GuestSlot::ALL.map(|slot| (slot, report.doubt(slot)));
     let verdict = Doubt::any(doubts.iter().map(|(_, doubt)| *doubt)).shadowing(host);
     // Each slot asked on its own whether it would withdraw a proven verdict,
     // through the same elimination form: a doubt has no other way out.

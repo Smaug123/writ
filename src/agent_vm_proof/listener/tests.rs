@@ -23,9 +23,12 @@ fn silent(peers: &str) -> ListenerExpectation {
 }
 
 /// The readiness check the harness makes from loopback, then the guest's
-/// request, as `python3 -m http.server` logs them.
+/// request, as `scripts/lib/accept-logging-http-server.py` logs them: an
+/// `accept` line per connection, then `http.server`'s access line.
 const BROKER_LOG: &str = "\
+accept 127.0.0.1 50100
 127.0.0.1 - - [25/Sep/2026 10:00:00] \"GET /broker.txt HTTP/1.1\" 200 -
+accept 192.168.252.2 41234
 192.168.252.2 - - [25/Sep/2026 10:00:03] \"GET /broker.txt HTTP/1.1\" 200 -
 ";
 
@@ -61,11 +64,26 @@ fn a_serve_is_a_well_formed_line_to_that_peer_for_that_path_with_200() {
             "an error line",
         ),
         (
+            "accept 192.168.252.2 41234\n",
+            "an accept with no request answered",
+        ),
+        (
             "----------------------------------------\n\
              Exception occurred during processing of request from ('192.168.252.2', 51234)\n",
             "an accept() that was never answered",
         ),
         ("", "nothing at all"),
+        (
+            // The request line is the guest's: http.server logs it verbatim,
+            // quotes and all, so a guest can write a status of its own into
+            // it. This is the 400 it actually got.
+            "192.168.252.2 - - [25/Sep/2026 10:00:03] \"GET /broker.txt HTTP/1.1\" 200 -\" 400 -\n",
+            "a status forged inside the request line",
+        ),
+        (
+            "192.168.252.2 - - [25/Sep/2026 10:00:03] \"GET /broker.txt HTTP/1.1 extra\" 200 -\n",
+            "a request line that is not exactly a GET of the path",
+        ),
     ] {
         assert!(
             grade_listener_log(log, &served("192.168.252.2", "/broker.txt")).is_err(),
@@ -85,6 +103,9 @@ fn silence_is_broken_by_any_mention_of_the_subnet() {
         "192.168.252.2 - - [25/Sep/2026 10:00:03] \"GET /forbidden.txt HTTP/1.1\" 200 -\n",
         "192.168.252.2 - - [25/Sep/2026 10:00:03] code 400, message Bad request\n",
         "Exception occurred during processing of request from ('192.168.252.2', 51234)\n",
+        // A connection accepted and closed without a request: the only line
+        // it leaves, and the one plain `http.server` never wrote.
+        "accept 192.168.252.2 51234\n",
         "peer 192.168.252.9.51234 reset\n",
         "from 192.168.252.9.\n",
     ] {

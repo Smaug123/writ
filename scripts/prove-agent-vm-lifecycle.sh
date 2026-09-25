@@ -253,11 +253,16 @@ pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
 
+# `http.server` that also logs every accept (scripts/lib/accept-logging-http-server.py):
+# a connection closed without a request leaves no line in plain `http.server`'s
+# log, and the forbidden listener's silence is graded on that log. Both
+# listeners run it, so the positive control exercises the same tool the
+# negative relies on.
 start_http_server() {
   local dir="$1"
   local port="$2"
   local log_file="$3"
-  python3 -m http.server "$port" --bind 0.0.0.0 --directory "$dir" \
+  python3 "${ROOT_DIR}/scripts/lib/accept-logging-http-server.py" "$port" "$dir" \
     >"$log_file" 2>&1 &
   echo "$!"
 }

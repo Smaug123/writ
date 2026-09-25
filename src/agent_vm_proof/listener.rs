@@ -71,7 +71,11 @@ pub fn grade_listener_log(
         ListenerExpectation::Served { peer, path } => {
             let served = log
                 .lines()
-                .filter(|line| access_line(line) == Some((*peer, "GET", path.as_str(), 200)))
+                .filter(|line| {
+                    access_line(line).is_some_and(|(logged_peer, request, status)| {
+                        logged_peer == *peer && status == 200 && is_get_of(request, path)
+                    })
+                })
                 .count();
             if served == 0 {
                 Err(ListenerRefusal::NotServed {
@@ -98,19 +102,36 @@ pub fn grade_listener_log(
     }
 }
 
-/// One access line: `<peer> - - [<date>] "<method> <path> <version>" <status> <size>`.
-fn access_line(line: &str) -> Option<(Ipv4Addr, &str, &str, u16)> {
+/// One access line: `<peer> - - [<date>] "<request line>" <status> <size>`,
+/// as `(peer, request line, status)`.
+///
+/// The peer, date, status, and size are the listener's; the request line is
+/// whatever the client sent, logged verbatim, quotes included. So the status
+/// is read from the *end* of the line — a guest that sends
+/// `GET /broker.txt HTTP/1.1" 200 -` gets a 400 logged after it, and reading
+/// from the front would take the guest's `200` for the listener's.
+fn access_line(line: &str) -> Option<(Ipv4Addr, &str, u16)> {
     let (peer, rest) = line.split_once(" - - [")?;
     let peer = peer.parse().ok()?;
     let (_date, rest) = rest.split_once("] \"")?;
-    let (request, rest) = rest.split_once("\" ")?;
-    let mut request = request.split(' ');
-    let (method, path, version) = (request.next()?, request.next()?, request.next()?);
-    if request.next().is_some() || !version.starts_with("HTTP/") {
+    let (rest, size) = rest.rsplit_once(' ')?;
+    if !is_logged_size(size) {
         return None;
     }
-    let status = rest.split(' ').next()?.parse().ok()?;
-    Some((peer, method, path, status))
+    let (request, status) = rest.rsplit_once(' ')?;
+    let request = request.strip_suffix('"')?;
+    Some((peer, request, status.parse().ok()?))
+}
+
+/// `http.server`'s size field: `-`, or a byte count.
+fn is_logged_size(size: &str) -> bool {
+    size == "-" || (!size.is_empty() && size.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether a logged request line is exactly a GET of `path`: three fields,
+/// nothing else, so no guest-supplied suffix rides along.
+fn is_get_of(request: &str, path: &str) -> bool {
+    request == format!("GET {path} HTTP/1.1") || request == format!("GET {path} HTTP/1.0")
 }
 
 /// Every IPv4 address in `line`: each four consecutive dot-separated numbers
