@@ -60,6 +60,11 @@ path = "src/bin/writ-agent-vm-pf-helper.rs"
 required-features = ["host"]
 
 [[bin]]
+name = "writ-agent-vm-proof"
+path = "src/bin/writ-agent-vm-proof.rs"
+required-features = ["host"]
+
+[[bin]]
 name = "writ-agent-vm-runner"
 path = "src/bin/writ-agent-vm-runner.rs"
 required-features = ["host"]

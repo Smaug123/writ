@@ -1281,6 +1281,212 @@ setuid, file capability, child process); do not build a schedule language.
 
 ---
 
+## Stage E3, in five parts
+
+E3 is one stage in the design and five in the doing, because "grade on
+host-owned facts" is four separable changes to the harness and a run on
+hardware, and only the last of them needs a Mac with `container` on it. The
+order is forced the usual way: the grader is what the rig feeds, the rig is
+what the attack binary exercises, and the record can only be written by a run
+that passed.
+
+What exists already, and is not rebuilt here: Stage C3's `PfCounterSnapshot`,
+its `delta`, and the helper's `counters` command, which reads one anchor's
+labelled rules as a typed document. What does *not* exist is a consumer: the
+harness still scrapes `pfctl -vsr` with `awk` of its own, which is the thing
+E3's evidence rules are about.
+
+One thing the survey settled. The session anchor's `pass` rules are
+deliberately unlabelled, so they carry no counter key and the typed document
+covers the **denies** only. That is the right shape for this stage rather than
+a gap to close: the denies are what the two profiles disagree about, and the
+positive control is graded by a host listener seeing a host-minted nonce, not
+by a pass counter. The harness keeps its ad-hoc read of the pass counters
+where it already uses them — diagnosing a failed positive control — and
+nothing grades on them.
+
+---
+
+### Stage E3a: the grader reads counters, not text
+
+**Dependencies:** C3.
+
+**Implements:** Evidence protocol rule 1 (the host grades on what the host
+read), for the counter half.
+
+The harness's `pf_iface_deny_packets` becomes two readings of the helper's
+`counters` document either side of a host-timed window, and a pure grader over
+their `delta`. The expectation is inert data with one variant per profile:
+the legacy profile's denies must rise by at least the number of probes
+commanded, the locked profile's must not move at all.
+
+The typed read is stronger than the `awk` it replaces in a way worth stating:
+`PfCounterSnapshot::delta` refuses two readings whose key sets differ or whose
+counters fell, so an anchor reloaded mid-window is an error rather than a
+plausible-looking small delta. The `awk` could only ever have read that as a
+number.
+
+**Correctness oracle:**
+- Property over pairs of snapshots: the graded rise equals the summed rise of
+  every interface-scoped IPv6 deny key, and no other key contributes.
+- A window in which the anchor was reloaded is refused, not graded.
+- `Unmoved` is met by exactly a zero rise, and `RoseByAtLeast(n)` by exactly a
+  rise of `n` or more; each refusal names the reading it saw.
+- A weakening that grades on the sum of *all* deny keys, or that reads a
+  missing key as zero, fails these.
+
+---
+
+**E3a landed.** `agent_vm_proof::grade_deny_window` is the pure grading, and
+`writ-agent-vm-proof deny-window` is the unprivileged binary the harness
+shells to. The harness's IPv4 leg — the one that already grades on a deny
+delta — is its first consumer; the IPv6 window arrives with the rig in E3c.
+
+The grader is its own binary rather than a helper subcommand on purpose. The
+helper runs under `sudo`, and its job is to *read* PF; this decides what a
+reading means. Building the grading into the helper would put a proof's
+expectations inside the thing being measured, and running it as root would be
+a second privileged surface for nothing.
+
+Two refusals are worth naming, because they are what the `awk` could not say.
+A window whose two readings have different key sets, or in which a counter
+fell, is a window in which the anchor was reloaded — so their difference is
+not a measurement, and `PfCounterSnapshot::delta` refuses it rather than
+returning a plausible number. And an anchor with *no* rule of the family under
+test counts nothing, which satisfies `Unmoved` perfectly; that absence is
+`NoSuchDeny` rather than a reading of zero, which is the same fail-closed move
+the `awk` made by dying unless a rule rendered with a counter.
+
+The harness keeps its text-scraping read of the counters in one place: the
+diagnosis of a *failed* positive control. Nothing grades on it, and a refusal
+to parse would be the wrong answer there — the question is where the packets
+went, not whether the anchor is well-formed.
+
+A review round found a third way for a missing rule to look like a satisfied
+one, and it is the same shape as the other two. A counter key is a label *and*
+an interface, and the grader matched on the label alone — so a rule carrying
+the interface-deny label but scoped to no interface counted as one. The helper
+never files that pairing (a subnet-scoped deny gets a different label), but
+the grader reads a *file*, and the wire format admits it: a document whose
+only rule of that label was unscoped would have satisfied `Unmoved` with no
+interface deny in it at all. Both halves of the key are matched now.
+
+Four weakenings were injected and fail these tests: a missing rule read as a
+zero rise, a rule scoped to no interface counted as an interface deny, a
+grader that sums every deny key rather than the family's, and an `Unmoved`
+that tolerates one stray frame. A fifth — ignoring the reloaded-anchor refusal
+— could not be written: `delta` returns a `Result` and `?` is the only way
+past it, so the refusal is structural rather than remembered.
+
+---
+
+### Stage E3b: what the guest says arrives as a claim
+
+**Dependencies:** E3a.
+
+**Implements:** Evidence protocol rules 2–4 (a guest-reported fact is not
+evidence).
+
+`Claim<T>` lands from `ipv4-lock/02-claim` and gets its first consumer. The
+harness reads guest-reported facts today — `ip -6 addr`, `ip -6 route`, the
+presence of `/proc/sys/net/ipv6` — and grades on them directly. They become
+claims: readable into the diagnostics appendix, and unable to reach a verdict
+except through `corroborated_by` against something the host holds.
+
+The nonce is what the host holds. `Claim::corroborated_by` is available only
+for `HostHeld` types, a sealed set that excludes `bool` on purpose, so a
+guest-computed verdict has no upward path at all.
+
+**Correctness oracle:**
+- The module's own tests come with it, including the one that pins `Claim`
+  having no `PartialEq`: `claim == Claim::asserted(true)` would recover any
+  guest verdict without going near `HostHeld`, and an earlier version shipped
+  exactly that.
+- A test enumerates every guest-reported field the harness reads and requires
+  each to be a `Claim`: a new one added as a bare value fails the build.
+- The grader's verdict is unchanged when every claim is replaced with a
+  hostile one — asserted by running the grading twice, once over the real
+  diagnostics and once over fabricated ones.
+
+---
+
+### Stage E3c: the observation rig
+
+**Dependencies:** E3b.
+
+**Implements:** Proof obligation 1; evidence protocol rules 5–6.
+
+The host mints a nonce, serves it from listeners bound to the bridge's ULA and
+link-local addresses, and measures the deny delta across a window of two RA
+intervals that the *host* times. The positive control runs in the same
+invocation: a root guest from the proof image, on a network the proof creates
+itself with no anchor on it, reaching an identical listener. Without it, a
+protected session that reaches nothing proves only that the harness is broken.
+
+**Correctness oracle:**
+- On hardware: the positive control reaches its listener and the protected
+  session's listeners accept nothing.
+- Distinct failures, each with its own message, for: the positive control not
+  reaching its listener, the listener tool missing, and the legacy run's RA
+  route never returning.
+- The window is host-timed, asserted by the grader refusing a window shorter
+  than two RA intervals — a bound that is pure and tested here, not timed on
+  hardware.
+
+---
+
+### Stage E3d: the attack binary
+
+**Dependencies:** E3c.
+
+**Implements:** Proof obligation 2.
+
+A guest-side binary attempting the eight attacks the design lists — sysctl,
+rtnetlink, raw socket, namespace, proc alias, setuid, file capability, child
+process — told its targets, reporting each outcome. Not a schedule language:
+eight attempts and eight results.
+
+Its output is diagnostics, never evidence. That is what E3b's shape is for,
+and the oracle below is the one that proves it.
+
+**Correctness oracle:**
+- Under the locked image, each attack fails at the syscall as UID 1000, and
+  the binary says which syscall and which errno.
+- **The host verdict is unchanged with the diagnostics deleted.** This is the
+  load-bearing one: it is what makes the attack binary an explanation rather
+  than a source of truth.
+- The binary compiles for the guest target and is absent from the production
+  image, asserted by the image's own rootfs scan.
+
+---
+
+### Stage E3e: the run, and the record
+
+**Dependencies:** E3d.
+
+**Implements:** the proof.
+
+Run the harness on hardware, twice, once per profile. Then — in the same
+change — add the host's `(CLI, macOS build, image digest)` record to
+`SHIPPED_PROVEN_PLATFORMS`, with the dated proof run E2c-3c made a required
+field.
+
+**This slice cannot be done without the hardware**, which is the point: the
+allowlist entry is the claim that the proof passed *there*, and nothing else
+in this plan can make it true.
+
+**Correctness oracle:**
+- Legacy profile: positive control reaches its listener; the protected
+  session's listener accepts nothing; deny counters rose by at least the
+  commanded probe count.
+- Locked profile: positive control reaches its listener; the protected
+  session's listener accepts nothing; deny counters are zero; the pre-release
+  `/proc/<pid>/status` read matches B1's `LockedAwaitingRelease`.
+- The profile admits on that host afterwards, and on no other — the allowlist
+  is three facts about one machine.
+
+---
+
 ## Beyond E3: what waits on the proof
 
 Nothing past E3 is planned as a stage yet, on purpose. The rest of the

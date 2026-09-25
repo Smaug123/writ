@@ -444,6 +444,14 @@ assert_pf_anchor_is_interface_scoped() {
 # reacquire a vmnet-RA ULA after release. Prove the *host* PF interface deny
 # still blocks its IPv6 egress, so the bypass is closed at a layer the guest
 # cannot touch.
+# Diagnostics only, and deliberately still text-scraping. What the proof
+# *grades* on goes through the helper's typed counters document and
+# `writ-agent-vm-proof` (see assert_forbidden_ipv4_egress_counted); this runs
+# in the one place a reading is wanted about a run that has already failed, to
+# say where the packets went. A refusal to parse would be the wrong answer
+# there: the question is what the host saw, not whether the anchor is
+# well-formed.
+#
 # The summed packet counter of the session anchor's interface-scoped denies of
 # one family (`inet` or `inet6`), read on the host from `pfctl -vsr`, which
 # renders each rule followed by an indented `[ Evaluations: N Packets: N Bytes:
@@ -610,6 +618,20 @@ assert_broker_reachable() {
   esac
 }
 
+# One reading of this session's anchor, as the helper's typed counters
+# document. The file is what the grader below is handed; nothing here reads
+# its contents, which is the point — the shell's job is to time the window,
+# not to interpret it.
+read_session_counters_into() {
+  local into="$1"
+  local args=(sudo "$HELPER" counters --session-id "$SESSION_ID" --ipv4-cidr "$IPV4_CIDR")
+  if [[ "$IPV6_MODE" == "dual-stack-required" && -n "$IPV6_CIDR" ]]; then
+    args+=(--ipv6-cidr "$IPV6_CIDR")
+  fi
+  "${args[@]}" > "$into" \
+    || die "could not read this session's PF counters for ${PF_ANCHOR}"
+}
+
 # The interface-scoped IPv4 deny is live on the guest's actual path: a TCP
 # connect from the guest to a host port that is not the broker's must be
 # blocked by that rule and counted by it. The guest's exit code is not the
@@ -620,20 +642,30 @@ assert_broker_reachable() {
 # and the forged-source measurement is a separate probe container's job (the
 # plan's "Beyond E3", question 4). What this proves is that the rule counted
 # in the readback is the rule deciding the guest's frames.
+#
+# The reading and the grading are both the helper's and the grader's, not this
+# script's: `sudo <helper> counters` prints one session anchor's labelled rules
+# as a typed document, and `writ-agent-vm-proof deny-window` decides what two
+# of them mean. What that buys over the `awk` it replaces is what the typed
+# read can refuse: two documents whose key sets differ, or whose counters
+# fell, are readings of an anchor that was reloaded in between, and their
+# difference is not a measurement. Scraped text could only ever subtract two
+# numbers and get a plausible one.
 assert_forbidden_ipv4_egress_counted() {
-  local before
-  before="$(pf_iface_deny_packets inet)"
-  log "probing a forbidden host port (IPv4 deny counter before: ${before})"
+  local before="${TMP_DIR}/counters-before-forbidden.json"
+  local after="${TMP_DIR}/counters-after-forbidden.json"
+  read_session_counters_into "$before"
+  log "probing a forbidden host port"
   expect_guest_blocked \
     "VM cannot reach forbidden host port" \
     "wget -q -T 3 -O - '$FORBIDDEN_URL'"
-  local after
-  after="$(pf_iface_deny_packets inet)"
-  log "IPv4 deny counter after: ${after}"
-  if (( after <= before )); then
-    die "the host IPv4 interface deny counted no packet during the guest's probe (before=${before}, after=${after}); the probe sent nothing, or PF did not see it on the bridge"
-  fi
-  log "pass: host PF blocked $((after - before)) IPv4 packet(s) to the forbidden host port"
+  read_session_counters_into "$after"
+  local graded
+  graded="$("$GRADER" deny-window \
+    --before "$before" --after "$after" \
+    --family ipv4 --rose-by-at-least 1 2>&1)" \
+    || die "the host IPv4 interface deny did not count the guest's probe: ${graded}"
+  log "pass: ${graded}"
 }
 
 assert_guest_ipv6_disable_is_irreversible() {
@@ -772,8 +804,10 @@ fi
 log "building PF helper and lifecycle runner"
 "${CARGO_CMD[@]}" build --quiet \
   --bin writ-agent-vm-pf-helper \
+  --bin writ-agent-vm-proof \
   --bin writ-agent-vm-runner
 HELPER="${ROOT_DIR}/target/debug/writ-agent-vm-pf-helper"
+GRADER="${ROOT_DIR}/target/debug/writ-agent-vm-proof"
 
 # Protocol v2: the helper validates every session against the pools and
 # broker-port range in its root-owned policy file, not against arguments. The
