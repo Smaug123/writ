@@ -1451,7 +1451,13 @@ being claimed:
   now its own counted window on the IPv4 interface deny, which is sound
   because a guest on an `--internal` network does get a default route via the
   host bridge (measured on `container` 1.4.1), so the first frame of each
-  probe lands on an interface the anchor is scoped to.
+  probe lands on an interface the anchor is scoped to. What that proves is
+  narrower than the legs' names, and the run's summary says only the narrow
+  thing (a fourth review round's point): the counter is not per destination,
+  so a guest that sent some other blocked frame instead of the commanded
+  probe satisfies it too. Destination-specific evidence is E3c's — evidence
+  protocol rule 4 puts the experiment's nonce in its own PF labels. The
+  forbidden-port leg is specific already, by its listener.
 - **The guest's address**, which scopes the broker-log grading and the
   post-stop PF state check, was the guest's `ip addr`. It is now read from
   `container inspect`, which the runtime that allocated it answers.

@@ -659,20 +659,29 @@ assert_forbidden_ipv4_egress_counted() {
 # an interface the anchor is scoped to, and the deny must count it. Until
 # Stage E3b these legs were graded on the guest's own exit status, which a
 # compromised guest sets to whatever passes.
+#
+# What the host can say here is narrower than the leg's name, and the summary
+# says only that: the interface-scoped IPv4 deny counted the guest's frames in
+# a window in which it was commanded to reach 1.1.1.1. The counter is not
+# per destination, so a guest that sent something else instead — another
+# blocked port — satisfies it too. Destination-specific evidence is the
+# observation rig's (plan Stage E3c; evidence protocol rule 4, a nonce in the
+# experiment's own PF labels). The forbidden-port leg above *is* specific, by
+# its listener; these two are the same rule exercised on the internet path.
 assert_direct_ipv4_egress_denied() {
   local before="${TMP_DIR}/counters-before-internet.json"
   local after="${TMP_DIR}/counters-after-internet.json"
   read_session_counters_into "$before"
   guest_report internet-fetch "$(fetch_command "http://1.1.1.1/")"
   read_session_counters_into "$after"
-  grade_ipv4_deny_rose "direct IPv4 internet" "$before" "$after"
+  grade_ipv4_deny_rose "the window commanding an HTTP fetch of 1.1.1.1" "$before" "$after"
 
   before="${TMP_DIR}/counters-before-dns.json"
   after="${TMP_DIR}/counters-after-dns.json"
   read_session_counters_into "$before"
   guest_report dns-lookup 'nslookup github.com 1.1.1.1 >/dev/null 2>&1; echo "exit $?"'
   read_session_counters_into "$after"
-  grade_ipv4_deny_rose "direct external DNS" "$before" "$after"
+  grade_ipv4_deny_rose "the window commanding a DNS lookup against 1.1.1.1" "$before" "$after"
 }
 
 # The P1 attack — a root guest writing `disable_ipv6=0`, re-soliciting a vmnet
@@ -924,7 +933,7 @@ trap - EXIT INT TERM
 # What the host established, and what it did not. The guest's answers appear
 # only as "raised no doubt": a guest that says it holds no NET_RAW, or has no
 # IPv6, has proved neither, and this summary does not say it has.
-HOST_PROVEN="session anchor interface-scoped, forbidden host port denied and counted by the IPv4 interface deny with its listener silent, direct IPv4 internet and DNS denied and counted, and runner cleanup verified"
+HOST_PROVEN="session anchor interface-scoped, forbidden host port denied and counted by the IPv4 interface deny with its listener silent, the IPv4 deny counting the guest's frames in the windows commanding direct internet and DNS (not per destination: plan Stage E3c), and runner cleanup verified"
 GUEST_UNDOUBTED="no guest answer doubts it (capabilities, probe tools, IPv6 posture before and after a root re-enable attempt: guest-reported, so never proof); the host's own IPv6 evidence is plan Stage E3c's"
 if (( BROKER_REACH_WAIVED == 1 )); then
   log "runner lifecycle proof INCOMPLETE for ${IPV4_CIDR}: the positive control (broker reachable) was waived under WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER=1 because a host socket filter blocked this proof's broker listener; host-graded: ${HOST_PROVEN}; ${GUEST_UNDOUBTED}"
