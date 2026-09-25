@@ -1410,6 +1410,87 @@ guest-computed verdict has no upward path at all.
 
 ---
 
+**E3b landed.** `Claim<T>` is `src/agent_vm_claim.rs` (renamed from the parked
+branch's `agent_vm_ipv6_claim`, since the claims it holds are no longer only
+about IPv6), and its first consumer is `agent_vm_proof::guest`.
+
+The harness no longer reads the guest at all. It has exactly two ways in:
+`guest_report <slot>` asks one question and captures the answer unread, and
+`guest_act` commands an action whose exit status is logged and ignored. The
+answers are graded once, at the end, by `writ-agent-vm-proof guest-report`,
+and the only thing they can do there is withdraw the verdict: each slot's
+parser is host-authored and fail-closed, reads its capture into a
+`Claim<bool>`, and from there into a `Doubt`, and `Doubt::shadowing` is the
+only way a doubt reaches `SessionVerdict`. So a guest that reports holding
+`NET_RAW` fails the proof, and one that reports not holding it has proved
+nothing — and the run's summary now says exactly that, instead of listing the
+guest's account among the things proven.
+
+The report is a total map from `GuestSlot` to `Claim<RawCapture>`, not a
+struct, so the "a new guest field added as a bare value fails the build"
+oracle is structural: there is no field to add, and a new slot does not
+compile until `GuestSlot::doubt` says how the host reads it. What is tested
+is the link to the script: every `guest_report` slot there is a `GuestSlot`,
+asked once, and nothing but the two helpers and the failure dump execs into
+the guest. The "grading twice" oracle is a property: over arbitrary host
+verdicts and pairs of arbitrary reports, the verdict is the host's or
+withdrawn, and the best any fabricated report can do — the passing answer to
+every question — is exactly the host's verdict.
+
+Three legs that graded on the guest had to move onto host evidence, or stop
+being claimed:
+
+- **The positive control** (the guest reaches the broker) was the guest's
+  `wget` exit status. It is now the broker listener's own access log, graded
+  by `writ-agent-vm-proof listener-log`: a well-formed `GET /broker.txt` line
+  answered 200 to the guest's address. The forbidden listener's log is graded
+  the other way, fail-closed: any address of the session subnet anywhere in
+  it, including a traceback's `request from (…)`, is contact.
+- **Direct internet and DNS** were graded only on the guest failing. Each is
+  now its own counted window on the IPv4 interface deny, which is sound
+  because a guest on an `--internal` network does get a default route via the
+  host bridge (measured on `container` 1.4.1), so the first frame of each
+  probe lands on an interface the anchor is scoped to.
+- **The guest's address**, which scopes the broker-log grading and the
+  post-stop PF state check, was the guest's `ip addr`. It is now read from
+  `container inspect`, which the runtime that allocated it answers.
+
+The IPv6 legs have no host evidence yet, on purpose: the guest's account of
+its posture before and after a root re-enable attempt is a doubt, and the
+host's own IPv6 evidence is E3c's window and positive control.
+
+When the broker reach is waived (`WRIT_PROVE_TOLERATE_BLOCKED_HOST_LISTENER`),
+the guest's broker answer fails by construction. `guest-report --waived
+broker-fetch` still withdraws the verdict; it exits 3 rather than 1 only when
+that is the sole answer withdrawing it, so the waiver the harness asked for is
+distinguishable from a guest answer it did not expect (and from clap's exit 2
+for a misspelt slot, which grades nothing).
+
+Weakenings injected and failing: the capability decoder reading only
+`CapEff`; tolerating a missing capability set; leaving one slot unparsed;
+ignoring the broker's body; ignoring doubt altogether; dropping the sysctl
+check after the re-enable; reading listener silence from access lines only;
+parsing whole digit runs rather than windows, which misses a `.port`-suffixed
+address; and a serve that ignores the status. On the script side: an exec
+outside the two helpers, a slot asked twice, a slot the grader lacks, and the
+capture bound drifting between the script and the grader.
+
+The script change itself runs only on hardware, and E3e exercises it.
+
+**A finding for E3c and E3e.** The E3 oracles above say that under the legacy
+profile "the root guest can re-enable IPv6, so the deny counters must rise".
+That stopped being true with #415: the legacy launch now passes
+`--kernel-arg ipv6.disable=1`, so a legacy root guest has no IPv6 stack to
+re-enable and emits no IPv6 at all — which is exactly what this harness's
+re-enable leg asserts. Under both profiles, then, the protected workload's
+IPv6 deny counter is expected to stay at zero, and "rose by at least the
+commanded probe count" needs a sender that *can* emit IPv6 on the protected
+session's network: a separately launched probe container attached there
+without the kernel argument, not the workload. E3c has to decide that before
+its oracle can be written.
+
+---
+
 ### Stage E3c: the observation rig
 
 **Dependencies:** E3b.
